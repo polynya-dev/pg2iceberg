@@ -1,0 +1,1 @@
+SELECT id, name, status FROM iceberg.`default.e2e_mixed_ops` ORDER BY id
