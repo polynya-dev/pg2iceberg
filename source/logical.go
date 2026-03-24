@@ -1,0 +1,427 @@
+package source
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/hasyimibhar/pg2iceberg/config"
+	"github.com/hasyimibhar/pg2iceberg/schema"
+	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+)
+
+// LogicalSource implements Source using PostgreSQL logical replication.
+// It manages the full lifecycle of the replication slot.
+type LogicalSource struct {
+	pgCfg  config.PostgresConfig
+	cfg    config.LogicalConfig
+	tables map[string]*schema.TableSchema
+
+	replConn *pgconn.PgConn
+	queryConn *pgx.Conn
+
+	// relations caches RelationMessage by OID for decoding tuples.
+	relations map[uint32]*pglogrepl.RelationMessageV2
+
+	// startLSN is the position to start streaming from.
+	startLSN pglogrepl.LSN
+	// confirmedLSN is the last position we confirmed to PG.
+	confirmedLSN pglogrepl.LSN
+
+	// slotCreated tracks whether we created the slot (for cleanup).
+	slotCreated bool
+}
+
+func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig) *LogicalSource {
+	return &LogicalSource{
+		pgCfg:     pgCfg,
+		cfg:       logicalCfg,
+		tables:    make(map[string]*schema.TableSchema),
+		relations: make(map[uint32]*pglogrepl.RelationMessageV2),
+	}
+}
+
+// SetStartLSN restores position from a checkpoint.
+func (l *LogicalSource) SetStartLSN(lsn uint64) {
+	l.startLSN = pglogrepl.LSN(lsn)
+	l.confirmedLSN = pglogrepl.LSN(lsn)
+}
+
+// ConfirmedLSN returns the current confirmed LSN for checkpointing.
+func (l *LogicalSource) ConfirmedLSN() uint64 {
+	return uint64(l.confirmedLSN)
+}
+
+func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) error {
+	// Open a regular connection for schema discovery and slot management.
+	var err error
+	l.queryConn, err = pgx.Connect(ctx, l.pgCfg.DSN())
+	if err != nil {
+		return fmt.Errorf("query connect: %w", err)
+	}
+	defer l.queryConn.Close(ctx)
+
+	// Discover schemas for configured tables.
+	for _, table := range l.cfg.Tables {
+		ts, err := schema.DiscoverSchema(ctx, l.queryConn, table)
+		if err != nil {
+			return fmt.Errorf("discover schema for %s: %w", table, err)
+		}
+		l.tables[table] = ts
+	}
+
+	// Validate publication exists.
+	var pubExists bool
+	err = l.queryConn.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
+		l.cfg.PublicationName,
+	).Scan(&pubExists)
+	if err != nil {
+		return fmt.Errorf("check publication: %w", err)
+	}
+	if !pubExists {
+		return fmt.Errorf("publication %q does not exist; create it with: CREATE PUBLICATION %s FOR TABLE ...",
+			l.cfg.PublicationName, l.cfg.PublicationName)
+	}
+
+	// Create or reuse replication slot.
+	if err := l.ensureSlot(ctx); err != nil {
+		return fmt.Errorf("ensure slot: %w", err)
+	}
+
+	// Open replication connection. Close is handled by LogicalSource.Close().
+	l.replConn, err = pgconn.Connect(ctx, l.pgCfg.ReplicationDSN())
+	if err != nil {
+		return fmt.Errorf("replication connect: %w", err)
+	}
+
+	// Start streaming.
+	err = pglogrepl.StartReplication(ctx, l.replConn, l.cfg.SlotName, l.startLSN,
+		pglogrepl.StartReplicationOptions{
+			PluginArgs: []string{
+				"proto_version '2'",
+				fmt.Sprintf("publication_names '%s'", l.cfg.PublicationName),
+				"messages 'true'",
+			},
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("start replication: %w", err)
+	}
+
+	log.Printf("[logical] streaming from LSN %s", l.startLSN)
+
+	standbyTicker := time.NewTicker(10 * time.Second)
+	defer standbyTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-standbyTicker.C:
+			l.sendStandby(ctx)
+		default:
+		}
+
+		rawMsg, err := l.replConn.ReceiveMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("receive message: %w", err)
+		}
+
+		switch msg := rawMsg.(type) {
+		case *pgproto3.CopyData:
+			if err := l.handleCopyData(ctx, msg, events); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyData, events chan<- ChangeEvent) error {
+	switch msg.Data[0] {
+	case pglogrepl.PrimaryKeepaliveMessageByteID:
+		pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
+		if err != nil {
+			return fmt.Errorf("parse keepalive: %w", err)
+		}
+		if pkm.ReplyRequested {
+			l.sendStandby(ctx)
+		}
+
+	case pglogrepl.XLogDataByteID:
+		xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
+		if err != nil {
+			return fmt.Errorf("parse xlog: %w", err)
+		}
+
+		if err := l.processWAL(ctx, xld, events); err != nil {
+			return err
+		}
+
+		// Track position for standby updates.
+		if xld.WALStart+pglogrepl.LSN(len(xld.WALData)) > l.confirmedLSN {
+			l.confirmedLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
+		}
+	}
+	return nil
+}
+
+func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, events chan<- ChangeEvent) error {
+	logicalMsg, err := pglogrepl.ParseV2(xld.WALData, false)
+	if err != nil {
+		return fmt.Errorf("parse logical msg: %w", err)
+	}
+
+	switch m := logicalMsg.(type) {
+	case *pglogrepl.RelationMessageV2:
+		l.relations[m.RelationID] = m
+
+	case *pglogrepl.InsertMessageV2:
+		rel, ok := l.relations[m.RelationID]
+		if !ok {
+			return nil // skip unknown relation
+		}
+		table := fqTable(rel.Namespace, rel.RelationName)
+		if !l.isTracked(table) {
+			return nil
+		}
+		ts := l.schemaForRelation(rel)
+		after := decodeTuple(rel, m.Tuple)
+
+		select {
+		case events <- ChangeEvent{
+			Table:     table,
+			Operation: OpInsert,
+			After:     after,
+			PK:        ts.PK,
+			Timestamp: time.Now(),
+		}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+	case *pglogrepl.UpdateMessageV2:
+		rel, ok := l.relations[m.RelationID]
+		if !ok {
+			return nil
+		}
+		table := fqTable(rel.Namespace, rel.RelationName)
+		if !l.isTracked(table) {
+			return nil
+		}
+		ts := l.schemaForRelation(rel)
+
+		var before map[string]any
+		if m.OldTuple != nil {
+			before = decodeTuple(rel, m.OldTuple)
+		}
+		after := decodeTuple(rel, m.NewTuple)
+
+		select {
+		case events <- ChangeEvent{
+			Table:     table,
+			Operation: OpUpdate,
+			Before:    before,
+			PK:        ts.PK,
+			After:     after,
+			Timestamp: time.Now(),
+		}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+	case *pglogrepl.DeleteMessageV2:
+		rel, ok := l.relations[m.RelationID]
+		if !ok {
+			return nil
+		}
+		table := fqTable(rel.Namespace, rel.RelationName)
+		if !l.isTracked(table) {
+			return nil
+		}
+		ts := l.schemaForRelation(rel)
+
+		var before map[string]any
+		if m.OldTuple != nil {
+			before = decodeTuple(rel, m.OldTuple)
+		}
+
+		select {
+		case events <- ChangeEvent{
+			Table:     table,
+			Operation: OpDelete,
+			Before:    before,
+			PK:        ts.PK,
+			Timestamp: time.Now(),
+		}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+	case *pglogrepl.BeginMessage:
+		// no-op: we could track transaction boundaries in the future
+	case *pglogrepl.CommitMessage:
+		// no-op
+	case *pglogrepl.TruncateMessageV2:
+		log.Printf("[logical] TRUNCATE detected (not yet handled)")
+	}
+
+	return nil
+}
+
+// ensureSlot creates the replication slot if it doesn't already exist.
+func (l *LogicalSource) ensureSlot(ctx context.Context) error {
+	var exists bool
+	err := l.queryConn.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+		l.cfg.SlotName,
+	).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("check slot: %w", err)
+	}
+
+	if exists {
+		log.Printf("[logical] reusing existing slot %q", l.cfg.SlotName)
+		return nil
+	}
+
+	// Create the slot. We use a temporary replication connection.
+	replConn, err := pgconn.Connect(ctx, l.pgCfg.ReplicationDSN())
+	if err != nil {
+		return fmt.Errorf("connect for slot creation: %w", err)
+	}
+	defer replConn.Close(ctx)
+
+	result, err := pglogrepl.CreateReplicationSlot(ctx, replConn, l.cfg.SlotName, "pgoutput",
+		pglogrepl.CreateReplicationSlotOptions{
+			Temporary: false,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("create slot: %w", err)
+	}
+
+	if l.startLSN == 0 {
+		lsn, err := pglogrepl.ParseLSN(result.ConsistentPoint)
+		if err == nil {
+			l.startLSN = lsn
+			l.confirmedLSN = lsn
+		}
+	}
+
+	l.slotCreated = true
+	log.Printf("[logical] created slot %q at LSN %s", l.cfg.SlotName, result.ConsistentPoint)
+	return nil
+}
+
+func (l *LogicalSource) sendStandby(ctx context.Context) {
+	err := pglogrepl.SendStandbyStatusUpdate(ctx, l.replConn, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: l.confirmedLSN,
+		WALFlushPosition: l.confirmedLSN,
+		WALApplyPosition: l.confirmedLSN,
+		ClientTime:       time.Now(),
+		ReplyRequested:   false,
+	})
+	if err != nil {
+		log.Printf("[logical] standby status error: %v", err)
+	}
+}
+
+// Close terminates the replication connection and drops the slot if we created it.
+func (l *LogicalSource) Close() error {
+	// Close the replication connection first so the slot becomes inactive.
+	if l.replConn != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		l.replConn.Close(ctx)
+		cancel()
+		l.replConn = nil
+	}
+
+	if !l.slotCreated {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, l.pgCfg.DSN())
+	if err != nil {
+		return fmt.Errorf("connect for cleanup: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	// Slot should be inactive now since we closed replConn above.
+	_, err = conn.Exec(ctx,
+		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+		l.cfg.SlotName,
+	)
+	if err != nil {
+		return fmt.Errorf("drop slot: %w", err)
+	}
+
+	log.Printf("[logical] dropped slot %q", l.cfg.SlotName)
+	return nil
+}
+
+func (l *LogicalSource) isTracked(table string) bool {
+	for _, t := range l.cfg.Tables {
+		if t == table {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *schema.TableSchema {
+	table := fqTable(rel.Namespace, rel.RelationName)
+	if ts, ok := l.tables[table]; ok {
+		return ts
+	}
+	// Build a minimal schema from the relation message
+	ts := &schema.TableSchema{Table: table}
+	for i, col := range rel.Columns {
+		ts.Columns = append(ts.Columns, schema.Column{
+			Name:    col.Name,
+			FieldID: i + 1,
+		})
+	}
+	l.tables[table] = ts
+	return ts
+}
+
+func decodeTuple(rel *pglogrepl.RelationMessageV2, tuple *pglogrepl.TupleData) map[string]any {
+	if tuple == nil {
+		return nil
+	}
+	row := make(map[string]any, len(tuple.Columns))
+	for i, col := range tuple.Columns {
+		if i >= len(rel.Columns) {
+			break
+		}
+		colName := rel.Columns[i].Name
+		switch col.DataType {
+		case 'n': // null
+			row[colName] = nil
+		case 'u': // unchanged
+			row[colName] = nil // we don't have the old value
+		case 't': // text
+			row[colName] = string(col.Data)
+		}
+	}
+	return row
+}
+
+func fqTable(namespace, name string) string {
+	if namespace == "" || strings.EqualFold(namespace, "public") {
+		return "public." + name
+	}
+	return namespace + "." + name
+}

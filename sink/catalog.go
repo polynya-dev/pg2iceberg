@@ -1,0 +1,239 @@
+package sink
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/hasyimibhar/pg2iceberg/schema"
+)
+
+// CatalogClient interacts with the Iceberg REST catalog.
+type CatalogClient struct {
+	baseURL string
+	client  *http.Client
+}
+
+func NewCatalogClient(baseURL string) *CatalogClient {
+	return &CatalogClient{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		client:  &http.Client{},
+	}
+}
+
+// TableMetadata holds the relevant fields from the Iceberg REST catalog response.
+type TableMetadata struct {
+	MetadataLocation string `json:"metadata-location"`
+	Metadata         struct {
+		FormatVersion      int    `json:"format-version"`
+		TableUUID          string `json:"table-uuid"`
+		Location           string `json:"location"`
+		LastSequenceNumber int64  `json:"last-sequence-number"`
+		LastUpdatedMs      int64  `json:"last-updated-ms"`
+		LastColumnID       int    `json:"last-column-id"`
+		CurrentSchemaID    int    `json:"current-schema-id"`
+		CurrentSnapshotID  int64  `json:"current-snapshot-id"`
+		Snapshots          []struct {
+			SnapshotID     int64             `json:"snapshot-id"`
+			TimestampMs    int64             `json:"timestamp-ms"`
+			ManifestList   string            `json:"manifest-list"`
+			Summary        map[string]string `json:"summary"`
+			SchemaID       int               `json:"schema-id"`
+			SequenceNumber int64             `json:"sequence-number"`
+		} `json:"snapshots"`
+		Properties map[string]string `json:"properties"`
+	} `json:"metadata"`
+}
+
+// CurrentManifestList returns the manifest-list URI of the current snapshot, or empty if no snapshots.
+func (tm *TableMetadata) CurrentManifestList() string {
+	if tm.Metadata.CurrentSnapshotID <= 0 {
+		return ""
+	}
+	for _, snap := range tm.Metadata.Snapshots {
+		if snap.SnapshotID == tm.Metadata.CurrentSnapshotID {
+			return snap.ManifestList
+		}
+	}
+	return ""
+}
+
+// EnsureNamespace creates a namespace if it doesn't exist.
+func (c *CatalogClient) EnsureNamespace(ns string) error {
+	body := map[string]any{
+		"namespace": []string{ns},
+	}
+	resp, err := c.post(fmt.Sprintf("/v1/namespaces"), body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// 200 = created, 409 = already exists — both fine
+	if resp.StatusCode != 200 && resp.StatusCode != 409 {
+		return c.readError(resp)
+	}
+	return nil
+}
+
+// LoadTable fetches table metadata from the catalog.
+func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
+	resp, err := c.get(fmt.Sprintf("/v1/namespaces/%s/tables/%s", ns, table))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		return nil, nil // table doesn't exist
+	}
+	if resp.StatusCode != 200 {
+		return nil, c.readError(resp)
+	}
+
+	var tm TableMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&tm); err != nil {
+		return nil, fmt.Errorf("decode table metadata: %w", err)
+	}
+	return &tm, nil
+}
+
+// CreateTable creates a new Iceberg table.
+func (c *CatalogClient) CreateTable(ns, table string, ts *schema.TableSchema, location string) (*TableMetadata, error) {
+	icebergSchema := schema.IcebergSchemaJSON(ts)
+
+	body := map[string]any{
+		"name":   table,
+		"schema": icebergSchema,
+		"partition-spec": map[string]any{
+			"spec-id": 0,
+			"fields":  []any{},
+		},
+		"write-order": map[string]any{
+			"order-id": 0,
+			"fields":   []any{},
+		},
+		"properties": map[string]string{
+			"format-version":       "2",
+			"write.format.default": "parquet",
+		},
+	}
+	if location != "" {
+		body["location"] = location
+	}
+
+	resp, err := c.post(fmt.Sprintf("/v1/namespaces/%s/tables", ns), body)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, c.readError(resp)
+	}
+
+	var tm TableMetadata
+	if err := json.NewDecoder(resp.Body).Decode(&tm); err != nil {
+		return nil, fmt.Errorf("decode create response: %w", err)
+	}
+	return &tm, nil
+}
+
+// CommitSnapshot commits a new snapshot to the table.
+func (c *CatalogClient) CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
+	// Build requirements
+	var requirements []map[string]any
+	if currentSnapshotID <= 0 {
+		// First commit: assert no current snapshot on main
+		requirements = []map[string]any{
+			{
+				"type": "assert-ref-snapshot-id",
+				"ref":  "main",
+				"snapshot-id": nil,
+			},
+		}
+	} else {
+		requirements = []map[string]any{
+			{
+				"type":        "assert-ref-snapshot-id",
+				"ref":         "main",
+				"snapshot-id": currentSnapshotID,
+			},
+		}
+	}
+
+	updates := []map[string]any{
+		{
+			"action": "add-snapshot",
+			"snapshot": map[string]any{
+				"snapshot-id":     snapshot.SnapshotID,
+				"timestamp-ms":   snapshot.TimestampMs,
+				"manifest-list":  snapshot.ManifestListPath,
+				"summary":        snapshot.Summary,
+				"schema-id":      0,
+				"sequence-number": snapshot.SequenceNumber,
+			},
+		},
+		{
+			"action":      "set-snapshot-ref",
+			"ref-name":    "main",
+			"type":        "branch",
+			"snapshot-id": snapshot.SnapshotID,
+		},
+	}
+
+	body := map[string]any{
+		"requirements": requirements,
+		"updates":      updates,
+	}
+
+	resp, err := c.post(fmt.Sprintf("/v1/namespaces/%s/tables/%s", ns, table), body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return c.readError(resp)
+	}
+	return nil
+}
+
+// SnapshotCommit holds the data needed to commit a new snapshot.
+type SnapshotCommit struct {
+	SnapshotID       int64
+	SequenceNumber   int64
+	TimestampMs      int64
+	ManifestListPath string
+	Summary          map[string]string
+}
+
+func (c *CatalogClient) get(path string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", c.baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.client.Do(req)
+}
+
+func (c *CatalogClient) post(path string, body any) (*http.Response, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequest("POST", c.baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.client.Do(req)
+}
+
+func (c *CatalogClient) readError(resp *http.Response) error {
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("catalog error %d: %s", resp.StatusCode, string(body))
+}

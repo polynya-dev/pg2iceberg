@@ -1,0 +1,39 @@
+source:
+  # "query" or "logical"
+  mode: logical
+
+  postgres:
+    host: localhost
+    port: 5434
+    database: testdb
+    user: postgres
+    password: postgres
+
+  # Query mode settings (used when mode=query)
+  query:
+    tables:
+      - name: public.orders
+        primary_key: [id]
+        watermark_column: updated_at
+    poll_interval: 5s
+
+  # Logical replication settings (used when mode=logical)
+  logical:
+    publication_name: pg2iceberg_pub
+    slot_name: pg2iceberg_slot
+    tables:
+      - public.orders
+
+sink:
+  catalog_uri: http://localhost:8181
+  warehouse: s3://warehouse/
+  namespace: default
+  s3_endpoint: http://localhost:9000
+  s3_access_key: admin
+  s3_secret_key: password
+  s3_region: us-east-1
+  flush_interval: 10s
+  flush_rows: 1000
+
+state:
+  path: ./pg2iceberg-state.json
