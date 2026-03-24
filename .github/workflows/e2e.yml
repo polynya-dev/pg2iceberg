@@ -1,0 +1,67 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start services
+        run: |
+          docker compose up -d
+          echo "Waiting for services to be healthy..."
+
+          # Wait for PostgreSQL
+          for i in $(seq 1 30); do
+            if docker compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; then
+              echo "PostgreSQL ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Wait for MinIO
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/ready >/dev/null 2>&1; then
+              echo "MinIO ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Wait for Iceberg REST catalog
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8181/v1/config >/dev/null 2>&1; then
+              echo "Iceberg REST catalog ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Wait for ClickHouse
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8123 --data-binary "SELECT 1" >/dev/null 2>&1; then
+              echo "ClickHouse ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run e2e tests
+        run: ./tests/run.sh
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --tail=50
