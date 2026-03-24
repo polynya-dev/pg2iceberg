@@ -1,4 +1,4 @@
-.PHONY: build run docker-up docker-down simulate query clean
+.PHONY: build run docker-up docker-down simulate query clean test
 
 build:
 	go build -o bin/pg2iceberg ./cmd/pg2iceberg
@@ -27,6 +27,9 @@ query-count:
 
 query-sql:
 	@docker compose exec clickhouse clickhouse-client
+
+test:
+	./tests/run.sh
 
 clean:
 	rm -rf bin/ pg2iceberg-state.json

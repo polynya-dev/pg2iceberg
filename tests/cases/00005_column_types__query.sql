@@ -1,0 +1,1 @@
+SELECT id, name, age, balance, is_active, score, created_at, birth_date FROM iceberg.`default.e2e_column_types` ORDER BY id
