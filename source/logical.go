@@ -371,6 +371,25 @@ func (l *LogicalSource) Close() error {
 	return nil
 }
 
+// AddTable adds a table to the tracked set. The table must already be in
+// the PG publication; this only controls which replicated events pg2iceberg processes.
+func (l *LogicalSource) AddTable(table string) {
+	if !l.isTracked(table) {
+		l.cfg.Tables = append(l.cfg.Tables, table)
+	}
+}
+
+// RemoveTable removes a table from the tracked set.
+func (l *LogicalSource) RemoveTable(table string) {
+	for i, t := range l.cfg.Tables {
+		if t == table {
+			l.cfg.Tables = append(l.cfg.Tables[:i], l.cfg.Tables[i+1:]...)
+			delete(l.tables, table)
+			return
+		}
+	}
+}
+
 func (l *LogicalSource) isTracked(table string) bool {
 	for _, t := range l.cfg.Tables {
 		if t == table {

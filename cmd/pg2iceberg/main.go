@@ -3,29 +3,23 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
+	"github.com/hasyimibhar/pg2iceberg/api"
 	"github.com/hasyimibhar/pg2iceberg/config"
-	"github.com/hasyimibhar/pg2iceberg/schema"
-	"github.com/hasyimibhar/pg2iceberg/sink"
-	"github.com/hasyimibhar/pg2iceberg/source"
-	"github.com/hasyimibhar/pg2iceberg/state"
-	"github.com/jackc/pgx/v5"
+	"github.com/hasyimibhar/pg2iceberg/pipeline"
 )
 
 func main() {
 	configPath := flag.String("config", "config.example.yaml", "path to config file")
+	serverMode := flag.Bool("server", false, "run in multi-tenant API server mode")
+	listenAddr := flag.String("listen", ":8080", "API server listen address")
+	storeDSN := flag.String("store-dsn", "", "postgres DSN for pipeline store (server mode)")
+	storeDir := flag.String("store-dir", "./pipelines", "file-based pipeline store directory (server mode, used if -store-dsn is not set)")
 	flag.Parse()
-
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -39,209 +33,60 @@ func main() {
 		cancel()
 	}()
 
-	if err := run(ctx, cfg); err != nil && err != context.Canceled {
+	if *serverMode {
+		runServer(ctx, *listenAddr, *storeDSN, *storeDir)
+	} else {
+		runSingle(ctx, *configPath)
+	}
+}
+
+func runSingle(ctx context.Context, configPath string) {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+
+	p := pipeline.NewPipeline("default", cfg)
+	if err := p.Start(ctx); err != nil {
+		log.Fatalf("fatal: %v", err)
+	}
+
+	<-p.Done()
+	if status, err := p.Status(); status == pipeline.StatusError && err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
 }
 
-func run(ctx context.Context, cfg *config.Config) error {
-	// Load checkpoint
-	store := state.NewStore(cfg.State.Path)
-	cp, err := store.Load()
-	if err != nil {
-		return fmt.Errorf("load checkpoint: %w", err)
-	}
+func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string) {
+	var store pipeline.PipelineStore
 
-	// Discover schemas via a regular PG connection
-	pgConn, err := pgx.Connect(ctx, cfg.Source.Postgres.DSN())
-	if err != nil {
-		return fmt.Errorf("connect to postgres: %w", err)
-	}
-
-	tables := getTables(cfg)
-	schemas := make(map[string]*schema.TableSchema)
-	for _, table := range tables {
-		ts, err := schema.DiscoverSchema(ctx, pgConn, table)
+	if storeDSN != "" {
+		pgStore, err := pipeline.NewPgStore(ctx, storeDSN)
 		if err != nil {
-			return fmt.Errorf("discover schema for %s: %w", table, err)
+			log.Fatalf("connect to pipeline store: %v", err)
 		}
-		// Override PK from config if using query mode
-		if cfg.Source.Mode == "query" {
-			for _, qt := range cfg.Source.Query.Tables {
-				if qt.Name == table && len(qt.PrimaryKey) > 0 {
-					ts.PK = qt.PrimaryKey
-				}
-			}
-		}
-		schemas[table] = ts
-		log.Printf("discovered schema for %s: %d columns, pk=%v", table, len(ts.Columns), ts.PK)
-	}
-	pgConn.Close(ctx)
-
-	// Initialize sink
-	s, err := sink.NewSink(cfg.Sink)
-	if err != nil {
-		return fmt.Errorf("create sink: %w", err)
+		defer pgStore.Close()
+		store = pgStore
+		log.Printf("using postgres pipeline store")
+	} else {
+		store = pipeline.NewFileStore(storeDir)
+		log.Printf("using file-based pipeline store at %s", storeDir)
 	}
 
-	for _, ts := range schemas {
-		if err := s.RegisterTable(ctx, ts); err != nil {
-			return fmt.Errorf("register table %s: %w", ts.Table, err)
-		}
+	mgr := pipeline.NewManager(store)
+
+	if err := mgr.RestoreAll(ctx); err != nil {
+		log.Fatalf("restore pipelines: %v", err)
 	}
 
-	// Start compactor if configured
-	compactionInterval := cfg.Sink.CompactionDuration()
-	if compactionInterval > 0 {
-		compactor := sink.NewCompactor(cfg.Sink, s, schemas)
-		go compactor.Run(ctx)
-		log.Printf("compactor started (interval=%s, target_size=%dMB, min_files=%d)",
-			compactionInterval,
-			cfg.Sink.CompactionTargetSizeOrDefault()/(1024*1024),
-			cfg.Sink.CompactionMinFilesOrDefault())
-	}
-
-	// Initialize source
-	var src source.Source
-	switch cfg.Source.Mode {
-	case "query":
-		qs := source.NewQuerySource(cfg.Source.Postgres, cfg.Source.Query)
-		if cp.Mode == "query" && cp.Watermark != "" {
-			t, err := time.Parse(time.RFC3339Nano, cp.Watermark)
-			if err == nil {
-				for _, qt := range cfg.Source.Query.Tables {
-					qs.SetWatermark(qt.Name, t)
-				}
-				log.Printf("restored query watermark: %v", t)
-			}
-		}
-		src = qs
-
-	case "logical":
-		ls := source.NewLogicalSource(cfg.Source.Postgres, cfg.Source.Logical)
-		if cp.Mode == "logical" && cp.LSN > 0 {
-			ls.SetStartLSN(cp.LSN)
-			log.Printf("restored logical LSN: %d", cp.LSN)
-		}
-		src = ls
-
-	default:
-		return fmt.Errorf("unknown source mode: %s", cfg.Source.Mode)
-	}
-
-	defer func() {
-		if err := src.Close(); err != nil {
-			log.Printf("source close error: %v", err)
-		}
-	}()
-
-	// Start capture
-	events := make(chan source.ChangeEvent, 1000)
-	errCh := make(chan error, 1)
+	srv := api.NewServer(mgr, listenAddr)
 
 	go func() {
-		errCh <- src.Capture(ctx, events)
+		<-ctx.Done()
+		mgr.StopAll()
 	}()
 
-	// Main loop: consume events, flush periodically
-	flushInterval := cfg.Sink.FlushDuration()
-	flushTicker := time.NewTicker(flushInterval)
-	defer flushTicker.Stop()
-
-	flushRows := cfg.Sink.FlushRows
-	flushBytes := cfg.Sink.FlushBytesOrDefault()
-
-	log.Printf("pg2iceberg started (mode=%s, flush_interval=%s, flush_rows=%d, flush_bytes=%dMB, target_file_size=%dMB)",
-		cfg.Source.Mode, flushInterval, flushRows,
-		flushBytes/(1024*1024),
-		cfg.Sink.TargetFileSizeOrDefault()/(1024*1024))
-
-	for {
-		select {
-		case event, ok := <-events:
-			if !ok {
-				// Channel closed, flush remaining
-				return flush(ctx, s, src, cfg, store, cp)
-			}
-
-			if err := s.Write(event); err != nil {
-				log.Printf("write error: %v", err)
-				continue
-			}
-
-			// Flush on row count threshold
-			if s.TotalBuffered() >= flushRows {
-				if err := doFlush(ctx, s, src, cfg, store, cp); err != nil {
-					log.Printf("flush error: %v", err)
-				}
-			}
-
-			// Flush on byte size threshold
-			if s.TotalBufferedBytes() >= flushBytes {
-				if err := doFlush(ctx, s, src, cfg, store, cp); err != nil {
-					log.Printf("flush error: %v", err)
-				}
-			}
-
-		case <-flushTicker.C:
-			if s.ShouldFlush() {
-				if err := doFlush(ctx, s, src, cfg, store, cp); err != nil {
-					log.Printf("flush error: %v", err)
-				}
-			}
-
-		case err := <-errCh:
-			// Source exited. Flush any remaining data.
-			if s.ShouldFlush() {
-				if flushErr := flush(ctx, s, src, cfg, store, cp); flushErr != nil {
-					log.Printf("final flush error: %v", flushErr)
-				}
-			}
-			return err
-		}
-	}
-}
-
-// doFlush checks backpressure then flushes.
-func doFlush(ctx context.Context, s *sink.Sink, src source.Source, cfg *config.Config, store *state.Store, cp *state.Checkpoint) error {
-	if err := s.CheckBackpressure(ctx); err != nil {
-		return err
-	}
-	return flush(ctx, s, src, cfg, store, cp)
-}
-
-func flush(ctx context.Context, s *sink.Sink, src source.Source, cfg *config.Config, store *state.Store, cp *state.Checkpoint) error {
-	if err := s.Flush(ctx); err != nil {
-		return fmt.Errorf("flush: %w", err)
-	}
-
-	// Update checkpoint
-	cp.Mode = cfg.Source.Mode
-	switch cfg.Source.Mode {
-	case "logical":
-		if ls, ok := src.(*source.LogicalSource); ok {
-			cp.LSN = ls.ConfirmedLSN()
-		}
-	}
-
-	if err := store.Save(cp); err != nil {
-		return fmt.Errorf("save checkpoint: %w", err)
-	}
-
-	return nil
-}
-
-func getTables(cfg *config.Config) []string {
-	switch cfg.Source.Mode {
-	case "query":
-		tables := make([]string, len(cfg.Source.Query.Tables))
-		for i, t := range cfg.Source.Query.Tables {
-			tables[i] = t.Name
-		}
-		return tables
-	case "logical":
-		return cfg.Source.Logical.Tables
-	default:
-		return nil
+	if err := srv.Run(ctx); err != nil {
+		log.Fatalf("server error: %v", err)
 	}
 }

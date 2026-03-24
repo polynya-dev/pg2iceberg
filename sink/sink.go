@@ -95,6 +95,13 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 	return nil
 }
 
+// UnregisterTable removes a table from the sink. Any buffered data is discarded.
+func (s *Sink) UnregisterTable(pgTable string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tables, pgTable)
+}
+
 // Write buffers a ChangeEvent for the next flush.
 func (s *Sink) Write(event source.ChangeEvent) error {
 	ts, ok := s.tables[event.Table]

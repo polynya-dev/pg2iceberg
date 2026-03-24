@@ -137,6 +137,23 @@ func (q *QuerySource) poll(ctx context.Context, events chan<- ChangeEvent) error
 	return nil
 }
 
+// AddTable adds a table to the polling set.
+func (q *QuerySource) AddTable(tbl config.QueryTableConfig) {
+	q.cfg.Tables = append(q.cfg.Tables, tbl)
+}
+
+// RemoveTable removes a table from the polling set.
+func (q *QuerySource) RemoveTable(tableName string) {
+	for i, t := range q.cfg.Tables {
+		if t.Name == tableName {
+			q.cfg.Tables = append(q.cfg.Tables[:i], q.cfg.Tables[i+1:]...)
+			delete(q.tables, tableName)
+			delete(q.watermarks, tableName)
+			return
+		}
+	}
+}
+
 func (q *QuerySource) Close() error {
 	// Query mode has no persistent resources to clean up.
 	return nil

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -9,24 +10,24 @@ import (
 )
 
 type Config struct {
-	Source SourceConfig `yaml:"source"`
-	Sink   SinkConfig   `yaml:"sink"`
-	State  StateConfig  `yaml:"state"`
+	Source SourceConfig `yaml:"source" json:"source"`
+	Sink   SinkConfig   `yaml:"sink" json:"sink"`
+	State  StateConfig  `yaml:"state" json:"state"`
 }
 
 type SourceConfig struct {
-	Mode    string         `yaml:"mode"` // "query" or "logical"
-	Postgres PostgresConfig `yaml:"postgres"`
-	Query   QueryConfig    `yaml:"query"`
-	Logical LogicalConfig  `yaml:"logical"`
+	Mode     string         `yaml:"mode" json:"mode"`
+	Postgres PostgresConfig `yaml:"postgres" json:"postgres"`
+	Query    QueryConfig    `yaml:"query" json:"query,omitempty"`
+	Logical  LogicalConfig  `yaml:"logical" json:"logical,omitempty"`
 }
 
 type PostgresConfig struct {
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	Database string `yaml:"database"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
+	Host     string `yaml:"host" json:"host"`
+	Port     int    `yaml:"port" json:"port"`
+	Database string `yaml:"database" json:"database"`
+	User     string `yaml:"user" json:"user"`
+	Password string `yaml:"password" json:"password"`
 }
 
 func (p PostgresConfig) DSN() string {
@@ -40,8 +41,8 @@ func (p PostgresConfig) ReplicationDSN() string {
 }
 
 type QueryConfig struct {
-	Tables       []QueryTableConfig `yaml:"tables"`
-	PollInterval string             `yaml:"poll_interval"`
+	Tables       []QueryTableConfig `yaml:"tables" json:"tables"`
+	PollInterval string             `yaml:"poll_interval" json:"poll_interval"`
 }
 
 func (q QueryConfig) PollDuration() time.Duration {
@@ -53,35 +54,35 @@ func (q QueryConfig) PollDuration() time.Duration {
 }
 
 type QueryTableConfig struct {
-	Name            string   `yaml:"name"`
-	PrimaryKey      []string `yaml:"primary_key"`
-	WatermarkColumn string   `yaml:"watermark_column"`
+	Name            string   `yaml:"name" json:"name"`
+	PrimaryKey      []string `yaml:"primary_key" json:"primary_key"`
+	WatermarkColumn string   `yaml:"watermark_column" json:"watermark_column"`
 }
 
 type LogicalConfig struct {
-	PublicationName string   `yaml:"publication_name"`
-	SlotName        string   `yaml:"slot_name"`
-	Tables          []string `yaml:"tables"`
+	PublicationName string   `yaml:"publication_name" json:"publication_name"`
+	SlotName        string   `yaml:"slot_name" json:"slot_name"`
+	Tables          []string `yaml:"tables" json:"tables"`
 }
 
 type SinkConfig struct {
-	CatalogURI    string `yaml:"catalog_uri"`
-	Warehouse     string `yaml:"warehouse"`
-	Namespace     string `yaml:"namespace"`
-	S3Endpoint    string `yaml:"s3_endpoint"`
-	S3AccessKey   string `yaml:"s3_access_key"`
-	S3SecretKey   string `yaml:"s3_secret_key"`
-	S3Region      string `yaml:"s3_region"`
-	FlushInterval string `yaml:"flush_interval"`
-	FlushRows     int    `yaml:"flush_rows"`
-	FlushBytes    int64  `yaml:"flush_bytes"`    // flush when buffered bytes exceed this (default 64MB)
-	TargetFileSize int64 `yaml:"target_file_size"` // max parquet file size before rolling (default 128MB)
+	CatalogURI     string `yaml:"catalog_uri" json:"catalog_uri"`
+	Warehouse      string `yaml:"warehouse" json:"warehouse"`
+	Namespace      string `yaml:"namespace" json:"namespace"`
+	S3Endpoint     string `yaml:"s3_endpoint" json:"s3_endpoint"`
+	S3AccessKey    string `yaml:"s3_access_key" json:"s3_access_key"`
+	S3SecretKey    string `yaml:"s3_secret_key" json:"s3_secret_key"`
+	S3Region       string `yaml:"s3_region" json:"s3_region"`
+	FlushInterval  string `yaml:"flush_interval" json:"flush_interval"`
+	FlushRows      int    `yaml:"flush_rows" json:"flush_rows"`
+	FlushBytes     int64  `yaml:"flush_bytes" json:"flush_bytes,omitempty"`
+	TargetFileSize int64  `yaml:"target_file_size" json:"target_file_size,omitempty"`
 
 	// Compaction settings
-	CompactionInterval string `yaml:"compaction_interval"` // e.g. "5m" (default disabled)
-	CompactionTargetSize int64 `yaml:"compaction_target_size"` // target merged file size (default 256MB)
-	CompactionMinFiles   int   `yaml:"compaction_min_files"`   // minimum files to trigger (default 4)
-	MaxSnapshots         int   `yaml:"max_snapshots"`          // pause writes when exceeded (default 0 = unlimited)
+	CompactionInterval   string `yaml:"compaction_interval" json:"compaction_interval,omitempty"`
+	CompactionTargetSize int64  `yaml:"compaction_target_size" json:"compaction_target_size,omitempty"`
+	CompactionMinFiles   int    `yaml:"compaction_min_files" json:"compaction_min_files,omitempty"`
+	MaxSnapshots         int    `yaml:"max_snapshots" json:"max_snapshots,omitempty"`
 }
 
 func (s SinkConfig) FlushBytesOrDefault() int64 {
@@ -132,9 +133,10 @@ func (s SinkConfig) FlushDuration() time.Duration {
 }
 
 type StateConfig struct {
-	Path string `yaml:"path"`
+	Path string `yaml:"path" json:"path"`
 }
 
+// Load reads a config from a YAML file.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -146,6 +148,22 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
+	applyDefaults(&cfg)
+	return &cfg, nil
+}
+
+// LoadJSON parses a config from JSON bytes (used by the API).
+func LoadJSON(data []byte) (*Config, error) {
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	applyDefaults(&cfg)
+	return &cfg, nil
+}
+
+func applyDefaults(cfg *Config) {
 	if cfg.Source.Mode == "" {
 		cfg.Source.Mode = "logical"
 	}
@@ -158,6 +176,4 @@ func Load(path string) (*Config, error) {
 	if cfg.Sink.S3Region == "" {
 		cfg.Sink.S3Region = "us-east-1"
 	}
-
-	return &cfg, nil
 }
