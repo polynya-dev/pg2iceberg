@@ -131,6 +131,7 @@ func (s *Server) createPipeline(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "config is required", http.StatusBadRequest)
 		return
 	}
+	req.Config.ApplyDefaults()
 
 	if err := s.mgr.Create(r.Context(), req.ID, req.Config); err != nil {
 		jsonError(w, err.Error(), http.StatusInternalServerError)

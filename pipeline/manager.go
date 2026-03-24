@@ -19,20 +19,29 @@ type PipelineInfo struct {
 
 // Manager manages the lifecycle of multiple pipelines.
 type Manager struct {
+	ctx       context.Context // long-lived context for all pipelines
 	pipelines map[string]*Pipeline
 	store     PipelineStore
+	ch        *ClickHouseProvisioner // optional, nil if not configured
 	mu        sync.RWMutex
 }
 
-func NewManager(store PipelineStore) *Manager {
+func NewManager(ctx context.Context, store PipelineStore) *Manager {
 	return &Manager{
+		ctx:       ctx,
 		pipelines: make(map[string]*Pipeline),
 		store:     store,
 	}
 }
 
+// SetClickHouse enables automatic ClickHouse database provisioning.
+func (m *Manager) SetClickHouse(ch *ClickHouseProvisioner) {
+	m.ch = ch
+}
+
 // Create validates, persists, and starts a new pipeline.
-func (m *Manager) Create(ctx context.Context, id string, cfg *config.Config) error {
+// The pipeline runs under the Manager's long-lived context, not the request context.
+func (m *Manager) Create(_ context.Context, id string, cfg *config.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -45,8 +54,18 @@ func (m *Manager) Create(ctx context.Context, id string, cfg *config.Config) err
 		return fmt.Errorf("persist config: %w", err)
 	}
 
+	// Provision ClickHouse database for this namespace.
+	if m.ch != nil {
+		if err := m.ch.EnsureDatabase(cfg.Sink.Namespace); err != nil {
+			log.Printf("[manager] warning: clickhouse provisioning failed for %q: %v", id, err)
+			// Non-fatal: pipeline can still replicate, ClickHouse can be set up later.
+		} else {
+			log.Printf("[manager] provisioned clickhouse database %q", cfg.Sink.Namespace)
+		}
+	}
+
 	p := NewPipeline(id, cfg)
-	if err := p.Start(ctx); err != nil {
+	if err := p.Start(m.ctx); err != nil {
 		m.store.Delete(id) // rollback
 		return fmt.Errorf("start pipeline: %w", err)
 	}
@@ -105,7 +124,7 @@ func (m *Manager) List() []PipelineInfo {
 }
 
 // AddTable adds a table to a running pipeline.
-func (m *Manager) AddTable(ctx context.Context, pipelineID, tableName string) error {
+func (m *Manager) AddTable(_ context.Context, pipelineID, tableName string) error {
 	m.mu.RLock()
 	p, exists := m.pipelines[pipelineID]
 	m.mu.RUnlock()
@@ -113,11 +132,11 @@ func (m *Manager) AddTable(ctx context.Context, pipelineID, tableName string) er
 	if !exists {
 		return fmt.Errorf("pipeline %q not found", pipelineID)
 	}
-	return p.AddTable(ctx, tableName)
+	return p.AddTable(m.ctx, tableName)
 }
 
 // RemoveTable removes a table from a running pipeline.
-func (m *Manager) RemoveTable(ctx context.Context, pipelineID, tableName string) error {
+func (m *Manager) RemoveTable(_ context.Context, pipelineID, tableName string) error {
 	m.mu.RLock()
 	p, exists := m.pipelines[pipelineID]
 	m.mu.RUnlock()
@@ -125,12 +144,12 @@ func (m *Manager) RemoveTable(ctx context.Context, pipelineID, tableName string)
 	if !exists {
 		return fmt.Errorf("pipeline %q not found", pipelineID)
 	}
-	return p.RemoveTable(ctx, tableName)
+	return p.RemoveTable(m.ctx, tableName)
 }
 
 // RestoreAll loads all persisted pipeline configs and starts them.
 // Called on server startup to resume pipelines from a previous run.
-func (m *Manager) RestoreAll(ctx context.Context) error {
+func (m *Manager) RestoreAll() error {
 	configs, err := m.store.List()
 	if err != nil {
 		return fmt.Errorf("list configs: %w", err)
@@ -138,7 +157,7 @@ func (m *Manager) RestoreAll(ctx context.Context) error {
 
 	for id, cfg := range configs {
 		p := NewPipeline(id, cfg)
-		if err := p.Start(ctx); err != nil {
+		if err := p.Start(m.ctx); err != nil {
 			log.Printf("[manager] failed to restore pipeline %q: %v", id, err)
 			continue
 		}

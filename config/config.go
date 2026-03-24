@@ -148,7 +148,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	applyDefaults(&cfg)
+	cfg.ApplyDefaults()
 	return &cfg, nil
 }
 
@@ -159,11 +159,12 @@ func LoadJSON(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	applyDefaults(&cfg)
+	cfg.ApplyDefaults()
 	return &cfg, nil
 }
 
-func applyDefaults(cfg *Config) {
+// ApplyDefaults fills in default values for any unset fields.
+func (cfg *Config) ApplyDefaults() {
 	if cfg.Source.Mode == "" {
 		cfg.Source.Mode = "logical"
 	}

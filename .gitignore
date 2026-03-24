@@ -1,3 +1,4 @@
 bin/
 pg2iceberg-state.json
 .claude
+state/
