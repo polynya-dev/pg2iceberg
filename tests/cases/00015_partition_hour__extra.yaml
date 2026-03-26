@@ -1,0 +1,3 @@
+    iceberg:
+      partition:
+        - hour(created_at)

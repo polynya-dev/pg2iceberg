@@ -1,0 +1,5 @@
+-1	charlie	id_truncate=-10
+1	alice	id_truncate=0
+15	bob	id_truncate=10
+25	dave	id_truncate=20
+100	eve	id_truncate=100

@@ -1,0 +1,3 @@
+    iceberg:
+      partition:
+        - truncate[50](price)

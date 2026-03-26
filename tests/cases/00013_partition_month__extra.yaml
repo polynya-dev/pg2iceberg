@@ -1,0 +1,3 @@
+    iceberg:
+      partition:
+        - month(created_at)

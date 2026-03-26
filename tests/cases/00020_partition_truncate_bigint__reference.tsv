@@ -1,0 +1,5 @@
+1	150	alice	amount_truncate=100
+2	250	bob	amount_truncate=200
+3	-50	charlie	amount_truncate=-100
+4	999	dave	amount_truncate=900
+5	0	eve	amount_truncate=0

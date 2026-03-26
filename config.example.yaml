@@ -6,6 +6,9 @@ tables:
   #     partition:
   #       - day(created_at)       # partition by day on a timestamp column
   #       - region                # partition by identity on a string column
+  #       # Also supported: year(), month(), hour(), bucket[N](), truncate[W]()
+  #       # - bucket[16](id)      # hash-based bucketing into 16 partitions
+  #       # - truncate[4](name)   # truncate string to first 4 characters
 
   # Query mode options (used when source.mode=query):
   # - name: public.orders

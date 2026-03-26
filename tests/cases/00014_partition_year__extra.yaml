@@ -1,0 +1,3 @@
+    iceberg:
+      partition:
+        - year(created_at)
