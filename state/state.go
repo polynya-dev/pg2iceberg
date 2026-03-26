@@ -30,17 +30,24 @@ type Checkpoint struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Store persists checkpoints to a local JSON file.
-type Store struct {
+// CheckpointStore abstracts checkpoint persistence.
+type CheckpointStore interface {
+	Load(pipelineID string) (*Checkpoint, error)
+	Save(pipelineID string, cp *Checkpoint) error
+	Close()
+}
+
+// FileStore persists checkpoints to a local JSON file.
+type FileStore struct {
 	path string
 }
 
-func NewStore(path string) *Store {
-	return &Store{path: path}
+func NewFileStore(path string) *FileStore {
+	return &FileStore{path: path}
 }
 
 // Load reads the checkpoint from disk. Returns a zero Checkpoint if the file doesn't exist.
-func (s *Store) Load() (*Checkpoint, error) {
+func (s *FileStore) Load(pipelineID string) (*Checkpoint, error) {
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
 		return &Checkpoint{}, nil
@@ -57,7 +64,7 @@ func (s *Store) Load() (*Checkpoint, error) {
 }
 
 // Save writes the checkpoint to disk atomically (write tmp + rename).
-func (s *Store) Save(cp *Checkpoint) error {
+func (s *FileStore) Save(pipelineID string, cp *Checkpoint) error {
 	cp.UpdatedAt = time.Now()
 
 	data, err := json.MarshalIndent(cp, "", "  ")
@@ -88,3 +95,6 @@ func (s *Store) Save(cp *Checkpoint) error {
 
 	return nil
 }
+
+// Close is a no-op for FileStore.
+func (s *FileStore) Close() {}

@@ -43,5 +43,9 @@ sink:
   # compaction_min_files: 4    # minimum small files to trigger compaction
   # max_snapshots: 0           # pause writes when exceeded (0 = unlimited)
 
+# State checkpoint storage.
+# By default, checkpoints are stored in the source postgres under the _pg2iceberg schema.
+# To use a separate postgres, set postgres_url. To use a local file (dev only), set path.
 state:
-  path: ./pg2iceberg-state.json
+  # postgres_url: postgresql://user:pass@host:5432/db?sslmode=disable
+  # path: ./pg2iceberg-state.json

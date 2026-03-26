@@ -38,9 +38,6 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_region": "us-east-1",
       "flush_interval": "10s",
       "flush_rows": 1000
-    },
-    "state": {
-      "path": "/data/rideshare-state.json"
     }
   }
 }'
@@ -81,9 +78,6 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_region": "us-east-1",
       "flush_interval": "10s",
       "flush_rows": 1000
-    },
-    "state": {
-      "path": "/data/cashcat-state.json"
     }
   }
 }'
@@ -123,9 +117,6 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_region": "us-east-1",
       "flush_interval": "10s",
       "flush_rows": 1000
-    },
-    "state": {
-      "path": "/data/todo-app-state.json"
     }
   }
 }'

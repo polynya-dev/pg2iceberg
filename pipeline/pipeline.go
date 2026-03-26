@@ -36,7 +36,7 @@ type Pipeline struct {
 
 	src     source.Source
 	snk     *sink.Sink
-	store   *state.Store
+	store   state.CheckpointStore
 	schemas map[string]*schema.TableSchema
 
 	cancel context.CancelFunc
@@ -120,6 +120,9 @@ func (p *Pipeline) Stop() error {
 			log.Printf("[pipeline:%s] source close error: %v", p.id, err)
 		}
 	}
+	if p.store != nil {
+		p.store.Close()
+	}
 
 	p.setStatus(StatusStopped, nil)
 	return nil
@@ -138,8 +141,12 @@ func (p *Pipeline) setStatus(s Status, err error) {
 // sink registration, compactor start, and source creation.
 func (p *Pipeline) setup(ctx context.Context) error {
 	// Load checkpoint.
-	p.store = state.NewStore(p.cfg.State.Path)
-	cp, err := p.store.Load()
+	store, err := newCheckpointStore(ctx, p.cfg)
+	if err != nil {
+		return fmt.Errorf("create checkpoint store: %w", err)
+	}
+	p.store = store
+	cp, err := p.store.Load(p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
@@ -308,7 +315,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 		return fmt.Errorf("flush: %w", err)
 	}
 
-	cp, err := p.store.Load()
+	cp, err := p.store.Load(p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint for update: %w", err)
 	}
@@ -321,7 +328,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 		}
 	}
 
-	if err := p.store.Save(cp); err != nil {
+	if err := p.store.Save(p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 
@@ -405,6 +412,20 @@ func (p *Pipeline) RemoveTable(ctx context.Context, tableName string) error {
 	delete(p.schemas, tableName)
 	log.Printf("[pipeline:%s] removed table %s", p.id, tableName)
 	return nil
+}
+
+func newCheckpointStore(ctx context.Context, cfg *config.Config) (state.CheckpointStore, error) {
+	// Explicit file path: use file store (local dev).
+	if cfg.State.Path != "" {
+		return state.NewFileStore(cfg.State.Path), nil
+	}
+
+	// Explicit postgres URL, or fall back to source postgres.
+	url := cfg.State.PostgresURL
+	if url == "" {
+		url = cfg.Source.Postgres.DSN()
+	}
+	return state.NewPgStore(ctx, url)
 }
 
 func getTables(cfg *config.Config) []string {

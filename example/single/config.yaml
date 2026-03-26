@@ -30,5 +30,4 @@ sink:
   flush_rows: 1000
   flush_bytes: 67108864
 
-state:
-  path: /data/pg2iceberg-state.json
+state: {}

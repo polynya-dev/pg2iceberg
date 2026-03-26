@@ -90,7 +90,6 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./config.yaml:/etc/pg2iceberg/config.yaml
-      - pg2iceberg-state:/data
     command: ["--config", "/etc/pg2iceberg/config.yaml"]
     depends_on:
       postgres:
@@ -128,4 +127,3 @@ services:
 
 volumes:
   pgdata:
-  pg2iceberg-state:

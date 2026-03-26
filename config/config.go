@@ -133,7 +133,8 @@ func (s SinkConfig) FlushDuration() time.Duration {
 }
 
 type StateConfig struct {
-	Path string `yaml:"path" json:"path"`
+	Path        string `yaml:"path" json:"path,omitempty"`
+	PostgresURL string `yaml:"postgres_url" json:"postgres_url,omitempty"`
 }
 
 // Load reads a config from a YAML file.
