@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // LogicalSource implements Source using PostgreSQL logical replication.
@@ -35,6 +36,9 @@ type LogicalSource struct {
 
 	// slotCreated tracks whether we created the slot (for cleanup).
 	slotCreated bool
+
+	// snapshotComplete is set from the checkpoint to skip the initial snapshot.
+	snapshotComplete bool
 }
 
 func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig) *LogicalSource {
@@ -50,6 +54,11 @@ func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConf
 func (l *LogicalSource) SetStartLSN(lsn uint64) {
 	l.startLSN = pglogrepl.LSN(lsn)
 	l.confirmedLSN = pglogrepl.LSN(lsn)
+}
+
+// SetSnapshotComplete marks the initial snapshot as already done (from checkpoint).
+func (l *LogicalSource) SetSnapshotComplete(done bool) {
+	l.snapshotComplete = done
 }
 
 // ConfirmedLSN returns the current confirmed LSN for checkpointing.
@@ -89,15 +98,32 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 			l.cfg.PublicationName, l.cfg.PublicationName)
 	}
 
-	// Create or reuse replication slot.
-	if err := l.ensureSlot(ctx); err != nil {
-		return fmt.Errorf("ensure slot: %w", err)
-	}
-
-	// Open replication connection. Close is handled by LogicalSource.Close().
+	// Open replication connection first — ensureSlot uses it so the exported
+	// snapshot stays valid until we finish the initial COPY.
 	l.replConn, err = pgconn.Connect(ctx, l.pgCfg.ReplicationDSN())
 	if err != nil {
 		return fmt.Errorf("replication connect: %w", err)
+	}
+
+	// Create or reuse replication slot.
+	snapshotName, err := l.ensureSlot(ctx)
+	if err != nil {
+		return fmt.Errorf("ensure slot: %w", err)
+	}
+
+	// If this is a fresh slot and the snapshot hasn't been completed yet,
+	// copy all existing rows before starting WAL streaming.
+	if !l.snapshotComplete && snapshotName != "" {
+		if err := l.snapshotTables(ctx, snapshotName, events); err != nil {
+			return fmt.Errorf("initial snapshot: %w", err)
+		}
+		// Signal to the pipeline that the snapshot is done so it can persist
+		// the flag in the checkpoint.
+		select {
+		case events <- ChangeEvent{Operation: OpSnapshotComplete}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	// Start streaming.
@@ -279,35 +305,31 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 }
 
 // ensureSlot creates the replication slot if it doesn't already exist.
-func (l *LogicalSource) ensureSlot(ctx context.Context) error {
+// It uses l.replConn (which must already be open) so that the exported
+// snapshot remains valid for the initial COPY.
+// Returns the snapshot name (non-empty only when a new slot was created).
+func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 	var exists bool
 	err := l.queryConn.QueryRow(ctx,
 		"SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
 		l.cfg.SlotName,
 	).Scan(&exists)
 	if err != nil {
-		return fmt.Errorf("check slot: %w", err)
+		return "", fmt.Errorf("check slot: %w", err)
 	}
 
 	if exists {
 		log.Printf("[logical] reusing existing slot %q", l.cfg.SlotName)
-		return nil
+		return "", nil
 	}
 
-	// Create the slot. We use a temporary replication connection.
-	replConn, err := pgconn.Connect(ctx, l.pgCfg.ReplicationDSN())
-	if err != nil {
-		return fmt.Errorf("connect for slot creation: %w", err)
-	}
-	defer replConn.Close(ctx)
-
-	result, err := pglogrepl.CreateReplicationSlot(ctx, replConn, l.cfg.SlotName, "pgoutput",
+	result, err := pglogrepl.CreateReplicationSlot(ctx, l.replConn, l.cfg.SlotName, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{
 			Temporary: false,
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("create slot: %w", err)
+		return "", fmt.Errorf("create slot: %w", err)
 	}
 
 	if l.startLSN == 0 {
@@ -319,8 +341,78 @@ func (l *LogicalSource) ensureSlot(ctx context.Context) error {
 	}
 
 	l.slotCreated = true
-	log.Printf("[logical] created slot %q at LSN %s", l.cfg.SlotName, result.ConsistentPoint)
-	return nil
+	log.Printf("[logical] created slot %q at LSN %s (snapshot %s)", l.cfg.SlotName, result.ConsistentPoint, result.SnapshotName)
+	return result.SnapshotName, nil
+}
+
+// snapshotTables performs an initial full-table copy for all tracked tables
+// using the exported snapshot from slot creation. This guarantees we see exactly
+// the rows that existed at the slot's ConsistentPoint.
+func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string, events chan<- ChangeEvent) error {
+	tx, err := l.queryConn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin snapshot tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Importing a snapshot requires REPEATABLE READ or SERIALIZABLE.
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		return fmt.Errorf("set isolation level: %w", err)
+	}
+
+	// Pin to the exported snapshot so we see exactly the same data as the
+	// slot's consistent point.
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", snapshotName)); err != nil {
+		return fmt.Errorf("set transaction snapshot: %w", err)
+	}
+
+	for _, table := range l.cfg.Tables {
+		ts := l.tables[table]
+
+		rows, err := tx.Query(ctx, fmt.Sprintf("SELECT * FROM %s", table))
+		if err != nil {
+			return fmt.Errorf("snapshot query %s: %w", table, err)
+		}
+
+		descs := rows.FieldDescriptions()
+		count := 0
+
+		for rows.Next() {
+			values, err := rows.Values()
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("snapshot scan %s: %w", table, err)
+			}
+
+			row := make(map[string]any, len(descs))
+			for i, desc := range descs {
+				row[string(desc.Name)] = pgValueToString(values[i])
+			}
+
+			select {
+			case events <- ChangeEvent{
+				Table:     table,
+				Operation: OpInsert,
+				After:     row,
+				PK:        ts.PK,
+				Timestamp: time.Now(),
+			}:
+			case <-ctx.Done():
+				rows.Close()
+				return ctx.Err()
+			}
+			count++
+		}
+		rows.Close()
+
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("snapshot rows %s: %w", table, err)
+		}
+
+		log.Printf("[logical] snapshot: emitted %d rows for %s", count, table)
+	}
+
+	return tx.Commit(ctx)
 }
 
 func (l *LogicalSource) sendStandby(ctx context.Context) {
@@ -439,6 +531,55 @@ func decodeTuple(rel *pglogrepl.RelationMessageV2, tuple *pglogrepl.TupleData) (
 		}
 	}
 	return row, unchangedCols
+}
+
+// pgValueToString converts a pgx native Go value to its text representation,
+// matching the format produced by the WAL decoder (which always returns strings).
+func pgValueToString(v any) any {
+	if v == nil {
+		return nil
+	}
+	switch x := v.(type) {
+	case string:
+		return x
+	case int16:
+		return fmt.Sprintf("%d", x)
+	case int32:
+		return fmt.Sprintf("%d", x)
+	case int64:
+		return fmt.Sprintf("%d", x)
+	case float32:
+		return fmt.Sprintf("%g", x)
+	case float64:
+		return fmt.Sprintf("%g", x)
+	case bool:
+		if x {
+			return "t"
+		}
+		return "f"
+	case time.Time:
+		return x.Format("2006-01-02 15:04:05.999999-07")
+	case pgtype.Numeric:
+		// Reconstruct the text representation preserving scale (trailing zeros).
+		// Exp is negative for fractional digits: e.g. Int=10050, Exp=-2 → "100.50"
+		if !x.Valid {
+			return nil
+		}
+		intStr := x.Int.String()
+		if x.Exp >= 0 {
+			return intStr + strings.Repeat("0", int(x.Exp))
+		}
+		scale := int(-x.Exp)
+		if len(intStr) <= scale {
+			intStr = strings.Repeat("0", scale-len(intStr)+1) + intStr
+		}
+		pos := len(intStr) - scale
+		return intStr[:pos] + "." + intStr[pos:]
+	case []byte:
+		return string(x)
+	default:
+		return fmt.Sprintf("%v", x)
+	}
 }
 
 func fqTable(namespace, name string) string {

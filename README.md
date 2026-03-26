@@ -88,6 +88,46 @@ state:
   path: ./pg2iceberg-state.json
 ```
 
+## Running tests
+
+Start dependencies:
+
+```sh
+docker compose up -d --wait
+```
+
+To run all tests:
+
+```sh
+./tests/run.sh
+```
+
+To run specific test:
+
+```sh
+./tests/run.sh 00001_basic_insert
+```
+
+### Writing tests
+
+Test cases live in `tests/cases/` with three files per test:
+
+| File | Purpose |
+|------|---------|
+| `<name>__input.sql` | SQL executed against PostgreSQL |
+| `<name>__query.sql` | Query run on ClickHouse to verify results |
+| `<name>__reference.tsv` | Expected tab-separated output from ClickHouse |
+
+Input SQL is split into steps using markers:
+
+```sql
+-- SETUP --     DDL phase: runs before pg2iceberg starts
+-- DATA --      DML phase: runs after pg2iceberg connects to replication
+-- SLEEP <N> -- pause for N seconds (useful between DDL and DML batches)
+```
+
+The table name, publication, and replication slot are auto-derived from the SQL.
+
 ## FAQ
 
 ### Will it support other sources and sinks in the future?

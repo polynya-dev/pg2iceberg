@@ -19,11 +19,12 @@ import (
 type Status string
 
 const (
-	StatusStarting Status = "starting"
-	StatusRunning  Status = "running"
-	StatusStopping Status = "stopping"
-	StatusStopped  Status = "stopped"
-	StatusError    Status = "error"
+	StatusStarting     Status = "starting"
+	StatusSnapshotting Status = "snapshotting"
+	StatusRunning      Status = "running"
+	StatusStopping     Status = "stopping"
+	StatusStopped      Status = "stopped"
+	StatusError        Status = "error"
 )
 
 // Pipeline encapsulates a single source-to-sink replication pipeline.
@@ -221,6 +222,10 @@ func (p *Pipeline) setup(ctx context.Context) error {
 			ls.SetStartLSN(cp.LSN)
 			log.Printf("[pipeline:%s] restored logical LSN: %d", p.id, cp.LSN)
 		}
+		ls.SetSnapshotComplete(cp.SnapshotComplete)
+		if !cp.SnapshotComplete {
+			p.setStatus(StatusSnapshotting, nil)
+		}
 		p.src = ls
 
 	default:
@@ -263,6 +268,17 @@ func (p *Pipeline) run(ctx context.Context) {
 					p.setStatus(StatusError, err)
 				}
 				return
+			}
+
+			// Handle snapshot-complete marker: flush remaining snapshot rows
+			// and persist the flag so we don't re-snapshot on restart.
+			if event.Operation == source.OpSnapshotComplete {
+				if err := p.flushSnapshotComplete(ctx); err != nil {
+					log.Printf("[pipeline:%s] snapshot complete flush error: %v", p.id, err)
+					p.setStatus(StatusError, err)
+					return
+				}
+				continue
 			}
 
 			if err := p.snk.Write(event); err != nil {
@@ -308,6 +324,33 @@ func (p *Pipeline) doFlush(ctx context.Context) error {
 		return err
 	}
 	return p.flush(ctx)
+}
+
+// flushSnapshotComplete flushes any buffered snapshot rows and saves the
+// SnapshotComplete flag to the checkpoint so a restart won't re-snapshot.
+func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
+	if err := p.snk.Flush(ctx); err != nil {
+		return fmt.Errorf("snapshot flush: %w", err)
+	}
+
+	cp, err := p.store.Load(p.id)
+	if err != nil {
+		return fmt.Errorf("load checkpoint: %w", err)
+	}
+
+	cp.Mode = p.cfg.Source.Mode
+	cp.SnapshotComplete = true
+	if ls, ok := p.src.(*source.LogicalSource); ok {
+		cp.LSN = ls.ConfirmedLSN()
+	}
+
+	if err := p.store.Save(p.id, cp); err != nil {
+		return fmt.Errorf("save checkpoint: %w", err)
+	}
+
+	p.setStatus(StatusRunning, nil)
+	log.Printf("[pipeline:%s] initial snapshot complete, checkpoint saved", p.id)
+	return nil
 }
 
 func (p *Pipeline) flush(ctx context.Context) error {

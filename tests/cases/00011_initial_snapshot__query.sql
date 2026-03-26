@@ -1,0 +1,1 @@
+SELECT id, name, amount FROM iceberg.`default.e2e_initial_snapshot` ORDER BY id

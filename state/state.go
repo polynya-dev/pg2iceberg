@@ -20,6 +20,11 @@ type Checkpoint struct {
 	// LSN is the confirmed flush LSN (logical replication mode).
 	LSN uint64 `json:"lsn,omitempty"`
 
+	// SnapshotComplete indicates whether the initial table snapshot has been
+	// fully copied into Iceberg. When false and LSN == 0, a fresh snapshot
+	// is needed before streaming WAL.
+	SnapshotComplete bool `json:"snapshot_complete,omitempty"`
+
 	// LastSnapshotID is the Iceberg snapshot ID of the last successful commit.
 	LastSnapshotID int64 `json:"last_snapshot_id,omitempty"`
 
