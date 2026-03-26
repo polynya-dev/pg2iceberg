@@ -1,0 +1,6 @@
+1	updated	100000	100000
+1	with_both	100000	100000
+2	bio_only	100000	\N
+2	updated	100000	\N
+3	payload_only	\N	100000
+3	updated	\N	100000

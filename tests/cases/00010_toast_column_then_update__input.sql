@@ -1,0 +1,23 @@
+-- SETUP --
+CREATE TABLE e2e_toast_col_then_update (
+    id SERIAL PRIMARY KEY,
+    label TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+ALTER TABLE e2e_toast_col_then_update ALTER COLUMN payload SET STORAGE EXTERNAL;
+CREATE PUBLICATION pg2iceberg_pub_e2e_toast_col_then_update FOR TABLE e2e_toast_col_then_update;
+-- DATA --
+INSERT INTO e2e_toast_col_then_update (id, label, payload) VALUES
+    (1, 'orig', repeat('A', 100000));
+
+-- First update: only label changes, payload is TOAST-unchanged.
+-- TOAST resolution will SELECT the current PG value at flush time.
+UPDATE e2e_toast_col_then_update SET label = 'step1' WHERE id = 1;
+
+-- Second update: payload itself changes. This is sent as 't' (full value).
+UPDATE e2e_toast_col_then_update SET payload = repeat('Z', 100000) WHERE id = 1;
+
+-- At flush time, the TOAST lookup for step1's row returns repeat('Z', 100000)
+-- (the current PG value), not repeat('A', 100000) (the value at WAL time).
+-- This is a known limitation of SELECT-on-miss: intermediate rows get the
+-- current value, not the historical value.

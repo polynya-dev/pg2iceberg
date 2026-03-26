@@ -1,0 +1,1 @@
+SELECT id, label, length(payload) FROM iceberg.`default.e2e_toast_update_delete` ORDER BY id, label
