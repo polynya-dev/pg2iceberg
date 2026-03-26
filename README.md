@@ -64,7 +64,7 @@ Then open http://localhost:3000 to manage pipelines.
 
 See [`example/multitenant`](example/multitenant) for a full working example with multiple Postgres sources.
 
-## State storage
+## Checkpoint storage
 
 pg2iceberg tracks replication progress (LSN for logical replication, watermark for query mode) in a checkpoint. By default, checkpoints are stored in the source Postgres database under the `_pg2iceberg` schema:
 
