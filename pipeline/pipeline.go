@@ -178,7 +178,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	pgConn.Close(ctx)
 
 	// Initialize sink.
-	p.snk, err = sink.NewSink(p.cfg.Sink)
+	p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres)
 	if err != nil {
 		return fmt.Errorf("create sink: %w", err)
 	}

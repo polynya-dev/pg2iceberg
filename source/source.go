@@ -38,6 +38,9 @@ type ChangeEvent struct {
 	// PK lists primary key column names for this table.
 	PK        []string
 	Timestamp time.Time
+	// UnchangedCols lists column names that were sent as 'unchanged' (TOAST).
+	// These columns are set to nil in After and need to be fetched from the source.
+	UnchangedCols []string
 }
 
 // Source captures change events from PostgreSQL.

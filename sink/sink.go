@@ -16,7 +16,9 @@ import (
 
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
 type Sink struct {
-	cfg     config.SinkConfig
+	cfg   config.SinkConfig
+	pgCfg config.PostgresConfig // source PG config for TOAST lookups
+
 	catalog *CatalogClient
 	s3      *S3Client
 
@@ -28,15 +30,26 @@ type Sink struct {
 	mu             sync.Mutex
 }
 
+// toastPendingRow holds a reference to a buffered row that has unchanged TOAST columns.
+type toastPendingRow struct {
+	row           map[string]any // reference to the buffered row (shared with writer)
+	unchangedCols []string       // columns that need to be fetched
+}
+
 type tableSink struct {
 	schema      *schema.TableSchema
 	icebergName string // table name in Iceberg catalog
 	dataWriter  *RollingWriter
 	delWriter   *RollingWriter
 	totalRows   int
+
+	// toastPending tracks rows that have unchanged TOAST columns.
+	// The row references are shared with the dataWriter, so mutating
+	// row[col] here also updates the writer's buffer.
+	toastPending []toastPendingRow
 }
 
-func NewSink(cfg config.SinkConfig) (*Sink, error) {
+func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig) (*Sink, error) {
 	catalog := NewCatalogClient(cfg.CatalogURI)
 
 	s3Client, err := NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
@@ -46,6 +59,7 @@ func NewSink(cfg config.SinkConfig) (*Sink, error) {
 
 	return &Sink{
 		cfg:            cfg,
+		pgCfg:          pgCfg,
 		catalog:        catalog,
 		s3:             s3Client,
 		tables:         make(map[string]*tableSink),
@@ -130,6 +144,12 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 				return err
 			}
 			ts.totalRows++
+			if len(event.UnchangedCols) > 0 {
+				ts.toastPending = append(ts.toastPending, toastPendingRow{
+					row:           event.After,
+					unchangedCols: event.UnchangedCols,
+				})
+			}
 		}
 	case source.OpDelete:
 		if event.Before != nil {
@@ -228,6 +248,13 @@ func (s *Sink) Flush(ctx context.Context) error {
 }
 
 func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) error {
+	// Resolve any unchanged TOAST columns before serializing to Parquet.
+	if len(ts.toastPending) > 0 {
+		if err := s.resolveToast(ctx, pgTable, ts); err != nil {
+			return fmt.Errorf("resolve TOAST: %w", err)
+		}
+	}
+
 	now := time.Now()
 	snapshotID := now.UnixMilli()
 	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.icebergName)
@@ -419,6 +446,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		snapshotID, pgTable, seqNum, dataCount, delCount, len(dataFiles), len(deleteFiles))
 
 	ts.totalRows = 0
+	ts.toastPending = nil
 	return nil
 }
 

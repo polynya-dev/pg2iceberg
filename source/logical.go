@@ -194,7 +194,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			return nil
 		}
 		ts := l.schemaForRelation(rel)
-		after := decodeTuple(rel, m.Tuple)
+		after, _ := decodeTuple(rel, m.Tuple)
 
 		select {
 		case events <- ChangeEvent{
@@ -221,18 +221,19 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 
 		var before map[string]any
 		if m.OldTuple != nil {
-			before = decodeTuple(rel, m.OldTuple)
+			before, _ = decodeTuple(rel, m.OldTuple)
 		}
-		after := decodeTuple(rel, m.NewTuple)
+		after, unchangedCols := decodeTuple(rel, m.NewTuple)
 
 		select {
 		case events <- ChangeEvent{
-			Table:     table,
-			Operation: OpUpdate,
-			Before:    before,
-			PK:        ts.PK,
-			After:     after,
-			Timestamp: time.Now(),
+			Table:         table,
+			Operation:     OpUpdate,
+			Before:        before,
+			PK:            ts.PK,
+			After:         after,
+			Timestamp:     time.Now(),
+			UnchangedCols: unchangedCols,
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
@@ -251,7 +252,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 
 		var before map[string]any
 		if m.OldTuple != nil {
-			before = decodeTuple(rel, m.OldTuple)
+			before, _ = decodeTuple(rel, m.OldTuple)
 		}
 
 		select {
@@ -416,11 +417,12 @@ func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *sch
 	return ts
 }
 
-func decodeTuple(rel *pglogrepl.RelationMessageV2, tuple *pglogrepl.TupleData) map[string]any {
+func decodeTuple(rel *pglogrepl.RelationMessageV2, tuple *pglogrepl.TupleData) (map[string]any, []string) {
 	if tuple == nil {
-		return nil
+		return nil, nil
 	}
 	row := make(map[string]any, len(tuple.Columns))
+	var unchangedCols []string
 	for i, col := range tuple.Columns {
 		if i >= len(rel.Columns) {
 			break
@@ -429,13 +431,14 @@ func decodeTuple(rel *pglogrepl.RelationMessageV2, tuple *pglogrepl.TupleData) m
 		switch col.DataType {
 		case 'n': // null
 			row[colName] = nil
-		case 'u': // unchanged
-			row[colName] = nil // we don't have the old value
+		case 'u': // unchanged TOAST column
+			row[colName] = nil
+			unchangedCols = append(unchangedCols, colName)
 		case 't': // text
 			row[colName] = string(col.Data)
 		}
 	}
-	return row
+	return row, unchangedCols
 }
 
 func fqTable(namespace, name string) string {
