@@ -22,7 +22,6 @@ type Manager struct {
 	ctx       context.Context // long-lived context for all pipelines
 	pipelines map[string]*Pipeline
 	store     PipelineStore
-	ch        *ClickHouseProvisioner // optional, nil if not configured
 	mu        sync.RWMutex
 }
 
@@ -32,11 +31,6 @@ func NewManager(ctx context.Context, store PipelineStore) *Manager {
 		pipelines: make(map[string]*Pipeline),
 		store:     store,
 	}
-}
-
-// SetClickHouse enables automatic ClickHouse database provisioning.
-func (m *Manager) SetClickHouse(ch *ClickHouseProvisioner) {
-	m.ch = ch
 }
 
 // Create validates, persists, and starts a new pipeline.
@@ -52,16 +46,6 @@ func (m *Manager) Create(_ context.Context, id string, cfg *config.Config) error
 	// Persist config before starting.
 	if err := m.store.Save(id, cfg); err != nil {
 		return fmt.Errorf("persist config: %w", err)
-	}
-
-	// Provision ClickHouse database for this namespace.
-	if m.ch != nil {
-		if err := m.ch.EnsureDatabase(cfg.Sink.Namespace); err != nil {
-			log.Printf("[manager] warning: clickhouse provisioning failed for %q: %v", id, err)
-			// Non-fatal: pipeline can still replicate, ClickHouse can be set up later.
-		} else {
-			log.Printf("[manager] provisioned clickhouse database %q", cfg.Sink.Namespace)
-		}
 	}
 
 	p := NewPipeline(id, cfg)

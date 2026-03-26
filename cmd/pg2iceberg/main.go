@@ -20,14 +20,6 @@ func main() {
 	storeDSN := flag.String("store-url", "", "postgres URL for pipeline store, e.g. postgresql://user:pass@host:5432/db (server mode)")
 	storeDir := flag.String("store-dir", "./pipelines", "file-based pipeline store directory (server mode, used if -store-dsn is not set)")
 
-	// ClickHouse auto-provisioning (server mode)
-	chAddr := flag.String("clickhouse-addr", "", "ClickHouse HTTP address for auto-provisioning (e.g. http://localhost:8123)")
-	chCatalogURI := flag.String("clickhouse-catalog-uri", "", "Iceberg catalog URI as seen by ClickHouse (e.g. http://iceberg-rest:8181/v1)")
-	chS3Endpoint := flag.String("clickhouse-s3-endpoint", "", "S3 endpoint as seen by ClickHouse (e.g. http://minio:9000)")
-	chS3AccessKey := flag.String("clickhouse-s3-access-key", "", "S3 access key for ClickHouse storage")
-	chS3SecretKey := flag.String("clickhouse-s3-secret-key", "", "S3 secret key for ClickHouse storage")
-	chWarehouse := flag.String("clickhouse-warehouse", "s3://warehouse/", "warehouse path for ClickHouse catalog")
-
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -43,15 +35,7 @@ func main() {
 	}()
 
 	if *serverMode {
-		chOpts := clickHouseOpts{
-			addr:        *chAddr,
-			catalogURI:  *chCatalogURI,
-			s3Endpoint:  *chS3Endpoint,
-			s3AccessKey: *chS3AccessKey,
-			s3SecretKey: *chS3SecretKey,
-			warehouse:   *chWarehouse,
-		}
-		runServer(ctx, *listenAddr, *storeDSN, *storeDir, chOpts)
+		runServer(ctx, *listenAddr, *storeDSN, *storeDir)
 	} else {
 		runSingle(ctx, *configPath)
 	}
@@ -74,16 +58,7 @@ func runSingle(ctx context.Context, configPath string) {
 	}
 }
 
-type clickHouseOpts struct {
-	addr        string
-	catalogURI  string
-	s3Endpoint  string
-	s3AccessKey string
-	s3SecretKey string
-	warehouse   string
-}
-
-func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string, chOpts clickHouseOpts) {
+func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string) {
 	var store pipeline.PipelineStore
 
 	if storeDSN != "" {
@@ -100,13 +75,6 @@ func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string, chOpt
 	}
 
 	mgr := pipeline.NewManager(ctx, store)
-
-	// Set up ClickHouse auto-provisioning if configured.
-	if chOpts.addr != "" {
-		ch := pipeline.NewClickHouseProvisioner(chOpts.addr, chOpts.catalogURI, chOpts.s3Endpoint, chOpts.s3AccessKey, chOpts.s3SecretKey, chOpts.warehouse)
-		mgr.SetClickHouse(ch)
-		log.Printf("clickhouse auto-provisioning enabled (%s)", chOpts.addr)
-	}
 
 	if err := mgr.RestoreAll(); err != nil {
 		log.Fatalf("restore pipelines: %v", err)

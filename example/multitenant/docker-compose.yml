@@ -148,12 +148,6 @@ services:
       - "--server"
       - "--listen=:8080"
       - "--store-url=postgresql://postgres:postgres@postgres-store:5432/pg2iceberg?sslmode=disable"
-      - "--clickhouse-addr=http://clickhouse:8123"
-      - "--clickhouse-catalog-uri=http://iceberg-rest:8181/v1"
-      - "--clickhouse-s3-endpoint=http://minio:9000"
-      - "--clickhouse-s3-access-key=admin"
-      - "--clickhouse-s3-secret-key=password"
-      - "--clickhouse-warehouse=s3://warehouse/"
     depends_on:
       postgres-store:
         condition: service_healthy
@@ -206,6 +200,7 @@ services:
     volumes:
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/s3.xml
       - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/iceberg.xml
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
     depends_on:
       iceberg-rest:
         condition: service_healthy
