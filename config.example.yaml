@@ -50,6 +50,12 @@ sink:
   flush_bytes: 67108864        # 64MB - flush when buffered bytes exceed this
   target_file_size: 134217728  # 128MB - max parquet file size before rolling
 
+  # Consistency table (optional)
+  # When enabled, flushes align to PG transaction boundaries and a _consistency
+  # table records {table_name, snapshot_id} per flush. Readers can query this
+  # table to get a cross-table consistent view using Iceberg time-travel.
+  # consistency_table: true
+
   # Compaction settings (optional)
   # compaction_interval: 5m    # how often to run compaction (disabled if empty)
   # compaction_target_size: 268435456  # 256MB - target merged file size

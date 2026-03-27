@@ -14,6 +14,8 @@ const (
 	OpDelete
 	OpSnapshotTableComplete
 	OpSnapshotComplete
+	OpBegin
+	OpCommit
 )
 
 func (o Op) String() string {
@@ -28,6 +30,10 @@ func (o Op) String() string {
 		return "SNAPSHOT_TABLE_COMPLETE"
 	case OpSnapshotComplete:
 		return "SNAPSHOT_COMPLETE"
+	case OpBegin:
+		return "BEGIN"
+	case OpCommit:
+		return "COMMIT"
 	default:
 		return "UNKNOWN"
 	}
@@ -53,6 +59,10 @@ type ChangeEvent struct {
 	// UnchangedCols lists column names that were sent as 'unchanged' (TOAST).
 	// These columns are set to nil in After and need to be fetched from the source.
 	UnchangedCols []string
+	// TransactionID is the PostgreSQL transaction ID (XID) from BeginMessage.
+	// Set on OpBegin, OpCommit, and all DML events within the transaction.
+	// Zero for snapshot and query-mode events.
+	TransactionID uint32
 }
 
 // Source captures change events from PostgreSQL.

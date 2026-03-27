@@ -37,6 +37,7 @@ import { ArrowLeft, ArrowRight, ChevronRight, Loader2, PlugZap } from "lucide-re
 import { toast } from "sonner";
 
 const defaultConfig: PipelineConfig = {
+  tables: [],
   source: {
     mode: "logical",
     postgres: {
@@ -49,7 +50,6 @@ const defaultConfig: PipelineConfig = {
     logical: {
       publication_name: "pg2iceberg_pub",
       slot_name: "pg2iceberg_slot",
-      tables: [],
     },
   },
   sink: {
@@ -174,9 +174,7 @@ export function CreatePipelinePage() {
     setCreating(true);
     try {
       const finalConfig = structuredClone(config);
-      if (finalConfig.source.mode === "logical" && finalConfig.source.logical) {
-        finalConfig.source.logical.tables = Array.from(selectedTables);
-      }
+      finalConfig.tables = Array.from(selectedTables).map((name) => ({ name }));
 
       await createPipeline(id.trim(), finalConfig);
       toast.success(`Pipeline "${id.trim()}" created`);

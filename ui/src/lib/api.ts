@@ -9,18 +9,20 @@ export interface PostgresConfig {
 export interface LogicalConfig {
   publication_name: string;
   slot_name: string;
-  tables: string[];
-}
-
-export interface QueryTableConfig {
-  name: string;
-  primary_key: string[];
-  watermark_column: string;
 }
 
 export interface QueryConfig {
-  tables: QueryTableConfig[];
   poll_interval: string;
+}
+
+export interface TableConfig {
+  name: string;
+  skip_snapshot?: boolean;
+  primary_key?: string[];
+  watermark_column?: string;
+  iceberg?: {
+    partition?: string[];
+  };
 }
 
 export interface SourceConfig {
@@ -48,6 +50,7 @@ export interface StateConfig {
 }
 
 export interface PipelineConfig {
+  tables: TableConfig[];
   source: SourceConfig;
   sink: SinkConfig;
   state: StateConfig;

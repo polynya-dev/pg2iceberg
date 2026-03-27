@@ -109,6 +109,12 @@ type SinkConfig struct {
 	FlushBytes     int64  `yaml:"flush_bytes" json:"flush_bytes,omitempty"`
 	TargetFileSize int64  `yaml:"target_file_size" json:"target_file_size,omitempty"`
 
+	// ConsistencyTable enables the _consistency metadata table for
+	// cross-table transactional consistency guarantees. When enabled,
+	// flushes align to transaction boundaries and snapshot IDs are
+	// recorded so readers can query a consistent cross-table view.
+	ConsistencyTable bool `yaml:"consistency_table" json:"consistency_table,omitempty"`
+
 	// Compaction settings
 	CompactionInterval   string `yaml:"compaction_interval" json:"compaction_interval,omitempty"`
 	CompactionTargetSize int64  `yaml:"compaction_target_size" json:"compaction_target_size,omitempty"`

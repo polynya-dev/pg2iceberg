@@ -7,6 +7,13 @@ echo "Creating rideshare pipeline..."
 curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
   "id": "rideshare",
   "config": {
+    "tables": [
+      {"name": "public.riders"},
+      {"name": "public.drivers"},
+      {"name": "public.rides", "iceberg": {"partition": ["day(requested_at)"]}},
+      {"name": "public.payments", "iceberg": {"partition": ["day(charged_at)"]}},
+      {"name": "public.ratings", "iceberg": {"partition": ["day(created_at)"]}}
+    ],
     "source": {
       "mode": "logical",
       "postgres": {
@@ -18,14 +25,7 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       },
       "logical": {
         "publication_name": "pg2iceberg_pub",
-        "slot_name": "pg2iceberg_slot",
-        "tables": [
-          "public.riders",
-          "public.drivers",
-          "public.rides",
-          "public.payments",
-          "public.ratings"
-        ]
+        "slot_name": "pg2iceberg_slot"
       }
     },
     "sink": {
@@ -37,7 +37,8 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_secret_key": "password",
       "s3_region": "us-east-1",
       "flush_interval": "10s",
-      "flush_rows": 1000
+      "flush_rows": 1000,
+      "consistency_table": true
     }
   }
 }'
@@ -47,6 +48,13 @@ echo "Creating cashcat pipeline..."
 curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
   "id": "cashcat",
   "config": {
+    "tables": [
+      {"name": "public.customers"},
+      {"name": "public.accounts"},
+      {"name": "public.transactions", "iceberg": {"partition": ["day(created_at)"]}},
+      {"name": "public.cards"},
+      {"name": "public.support_tickets", "iceberg": {"partition": ["day(created_at)"]}}
+    ],
     "source": {
       "mode": "logical",
       "postgres": {
@@ -58,14 +66,7 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       },
       "logical": {
         "publication_name": "pg2iceberg_pub",
-        "slot_name": "pg2iceberg_slot",
-        "tables": [
-          "public.customers",
-          "public.accounts",
-          "public.transactions",
-          "public.cards",
-          "public.support_tickets"
-        ]
+        "slot_name": "pg2iceberg_slot"
       }
     },
     "sink": {
@@ -77,7 +78,8 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_secret_key": "password",
       "s3_region": "us-east-1",
       "flush_interval": "10s",
-      "flush_rows": 1000
+      "flush_rows": 1000,
+      "consistency_table": true
     }
   }
 }'
@@ -87,6 +89,12 @@ echo "Creating todo-app pipeline..."
 curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
   "id": "todo-app",
   "config": {
+    "tables": [
+      {"name": "public.users"},
+      {"name": "public.todos", "iceberg": {"partition": ["month(created_at)"]}},
+      {"name": "public.labels"},
+      {"name": "public.todo_labels"}
+    ],
     "source": {
       "mode": "logical",
       "postgres": {
@@ -98,13 +106,7 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       },
       "logical": {
         "publication_name": "pg2iceberg_pub",
-        "slot_name": "pg2iceberg_slot",
-        "tables": [
-          "public.users",
-          "public.todos",
-          "public.labels",
-          "public.todo_labels"
-        ]
+        "slot_name": "pg2iceberg_slot"
       }
     },
     "sink": {
@@ -116,7 +118,8 @@ curl -sf -X POST "$API" -H "Content-Type: application/json" -d '{
       "s3_secret_key": "password",
       "s3_region": "us-east-1",
       "flush_interval": "10s",
-      "flush_rows": 1000
+      "flush_rows": 1000,
+      "consistency_table": true
     }
   }
 }'

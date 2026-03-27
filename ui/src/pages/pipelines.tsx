@@ -130,10 +130,7 @@ export function PipelinesPage() {
               </TableRow>
             ) : (
               pipelines.map((p) => {
-                const tableCount =
-                  p.config.source.mode === "logical"
-                    ? (p.config.source.logical?.tables?.length ?? 0)
-                    : (p.config.source.query?.tables?.length ?? 0);
+                const tableCount = p.config.tables?.length ?? 0;
 
                 return (
                   <TableRow

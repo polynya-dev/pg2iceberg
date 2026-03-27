@@ -17,6 +17,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// txBuffer holds events for a single in-flight PG transaction.
+type txBuffer struct {
+	xid       uint32
+	events    []source.ChangeEvent
+	tables    map[string]bool // which tables this tx touches
+	committed bool
+	commitTS  time.Time // PG commit timestamp
+}
+
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
 type Sink struct {
 	cfg       config.SinkConfig
@@ -28,6 +37,11 @@ type Sink struct {
 
 	// Per-table state
 	tables map[string]*tableSink
+
+	// Transaction tracking (only used when consistency is enabled).
+	consistencyEnabled bool
+	openTxns           map[uint32]*txBuffer // XID -> in-flight tx
+	committedTxns      []*txBuffer          // txns that received Commit, in order
 
 	// Backpressure: compactor signals when snapshots are cleaned up.
 	compactionDone chan struct{}
@@ -80,13 +94,15 @@ func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []con
 	}
 
 	return &Sink{
-		cfg:            cfg,
-		pgCfg:          pgCfg,
-		tableCfgs:      tableCfgs,
-		catalog:        catalog,
-		s3:             s3Client,
-		tables:         make(map[string]*tableSink),
-		compactionDone: make(chan struct{}, 1),
+		cfg:                cfg,
+		pgCfg:              pgCfg,
+		tableCfgs:          tableCfgs,
+		catalog:            catalog,
+		s3:                 s3Client,
+		tables:             make(map[string]*tableSink),
+		consistencyEnabled: cfg.ConsistencyTable,
+		openTxns:           make(map[uint32]*txBuffer),
+		compactionDone:     make(chan struct{}, 1),
 	}, nil
 }
 
@@ -180,8 +196,56 @@ func (ts *tableSink) getPartitionWriter(row map[string]any) *partitionedWriter {
 	return pw
 }
 
-// Write buffers a ChangeEvent for the next flush.
+// Write buffers a ChangeEvent for the next flush. When consistency mode is
+// enabled, DML events are held in per-transaction buffers until the
+// corresponding OpCommit arrives.
 func (s *Sink) Write(event source.ChangeEvent) error {
+	// Skip transaction boundary events when consistency mode is disabled.
+	if !s.consistencyEnabled {
+		if event.Operation == source.OpBegin || event.Operation == source.OpCommit {
+			return nil
+		}
+	}
+
+	// Transaction boundary events (consistency mode only).
+	if s.consistencyEnabled {
+		switch event.Operation {
+		case source.OpBegin:
+			s.openTxns[event.TransactionID] = &txBuffer{
+				xid:    event.TransactionID,
+				tables: make(map[string]bool),
+			}
+			return nil
+		case source.OpCommit:
+			tx, ok := s.openTxns[event.TransactionID]
+			if !ok {
+				return nil // no tracked DML in this tx
+			}
+			tx.committed = true
+			tx.commitTS = event.SourceTimestamp
+			s.committedTxns = append(s.committedTxns, tx)
+			delete(s.openTxns, event.TransactionID)
+			return nil
+		}
+
+		// DML event — buffer in the transaction.
+		if event.TransactionID != 0 {
+			tx, ok := s.openTxns[event.TransactionID]
+			if ok {
+				tx.events = append(tx.events, event)
+				tx.tables[event.Table] = true
+				return nil
+			}
+		}
+		// Fall through: events without a transaction ID (e.g., snapshot)
+		// are written directly.
+	}
+
+	return s.writeDirect(event)
+}
+
+// writeDirect writes an event directly to the per-table writers.
+func (s *Sink) writeDirect(event source.ChangeEvent) error {
 	ts, ok := s.tables[event.Table]
 	if !ok {
 		return fmt.Errorf("unregistered table: %s", event.Table)
@@ -231,8 +295,12 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 	return nil
 }
 
-// ShouldFlush checks if any table has buffered data.
+// ShouldFlush checks if there is flushable data. When consistency is enabled,
+// only committed transactions count.
 func (s *Sink) ShouldFlush() bool {
+	if s.consistencyEnabled {
+		return len(s.committedTxns) > 0
+	}
 	for _, ts := range s.tables {
 		for _, pw := range ts.partitions {
 			if pw.dataWriter.Len()+pw.delWriter.Len() > 0 {
@@ -243,8 +311,16 @@ func (s *Sink) ShouldFlush() bool {
 	return false
 }
 
-// TotalBuffered returns the total number of buffered rows across all tables.
+// TotalBuffered returns the total number of buffered rows eligible for flush.
+// When consistency is enabled, only committed transaction events are counted.
 func (s *Sink) TotalBuffered() int {
+	if s.consistencyEnabled {
+		total := 0
+		for _, tx := range s.committedTxns {
+			total += len(tx.events)
+		}
+		return total
+	}
 	total := 0
 	for _, ts := range s.tables {
 		for _, pw := range ts.partitions {
@@ -255,11 +331,22 @@ func (s *Sink) TotalBuffered() int {
 }
 
 // TotalBufferedBytes returns the estimated buffered bytes across all tables.
+// In consistency mode this includes both committed and in-flight data (for
+// backpressure monitoring).
 func (s *Sink) TotalBufferedBytes() int64 {
 	var total int64
 	for _, ts := range s.tables {
 		for _, pw := range ts.partitions {
 			total += pw.dataWriter.EstimatedBytes() + pw.delWriter.EstimatedBytes()
+		}
+	}
+	// Include in-flight transaction events not yet in writers.
+	if s.consistencyEnabled {
+		for _, tx := range s.committedTxns {
+			total += int64(len(tx.events)) * 128 // rough estimate per event
+		}
+		for _, tx := range s.openTxns {
+			total += int64(len(tx.events)) * 128
 		}
 	}
 	return total
@@ -309,8 +396,69 @@ func (s *Sink) NotifyCompactionDone() {
 }
 
 // Flush writes all buffered data to Iceberg for each table, flushing tables in parallel.
+// When consistency is enabled, committed transactions are replayed into writers
+// first, and a consistency record is written after all tables commit.
 func (s *Sink) Flush(ctx context.Context) error {
+	if s.consistencyEnabled {
+		return s.flushWithConsistency(ctx)
+	}
+	return s.flushDirect(ctx)
+}
+
+// flushDirect is the original flush path (no transaction tracking).
+func (s *Sink) flushDirect(ctx context.Context) error {
+	snapshotIDs, err := s.flushAllTables(ctx)
+	if err != nil {
+		return err
+	}
+	_ = snapshotIDs
+	return nil
+}
+
+// flushWithConsistency replays committed transactions into writers, flushes
+// all tables in parallel, then writes a consistency record.
+func (s *Sink) flushWithConsistency(ctx context.Context) error {
+	if len(s.committedTxns) == 0 {
+		return nil
+	}
+
+	// Drain committed transactions into per-table writers.
+	txns := s.committedTxns
+	for _, tx := range txns {
+		for _, event := range tx.events {
+			if err := s.writeDirect(event); err != nil {
+				return fmt.Errorf("replay tx %d: %w", tx.xid, err)
+			}
+		}
+	}
+
+	// Flush all tables in parallel, collecting snapshot IDs.
+	snapshotIDs, err := s.flushAllTables(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Write consistency records.
+	if err := s.writeConsistencyRecords(ctx, txns, snapshotIDs); err != nil {
+		return fmt.Errorf("write consistency records: %w", err)
+	}
+
+	// Clear committed transactions only after everything succeeded.
+	s.committedTxns = nil
+	return nil
+}
+
+// flushAllTables flushes all tables that have buffered data in parallel.
+// Returns a map of pgTable -> snapshotID for each flushed table.
+func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
+	type tableFlushResult struct {
+		pgTable    string
+		snapshotID int64
+	}
+
 	var tasks []worker.Task
+	resultCh := make(chan tableFlushResult, len(s.tables))
+
 	for pgTable, ts := range s.tables {
 		hasData := false
 		for _, pw := range ts.partitions {
@@ -323,22 +471,36 @@ func (s *Sink) Flush(ctx context.Context) error {
 			continue
 		}
 
-		pgTable, ts := pgTable, ts // capture loop vars
+		pgTable, ts := pgTable, ts
 		tasks = append(tasks, worker.Task{
 			Name: pgTable,
 			Fn: func(ctx context.Context, progress *worker.Progress) error {
-				return s.flushTable(ctx, pgTable, ts)
+				snapID, err := s.flushTable(ctx, pgTable, ts)
+				if err != nil {
+					return err
+				}
+				resultCh <- tableFlushResult{pgTable: pgTable, snapshotID: snapID}
+				return nil
 			},
 		})
 	}
 
 	if len(tasks) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	pool := worker.NewPool(len(tasks))
 	_, err := pool.Run(ctx, tasks)
-	return err
+	close(resultCh)
+	if err != nil {
+		return nil, err
+	}
+
+	snapshotIDs := make(map[string]int64, len(tasks))
+	for r := range resultCh {
+		snapshotIDs[r.pgTable] = r.snapshotID
+	}
+	return snapshotIDs, nil
 }
 
 // pendingUpload holds the data needed to upload a single Parquet file to S3.
@@ -357,11 +519,11 @@ type uploadResult struct {
 	pendingUpload
 }
 
-func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) error {
+func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) (int64, error) {
 	// Resolve any unchanged TOAST columns before serializing to Parquet.
 	if len(ts.toastPending) > 0 {
 		if err := s.resolveToast(ctx, pgTable, ts); err != nil {
-			return fmt.Errorf("resolve TOAST: %w", err)
+			return 0, fmt.Errorf("resolve TOAST: %w", err)
 		}
 	}
 
@@ -384,7 +546,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 
 		dataChunks, err := pw.dataWriter.FlushAll()
 		if err != nil {
-			return fmt.Errorf("flush data: %w", err)
+			return 0, fmt.Errorf("flush data: %w", err)
 		}
 		for i, chunk := range dataChunks {
 			fileUUID := uuid.New().String()
@@ -405,7 +567,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 
 		delChunks, err := pw.delWriter.FlushAll()
 		if err != nil {
-			return fmt.Errorf("flush deletes: %w", err)
+			return 0, fmt.Errorf("flush deletes: %w", err)
 		}
 		for i, chunk := range delChunks {
 			fileUUID := uuid.New().String()
@@ -441,7 +603,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return err
+		return 0, err
 	}
 
 	// Separate uploaded files into data and delete lists.
@@ -465,7 +627,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 	// 3. Load current table metadata to get existing manifests.
 	tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.icebergName)
 	if err != nil {
-		return fmt.Errorf("load table: %w", err)
+		return 0, fmt.Errorf("load table: %w", err)
 	}
 
 	seqNum := tm.Metadata.LastSequenceNumber + 1
@@ -474,15 +636,15 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 	if ml := tm.CurrentManifestList(); ml != "" {
 		mlKey, err := KeyFromURI(ml)
 		if err != nil {
-			return fmt.Errorf("parse manifest list URI: %w", err)
+			return 0, fmt.Errorf("parse manifest list URI: %w", err)
 		}
 		mlData, err := s.s3.Download(ctx, mlKey)
 		if err != nil {
-			return fmt.Errorf("download manifest list: %w", err)
+			return 0, fmt.Errorf("download manifest list: %w", err)
 		}
 		existingManifests, err = ReadManifestList(mlData)
 		if err != nil {
-			return fmt.Errorf("read manifest list: %w", err)
+			return 0, fmt.Errorf("read manifest list: %w", err)
 		}
 	}
 
@@ -499,13 +661,13 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		}
 		manifestBytes, err := WriteManifest(ts.schema, entries, seqNum, 0, ts.partSpec)
 		if err != nil {
-			return fmt.Errorf("write data manifest: %w", err)
+			return 0, fmt.Errorf("write data manifest: %w", err)
 		}
 
 		manifestKey := fmt.Sprintf("%s/metadata/%s-m0.avro", basePath, uuid.New().String())
 		manifestURI, err := s.s3.Upload(ctx, manifestKey, manifestBytes)
 		if err != nil {
-			return fmt.Errorf("upload data manifest: %w", err)
+			return 0, fmt.Errorf("upload data manifest: %w", err)
 		}
 
 		var totalRows int64
@@ -535,13 +697,13 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		}
 		manifestBytes, err := WriteManifest(ts.schema, entries, seqNum, 1, ts.partSpec)
 		if err != nil {
-			return fmt.Errorf("write delete manifest: %w", err)
+			return 0, fmt.Errorf("write delete manifest: %w", err)
 		}
 
 		manifestKey := fmt.Sprintf("%s/metadata/%s-m1.avro", basePath, uuid.New().String())
 		manifestURI, err := s.s3.Upload(ctx, manifestKey, manifestBytes)
 		if err != nil {
-			return fmt.Errorf("upload delete manifest: %w", err)
+			return 0, fmt.Errorf("upload delete manifest: %w", err)
 		}
 
 		var totalRows int64
@@ -563,13 +725,13 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 	allManifests := append(existingManifests, manifestInfos...)
 	mlBytes, err := WriteManifestList(allManifests)
 	if err != nil {
-		return fmt.Errorf("write manifest list: %w", err)
+		return 0, fmt.Errorf("write manifest list: %w", err)
 	}
 
 	mlKey := fmt.Sprintf("%s/metadata/snap-%d-0-manifest-list.avro", basePath, snapshotID)
 	mlURI, err := s.s3.Upload(ctx, mlKey, mlBytes)
 	if err != nil {
-		return fmt.Errorf("upload manifest list: %w", err)
+		return 0, fmt.Errorf("upload manifest list: %w", err)
 	}
 
 	// 7. Commit snapshot.
@@ -589,7 +751,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 	}
 
 	if err := s.catalog.CommitSnapshot(s.cfg.Namespace, ts.icebergName, tm.Metadata.CurrentSnapshotID, commit); err != nil {
-		return fmt.Errorf("commit snapshot: %w", err)
+		return 0, fmt.Errorf("commit snapshot: %w", err)
 	}
 
 	dataCount := 0
@@ -621,7 +783,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		}
 	}
 
-	return nil
+	return snapshotID, nil
 }
 
 func extractPK(row map[string]any, pk []string) map[string]any {

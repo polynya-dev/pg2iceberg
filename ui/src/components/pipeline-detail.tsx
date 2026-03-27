@@ -66,10 +66,7 @@ export function PipelineDetail({
   const [newTable, setNewTable] = useState("");
   const [addingTable, setAddingTable] = useState(false);
 
-  const tables =
-    pipeline.config.source.mode === "logical"
-      ? pipeline.config.source.logical?.tables ?? []
-      : pipeline.config.source.query?.tables.map((t) => t.name) ?? [];
+  const tables = (pipeline.config.tables ?? []).map((t) => t.name);
 
   async function handleDelete() {
     try {

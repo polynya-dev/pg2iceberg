@@ -30,5 +30,6 @@ sink:
   flush_interval: 10s
   flush_rows: 1000
   flush_bytes: 67108864
+  consistency_table: true
 
 state: {}

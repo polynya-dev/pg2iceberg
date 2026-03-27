@@ -48,6 +48,9 @@ type LogicalSource struct {
 	// transaction, captured from BeginMessage. This is the source-of-truth
 	// timestamp (equivalent to Debezium's source.ts_ms).
 	currentTxCommitTime time.Time
+	// currentTxXID is the PostgreSQL transaction ID (XID) of the in-flight
+	// transaction, captured from BeginMessage.
+	currentTxXID uint32
 }
 
 func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig, tableCfgs []config.TableConfig) *LogicalSource {
@@ -248,6 +251,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			PK:                 ts.PK,
 			SourceTimestamp:     l.currentTxCommitTime,
 			ProcessingTimestamp: time.Now(),
+			TransactionID:      l.currentTxXID,
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
@@ -280,6 +284,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			SourceTimestamp:     l.currentTxCommitTime,
 			ProcessingTimestamp: time.Now(),
 			UnchangedCols:      unchangedCols,
+			TransactionID:      l.currentTxXID,
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
@@ -309,6 +314,7 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			PK:                 ts.PK,
 			SourceTimestamp:     l.currentTxCommitTime,
 			ProcessingTimestamp: time.Now(),
+			TransactionID:      l.currentTxXID,
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
@@ -316,8 +322,28 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 
 	case *pglogrepl.BeginMessage:
 		l.currentTxCommitTime = m.CommitTime
+		l.currentTxXID = m.Xid
+		select {
+		case events <- ChangeEvent{
+			Operation:      OpBegin,
+			TransactionID:  m.Xid,
+			SourceTimestamp: m.CommitTime,
+		}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	case *pglogrepl.CommitMessage:
+		select {
+		case events <- ChangeEvent{
+			Operation:      OpCommit,
+			TransactionID:  l.currentTxXID,
+			SourceTimestamp: m.CommitTime,
+		}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		l.currentTxCommitTime = time.Time{}
+		l.currentTxXID = 0
 	case *pglogrepl.TruncateMessageV2:
 		log.Printf("[logical] TRUNCATE detected (not yet handled)")
 	}
