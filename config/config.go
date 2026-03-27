@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -200,6 +201,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
@@ -211,6 +215,9 @@ func LoadJSON(data []byte) (*Config, error) {
 	}
 
 	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }
 
@@ -228,4 +235,108 @@ func (cfg *Config) ApplyDefaults() {
 	if cfg.Sink.S3Region == "" {
 		cfg.Sink.S3Region = "us-east-1"
 	}
+}
+
+// Validate checks that the config has all required fields and valid values.
+// It should be called after ApplyDefaults.
+func (cfg *Config) Validate() error {
+	var errs []string
+
+	// Tables
+	if len(cfg.Tables) == 0 {
+		errs = append(errs, "tables: at least one table is required")
+	}
+	seen := make(map[string]bool)
+	for i, t := range cfg.Tables {
+		if t.Name == "" {
+			errs = append(errs, fmt.Sprintf("tables[%d].name: required", i))
+		} else if seen[t.Name] {
+			errs = append(errs, fmt.Sprintf("tables[%d].name: duplicate table %q", i, t.Name))
+		} else {
+			seen[t.Name] = true
+		}
+	}
+
+	// Source
+	switch cfg.Source.Mode {
+	case "logical", "query":
+	default:
+		errs = append(errs, fmt.Sprintf("source.mode: must be \"logical\" or \"query\", got %q", cfg.Source.Mode))
+	}
+
+	pg := cfg.Source.Postgres
+	if pg.Host == "" {
+		errs = append(errs, "source.postgres.host: required")
+	}
+	if pg.Database == "" {
+		errs = append(errs, "source.postgres.database: required")
+	}
+	if pg.User == "" {
+		errs = append(errs, "source.postgres.user: required")
+	}
+
+	if cfg.Source.Mode == "logical" {
+		if cfg.Source.Logical.SlotName == "" {
+			errs = append(errs, "source.logical.slot_name: required for logical mode")
+		}
+		if cfg.Source.Logical.PublicationName == "" {
+			errs = append(errs, "source.logical.publication_name: required for logical mode")
+		}
+	}
+
+	if cfg.Source.Mode == "query" {
+		if cfg.Source.Query.PollInterval != "" {
+			if _, err := time.ParseDuration(cfg.Source.Query.PollInterval); err != nil {
+				errs = append(errs, fmt.Sprintf("source.query.poll_interval: invalid duration %q", cfg.Source.Query.PollInterval))
+			}
+		}
+		for i, t := range cfg.Tables {
+			if len(t.PrimaryKey) == 0 {
+				errs = append(errs, fmt.Sprintf("tables[%d].primary_key: required for query mode", i))
+			}
+			if t.WatermarkColumn == "" {
+				errs = append(errs, fmt.Sprintf("tables[%d].watermark_column: required for query mode", i))
+			}
+		}
+	}
+
+	// Sink
+	if cfg.Sink.CatalogURI == "" {
+		errs = append(errs, "sink.catalog_uri: required")
+	}
+	if cfg.Sink.Warehouse == "" {
+		errs = append(errs, "sink.warehouse: required")
+	}
+	if cfg.Sink.Namespace == "" {
+		errs = append(errs, "sink.namespace: required")
+	}
+	if cfg.Sink.S3Endpoint == "" {
+		errs = append(errs, "sink.s3_endpoint: required")
+	}
+
+	if cfg.Sink.FlushInterval != "" {
+		if _, err := time.ParseDuration(cfg.Sink.FlushInterval); err != nil {
+			errs = append(errs, fmt.Sprintf("sink.flush_interval: invalid duration %q", cfg.Sink.FlushInterval))
+		}
+	}
+	if cfg.Sink.CompactionInterval != "" {
+		if _, err := time.ParseDuration(cfg.Sink.CompactionInterval); err != nil {
+			errs = append(errs, fmt.Sprintf("sink.compaction_interval: invalid duration %q", cfg.Sink.CompactionInterval))
+		}
+	}
+
+	if cfg.Sink.FlushRows < 0 {
+		errs = append(errs, "sink.flush_rows: must be positive")
+	}
+	if cfg.Sink.FlushBytes < 0 {
+		errs = append(errs, "sink.flush_bytes: must be positive")
+	}
+	if cfg.Sink.TargetFileSize < 0 {
+		errs = append(errs, "sink.target_file_size: must be positive")
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("config validation failed:\n  %s", strings.Join(errs, "\n  "))
+	}
+	return nil
 }
