@@ -1,0 +1,1 @@
+SELECT id, name, amount FROM iceberg.`default.e2e_txn_insert` ORDER BY id
