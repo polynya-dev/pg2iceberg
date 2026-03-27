@@ -37,6 +37,17 @@ func (ts *TableSchema) PKFieldIDs() []int {
 	return ids
 }
 
+// MaxFieldID returns the highest Iceberg field ID assigned in this schema.
+func (ts *TableSchema) MaxFieldID() int {
+	max := 0
+	for _, col := range ts.Columns {
+		if col.FieldID > max {
+			max = col.FieldID
+		}
+	}
+	return max
+}
+
 // DiscoverSchema queries PostgreSQL to build the table schema.
 func DiscoverSchema(ctx context.Context, conn *pgx.Conn, table string) (*TableSchema, error) {
 	schema, tableName := splitTableName(table)
@@ -143,6 +154,11 @@ func IcebergType(pgType string) string {
 
 // IcebergSchemaJSON builds the Iceberg schema as a map for the REST catalog API.
 func IcebergSchemaJSON(ts *TableSchema) map[string]any {
+	return IcebergSchemaJSONWithID(ts, 0)
+}
+
+// IcebergSchemaJSONWithID builds the Iceberg schema with a specific schema-id.
+func IcebergSchemaJSONWithID(ts *TableSchema, schemaID int) map[string]any {
 	fields := make([]map[string]any, len(ts.Columns))
 	for i, col := range ts.Columns {
 		fields[i] = map[string]any{
@@ -154,7 +170,7 @@ func IcebergSchemaJSON(ts *TableSchema) map[string]any {
 	}
 	return map[string]any{
 		"type":      "struct",
-		"schema-id": 0,
+		"schema-id": schemaID,
 		"fields":    fields,
 	}
 }

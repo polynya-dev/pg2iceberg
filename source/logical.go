@@ -229,6 +229,25 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 
 	switch m := logicalMsg.(type) {
 	case *pglogrepl.RelationMessageV2:
+		table := fqTable(m.Namespace, m.RelationName)
+		if l.isTracked(table) {
+			if old, exists := l.relations[m.RelationID]; exists {
+				if diff := diffRelation(old, m); diff != nil {
+					diff.Table = table
+					log.Printf("[logical] schema change detected for %s: +%d columns, -%d columns, %d type changes",
+						table, len(diff.AddedColumns), len(diff.DroppedColumns), len(diff.TypeChanges))
+					select {
+					case events <- ChangeEvent{
+						Table:        table,
+						Operation:    OpSchemaChange,
+						SchemaChange: diff,
+					}:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			}
+		}
 		l.relations[m.RelationID] = m
 
 	case *pglogrepl.InsertMessageV2:
@@ -545,6 +564,7 @@ func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *sch
 	for i, col := range rel.Columns {
 		ts.Columns = append(ts.Columns, schema.Column{
 			Name:    col.Name,
+			PGType:  oidToPGType(col.DataType),
 			FieldID: i + 1,
 		})
 	}
@@ -630,4 +650,77 @@ func fqTable(namespace, name string) string {
 		return "public." + name
 	}
 	return namespace + "." + name
+}
+
+// pgOIDToType maps well-known PostgreSQL type OIDs to their canonical type names.
+// Unknown OIDs default to "text".
+var pgOIDToType = map[uint32]string{
+	16:   "bool",
+	17:   "bytea",
+	20:   "int8",
+	21:   "int2",
+	23:   "int4",
+	25:   "text",
+	114:  "json",
+	700:  "float4",
+	701:  "float8",
+	1042: "bpchar",
+	1043: "varchar",
+	1082: "date",
+	1114: "timestamp",
+	1184: "timestamptz",
+	1700: "numeric",
+	2950: "uuid",
+	3802: "jsonb",
+}
+
+func oidToPGType(oid uint32) string {
+	if t, ok := pgOIDToType[oid]; ok {
+		return t
+	}
+	return "text"
+}
+
+// diffRelation compares two RelationMessageV2 and returns a SchemaChange if
+// columns were added, dropped, or changed type. Returns nil when identical.
+func diffRelation(old, new *pglogrepl.RelationMessageV2) *SchemaChange {
+	oldCols := make(map[string]uint32, len(old.Columns))
+	for _, c := range old.Columns {
+		oldCols[c.Name] = c.DataType
+	}
+	newCols := make(map[string]uint32, len(new.Columns))
+	for _, c := range new.Columns {
+		newCols[c.Name] = c.DataType
+	}
+
+	var sc SchemaChange
+
+	// Detect added columns and type changes.
+	for _, c := range new.Columns {
+		oldOID, existed := oldCols[c.Name]
+		if !existed {
+			sc.AddedColumns = append(sc.AddedColumns, SchemaColumn{
+				Name:   c.Name,
+				PGType: oidToPGType(c.DataType),
+			})
+		} else if oldOID != c.DataType {
+			sc.TypeChanges = append(sc.TypeChanges, TypeChange{
+				Name:    c.Name,
+				OldType: oidToPGType(oldOID),
+				NewType: oidToPGType(c.DataType),
+			})
+		}
+	}
+
+	// Detect dropped columns.
+	for _, c := range old.Columns {
+		if _, exists := newCols[c.Name]; !exists {
+			sc.DroppedColumns = append(sc.DroppedColumns, c.Name)
+		}
+	}
+
+	if len(sc.AddedColumns) == 0 && len(sc.DroppedColumns) == 0 && len(sc.TypeChanges) == 0 {
+		return nil
+	}
+	return &sc
 }

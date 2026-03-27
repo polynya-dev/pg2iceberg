@@ -1,0 +1,1 @@
+SELECT id, name, score FROM iceberg.`default.e2e_schema_add_upd` ORDER BY id

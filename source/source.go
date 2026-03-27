@@ -16,6 +16,7 @@ const (
 	OpSnapshotComplete
 	OpBegin
 	OpCommit
+	OpSchemaChange
 )
 
 func (o Op) String() string {
@@ -34,9 +35,33 @@ func (o Op) String() string {
 		return "BEGIN"
 	case OpCommit:
 		return "COMMIT"
+	case OpSchemaChange:
+		return "SCHEMA_CHANGE"
 	default:
 		return "UNKNOWN"
 	}
+}
+
+// SchemaChange describes a DDL-driven schema change detected from a
+// RelationMessage diff in the WAL stream.
+type SchemaChange struct {
+	Table          string
+	AddedColumns   []SchemaColumn
+	DroppedColumns []string     // column names removed
+	TypeChanges    []TypeChange // columns whose PG type changed
+}
+
+// SchemaColumn describes a column discovered from a RelationMessage.
+type SchemaColumn struct {
+	Name   string
+	PGType string // resolved from OID, e.g. "int4", "text"
+}
+
+// TypeChange records an OID-level type change for a single column.
+type TypeChange struct {
+	Name    string
+	OldType string
+	NewType string
 }
 
 // ChangeEvent is the unified event emitted by all source modes.
@@ -63,6 +88,8 @@ type ChangeEvent struct {
 	// Set on OpBegin, OpCommit, and all DML events within the transaction.
 	// Zero for snapshot and query-mode events.
 	TransactionID uint32
+	// SchemaChange is populated only for OpSchemaChange events.
+	SchemaChange *SchemaChange
 }
 
 // Source captures change events from PostgreSQL.

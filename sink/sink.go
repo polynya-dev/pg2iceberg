@@ -66,6 +66,7 @@ type tableSink struct {
 	icebergName string // table name in Iceberg catalog
 	partSpec    *PartitionSpec
 	targetSize  int64
+	schemaID    int // current Iceberg schema ID
 
 	// Per-partition writers, keyed by partition key string ("" for unpartitioned).
 	partitions map[string]*partitionedWriter
@@ -156,6 +157,7 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 		icebergName: icebergTable,
 		partSpec:    partSpec,
 		targetSize:  targetSize,
+		schemaID:    tm.Metadata.CurrentSchemaID,
 		partitions:  make(map[string]*partitionedWriter),
 	}
 	// Pre-create the default (unpartitioned) writer if no partition spec.
@@ -174,6 +176,86 @@ func (s *Sink) UnregisterTable(pgTable string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.tables, pgTable)
+}
+
+// EvolveSchema applies a schema change to a table: updates the in-memory schema,
+// evolves the Iceberg table via the catalog, and rebuilds the Parquet writers.
+// The caller must flush all buffered data before calling this.
+func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.SchemaChange) error {
+	ts, ok := s.tables[pgTable]
+	if !ok {
+		return fmt.Errorf("unregistered table: %s", pgTable)
+	}
+
+	// Apply diff to the in-memory schema, tracking whether anything
+	// actually changes at the Iceberg level.
+	icebergChanged := false
+	nextFieldID := ts.schema.MaxFieldID() + 1
+
+	// Add new columns (always nullable — safe default for evolution).
+	for _, col := range change.AddedColumns {
+		ts.schema.Columns = append(ts.schema.Columns, schema.Column{
+			Name:       col.Name,
+			PGType:     col.PGType,
+			IsNullable: true,
+			FieldID:    nextFieldID,
+		})
+		nextFieldID++
+		icebergChanged = true
+	}
+
+	// Drop columns — remove from active column list.
+	// Old Parquet files still reference old field IDs; Iceberg handles this.
+	for _, dropped := range change.DroppedColumns {
+		for i, col := range ts.schema.Columns {
+			if col.Name == dropped {
+				ts.schema.Columns = append(ts.schema.Columns[:i], ts.schema.Columns[i+1:]...)
+				icebergChanged = true
+				break
+			}
+		}
+	}
+
+	// Type changes — update PGType in-place. Only flag as changed if the
+	// Iceberg type actually differs (e.g. varchar→text both map to "string").
+	for _, tc := range change.TypeChanges {
+		for i, col := range ts.schema.Columns {
+			if col.Name == tc.Name {
+				oldIceberg := schema.IcebergType(col.PGType)
+				newIceberg := schema.IcebergType(tc.NewType)
+				ts.schema.Columns[i].PGType = tc.NewType
+				if oldIceberg != newIceberg {
+					icebergChanged = true
+				}
+				break
+			}
+		}
+	}
+
+	// Only call the catalog if the Iceberg schema actually changed.
+	// Some PG type changes (e.g. varchar→text) are no-ops at the Iceberg level.
+	if icebergChanged {
+		newSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.icebergName, ts.schemaID, ts.schema)
+		if err != nil {
+			return fmt.Errorf("catalog evolve schema for %s: %w", pgTable, err)
+		}
+		ts.schemaID = newSchemaID
+	} else {
+		log.Printf("[sink] schema change for %s is a no-op at Iceberg level, skipping catalog evolution", pgTable)
+	}
+
+	// Rebuild writers with the new schema. Since the caller flushed first,
+	// all writers should be empty.
+	for key, pw := range ts.partitions {
+		ts.partitions[key] = &partitionedWriter{
+			dataWriter: NewRollingDataWriter(ts.schema, ts.targetSize),
+			delWriter:  NewRollingDeleteWriter(ts.schema, ts.targetSize),
+			partValues: pw.partValues,
+		}
+	}
+
+	log.Printf("[sink] evolved schema for %s to schema-id %d", pgTable, ts.schemaID)
+	return nil
 }
 
 // getPartitionWriter returns the partitioned writer for a given row, creating it if needed.
@@ -737,6 +819,7 @@ func (s *Sink) prepareTableFlush(ctx context.Context, pgTable string, ts *tableS
 			SequenceNumber:   seqNum,
 			TimestampMs:      now.UnixMilli(),
 			ManifestListPath: mlURI,
+			SchemaID:         ts.schemaID,
 			Summary: map[string]string{
 				"operation": operation,
 			},

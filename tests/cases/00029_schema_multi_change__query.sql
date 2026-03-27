@@ -1,0 +1,1 @@
+SELECT id, name, value, score FROM iceberg.`default.e2e_schema_multi` ORDER BY id

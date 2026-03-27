@@ -1,0 +1,1 @@
+SELECT id, name, value FROM iceberg.`default.e2e_schema_widen_int` ORDER BY id

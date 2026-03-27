@@ -181,7 +181,7 @@ func (c *CatalogClient) CommitSnapshot(ns, table string, currentSnapshotID int64
 				"timestamp-ms":   snapshot.TimestampMs,
 				"manifest-list":  snapshot.ManifestListPath,
 				"summary":        snapshot.Summary,
-				"schema-id":      0,
+				"schema-id":      snapshot.SchemaID,
 				"sequence-number": snapshot.SequenceNumber,
 			},
 		},
@@ -217,6 +217,7 @@ type SnapshotCommit struct {
 	TimestampMs      int64
 	ManifestListPath string
 	Summary          map[string]string
+	SchemaID         int
 }
 
 // TableCommit holds the data needed to commit a snapshot for one table
@@ -269,7 +270,7 @@ func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) erro
 					"timestamp-ms":    tc.Snapshot.TimestampMs,
 					"manifest-list":   tc.Snapshot.ManifestListPath,
 					"summary":         tc.Snapshot.Summary,
-					"schema-id":       0,
+					"schema-id":       tc.Snapshot.SchemaID,
 					"sequence-number": tc.Snapshot.SequenceNumber,
 				},
 			},
@@ -305,6 +306,43 @@ func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) erro
 		return c.readError(resp)
 	}
 	return nil
+}
+
+// EvolveSchema updates the Iceberg table schema via the REST catalog.
+// It adds a new schema version and sets it as the current schema.
+// Returns the new schema ID.
+func (c *CatalogClient) EvolveSchema(ns, table string, currentSchemaID int, newSchema *schema.TableSchema) (int, error) {
+	newSchemaID := currentSchemaID + 1
+
+	body := map[string]any{
+		"requirements": []map[string]any{
+			{
+				"type":              "assert-current-schema-id",
+				"current-schema-id": currentSchemaID,
+			},
+		},
+		"updates": []map[string]any{
+			{
+				"action": "add-schema",
+				"schema": schema.IcebergSchemaJSONWithID(newSchema, newSchemaID),
+			},
+			{
+				"action":    "set-current-schema",
+				"schema-id": -1, // -1 means "use the last added schema"
+			},
+		},
+	}
+
+	resp, err := c.post(fmt.Sprintf("/v1/namespaces/%s/tables/%s", ns, table), body)
+	if err != nil {
+		return 0, fmt.Errorf("evolve schema: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, c.readError(resp)
+	}
+	return newSchemaID, nil
 }
 
 func (c *CatalogClient) get(path string) (*http.Response, error) {

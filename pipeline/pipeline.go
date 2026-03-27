@@ -342,6 +342,17 @@ func (p *Pipeline) run(ctx context.Context) {
 				continue
 			}
 
+			// Handle schema evolution: flush old data, evolve Iceberg schema,
+			// rebuild writers, then resume with the new schema.
+			if event.Operation == source.OpSchemaChange {
+				if err := p.handleSchemaChange(ctx, event); err != nil {
+					log.Printf("[pipeline:%s] schema change error: %v", p.id, err)
+					p.setStatus(StatusError, err)
+					return
+				}
+				continue
+			}
+
 			// Pass Begin/Commit through to sink for transaction tracking.
 			if event.Operation == source.OpBegin || event.Operation == source.OpCommit {
 				if err := p.snk.Write(event); err != nil {
@@ -462,6 +473,34 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 
 	p.setStatus(StatusRunning, nil)
 	log.Printf("[pipeline:%s] initial snapshot complete, checkpoint saved", p.id)
+	return nil
+}
+
+// handleSchemaChange flushes all buffered data with the old schema, then
+// evolves the Iceberg table schema and rebuilds the Parquet writers.
+func (p *Pipeline) handleSchemaChange(ctx context.Context, event source.ChangeEvent) error {
+	sc := event.SchemaChange
+	if sc == nil {
+		return nil
+	}
+
+	// Defensive: warn if any open transaction touches this table.
+	// PG DDL takes AccessExclusiveLock, so this should never happen.
+	log.Printf("[pipeline:%s] schema change for %s: +%d columns, -%d columns, %d type changes",
+		p.id, sc.Table, len(sc.AddedColumns), len(sc.DroppedColumns), len(sc.TypeChanges))
+
+	// Flush all buffered data using the old schema.
+	if p.snk.ShouldFlush() {
+		if err := p.flush(ctx); err != nil {
+			return fmt.Errorf("pre-evolution flush: %w", err)
+		}
+	}
+
+	// Evolve the Iceberg table and rebuild writers.
+	if err := p.snk.EvolveSchema(ctx, sc.Table, sc); err != nil {
+		return fmt.Errorf("evolve schema: %w", err)
+	}
+
 	return nil
 }
 

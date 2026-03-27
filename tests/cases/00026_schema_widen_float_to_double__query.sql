@@ -1,0 +1,1 @@
+SELECT id, name, round(score, 6) FROM iceberg.`default.e2e_schema_widen_float` ORDER BY id
