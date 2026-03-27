@@ -39,8 +39,14 @@ type ChangeEvent struct {
 	// After contains new row values. Nil for DELETEs.
 	After map[string]any
 	// PK lists primary key column names for this table.
-	PK        []string
-	Timestamp time.Time
+	PK []string
+	// SourceTimestamp is when the change was committed in PostgreSQL
+	// (equivalent to Debezium's source.ts_ms). For snapshot and query-mode
+	// events this equals ProcessingTimestamp.
+	SourceTimestamp time.Time
+	// ProcessingTimestamp is when pg2iceberg processed the event
+	// (equivalent to Debezium's ts_ms). Useful for measuring replication lag.
+	ProcessingTimestamp time.Time
 	// UnchangedCols lists column names that were sent as 'unchanged' (TOAST).
 	// These columns are set to nil in After and need to be fetched from the source.
 	UnchangedCols []string

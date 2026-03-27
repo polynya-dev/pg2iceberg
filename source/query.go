@@ -115,13 +115,15 @@ func (q *QuerySource) poll(ctx context.Context, events chan<- ChangeEvent) error
 				}
 			}
 
+			now := time.Now()
 			select {
 			case events <- ChangeEvent{
-				Table:     tbl.Name,
-				Operation: OpInsert, // query mode treats everything as upserts
-				After:     row,
-				PK:        ts.PK,
-				Timestamp: time.Now(),
+				Table:              tbl.Name,
+				Operation:          OpInsert, // query mode treats everything as upserts
+				After:              row,
+				PK:                 ts.PK,
+				SourceTimestamp:     now,
+				ProcessingTimestamp: now,
 			}:
 			case <-ctx.Done():
 				rows.Close()

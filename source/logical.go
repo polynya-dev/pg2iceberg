@@ -40,6 +40,11 @@ type LogicalSource struct {
 
 	// snapshotComplete is set from the checkpoint to skip the initial snapshot.
 	snapshotComplete bool
+
+	// currentTxCommitTime is the PostgreSQL commit timestamp of the in-flight
+	// transaction, captured from BeginMessage. This is the source-of-truth
+	// timestamp (equivalent to Debezium's source.ts_ms).
+	currentTxCommitTime time.Time
 }
 
 func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig, tableCfgs []config.TableConfig) *LogicalSource {
@@ -226,11 +231,12 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 
 		select {
 		case events <- ChangeEvent{
-			Table:     table,
-			Operation: OpInsert,
-			After:     after,
-			PK:        ts.PK,
-			Timestamp: time.Now(),
+			Table:              table,
+			Operation:          OpInsert,
+			After:              after,
+			PK:                 ts.PK,
+			SourceTimestamp:     l.currentTxCommitTime,
+			ProcessingTimestamp: time.Now(),
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
@@ -255,13 +261,14 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 
 		select {
 		case events <- ChangeEvent{
-			Table:         table,
-			Operation:     OpUpdate,
-			Before:        before,
-			PK:            ts.PK,
-			After:         after,
-			Timestamp:     time.Now(),
-			UnchangedCols: unchangedCols,
+			Table:              table,
+			Operation:          OpUpdate,
+			Before:             before,
+			PK:                 ts.PK,
+			After:              after,
+			SourceTimestamp:     l.currentTxCommitTime,
+			ProcessingTimestamp: time.Now(),
+			UnchangedCols:      unchangedCols,
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
@@ -285,20 +292,21 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 
 		select {
 		case events <- ChangeEvent{
-			Table:     table,
-			Operation: OpDelete,
-			Before:    before,
-			PK:        ts.PK,
-			Timestamp: time.Now(),
+			Table:              table,
+			Operation:          OpDelete,
+			Before:             before,
+			PK:                 ts.PK,
+			SourceTimestamp:     l.currentTxCommitTime,
+			ProcessingTimestamp: time.Now(),
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 
 	case *pglogrepl.BeginMessage:
-		// no-op: we could track transaction boundaries in the future
+		l.currentTxCommitTime = m.CommitTime
 	case *pglogrepl.CommitMessage:
-		// no-op
+		l.currentTxCommitTime = time.Time{}
 	case *pglogrepl.TruncateMessageV2:
 		log.Printf("[logical] TRUNCATE detected (not yet handled)")
 	}
@@ -396,13 +404,15 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string,
 				row[string(desc.Name)] = pgValueToString(values[i])
 			}
 
+			now := time.Now()
 			select {
 			case events <- ChangeEvent{
-				Table:     table,
-				Operation: OpInsert,
-				After:     row,
-				PK:        ts.PK,
-				Timestamp: time.Now(),
+				Table:              table,
+				Operation:          OpInsert,
+				After:              row,
+				PK:                 ts.PK,
+				SourceTimestamp:     now,
+				ProcessingTimestamp: now,
 			}:
 			case <-ctx.Done():
 				rows.Close()
