@@ -282,6 +282,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 // run is the main event loop, executed in a goroutine.
 func (p *Pipeline) run(ctx context.Context) {
 	defer close(p.done)
+	defer p.snk.Close()
 
 	p.mu.Lock()
 	p.startedAt = time.Now()

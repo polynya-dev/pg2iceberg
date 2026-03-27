@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // resolveToast fetches missing TOAST column values from PostgreSQL
@@ -74,14 +72,13 @@ func (s *Sink) resolveToast(ctx context.Context, pgTable string, ts *tableSink) 
 	// Build query and args.
 	query, args := buildToastQuery(pgTable, selectCols, pk, pkValues)
 
-	// Connect to source PostgreSQL.
-	conn, err := pgx.Connect(ctx, s.pgCfg.DSN())
+	// Acquire a connection from the pool.
+	pool, err := s.pgConnPool(ctx)
 	if err != nil {
-		return fmt.Errorf("connect to source for TOAST lookup: %w", err)
+		return err
 	}
-	defer conn.Close(ctx)
 
-	rows, err := conn.Query(ctx, query, args...)
+	rows, err := pool.Query(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("TOAST lookup query: %w", err)
 	}

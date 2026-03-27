@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/source"
@@ -46,6 +47,10 @@ type Sink struct {
 	// Backpressure: compactor signals when snapshots are cleaned up.
 	compactionDone chan struct{}
 	mu             sync.Mutex
+
+	// Connection pool for TOAST lookups (lazy-initialized).
+	pgPool   *pgxpool.Pool
+	pgPoolMu sync.Mutex
 }
 
 // toastPendingRow holds a reference to a buffered row that has unchanged TOAST columns.
@@ -104,6 +109,35 @@ func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []con
 		openTxns:       make(map[uint32]*txBuffer),
 		compactionDone:     make(chan struct{}, 1),
 	}, nil
+}
+
+// pgConnPool returns the shared connection pool for source PG lookups (TOAST resolution).
+// The pool is lazily created on first use.
+func (s *Sink) pgConnPool(ctx context.Context) (*pgxpool.Pool, error) {
+	s.pgPoolMu.Lock()
+	defer s.pgPoolMu.Unlock()
+
+	if s.pgPool != nil {
+		return s.pgPool, nil
+	}
+
+	pool, err := pgxpool.New(ctx, s.pgCfg.DSN())
+	if err != nil {
+		return nil, fmt.Errorf("create PG connection pool: %w", err)
+	}
+	s.pgPool = pool
+	return pool, nil
+}
+
+// Close releases resources held by the sink.
+func (s *Sink) Close() {
+	s.pgPoolMu.Lock()
+	defer s.pgPoolMu.Unlock()
+
+	if s.pgPool != nil {
+		s.pgPool.Close()
+		s.pgPool = nil
+	}
 }
 
 // Catalog returns the catalog client (for use by compactor).
