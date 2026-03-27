@@ -12,6 +12,7 @@ const (
 	OpInsert Op = iota
 	OpUpdate
 	OpDelete
+	OpSnapshotTableComplete
 	OpSnapshotComplete
 )
 
@@ -23,6 +24,8 @@ func (o Op) String() string {
 		return "UPDATE"
 	case OpDelete:
 		return "DELETE"
+	case OpSnapshotTableComplete:
+		return "SNAPSHOT_TABLE_COMPLETE"
 	case OpSnapshotComplete:
 		return "SNAPSHOT_COMPLETE"
 	default:

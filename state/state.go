@@ -25,6 +25,10 @@ type Checkpoint struct {
 	// is needed before streaming WAL.
 	SnapshotComplete bool `json:"snapshot_complete,omitempty"`
 
+	// SnapshotedTables tracks which tables have completed their initial
+	// snapshot. On crash recovery, only tables not in this map are re-snapshotted.
+	SnapshotedTables map[string]bool `json:"snapshoted_tables,omitempty"`
+
 	// LastSnapshotID is the Iceberg snapshot ID of the last successful commit.
 	LastSnapshotID int64 `json:"last_snapshot_id,omitempty"`
 

@@ -266,6 +266,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 			log.Printf("[pipeline:%s] restored logical LSN: %d", p.id, cp.LSN)
 		}
 		ls.SetSnapshotComplete(cp.SnapshotComplete)
+		ls.SetSnapshotedTables(cp.SnapshotedTables)
 		if !cp.SnapshotComplete {
 			p.setStatus(StatusSnapshotting, nil)
 		}
@@ -317,6 +318,17 @@ func (p *Pipeline) run(ctx context.Context) {
 					p.setStatus(StatusError, err)
 				}
 				return
+			}
+
+			// Handle per-table snapshot completion: flush buffered rows and
+			// checkpoint this table so crash recovery skips it.
+			if event.Operation == source.OpSnapshotTableComplete {
+				if err := p.flushSnapshotTable(ctx, event.Table); err != nil {
+					log.Printf("[pipeline:%s] snapshot table %s flush error: %v", p.id, event.Table, err)
+					p.setStatus(StatusError, err)
+					return
+				}
+				continue
 			}
 
 			// Handle snapshot-complete marker: flush remaining snapshot rows
@@ -384,6 +396,37 @@ func (p *Pipeline) doFlush(ctx context.Context) error {
 	return err
 }
 
+// flushSnapshotTable flushes buffered rows and marks a single table's snapshot
+// as complete in the checkpoint. On crash recovery, this table will be skipped.
+func (p *Pipeline) flushSnapshotTable(ctx context.Context, table string) error {
+	flushedBytes := p.snk.TotalBufferedBytes()
+	if err := p.snk.Flush(ctx); err != nil {
+		return fmt.Errorf("snapshot table flush: %w", err)
+	}
+	p.bytesProcessed += flushedBytes
+
+	cp, err := p.store.Load(p.id)
+	if err != nil {
+		return fmt.Errorf("load checkpoint: %w", err)
+	}
+
+	cp.Mode = p.cfg.Source.Mode
+	if cp.SnapshotedTables == nil {
+		cp.SnapshotedTables = make(map[string]bool)
+	}
+	cp.SnapshotedTables[table] = true
+	if ls, ok := p.src.(*source.LogicalSource); ok {
+		cp.LSN = ls.ConfirmedLSN()
+	}
+
+	if err := p.store.Save(p.id, cp); err != nil {
+		return fmt.Errorf("save checkpoint: %w", err)
+	}
+
+	log.Printf("[pipeline:%s] snapshot table %s complete, checkpoint saved", p.id, table)
+	return nil
+}
+
 // flushSnapshotComplete flushes any buffered snapshot rows and saves the
 // SnapshotComplete flag to the checkpoint so a restart won't re-snapshot.
 func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
@@ -400,6 +443,7 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 
 	cp.Mode = p.cfg.Source.Mode
 	cp.SnapshotComplete = true
+	cp.SnapshotedTables = nil // no longer needed once fully complete
 	if ls, ok := p.src.(*source.LogicalSource); ok {
 		cp.LSN = ls.ConfirmedLSN()
 	}

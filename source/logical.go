@@ -40,6 +40,9 @@ type LogicalSource struct {
 
 	// snapshotComplete is set from the checkpoint to skip the initial snapshot.
 	snapshotComplete bool
+	// snapshotedTables tracks which tables already completed their snapshot
+	// (restored from checkpoint for crash recovery).
+	snapshotedTables map[string]bool
 
 	// currentTxCommitTime is the PostgreSQL commit timestamp of the in-flight
 	// transaction, captured from BeginMessage. This is the source-of-truth
@@ -66,6 +69,11 @@ func (l *LogicalSource) SetStartLSN(lsn uint64) {
 // SetSnapshotComplete marks the initial snapshot as already done (from checkpoint).
 func (l *LogicalSource) SetSnapshotComplete(done bool) {
 	l.snapshotComplete = done
+}
+
+// SetSnapshotedTables restores per-table snapshot progress from checkpoint.
+func (l *LogicalSource) SetSnapshotedTables(tables map[string]bool) {
+	l.snapshotedTables = tables
 }
 
 // ConfirmedLSN returns the current confirmed LSN for checkpointing.
@@ -118,9 +126,12 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 		return fmt.Errorf("ensure slot: %w", err)
 	}
 
-	// If this is a fresh slot and the snapshot hasn't been completed yet,
-	// copy all existing rows before starting WAL streaming.
-	if !l.snapshotComplete && snapshotName != "" {
+	// If the snapshot hasn't been completed yet, copy all existing rows
+	// before starting WAL streaming. On a fresh slot we pin to the exported
+	// snapshot; on crash recovery (slot exists, no exported snapshot) we use
+	// a plain REPEATABLE READ transaction — duplicates are safe because the
+	// sink merges on PK.
+	if !l.snapshotComplete {
 		if err := l.snapshotTables(ctx, snapshotName, events); err != nil {
 			return fmt.Errorf("initial snapshot: %w", err)
 		}
@@ -355,81 +366,70 @@ func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 	return result.SnapshotName, nil
 }
 
-// snapshotTables performs an initial full-table copy for all tracked tables
-// using the exported snapshot from slot creation. This guarantees we see exactly
-// the rows that existed at the slot's ConsistentPoint.
+// snapshotTables performs an initial full-table copy for all tracked tables.
+// When snapshotName is non-empty (fresh slot), each per-table transaction is
+// pinned to the exported snapshot. On crash recovery (empty snapshotName),
+// a plain REPEATABLE READ transaction is used instead.
 func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string, events chan<- ChangeEvent) error {
-	tx, err := l.queryConn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin snapshot tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Importing a snapshot requires REPEATABLE READ or SERIALIZABLE.
-	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
-		return fmt.Errorf("set isolation level: %w", err)
-	}
-
-	// Pin to the exported snapshot so we see exactly the same data as the
-	// slot's consistent point.
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", snapshotName)); err != nil {
-		return fmt.Errorf("set transaction snapshot: %w", err)
-	}
-
+	var tables []SnapshotTable
 	for _, tc := range l.tableCfgs {
 		if tc.SkipSnapshot {
 			log.Printf("[logical] snapshot: skipping %s (skip_snapshot=true)", tc.Name)
 			continue
 		}
-		table := tc.Name
-		ts := l.tables[table]
-
-		rows, err := tx.Query(ctx, fmt.Sprintf("SELECT * FROM %s", table))
-		if err != nil {
-			return fmt.Errorf("snapshot query %s: %w", table, err)
+		if l.snapshotedTables[tc.Name] {
+			log.Printf("[logical] snapshot: skipping %s (already completed)", tc.Name)
+			continue
 		}
-
-		descs := rows.FieldDescriptions()
-		count := 0
-
-		for rows.Next() {
-			values, err := rows.Values()
-			if err != nil {
-				rows.Close()
-				return fmt.Errorf("snapshot scan %s: %w", table, err)
-			}
-
-			row := make(map[string]any, len(descs))
-			for i, desc := range descs {
-				row[string(desc.Name)] = pgValueToString(values[i])
-			}
-
-			now := time.Now()
-			select {
-			case events <- ChangeEvent{
-				Table:              table,
-				Operation:          OpInsert,
-				After:              row,
-				PK:                 ts.PK,
-				SourceTimestamp:     now,
-				ProcessingTimestamp: now,
-			}:
-			case <-ctx.Done():
-				rows.Close()
-				return ctx.Err()
-			}
-			count++
-		}
-		rows.Close()
-
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("snapshot rows %s: %w", table, err)
-		}
-
-		log.Printf("[logical] snapshot: emitted %d rows for %s", count, table)
+		tables = append(tables, SnapshotTable{
+			Name:   tc.Name,
+			Schema: l.tables[tc.Name],
+		})
 	}
 
-	return tx.Commit(ctx)
+	if len(tables) == 0 {
+		return nil
+	}
+
+	dsn := l.pgCfg.DSN()
+	txFactory := func(ctx context.Context) (pgx.Tx, func(context.Context), error) {
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return nil, nil, fmt.Errorf("snapshot connect: %w", err)
+		}
+		cleanup := func(ctx context.Context) { conn.Close(ctx) }
+
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			cleanup(ctx)
+			return nil, nil, fmt.Errorf("begin snapshot tx: %w", err)
+		}
+
+		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			tx.Rollback(ctx)
+			cleanup(ctx)
+			return nil, nil, fmt.Errorf("set isolation level: %w", err)
+		}
+
+		// Pin to exported snapshot if available (fresh slot).
+		if snapshotName != "" {
+			if _, err := tx.Exec(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", snapshotName)); err != nil {
+				tx.Rollback(ctx)
+				cleanup(ctx)
+				return nil, nil, fmt.Errorf("set transaction snapshot: %w", err)
+			}
+		}
+
+		return tx, cleanup, nil
+	}
+
+	snap := NewSnapshotter(tables, txFactory, l.cfg.SnapshotConcurrencyOrDefault())
+	log.Printf("[logical] snapshot: %d tables, concurrency=%d", len(tables), l.cfg.SnapshotConcurrencyOrDefault())
+	if _, err := snap.Run(ctx, events); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (l *LogicalSource) sendStandby(ctx context.Context) {

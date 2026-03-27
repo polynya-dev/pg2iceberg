@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -80,8 +81,18 @@ func (q QueryConfig) PollDuration() time.Duration {
 }
 
 type LogicalConfig struct {
-	PublicationName string `yaml:"publication_name" json:"publication_name"`
-	SlotName        string `yaml:"slot_name" json:"slot_name"`
+	PublicationName     string `yaml:"publication_name" json:"publication_name"`
+	SlotName            string `yaml:"slot_name" json:"slot_name"`
+	SnapshotConcurrency int    `yaml:"snapshot_concurrency" json:"snapshot_concurrency,omitempty"`
+}
+
+// SnapshotConcurrencyOrDefault returns the configured snapshot concurrency,
+// defaulting to GOMAXPROCS if not set.
+func (c LogicalConfig) SnapshotConcurrencyOrDefault() int {
+	if c.SnapshotConcurrency > 0 {
+		return c.SnapshotConcurrency
+	}
+	return runtime.GOMAXPROCS(0)
 }
 
 type SinkConfig struct {
