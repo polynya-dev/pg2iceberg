@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,8 +15,11 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -47,9 +51,27 @@ func main() {
 
 	s3Client := newS3Client(cfg)
 
+	// Build HTTP client for catalog calls (plain or SigV4-signed).
+	catalogClient := &http.Client{}
+	if cfg.CatalogAuth == "sigv4" {
+		awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(cfg.S3Region))
+		if err != nil {
+			log.Fatalf("load aws config: %v", err)
+		}
+		catalogClient = &http.Client{
+			Transport: &sigV4Transport{
+				inner:   http.DefaultTransport,
+				creds:   awsCfg.Credentials,
+				signer:  v4.NewSigner(),
+				region:  cfg.S3Region,
+				service: "glue",
+			},
+		}
+	}
+
 	// Step 1: Discover Iceberg data files grouped by partition.
 	log.Println("step 1: reading iceberg table metadata...")
-	partitionFiles, deleteSet, err := loadIcebergFileIndex(ctx, cfg, s3Client)
+	partitionFiles, deleteSet, err := loadIcebergFileIndex(ctx, cfg, s3Client, catalogClient)
 	if err != nil {
 		log.Fatalf("load iceberg file index: %v", err)
 	}
@@ -151,6 +173,7 @@ type config struct {
 	S3SecretKey string
 	S3Region    string
 	CatalogURI  string
+	CatalogAuth string // "" or "sigv4"
 	Warehouse   string
 	Namespace   string
 	Table       string
@@ -159,11 +182,12 @@ type config struct {
 func loadConfig() config {
 	return config{
 		DatabaseURL: requireEnv("DATABASE_URL"),
-		S3Endpoint:  requireEnv("S3_ENDPOINT"),
-		S3AccessKey: requireEnv("S3_ACCESS_KEY"),
-		S3SecretKey: requireEnv("S3_SECRET_KEY"),
+		S3Endpoint:  os.Getenv("S3_ENDPOINT"),
+		S3AccessKey: os.Getenv("S3_ACCESS_KEY"),
+		S3SecretKey: os.Getenv("S3_SECRET_KEY"),
 		S3Region:    envOr("S3_REGION", "us-east-1"),
 		CatalogURI:  requireEnv("CATALOG_URI"),
+		CatalogAuth: os.Getenv("CATALOG_AUTH"),
 		Warehouse:   requireEnv("WAREHOUSE"),
 		Namespace:   requireEnv("NAMESPACE"),
 		Table:       requireEnv("TABLE"),
@@ -189,8 +213,8 @@ func envOr(key, fallback string) string {
 
 // loadIcebergFileIndex reads the Iceberg catalog and returns data files grouped by
 // partition path prefix, plus a set of deleted IDs from equality delete files.
-func loadIcebergFileIndex(ctx context.Context, cfg config, s3Client *s3.Client) (map[string][]string, map[int64]struct{}, error) {
-	manifestListURI, err := getManifestListURI(cfg)
+func loadIcebergFileIndex(ctx context.Context, cfg config, s3Client *s3.Client, httpClient *http.Client) (map[string][]string, map[int64]struct{}, error) {
+	manifestListURI, err := getManifestListURI(cfg, httpClient)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get manifest list: %w", err)
 	}
@@ -494,12 +518,17 @@ func printResult(r verifyResult) {
 // --- S3 helpers ---
 
 func newS3Client(cfg config) *s3.Client {
-	return s3.New(s3.Options{
-		Region:       cfg.S3Region,
-		Credentials:  credentials.NewStaticCredentialsProvider(cfg.S3AccessKey, cfg.S3SecretKey, ""),
-		BaseEndpoint: &cfg.S3Endpoint,
-		UsePathStyle: true,
-	})
+	opts := s3.Options{
+		Region: cfg.S3Region,
+	}
+	if cfg.S3AccessKey != "" {
+		opts.Credentials = credentials.NewStaticCredentialsProvider(cfg.S3AccessKey, cfg.S3SecretKey, "")
+	}
+	if cfg.S3Endpoint != "" {
+		opts.BaseEndpoint = &cfg.S3Endpoint
+		opts.UsePathStyle = true
+	}
+	return s3.New(opts)
 }
 
 func s3Download(ctx context.Context, client *s3.Client, warehouse, key string) ([]byte, error) {
@@ -529,9 +558,9 @@ func s3KeyFromURI(uri string) string {
 
 // --- Iceberg catalog helpers ---
 
-func getManifestListURI(cfg config) (string, error) {
+func getManifestListURI(cfg config, httpClient *http.Client) (string, error) {
 	url := fmt.Sprintf("%s/v1/namespaces/%s/tables/%s", strings.TrimRight(cfg.CatalogURI, "/"), cfg.Namespace, cfg.Table)
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("GET %s: %w", url, err)
 	}
@@ -730,4 +759,40 @@ func toInt64(v any) int64 {
 	default:
 		return 0
 	}
+}
+
+// --- SigV4 HTTP transport ---
+
+type sigV4Transport struct {
+	inner   http.RoundTripper
+	creds   aws.CredentialsProvider
+	signer  *v4.Signer
+	region  string
+	service string
+}
+
+func (t *sigV4Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body []byte
+	if req.Body != nil {
+		var err error
+		body, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, fmt.Errorf("read body for signing: %w", err)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
+
+	hash := sha256.Sum256(body)
+	payloadHash := fmt.Sprintf("%x", hash)
+
+	creds, err := t.creds.Retrieve(req.Context())
+	if err != nil {
+		return nil, fmt.Errorf("retrieve aws credentials: %w", err)
+	}
+
+	if err := t.signer.SignHTTP(req.Context(), creds, req, payloadHash, t.service, t.region, time.Now()); err != nil {
+		return nil, fmt.Errorf("sigv4 sign: %w", err)
+	}
+
+	return t.inner.RoundTrip(req)
 }

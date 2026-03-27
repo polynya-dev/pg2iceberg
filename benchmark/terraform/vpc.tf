@@ -97,14 +97,6 @@ resource "aws_security_group" "ecs" {
     cidr_blocks = [aws_vpc.main.cidr_block]
   }
 
-  # iceberg-rest API.
-  ingress {
-    from_port   = 8181
-    to_port     = 8181
-    protocol    = "tcp"
-    cidr_blocks = [aws_vpc.main.cidr_block]
-  }
-
   tags = { Name = "${var.project}-ecs-sg" }
 }
 

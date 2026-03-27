@@ -36,20 +36,6 @@ variable "source_db_password" {
   default     = "benchpassword123"
 }
 
-# RDS catalog database.
-variable "catalog_db_instance_class" {
-  description = "RDS instance class for Iceberg catalog PostgreSQL"
-  type        = string
-  default     = "db.t4g.micro"
-}
-
-variable "catalog_db_password" {
-  description = "Password for the catalog PostgreSQL"
-  type        = string
-  sensitive   = true
-  default     = "catalogpass123"
-}
-
 # ECS.
 variable "pg2iceberg_cpu" {
   description = "CPU units for pg2iceberg task (1024 = 1 vCPU)"
@@ -59,18 +45,6 @@ variable "pg2iceberg_cpu" {
 
 variable "pg2iceberg_memory" {
   description = "Memory in MB for pg2iceberg task"
-  type        = number
-  default     = 2048
-}
-
-variable "iceberg_rest_cpu" {
-  description = "CPU units for iceberg-rest task"
-  type        = number
-  default     = 1024
-}
-
-variable "iceberg_rest_memory" {
-  description = "Memory in MB for iceberg-rest task"
   type        = number
   default     = 2048
 }

@@ -37,6 +37,8 @@ source:
 
 sink:
   catalog_uri: http://localhost:8181
+  # catalog_auth: sigv4           # enable AWS SigV4 signing for Glue Iceberg REST endpoint
+  #                                # catalog_uri: https://glue.us-east-1.amazonaws.com/iceberg
   warehouse: s3://warehouse/
   namespace: default
   s3_endpoint: http://localhost:9000

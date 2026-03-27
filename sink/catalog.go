@@ -17,10 +17,13 @@ type CatalogClient struct {
 	client  *http.Client
 }
 
-func NewCatalogClient(baseURL string) *CatalogClient {
+func NewCatalogClient(baseURL string, httpClient *http.Client) *CatalogClient {
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
 	return &CatalogClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  httpClient,
 	}
 }
 

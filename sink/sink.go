@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -61,7 +62,15 @@ type tableSink struct {
 }
 
 func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig) (*Sink, error) {
-	catalog := NewCatalogClient(cfg.CatalogURI)
+	var httpClient *http.Client
+	if cfg.CatalogAuth == "sigv4" {
+		transport, err := NewSigV4Transport(cfg.S3Region)
+		if err != nil {
+			return nil, fmt.Errorf("create sigv4 transport: %w", err)
+		}
+		httpClient = &http.Client{Transport: transport}
+	}
+	catalog := NewCatalogClient(cfg.CatalogURI, httpClient)
 
 	s3Client, err := NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
 	if err != nil {

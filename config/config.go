@@ -85,13 +85,14 @@ type LogicalConfig struct {
 }
 
 type SinkConfig struct {
-	CatalogURI     string `yaml:"catalog_uri" json:"catalog_uri"`
-	Warehouse      string `yaml:"warehouse" json:"warehouse"`
-	Namespace      string `yaml:"namespace" json:"namespace"`
-	S3Endpoint     string `yaml:"s3_endpoint" json:"s3_endpoint"`
-	S3AccessKey    string `yaml:"s3_access_key" json:"s3_access_key"`
-	S3SecretKey    string `yaml:"s3_secret_key" json:"s3_secret_key"`
-	S3Region       string `yaml:"s3_region" json:"s3_region"`
+	CatalogURI  string `yaml:"catalog_uri" json:"catalog_uri"`
+	CatalogAuth string `yaml:"catalog_auth" json:"catalog_auth,omitempty"` // "" (none) or "sigv4" (AWS SigV4)
+	Warehouse   string `yaml:"warehouse" json:"warehouse"`
+	Namespace   string `yaml:"namespace" json:"namespace"`
+	S3Endpoint  string `yaml:"s3_endpoint" json:"s3_endpoint"`
+	S3AccessKey string `yaml:"s3_access_key" json:"s3_access_key"`
+	S3SecretKey string `yaml:"s3_secret_key" json:"s3_secret_key"`
+	S3Region    string `yaml:"s3_region" json:"s3_region"`
 	FlushInterval  string `yaml:"flush_interval" json:"flush_interval"`
 	FlushRows      int    `yaml:"flush_rows" json:"flush_rows"`
 	FlushBytes     int64  `yaml:"flush_bytes" json:"flush_bytes,omitempty"`

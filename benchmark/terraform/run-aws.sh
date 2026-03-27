@@ -3,6 +3,8 @@ set -euo pipefail
 
 # pg2iceberg AWS benchmark runner
 #
+# Uses AWS Glue as Iceberg REST catalog (no self-hosted catalog needed).
+#
 # Prerequisites:
 #   - Terraform applied (terraform apply)
 #   - AWS CLI configured
@@ -61,10 +63,6 @@ cmd_build() {
     docker build -t "$TF_ECR_PG2ICEBERG:latest" -f "$REPO_ROOT/Dockerfile" "$REPO_ROOT"
     docker push "$TF_ECR_PG2ICEBERG:latest"
 
-    # iceberg-rest
-    docker build -t "$TF_ECR_ICEBERG_REST:latest" "$REPO_ROOT/example/single/iceberg-rest"
-    docker push "$TF_ECR_ICEBERG_REST:latest"
-
     # bench-writer
     docker build -t "$TF_ECR_BENCH_WRITER:latest" \
         --target bench-writer \
@@ -81,13 +79,11 @@ cmd_build() {
 }
 
 # ============================================================
-# Schema init (run bench-writer with --mode=init or use psql)
+# Schema init
 # ============================================================
 
 cmd_init_schema() {
     log "Initializing schema on RDS..."
-    # Run bench-writer as a one-off task just to get network access to RDS,
-    # then exec psql. Simpler: use the schema.sql via a task override.
     local task_arn
     task_arn=$(aws ecs run-task \
         --cluster "$CLUSTER" \

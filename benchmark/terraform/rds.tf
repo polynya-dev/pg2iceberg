@@ -73,29 +73,3 @@ resource "aws_db_instance" "source" {
 
   tags = { Name = "${var.project}-source" }
 }
-
-# Catalog PostgreSQL — backing store for Iceberg REST catalog.
-resource "aws_db_instance" "catalog" {
-  identifier     = "${var.project}-catalog"
-  engine         = "postgres"
-  engine_version = "16"
-  instance_class = var.catalog_db_instance_class
-
-  allocated_storage = 20
-  storage_type      = "gp3"
-  storage_encrypted = true
-
-  db_name  = "iceberg_catalog"
-  username = "iceberg"
-  password = var.catalog_db_password
-
-  db_subnet_group_name   = aws_db_subnet_group.main.name
-  vpc_security_group_ids = [aws_security_group.rds.id]
-
-  multi_az            = false
-  availability_zone   = var.az
-  publicly_accessible = false
-  skip_final_snapshot = true
-
-  tags = { Name = "${var.project}-catalog" }
-}
