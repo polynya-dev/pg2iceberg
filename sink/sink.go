@@ -499,6 +499,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 			pw.delWriter.DiscardCompleted()
 		}
 		ts.toastPending = nil
+		ts.rowCache = make(map[string]map[string]any)
 	}
 
 	// Drain committed transactions into per-table writers.
@@ -604,6 +605,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		}
 		pf.ts.totalRows = 0
 		pf.ts.toastPending = nil
+		pf.ts.rowCache = make(map[string]map[string]any)
 		if !pf.ts.partSpec.IsUnpartitioned() {
 			for key := range pf.ts.partitions {
 				delete(pf.ts.partitions, key)
@@ -901,6 +903,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) (i
 	}
 	ts.totalRows = 0
 	ts.toastPending = nil
+	ts.rowCache = make(map[string]map[string]any)
 	if !ts.partSpec.IsUnpartitioned() {
 		for key := range ts.partitions {
 			delete(ts.partitions, key)

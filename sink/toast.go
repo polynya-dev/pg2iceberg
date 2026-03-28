@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/metrics"
 )
@@ -50,6 +51,8 @@ func (s *Sink) resolveToast(ctx context.Context, pgTable string, ts *tableSink) 
 	if len(pendingByPK) == 0 {
 		return nil
 	}
+
+	startTime := time.Now()
 
 	// Load current table metadata to find data files.
 	tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.icebergName)
@@ -169,8 +172,10 @@ func (s *Sink) resolveToast(ctx context.Context, pgTable string, ts *tableSink) 
 		}
 	}
 
+	duration := time.Since(startTime)
 	metrics.ToastLookupsTotal.WithLabelValues(s.pipelineID, pgTable).Inc()
 	metrics.ToastRowsResolvedTotal.WithLabelValues(s.pipelineID, pgTable).Add(float64(resolved))
+	metrics.ToastLookupDurationSeconds.WithLabelValues(s.pipelineID, pgTable).Observe(duration.Seconds())
 
 	unresolved := len(pendingByPK)
 	if unresolved > 0 {

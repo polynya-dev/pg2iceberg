@@ -244,15 +244,15 @@ scenario_steady_state() {
 }
 
 scenario_high_throughput() {
-    STREAM_RATE=10000
+    STREAM_RATE="${STREAM_RATE:-10000}"
     STREAM_DURATION="${STREAM_DURATION:-15m}"
     log "=== Scenario: high-throughput ==="
     scenario_steady_state
 }
 
 scenario_toast() {
-    STREAM_RATE=500
-    LARGE_TEXT_PCT=50
+    STREAM_RATE="${STREAM_RATE:-500}"
+    LARGE_TEXT_PCT="${LARGE_TEXT_PCT:-50}"
     STREAM_DURATION="${STREAM_DURATION:-15m}"
     log "=== Scenario: toast ==="
     scenario_steady_state

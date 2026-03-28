@@ -110,6 +110,8 @@ CREATE TABLE IF NOT EXISTS bench_events (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE bench_events ALTER COLUMN large_text SET STORAGE EXTERNAL;
+
 CREATE INDEX IF NOT EXISTS idx_bench_events_seq ON bench_events (seq);
 
 CREATE PUBLICATION pg2iceberg_bench FOR TABLE bench_events;
@@ -406,6 +408,9 @@ func runStream(ctx context.Context, pool *pgxpool.Pool, writerID uuid.UUID, targ
 					"insert", seq, seq, writerID)
 				if err != nil {
 					tx.Rollback(ctx)
+					if ctx.Err() != nil {
+						return nil
+					}
 					return fmt.Errorf("log insert: %w", err)
 				}
 				liveSeqs = append(liveSeqs, seq)
@@ -432,6 +437,9 @@ func runStream(ctx context.Context, pool *pgxpool.Pool, writerID uuid.UUID, targ
 					"update", seq, newVal, writerID)
 				if err != nil {
 					tx.Rollback(ctx)
+					if ctx.Err() != nil {
+						return nil
+					}
 					return fmt.Errorf("log update: %w", err)
 				}
 				opsUpdate.Add(1)
@@ -460,6 +468,9 @@ func runStream(ctx context.Context, pool *pgxpool.Pool, writerID uuid.UUID, targ
 						"delete", seq, nil, writerID)
 					if err != nil {
 						tx.Rollback(ctx)
+						if ctx.Err() != nil {
+							return nil
+						}
 						return fmt.Errorf("log delete: %w", err)
 					}
 					opsDelete.Add(1)
