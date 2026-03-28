@@ -66,13 +66,13 @@ type Pipeline struct {
 // BuildPipeline creates a fully-wired Pipeline from config, constructing the
 // sink and checkpoint store. Use NewPipeline when you need to inject custom
 // dependencies (e.g. in tests).
-func BuildPipeline(ctx context.Context, id string, cfg *config.Config, sinkOpts ...sink.Option) (*Pipeline, error) {
+func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipeline, error) {
 	cpStore, err := NewCheckpointStore(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create checkpoint store: %w", err)
 	}
 
-	snk, err := sink.NewSink(cfg.Sink, cfg.Source.Postgres, cfg.Tables, id, sinkOpts...)
+	snk, err := sink.BuildSink(cfg.Sink, cfg.Source.Postgres, cfg.Tables, id)
 	if err != nil {
 		cpStore.Close()
 		return nil, fmt.Errorf("create sink: %w", err)

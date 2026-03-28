@@ -81,13 +81,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	mem := newMemStorage()
 	cat := newMemCatalog()
 
-	snk, err := sink.NewSink(sinkCfg, pgCfg, cfg.Tables, "test",
-		sink.WithObjectStorage(mem),
-		sink.WithCatalog(cat),
-	)
-	if err != nil {
-		t.Fatalf("create sink: %v", err)
-	}
+	snk := sink.NewSink(sinkCfg, pgCfg, cfg.Tables, "test", mem, cat)
 
 	p := pipeline.NewPipeline("test", cfg, snk, state.NewMemStore())
 
