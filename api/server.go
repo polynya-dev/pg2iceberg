@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
@@ -29,6 +30,7 @@ func NewServer(mgr *pipeline.Manager, addr string) *Server {
 	mux.HandleFunc("/api/v1/pipelines", s.handlePipelines)
 	mux.HandleFunc("/api/v1/pipelines/", s.handlePipeline)
 	mux.HandleFunc("/api/v1/discover-tables", s.handleDiscoverTables)
+	mux.Handle("/metrics", promhttp.Handler())
 
 	s.server = &http.Server{
 		Addr:    addr,

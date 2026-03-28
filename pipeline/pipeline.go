@@ -7,12 +7,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/metrics"
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/sink"
 	"github.com/pg2iceberg/pg2iceberg/source"
 	"github.com/pg2iceberg/pg2iceberg/state"
-	"github.com/jackc/pgx/v5"
 )
 
 // Status represents the current state of a Pipeline.
@@ -184,6 +185,9 @@ func (p *Pipeline) setStatus(s Status, err error) {
 		p.err = err
 	}
 	p.mu.Unlock()
+	if v, ok := metrics.StatusToFloat[string(s)]; ok {
+		metrics.PipelineStatus.WithLabelValues(p.id).Set(v)
+	}
 }
 
 // setup performs all synchronous initialization: checkpoint, schema discovery,
@@ -222,7 +226,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	pgConn.Close(ctx)
 
 	// Initialize sink.
-	p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres, p.cfg.Tables)
+	p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres, p.cfg.Tables, p.id)
 	if err != nil {
 		return fmt.Errorf("create sink: %w", err)
 	}
@@ -231,6 +235,11 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		if err := p.snk.RegisterTable(ctx, ts); err != nil {
 			return fmt.Errorf("register table %s: %w", ts.Table, err)
 		}
+	}
+
+	// Start WAL lag monitor for logical mode.
+	if p.cfg.Source.Mode == "logical" {
+		go p.monitorWALLag(ctx)
 	}
 
 	// Start compactor if configured.
@@ -260,7 +269,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		p.src = qs
 
 	case "logical":
-		ls := source.NewLogicalSource(p.cfg.Source.Postgres, p.cfg.Source.Logical, p.cfg.Tables)
+		ls := source.NewLogicalSource(p.cfg.Source.Postgres, p.cfg.Source.Logical, p.cfg.Tables, p.id)
 		if cp.Mode == "logical" && cp.LSN > 0 {
 			ls.SetStartLSN(cp.LSN)
 			log.Printf("[pipeline:%s] restored logical LSN: %d", p.id, cp.LSN)
@@ -269,6 +278,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		ls.SetSnapshotedTables(cp.SnapshotedTables)
 		if !cp.SnapshotComplete {
 			p.setStatus(StatusSnapshotting, nil)
+			metrics.SnapshotInProgress.WithLabelValues(p.id).Set(1)
 		}
 		p.src = ls
 
@@ -289,8 +299,32 @@ func (p *Pipeline) run(ctx context.Context) {
 	// Only transition to Running if not already Snapshotting (set in initSource).
 	if p.status != StatusSnapshotting {
 		p.status = StatusRunning
+		metrics.PipelineStatus.WithLabelValues(p.id).Set(metrics.StatusToFloat["running"])
 	}
 	p.mu.Unlock()
+
+	// Periodically update gauge-style metrics.
+	metricsTicker := time.NewTicker(5 * time.Second)
+	defer metricsTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-metricsTicker.C:
+				p.mu.RLock()
+				if !p.startedAt.IsZero() {
+					metrics.PipelineUptimeSeconds.WithLabelValues(p.id).Set(time.Since(p.startedAt).Seconds())
+				}
+				p.mu.RUnlock()
+				metrics.EventsBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBuffered()))
+				metrics.BytesBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBufferedBytes()))
+				if ls, ok := p.src.(*source.LogicalSource); ok {
+					metrics.ConfirmedLSN.WithLabelValues(p.id).Set(float64(ls.ConfirmedLSN()))
+				}
+			}
+		}
+	}()
 
 	events := make(chan source.ChangeEvent, 1000)
 	errCh := make(chan error, 1)
@@ -367,6 +401,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				continue
 			}
 			p.rowsProcessed++
+			metrics.RowsProcessedTotal.WithLabelValues(p.id, event.Table, event.Operation.String()).Inc()
 
 			if p.snk.TotalBuffered() >= flushRows {
 				if err := p.doFlush(ctx); err != nil {
@@ -408,10 +443,22 @@ func (p *Pipeline) doFlush(ctx context.Context) error {
 	if err := p.snk.CheckBackpressure(ctx); err != nil {
 		return err
 	}
+	flushedRows := p.snk.TotalBuffered()
 	flushedBytes := p.snk.TotalBufferedBytes()
+
+	start := time.Now()
 	err := p.flush(ctx)
+	duration := time.Since(start).Seconds()
+
+	metrics.FlushDurationSeconds.WithLabelValues(p.id).Observe(duration)
+	metrics.FlushTotal.WithLabelValues(p.id).Inc()
+
 	if err == nil {
 		p.bytesProcessed += flushedBytes
+		metrics.BytesProcessedTotal.WithLabelValues(p.id).Add(float64(flushedBytes))
+		metrics.FlushRowsTotal.WithLabelValues(p.id).Add(float64(flushedRows))
+	} else {
+		metrics.FlushErrorsTotal.WithLabelValues(p.id).Inc()
 	}
 	return err
 }
@@ -443,6 +490,7 @@ func (p *Pipeline) flushSnapshotTable(ctx context.Context, table string) error {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 
+	metrics.SnapshotTablesCompleted.WithLabelValues(p.id).Inc()
 	log.Printf("[pipeline:%s] snapshot table %s complete, checkpoint saved", p.id, table)
 	return nil
 }
@@ -473,6 +521,7 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	}
 
 	p.setStatus(StatusRunning, nil)
+	metrics.SnapshotInProgress.WithLabelValues(p.id).Set(0)
 	log.Printf("[pipeline:%s] initial snapshot complete, checkpoint saved", p.id)
 	return nil
 }
@@ -611,6 +660,46 @@ func (p *Pipeline) RemoveTable(ctx context.Context, tableName string) error {
 	delete(p.schemas, tableName)
 	log.Printf("[pipeline:%s] removed table %s", p.id, tableName)
 	return nil
+}
+
+// monitorWALLag periodically queries PG for WAL position and replication slot lag.
+func (p *Pipeline) monitorWALLag(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			conn, err := pgx.Connect(ctx, p.cfg.Source.Postgres.DSN())
+			if err != nil {
+				continue
+			}
+
+			// Query replication slot lag and WAL disk usage.
+			var lagBytes int64
+			var walSizeBytes int64
+			err = conn.QueryRow(ctx, `
+				SELECT COALESCE(pg_current_wal_lsn() - confirmed_flush_lsn, 0),
+				       pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+				FROM pg_replication_slots
+				WHERE slot_name = $1
+			`, p.cfg.Source.Logical.SlotName).Scan(&lagBytes, &walSizeBytes)
+			conn.Close(ctx)
+
+			if err != nil {
+				continue
+			}
+
+			// Replication lag: how far behind pg2iceberg is from the WAL tip.
+			metrics.ReplicationLagBytes.WithLabelValues(p.id).Set(float64(lagBytes))
+			// WAL retained: bytes Postgres must keep on disk for this slot.
+			// Uses restart_lsn (where PG would restart streaming), which is
+			// older than confirmed_flush_lsn, so this is always >= lag.
+			metrics.WALRetainedBytes.WithLabelValues(p.id).Set(float64(walSizeBytes))
+		}
+	}
 }
 
 func newCheckpointStore(ctx context.Context, cfg *config.Config) (state.CheckpointStore, error) {

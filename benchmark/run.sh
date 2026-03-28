@@ -28,7 +28,7 @@ SEED_CONCURRENCY="${SEED_CONCURRENCY:-4}"
 SEED_BATCH_SIZE="${SEED_BATCH_SIZE:-5000}"
 # Max seconds to wait for drain before giving up.
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-0}"
-METRICS_URL="http://localhost:9090/metrics"
+STATUS_URL="http://localhost:9090/status"
 
 cd "$(dirname "$0")"
 
@@ -42,7 +42,7 @@ log() {
     echo "[$(date '+%H:%M:%S')] $*"
 }
 
-# wait_for_drain polls the /metrics endpoint until buffered_rows == 0 and
+# wait_for_drain polls the /status endpoint until buffered_rows == 0 and
 # status is "running" (not snapshotting).
 #
 # Usage:
@@ -69,9 +69,9 @@ wait_for_drain() {
             return 1
         fi
 
-        # Fetch metrics from pg2iceberg.
+        # Fetch status from pg2iceberg.
         local metrics
-        metrics=$(curl -sf "$METRICS_URL" 2>/dev/null || echo "")
+        metrics=$(curl -sf "$STATUS_URL" 2>/dev/null || echo "")
         if [ -z "$metrics" ]; then
             sleep 2
             continue
@@ -109,7 +109,7 @@ wait_for_drain() {
                 # PG and pg2iceberg. Wait one flush interval then re-check.
                 log "Buffer empty, waiting one flush interval (10s) for stragglers..."
                 sleep 10
-                metrics=$(curl -sf "$METRICS_URL" 2>/dev/null || echo "")
+                metrics=$(curl -sf "$STATUS_URL" 2>/dev/null || echo "")
                 buffered=$(echo "$metrics" | grep -o '"buffered_rows":[0-9]*' | grep -o '[0-9]*' || echo "-1")
                 if [ "$buffered" = "0" ]; then
                     log "Drain complete (${elapsed}s)"
@@ -137,17 +137,21 @@ start_infra() {
 start_pg2iceberg() {
     log "Starting pg2iceberg..."
     $COMPOSE up -d pg2iceberg
-    # Wait for metrics endpoint to be available.
+    # Wait for status endpoint to be available.
     local retries=0
-    while ! curl -sf "$METRICS_URL" > /dev/null 2>&1; do
+    while ! curl -sf "$STATUS_URL" > /dev/null 2>&1; do
         retries=$((retries + 1))
         if [ "$retries" -ge 30 ]; then
-            log "WARNING: pg2iceberg metrics not available after 30s"
+            log "WARNING: pg2iceberg status not available after 30s"
             break
         fi
         sleep 1
     done
     log "pg2iceberg started."
+
+    # Start monitoring stack (non-blocking, best-effort).
+    log "Starting prometheus + grafana..."
+    $COMPOSE up -d prometheus grafana
 }
 
 stop_pg2iceberg() {
@@ -199,7 +203,7 @@ monitor_replication_lag() {
     # Run in background, writing lag to stdout every 5s.
     while true; do
         local metrics
-        metrics=$(curl -sf "$METRICS_URL" 2>/dev/null || echo "")
+        metrics=$(curl -sf "$STATUS_URL" 2>/dev/null || echo "")
         local buffered="N/A"
         local status="N/A"
         if [ -n "$metrics" ]; then

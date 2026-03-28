@@ -8,9 +8,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pg2iceberg/pg2iceberg/config"
-	"github.com/pg2iceberg/pg2iceberg/schema"
 	pq "github.com/parquet-go/parquet-go"
+	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/metrics"
+	"github.com/pg2iceberg/pg2iceberg/schema"
 )
 
 // Compactor periodically merges small data files and applies equality deletes.
@@ -53,6 +54,7 @@ func (c *Compactor) Run(ctx context.Context) {
 			for pgTable, ts := range c.schemas {
 				icebergTable := pgTableToIceberg(pgTable)
 				if err := c.CompactTable(ctx, icebergTable, ts); err != nil {
+					metrics.CompactionRunsTotal.WithLabelValues(icebergTable, "error").Inc()
 					log.Printf("[compactor] error compacting %s: %v", pgTable, err)
 				}
 			}
@@ -62,6 +64,7 @@ func (c *Compactor) Run(ctx context.Context) {
 
 // CompactTable merges small data files and applies equality deletes for one table.
 func (c *Compactor) CompactTable(ctx context.Context, icebergTable string, ts *schema.TableSchema) error {
+	start := time.Now()
 	catalog := c.sink.Catalog()
 	s3 := c.sink.S3()
 	ns := c.cfg.Namespace
@@ -283,6 +286,11 @@ func (c *Compactor) CompactTable(ctx context.Context, icebergTable string, ts *s
 	if err := catalog.CommitSnapshot(ns, icebergTable, tm.Metadata.CurrentSnapshotID, commit); err != nil {
 		return fmt.Errorf("commit compacted snapshot: %w", err)
 	}
+
+	metrics.CompactionDurationSeconds.WithLabelValues(icebergTable).Observe(time.Since(start).Seconds())
+	metrics.CompactionRunsTotal.WithLabelValues(icebergTable, "success").Inc()
+	metrics.CompactionInputRowsTotal.WithLabelValues(icebergTable).Add(float64(totalInput))
+	metrics.CompactionDeletedRowsTotal.WithLabelValues(icebergTable).Add(float64(totalInput - totalOutput))
 
 	log.Printf("[compactor] compacted %s: %d input rows -> %d output rows (%d deleted), %d files -> %d files",
 		icebergTable, totalInput, totalOutput, totalInput-totalOutput, len(allDataFiles), len(newDataFiles))

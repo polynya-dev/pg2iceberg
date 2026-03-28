@@ -15,6 +15,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/api"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -77,7 +78,8 @@ func runSingle(ctx context.Context, configPath string) error {
 
 func startMetricsServer(ctx context.Context, addr string, p *pipeline.Pipeline) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(p.Metrics())
 	})

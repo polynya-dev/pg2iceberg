@@ -29,9 +29,10 @@ type txBuffer struct {
 
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
 type Sink struct {
-	cfg       config.SinkConfig
-	pgCfg     config.PostgresConfig // source PG config for TOAST lookups
-	tableCfgs []config.TableConfig
+	cfg        config.SinkConfig
+	pgCfg      config.PostgresConfig // source PG config for TOAST lookups
+	tableCfgs  []config.TableConfig
+	pipelineID string // for metrics labeling
 
 	catalog *CatalogClient
 	s3      *S3Client
@@ -83,7 +84,11 @@ type tableSink struct {
 	toastPending []toastPendingRow
 }
 
-func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig) (*Sink, error) {
+func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig, pipelineID ...string) (*Sink, error) {
+	pid := ""
+	if len(pipelineID) > 0 {
+		pid = pipelineID[0]
+	}
 	var httpClient *http.Client
 	if cfg.CatalogAuth == "sigv4" {
 		transport, err := NewSigV4Transport(cfg.S3Region)
@@ -100,14 +105,15 @@ func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []con
 	}
 
 	return &Sink{
-		cfg:                cfg,
-		pgCfg:              pgCfg,
-		tableCfgs:          tableCfgs,
-		catalog:            catalog,
-		s3:                 s3Client,
-		tables:             make(map[string]*tableSink),
+		cfg:            cfg,
+		pgCfg:          pgCfg,
+		tableCfgs:      tableCfgs,
+		pipelineID:     pid,
+		catalog:        catalog,
+		s3:             s3Client,
+		tables:         make(map[string]*tableSink),
 		openTxns:       make(map[uint32]*txBuffer),
-		compactionDone:     make(chan struct{}, 1),
+		compactionDone: make(chan struct{}, 1),
 	}, nil
 }
 

@@ -19,10 +19,11 @@ import (
 // LogicalSource implements Source using PostgreSQL logical replication.
 // It manages the full lifecycle of the replication slot.
 type LogicalSource struct {
-	pgCfg     config.PostgresConfig
-	cfg       config.LogicalConfig
-	tableCfgs []config.TableConfig
-	tables    map[string]*schema.TableSchema
+	pgCfg      config.PostgresConfig
+	cfg        config.LogicalConfig
+	tableCfgs  []config.TableConfig
+	tables     map[string]*schema.TableSchema
+	pipelineID string
 
 	replConn  *pgconn.PgConn
 	queryConn *pgx.Conn
@@ -53,13 +54,18 @@ type LogicalSource struct {
 	currentTxXID uint32
 }
 
-func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig, tableCfgs []config.TableConfig) *LogicalSource {
+func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig, tableCfgs []config.TableConfig, pipelineID ...string) *LogicalSource {
+	pid := ""
+	if len(pipelineID) > 0 {
+		pid = pipelineID[0]
+	}
 	return &LogicalSource{
-		pgCfg:     pgCfg,
-		cfg:       logicalCfg,
-		tableCfgs: tableCfgs,
-		tables:    make(map[string]*schema.TableSchema),
-		relations: make(map[uint32]*pglogrepl.RelationMessageV2),
+		pgCfg:      pgCfg,
+		cfg:        logicalCfg,
+		tableCfgs:  tableCfgs,
+		tables:     make(map[string]*schema.TableSchema),
+		relations:  make(map[uint32]*pglogrepl.RelationMessageV2),
+		pipelineID: pid,
 	}
 }
 
@@ -468,7 +474,7 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string,
 		return tx, cleanup, nil
 	}
 
-	snap := NewSnapshotter(tables, txFactory, l.cfg.SnapshotConcurrencyOrDefault())
+	snap := NewSnapshotter(tables, txFactory, l.cfg.SnapshotConcurrencyOrDefault(), l.pipelineID)
 	log.Printf("[logical] snapshot: %d tables, concurrency=%d", len(tables), l.cfg.SnapshotConcurrencyOrDefault())
 	if _, err := snap.Run(ctx, events); err != nil {
 		return err

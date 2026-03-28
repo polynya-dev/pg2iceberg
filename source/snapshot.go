@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/pg2iceberg/pg2iceberg/metrics"
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/worker"
 )
@@ -27,14 +28,15 @@ type SnapshotTable struct {
 // Snapshotter performs bulk SELECT * table copies using per-table transactions
 // obtained from a TxFactory. Tables are snapshotted concurrently via a WorkerPool.
 type Snapshotter struct {
-	tables    []SnapshotTable
-	txFactory TxFactory
-	pool      *worker.Pool
+	tables     []SnapshotTable
+	txFactory  TxFactory
+	pool       *worker.Pool
+	pipelineID string
 }
 
 // NewSnapshotter creates a Snapshotter for the given tables.
 // Concurrency controls how many tables are snapshotted in parallel.
-func NewSnapshotter(tables []SnapshotTable, txFactory TxFactory, concurrency int) *Snapshotter {
+func NewSnapshotter(tables []SnapshotTable, txFactory TxFactory, concurrency int, pipelineID ...string) *Snapshotter {
 	if concurrency <= 0 {
 		concurrency = 1
 	}
@@ -42,10 +44,15 @@ func NewSnapshotter(tables []SnapshotTable, txFactory TxFactory, concurrency int
 	if concurrency > len(tables) {
 		concurrency = len(tables)
 	}
+	pid := ""
+	if len(pipelineID) > 0 {
+		pid = pipelineID[0]
+	}
 	return &Snapshotter{
-		tables:    tables,
-		txFactory: txFactory,
-		pool:      worker.NewPool(concurrency),
+		tables:     tables,
+		txFactory:  txFactory,
+		pool:       worker.NewPool(concurrency),
+		pipelineID: pid,
 	}
 }
 
@@ -136,6 +143,7 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, e
 			return ctx.Err()
 		}
 		progress.Add(1)
+		metrics.SnapshotRowsTotal.WithLabelValues(s.pipelineID, tbl.Name).Inc()
 	}
 	rows.Close()
 

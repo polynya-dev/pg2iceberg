@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+
+	"github.com/pg2iceberg/pg2iceberg/metrics"
 )
 
 // resolveToast fetches missing TOAST column values from PostgreSQL
@@ -141,6 +143,9 @@ func (s *Sink) resolveToast(ctx context.Context, pgTable string, ts *tableSink) 
 		}
 		resolved++
 	}
+
+	metrics.ToastLookupsTotal.WithLabelValues(s.pipelineID, pgTable).Inc()
+	metrics.ToastRowsResolvedTotal.WithLabelValues(s.pipelineID, pgTable).Add(float64(resolved))
 
 	log.Printf("[sink] TOAST: resolved %d/%d rows for %s (%d unique PKs queried)",
 		resolved, len(ts.toastPending), pgTable, len(seen))
