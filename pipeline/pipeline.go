@@ -13,7 +13,6 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/sink"
 	"github.com/pg2iceberg/pg2iceberg/source"
-	"github.com/pg2iceberg/pg2iceberg/state"
 )
 
 // Status represents the current state of a Pipeline.
@@ -50,24 +49,46 @@ type Pipeline struct {
 
 	src     source.Source
 	snk     *sink.Sink
-	store   state.CheckpointStore
+	store   CheckpointStore
 	schemas map[string]*schema.TableSchema
 
-	startedAt     time.Time
-	lastFlushAt   time.Time
+	startedAt      time.Time
+	lastFlushAt    time.Time
 	rowsProcessed  int64
 	bytesProcessed int64
+	lastWrittenLSN uint64 // LSN of the last event written to sink
 
 	cancel context.CancelFunc
 	done   chan struct{}
 	mu     sync.RWMutex
 }
 
+// BuildPipeline creates a fully-wired Pipeline from config, constructing the
+// sink and checkpoint store. Use NewPipeline when you need to inject custom
+// dependencies (e.g. in tests).
+func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipeline, error) {
+	cpStore, err := NewCheckpointStore(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create checkpoint store: %w", err)
+	}
+
+	snk, err := sink.BuildSink(cfg.Sink, cfg.Source.Postgres, cfg.Tables, id)
+	if err != nil {
+		cpStore.Close()
+		return nil, fmt.Errorf("create sink: %w", err)
+	}
+
+	return NewPipeline(id, cfg, snk, cpStore), nil
+}
+
 // NewPipeline creates a Pipeline but does not start it.
-func NewPipeline(id string, cfg *config.Config) *Pipeline {
+// The sink and checkpoint store must be created by the caller.
+func NewPipeline(id string, cfg *config.Config, snk *sink.Sink, store CheckpointStore) *Pipeline {
 	return &Pipeline{
 		id:     id,
 		cfg:    cfg,
+		snk:    snk,
+		store:  store,
 		status: StatusStopped,
 		done:   make(chan struct{}),
 	}
@@ -78,6 +99,9 @@ func (p *Pipeline) ID() string { return p.id }
 
 // Config returns the pipeline configuration.
 func (p *Pipeline) Config() *config.Config { return p.cfg }
+
+// Source returns the pipeline's source (for testing/inspection).
+func (p *Pipeline) Source() source.Source { return p.src }
 
 // Status returns the current status and last error (if any).
 func (p *Pipeline) Status() (Status, error) {
@@ -106,7 +130,7 @@ func (p *Pipeline) Metrics() Metrics {
 	}
 
 	if ls, ok := p.src.(*source.LogicalSource); ok {
-		m.LSN = ls.ConfirmedLSN()
+		m.LSN = ls.FlushedLSN()
 	}
 
 	if !p.lastFlushAt.IsZero() {
@@ -190,15 +214,10 @@ func (p *Pipeline) setStatus(s Status, err error) {
 	}
 }
 
-// setup performs all synchronous initialization: checkpoint, schema discovery,
+// setup performs all synchronous initialization: schema discovery,
 // sink registration, compactor start, and source creation.
 func (p *Pipeline) setup(ctx context.Context) error {
 	// Load checkpoint.
-	store, err := newCheckpointStore(ctx, p.cfg)
-	if err != nil {
-		return fmt.Errorf("create checkpoint store: %w", err)
-	}
-	p.store = store
 	cp, err := p.store.Load(p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
@@ -224,12 +243,6 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		log.Printf("[pipeline:%s] discovered schema for %s: %d columns, pk=%v", p.id, tc.Name, len(ts.Columns), ts.PK)
 	}
 	pgConn.Close(ctx)
-
-	// Initialize sink.
-	p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres, p.cfg.Tables, p.id)
-	if err != nil {
-		return fmt.Errorf("create sink: %w", err)
-	}
 
 	for _, ts := range p.schemas {
 		if err := p.snk.RegisterTable(ctx, ts); err != nil {
@@ -320,7 +333,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				metrics.EventsBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBuffered()))
 				metrics.BytesBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBufferedBytes()))
 				if ls, ok := p.src.(*source.LogicalSource); ok {
-					metrics.ConfirmedLSN.WithLabelValues(p.id).Set(float64(ls.ConfirmedLSN()))
+					metrics.ConfirmedLSN.WithLabelValues(p.id).Set(float64(ls.FlushedLSN()))
 				}
 			}
 		}
@@ -393,12 +406,18 @@ func (p *Pipeline) run(ctx context.Context) {
 				if err := p.snk.Write(event); err != nil {
 					log.Printf("[pipeline:%s] write error: %v", p.id, err)
 				}
+				if event.LSN > p.lastWrittenLSN {
+					p.lastWrittenLSN = event.LSN
+				}
 				continue
 			}
 
 			if err := p.snk.Write(event); err != nil {
 				log.Printf("[pipeline:%s] write error: %v", p.id, err)
 				continue
+			}
+			if event.LSN > p.lastWrittenLSN {
+				p.lastWrittenLSN = event.LSN
 			}
 			p.rowsProcessed++
 			metrics.RowsProcessedTotal.WithLabelValues(p.id, event.Table, event.Operation.String()).Inc()
@@ -483,7 +502,8 @@ func (p *Pipeline) flushSnapshotTable(ctx context.Context, table string) error {
 	}
 	cp.SnapshotedTables[table] = true
 	if ls, ok := p.src.(*source.LogicalSource); ok {
-		cp.LSN = ls.ConfirmedLSN()
+		cp.LSN = p.lastWrittenLSN
+		ls.SetFlushedLSN(cp.LSN)
 	}
 
 	if err := p.store.Save(p.id, cp); err != nil {
@@ -513,7 +533,8 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	cp.SnapshotComplete = true
 	cp.SnapshotedTables = nil // no longer needed once fully complete
 	if ls, ok := p.src.(*source.LogicalSource); ok {
-		cp.LSN = ls.ConfirmedLSN()
+		cp.LSN = p.lastWrittenLSN
+		ls.SetFlushedLSN(cp.LSN)
 	}
 
 	if err := p.store.Save(p.id, cp); err != nil {
@@ -572,7 +593,8 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	switch p.cfg.Source.Mode {
 	case "logical":
 		if ls, ok := p.src.(*source.LogicalSource); ok {
-			cp.LSN = ls.ConfirmedLSN()
+			cp.LSN = p.lastWrittenLSN
+			ls.SetFlushedLSN(cp.LSN)
 		}
 	}
 
@@ -702,10 +724,12 @@ func (p *Pipeline) monitorWALLag(ctx context.Context) {
 	}
 }
 
-func newCheckpointStore(ctx context.Context, cfg *config.Config) (state.CheckpointStore, error) {
+// NewCheckpointStore creates a CheckpointStore from config. It uses a file store
+// if a path is configured, otherwise falls back to Postgres.
+func NewCheckpointStore(ctx context.Context, cfg *config.Config) (CheckpointStore, error) {
 	// Explicit file path: use file store (local dev).
 	if cfg.State.Path != "" {
-		return state.NewFileStore(cfg.State.Path), nil
+		return NewFileCheckpointStore(cfg.State.Path), nil
 	}
 
 	// Explicit postgres URL, or fall back to source postgres.
@@ -713,6 +737,6 @@ func newCheckpointStore(ctx context.Context, cfg *config.Config) (state.Checkpoi
 	if url == "" {
 		url = cfg.Source.Postgres.DSN()
 	}
-	return state.NewPgStore(ctx, url)
+	return NewPgCheckpointStore(ctx, url)
 }
 

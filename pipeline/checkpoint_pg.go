@@ -1,4 +1,4 @@
-package state
+package pipeline
 
 import (
 	"context"
@@ -10,12 +10,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// PgStore persists checkpoints to a PostgreSQL table under the _pg2iceberg schema.
-type PgStore struct {
+// PgCheckpointStore persists checkpoints to a PostgreSQL table under the _pg2iceberg schema.
+type PgCheckpointStore struct {
 	pool *pgxpool.Pool
 }
 
-func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
+func NewPgCheckpointStore(ctx context.Context, dsn string) (*PgCheckpointStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("connect to checkpoint store: %w", err)
@@ -26,7 +26,7 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 		return nil, fmt.Errorf("ping checkpoint store: %w", err)
 	}
 
-	s := &PgStore{pool: pool}
+	s := &PgCheckpointStore{pool: pool}
 	if err := s.migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -35,7 +35,7 @@ func NewPgStore(ctx context.Context, dsn string) (*PgStore, error) {
 	return s, nil
 }
 
-func (s *PgStore) migrate(ctx context.Context) error {
+func (s *PgCheckpointStore) migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS _pg2iceberg`)
 	if err != nil {
 		return fmt.Errorf(
@@ -64,7 +64,7 @@ func (s *PgStore) migrate(ctx context.Context) error {
 }
 
 // Load reads the checkpoint for a pipeline. Returns a zero Checkpoint if no row exists.
-func (s *PgStore) Load(pipelineID string) (*Checkpoint, error) {
+func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -89,7 +89,7 @@ func (s *PgStore) Load(pipelineID string) (*Checkpoint, error) {
 }
 
 // Save upserts the checkpoint for a pipeline.
-func (s *PgStore) Save(pipelineID string, cp *Checkpoint) error {
+func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -112,6 +112,6 @@ func (s *PgStore) Save(pipelineID string, cp *Checkpoint) error {
 }
 
 // Close releases the connection pool.
-func (s *PgStore) Close() {
+func (s *PgCheckpointStore) Close() {
 	s.pool.Close()
 }

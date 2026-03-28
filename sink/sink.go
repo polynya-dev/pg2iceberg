@@ -34,8 +34,8 @@ type Sink struct {
 	tableCfgs  []config.TableConfig
 	pipelineID string // for metrics labeling
 
-	catalog *CatalogClient
-	s3      *S3Client
+	catalog Catalog
+	s3      ObjectStorage
 
 	// Per-table state
 	tables map[string]*tableSink
@@ -84,11 +84,10 @@ type tableSink struct {
 	toastPending []toastPendingRow
 }
 
-func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig, pipelineID ...string) (*Sink, error) {
-	pid := ""
-	if len(pipelineID) > 0 {
-		pid = pipelineID[0]
-	}
+// BuildSink creates a fully-wired Sink from config, constructing the default
+// S3 and catalog clients. Use NewSink when you need to inject custom
+// dependencies (e.g. in tests).
+func BuildSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig, pipelineID string) (*Sink, error) {
 	var httpClient *http.Client
 	if cfg.CatalogAuth == "sigv4" {
 		transport, err := NewSigV4Transport(cfg.S3Region)
@@ -104,17 +103,22 @@ func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []con
 		return nil, fmt.Errorf("create s3 client: %w", err)
 	}
 
+	return NewSink(cfg, pgCfg, tableCfgs, pipelineID, s3Client, catalog), nil
+}
+
+// NewSink creates a Sink with the given dependencies.
+func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig, pipelineID string, s3 ObjectStorage, catalog Catalog) *Sink {
 	return &Sink{
 		cfg:            cfg,
 		pgCfg:          pgCfg,
 		tableCfgs:      tableCfgs,
-		pipelineID:     pid,
+		pipelineID:     pipelineID,
 		catalog:        catalog,
-		s3:             s3Client,
+		s3:             s3,
 		tables:         make(map[string]*tableSink),
 		openTxns:       make(map[uint32]*txBuffer),
 		compactionDone: make(chan struct{}, 1),
-	}, nil
+	}
 }
 
 // pgConnPool returns the shared connection pool for source PG lookups (TOAST resolution).
@@ -147,10 +151,10 @@ func (s *Sink) Close() {
 }
 
 // Catalog returns the catalog client (for use by compactor).
-func (s *Sink) Catalog() *CatalogClient { return s.catalog }
+func (s *Sink) Catalog() Catalog { return s.catalog }
 
 // S3 returns the S3 client (for use by compactor).
-func (s *Sink) S3() *S3Client { return s.s3 }
+func (s *Sink) S3() ObjectStorage { return s.s3 }
 
 // RegisterTable sets up writers for a table and ensures it exists in the catalog.
 func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error {

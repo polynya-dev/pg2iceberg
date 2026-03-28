@@ -48,7 +48,11 @@ func (m *Manager) Create(_ context.Context, id string, cfg *config.Config) error
 		return fmt.Errorf("persist config: %w", err)
 	}
 
-	p := NewPipeline(id, cfg)
+	p, err := BuildPipeline(m.ctx, id, cfg)
+	if err != nil {
+		m.store.Delete(id) // rollback
+		return fmt.Errorf("build pipeline: %w", err)
+	}
 	if err := p.Start(m.ctx); err != nil {
 		m.store.Delete(id) // rollback
 		return fmt.Errorf("start pipeline: %w", err)
@@ -154,7 +158,11 @@ func (m *Manager) RestoreAll() error {
 	}
 
 	for id, cfg := range configs {
-		p := NewPipeline(id, cfg)
+		p, err := BuildPipeline(m.ctx, id, cfg)
+		if err != nil {
+			log.Printf("[manager] failed to build pipeline %q: %v", id, err)
+			continue
+		}
 		if err := p.Start(m.ctx); err != nil {
 			log.Printf("[manager] failed to restore pipeline %q: %v", id, err)
 			continue

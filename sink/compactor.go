@@ -300,7 +300,7 @@ func (c *Compactor) CompactTable(ctx context.Context, icebergTable string, ts *s
 }
 
 // buildDeleteSet reads all equality delete files and returns a set of PK strings to delete.
-func (c *Compactor) buildDeleteSet(ctx context.Context, s3 *S3Client, deleteFiles []DataFileInfo, ts *schema.TableSchema) (map[string]struct{}, error) {
+func (c *Compactor) buildDeleteSet(ctx context.Context, s3 ObjectStorage, deleteFiles []DataFileInfo, ts *schema.TableSchema) (map[string]struct{}, error) {
 	deleteSet := make(map[string]struct{})
 	for _, df := range deleteFiles {
 		key, err := KeyFromURI(df.Path)

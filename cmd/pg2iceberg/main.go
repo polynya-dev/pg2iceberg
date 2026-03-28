@@ -57,7 +57,10 @@ func runSingle(ctx context.Context, configPath string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	p := pipeline.NewPipeline("default", cfg)
+	p, err := pipeline.BuildPipeline(ctx, "default", cfg)
+	if err != nil {
+		return fmt.Errorf("build pipeline: %w", err)
+	}
 	if err := p.Start(ctx); err != nil {
 		return err
 	}

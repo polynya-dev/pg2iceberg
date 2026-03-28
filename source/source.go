@@ -84,6 +84,9 @@ type ChangeEvent struct {
 	// UnchangedCols lists column names that were sent as 'unchanged' (TOAST).
 	// These columns are set to nil in After and need to be fetched from the source.
 	UnchangedCols []string
+	// LSN is the WAL position of this event (logical replication mode only).
+	// Zero for snapshot and query-mode events.
+	LSN uint64
 	// TransactionID is the PostgreSQL transaction ID (XID) from BeginMessage.
 	// Set on OpBegin, OpCommit, and all DML events within the transaction.
 	// Zero for snapshot and query-mode events.
