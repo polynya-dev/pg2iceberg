@@ -21,17 +21,29 @@ type ParquetWriter struct {
 	colOrder       map[string]int
 	rows           []map[string]any
 	estimatedBytes int64
+
+	// Reusable parquet encoding state — avoids re-allocating internal column
+	// buffers on every flush.
+	rowBuf   *parquet.Buffer
+	pqWriter *parquet.Writer
+	outBuf   bytes.Buffer
+	pqRow    parquet.Row
 }
 
 // NewDataWriter creates a writer for data files (all columns).
 func NewDataWriter(ts *schema.TableSchema) *ParquetWriter {
 	pqSchema := buildParquetSchema("data", ts.Columns)
-	return &ParquetWriter{
+	colOrder := schemaColumnOrder(pqSchema)
+	w := &ParquetWriter{
 		tableSchema: ts,
 		pqSchema:    pqSchema,
 		columns:     ts.Columns,
-		colOrder:    schemaColumnOrder(pqSchema),
+		colOrder:    colOrder,
+		rowBuf:      parquet.NewBuffer(pqSchema),
+		pqRow:       make(parquet.Row, len(colOrder)),
 	}
+	w.pqWriter = parquet.NewWriter(&w.outBuf)
+	return w
 }
 
 // NewDeleteWriter creates a writer for equality delete files (PK columns only).
@@ -46,12 +58,17 @@ func NewDeleteWriter(ts *schema.TableSchema) *ParquetWriter {
 		}
 	}
 	pqSchema := buildParquetSchema("equality_delete", pkCols)
-	return &ParquetWriter{
+	colOrder := schemaColumnOrder(pqSchema)
+	w := &ParquetWriter{
 		tableSchema: ts,
 		pqSchema:    pqSchema,
 		columns:     pkCols,
-		colOrder:    schemaColumnOrder(pqSchema),
+		colOrder:    colOrder,
+		rowBuf:      parquet.NewBuffer(pqSchema),
+		pqRow:       make(parquet.Row, len(colOrder)),
 	}
+	w.pqWriter = parquet.NewWriter(&w.outBuf)
+	return w
 }
 
 // schemaColumnOrder extracts the leaf column ordering from a parquet schema.
@@ -77,6 +94,12 @@ func (w *ParquetWriter) EstimatedBytes() int64 {
 }
 
 func (w *ParquetWriter) Reset() {
+	// Nil out references so GC can collect row maps between flushes.
+	// Row maps are NOT released to the pool here because some may still
+	// be referenced by rowCache. They are released when rowCache is cleared.
+	for i := range w.rows {
+		w.rows[i] = nil
+	}
 	w.rows = w.rows[:0]
 	w.estimatedBytes = 0
 }
@@ -225,31 +248,37 @@ func (w *ParquetWriter) Flush() ([]byte, int64, error) {
 		return nil, 0, nil
 	}
 
-	rowBuf := parquet.NewBuffer(w.pqSchema)
+	w.rowBuf.Reset()
+	batch := [1]parquet.Row{} // stack-allocated single-element batch for WriteRows
 
 	for _, row := range w.rows {
-		pqRow := w.encodeRow(row)
-		if _, err := rowBuf.WriteRows([]parquet.Row{pqRow}); err != nil {
+		w.encodeRowInto(w.pqRow, row)
+		batch[0] = w.pqRow
+		if _, err := w.rowBuf.WriteRows(batch[:]); err != nil {
 			return nil, 0, fmt.Errorf("write row to buffer: %w", err)
 		}
 	}
 
-	var buf bytes.Buffer
-	writer := parquet.NewWriter(&buf)
-	if _, err := writer.WriteRowGroup(rowBuf); err != nil {
+	w.outBuf.Reset()
+	w.outBuf.Grow(int(w.estimatedBytes))
+	w.pqWriter.Reset(&w.outBuf)
+	if _, err := w.pqWriter.WriteRowGroup(w.rowBuf); err != nil {
 		return nil, 0, fmt.Errorf("write row group: %w", err)
 	}
-	if err := writer.Close(); err != nil {
+	if err := w.pqWriter.Close(); err != nil {
 		return nil, 0, fmt.Errorf("close writer: %w", err)
 	}
 
+	// Copy output — the caller takes ownership and outBuf will be reused.
+	out := make([]byte, w.outBuf.Len())
+	copy(out, w.outBuf.Bytes())
+
 	count := int64(len(w.rows))
-	return buf.Bytes(), count, nil
+	return out, count, nil
 }
 
-func (w *ParquetWriter) encodeRow(data map[string]any) parquet.Row {
-	// Build row with values at the correct column indices from the parquet schema.
-	row := make(parquet.Row, len(w.colOrder))
+// encodeRowInto populates the pre-allocated dst slice with parquet values.
+func (w *ParquetWriter) encodeRowInto(dst parquet.Row, data map[string]any) {
 	for _, col := range w.columns {
 		idx, ok := w.colOrder[col.Name]
 		if !ok {
@@ -258,20 +287,19 @@ func (w *ParquetWriter) encodeRow(data map[string]any) parquet.Row {
 		v := data[col.Name]
 		if v == nil {
 			if col.IsNullable {
-				row[idx] = parquet.Value{}.Level(0, 0, idx)
+				dst[idx] = parquet.Value{}.Level(0, 0, idx)
 			} else {
-				row[idx] = zeroValue(col).Level(0, 0, idx)
+				dst[idx] = zeroValue(col).Level(0, 0, idx)
 			}
 			continue
 		}
 		pv := toParquetValue(col, v)
 		if col.IsNullable {
-			row[idx] = pv.Level(0, 1, idx)
+			dst[idx] = pv.Level(0, 1, idx)
 		} else {
-			row[idx] = pv.Level(0, 0, idx)
+			dst[idx] = pv.Level(0, 0, idx)
 		}
 	}
-	return row
 }
 
 func zeroValue(col schema.Column) parquet.Value {
@@ -438,34 +466,142 @@ func toTimestampMicros(v any) int64 {
 	case time.Time:
 		return x.UnixMicro()
 	case string:
-		// Try common PG timestamp formats.
-		// PG logical replication sends timestamps like: "2026-03-24 10:48:20.123456+08"
-		for _, layout := range []string{
-			time.RFC3339Nano,
-			time.RFC3339,
-			"2006-01-02 15:04:05.999999-07:00",
-			"2006-01-02 15:04:05.999999-07",
-			"2006-01-02 15:04:05.999999+00",
-			"2006-01-02 15:04:05-07:00",
-			"2006-01-02 15:04:05-07",
-			"2006-01-02 15:04:05+00",
-			"2006-01-02 15:04:05",
-		} {
-			if t, err := time.Parse(layout, x); err == nil {
-				return t.UnixMicro()
-			}
-		}
-		// Last resort: try replacing space with T for RFC3339 compatibility
-		if len(x) > 10 {
-			rfc := x[:10] + "T" + x[11:]
-			if t, err := time.Parse(time.RFC3339Nano, rfc); err == nil {
-				return t.UnixMicro()
-			}
-		}
-		return 0
+		us, _ := fastParseTimestamp(x)
+		return us
 	default:
 		return 0
 	}
+}
+
+// fastParseTimestamp parses the PG logical replication timestamp format directly
+// without going through time.Parse. Expected format:
+//
+//	"2006-01-02 15:04:05.999999+08"     (short tz)
+//	"2006-01-02 15:04:05.999999+08:00"  (long tz)
+//	"2006-01-02 15:04:05+08"            (no fractional seconds)
+//
+// Returns microseconds since Unix epoch and true if parsed successfully.
+func fastParseTimestamp(s string) (int64, bool) {
+	// Minimum: "2006-01-02 15:04:05+08" = 22 chars
+	if len(s) < 22 || s[4] != '-' || s[7] != '-' || s[10] != ' ' || s[13] != ':' || s[16] != ':' {
+		return 0, false
+	}
+
+	year := atoi4(s[0:4])
+	month := atoi2(s[5:7])
+	day := atoi2(s[8:10])
+	hour := atoi2(s[11:13])
+	min := atoi2(s[14:16])
+	sec := atoi2(s[17:19])
+
+	if year < 0 || month < 1 || month > 12 || day < 1 || day > 31 ||
+		hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 || sec > 60 {
+		return 0, false
+	}
+
+	// Parse fractional seconds and timezone offset.
+	var micros int
+	rest := s[19:]
+	if len(rest) > 0 && rest[0] == '.' {
+		rest = rest[1:]
+		// Read up to 6 fractional digits.
+		digits := 0
+		for digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9' {
+			digits++
+		}
+		if digits == 0 {
+			return 0, false
+		}
+		micros = atoiN(rest[:digits])
+		// Scale to microseconds (e.g., 3 digits = milliseconds * 1000).
+		for i := digits; i < 6; i++ {
+			micros *= 10
+		}
+		// Truncate if more than 6 digits.
+		for i := 6; i < digits; i++ {
+			micros /= 10
+		}
+		rest = rest[digits:]
+	}
+
+	// Parse timezone: +08, -05:30, +00:00, Z, or absent (timestamp without tz).
+	var tzOffsetSec int
+	if len(rest) == 0 {
+		// No timezone — timestamp without time zone. Treat as UTC.
+		days := daysSinceEpoch(year, int(month), day)
+		unixSec := int64(days)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec)
+		return unixSec*1_000_000 + int64(micros), true
+	}
+	switch rest[0] {
+	case 'Z':
+		// UTC, offset 0
+	case '+', '-':
+		if len(rest) < 3 {
+			return 0, false
+		}
+		tzH := atoi2(rest[1:3])
+		if tzH < 0 || tzH > 14 {
+			return 0, false
+		}
+		tzM := 0
+		if len(rest) >= 5 && rest[3] == ':' {
+			tzM = atoi2(rest[4:6])
+		} else if len(rest) >= 5 && rest[3] >= '0' && rest[3] <= '9' {
+			tzM = atoi2(rest[3:5])
+		}
+		if tzM < 0 || tzM > 59 {
+			return 0, false
+		}
+		tzOffsetSec = tzH*3600 + tzM*60
+		if rest[0] == '-' {
+			tzOffsetSec = -tzOffsetSec
+		}
+	default:
+		return 0, false
+	}
+
+	// Convert to Unix timestamp using a fast days-since-epoch calculation.
+	days := daysSinceEpoch(year, int(month), day)
+	unixSec := int64(days)*86400 + int64(hour)*3600 + int64(min)*60 + int64(sec) - int64(tzOffsetSec)
+	return unixSec*1_000_000 + int64(micros), true
+}
+
+// daysSinceEpoch returns the number of days from 1970-01-01 to the given date.
+func daysSinceEpoch(year, month, day int) int64 {
+	// Adjust for months before March (shifts leap day to end of year).
+	if month <= 2 {
+		year--
+		month += 12
+	}
+	era := year / 400
+	yoe := year - era*400                          // year of era [0, 399]
+	doy := (153*(month-3)+2)/5 + day - 1           // day of year [0, 365]
+	doe := yoe*365 + yoe/4 - yoe/100 + doy         // day of era [0, 146096]
+	return int64(era)*146097 + int64(doe) - 719468  // days since 1970-01-01
+}
+
+func atoi2(s string) int {
+	d0, d1 := int(s[0]-'0'), int(s[1]-'0')
+	if d0 < 0 || d0 > 9 || d1 < 0 || d1 > 9 {
+		return -1
+	}
+	return d0*10 + d1
+}
+
+func atoi4(s string) int {
+	d0, d1, d2, d3 := int(s[0]-'0'), int(s[1]-'0'), int(s[2]-'0'), int(s[3]-'0')
+	if d0 < 0 || d0 > 9 || d1 < 0 || d1 > 9 || d2 < 0 || d2 > 9 || d3 < 0 || d3 > 9 {
+		return -1
+	}
+	return d0*1000 + d1*100 + d2*10 + d3
+}
+
+func atoiN(s string) int {
+	n := 0
+	for _, c := range []byte(s) {
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 func toDateDays(v any) int32 {

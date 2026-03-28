@@ -72,7 +72,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 		return nil, fmt.Errorf("create checkpoint store: %w", err)
 	}
 
-	snk, err := sink.BuildSink(cfg.Sink, cfg.Source.Postgres, cfg.Tables, id)
+	snk, err := sink.BuildSink(cfg.Sink, cfg.Tables, id)
 	if err != nil {
 		cpStore.Close()
 		return nil, fmt.Errorf("create sink: %w", err)

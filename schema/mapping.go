@@ -18,9 +18,10 @@ type Column struct {
 
 // TableSchema holds discovered schema for a single table.
 type TableSchema struct {
-	Table   string   // fully qualified: schema.table
-	Columns []Column
-	PK      []string // primary key column names
+	Table              string   // fully qualified: schema.table
+	Columns            []Column
+	PK                 []string // primary key column names
+	ReplicaIdentityFull bool   // true if table uses REPLICA IDENTITY FULL
 }
 
 // PKFieldIDs returns the Iceberg field IDs corresponding to primary key columns.
@@ -103,6 +104,15 @@ func DiscoverSchema(ctx context.Context, conn *pgx.Conn, table string) (*TableSc
 			return nil, fmt.Errorf("scan pk: %w", err)
 		}
 		ts.PK = append(ts.PK, pkCol)
+	}
+
+	// Discover replica identity.
+	var relReplIdent byte
+	err = conn.QueryRow(ctx,
+		`SELECT relreplident FROM pg_class WHERE oid = $1::regclass`, table,
+	).Scan(&relReplIdent)
+	if err == nil && relReplIdent == 'f' {
+		ts.ReplicaIdentityFull = true
 	}
 
 	return ts, nil

@@ -291,6 +291,13 @@ func ReadManifest(data []byte) ([]ManifestEntry, error) {
 				FileSizeBytes: getInt64(df, "file_size_in_bytes"),
 			}
 
+			// Read partition values for file filtering.
+			if partRaw, ok := df["partition"]; ok && partRaw != nil {
+				if partMap, ok := partRaw.(map[string]any); ok && len(partMap) > 0 {
+					entry.DataFile.PartitionValues = partMap
+				}
+			}
+
 			// Read equality_ids
 			if eqRaw, ok := df["equality_ids"]; ok && eqRaw != nil {
 				if um, ok := eqRaw.(map[string]any); ok {

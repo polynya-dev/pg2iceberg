@@ -82,7 +82,7 @@ var FlushDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Namespace: namespace,
 	Name:      "flush_duration_seconds",
 	Help:      "Time taken to flush buffered data to Iceberg.",
-	Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 0.1s to ~200s
+	Buckets:   []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
 }, []string{"pipeline"})
 
 var FlushTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -109,7 +109,7 @@ var S3OperationDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOp
 	Namespace: namespace,
 	Name:      "s3_operation_duration_seconds",
 	Help:      "Time taken for S3 operations.",
-	Buckets:   prometheus.ExponentialBuckets(0.01, 2, 12), // 10ms to ~20s
+	Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 }, []string{"operation"})
 
 var S3BytesUploadedTotal = promauto.NewCounter(prometheus.CounterOpts{
@@ -136,7 +136,7 @@ var CatalogOperationDurationSeconds = promauto.NewHistogramVec(prometheus.Histog
 	Namespace: namespace,
 	Name:      "catalog_operation_duration_seconds",
 	Help:      "Time taken for Iceberg catalog operations.",
-	Buckets:   prometheus.ExponentialBuckets(0.01, 2, 10), // 10ms to ~5s
+	Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 }, []string{"operation"})
 
 var CatalogErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -159,13 +159,20 @@ var ToastRowsResolvedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help:      "Total rows resolved via TOAST lookups.",
 }, []string{"pipeline", "table"})
 
+var ToastLookupDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace: namespace,
+	Name:      "toast_lookup_duration_seconds",
+	Help:      "Time taken for TOAST Iceberg scan lookups.",
+	Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+}, []string{"pipeline", "table"})
+
 // --- Compaction ---
 
 var CompactionDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Namespace: namespace,
 	Name:      "compaction_duration_seconds",
 	Help:      "Time taken for compaction runs.",
-	Buckets:   prometheus.ExponentialBuckets(1, 2, 10), // 1s to ~500s
+	Buckets:   []float64{0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
 }, []string{"table"})
 
 var CompactionRunsTotal = promauto.NewCounterVec(prometheus.CounterOpts{

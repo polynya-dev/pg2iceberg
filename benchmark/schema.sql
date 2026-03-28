@@ -11,6 +11,8 @@ CREATE TABLE bench_events (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE bench_events ALTER COLUMN large_text SET STORAGE EXTERNAL;
+
 CREATE INDEX idx_bench_events_seq ON bench_events (seq);
 
 -- Publication for pg2iceberg logical replication.

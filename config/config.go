@@ -124,6 +124,9 @@ type SinkConfig struct {
 	FlushBytes     int64  `yaml:"flush_bytes" json:"flush_bytes,omitempty"`
 	TargetFileSize int64  `yaml:"target_file_size" json:"target_file_size,omitempty"`
 
+	// TOAST cache size (bytes). Shared LRU across all tables.
+	ToastCacheBytes int64 `yaml:"toast_cache_bytes" json:"toast_cache_bytes,omitempty"`
+
 	// Compaction settings
 	CompactionInterval   string `yaml:"compaction_interval" json:"compaction_interval,omitempty"`
 	CompactionTargetSize int64  `yaml:"compaction_target_size" json:"compaction_target_size,omitempty"`
@@ -141,6 +144,13 @@ func (s SinkConfig) FlushBytesOrDefault() int64 {
 func (s SinkConfig) TargetFileSizeOrDefault() int64 {
 	if s.TargetFileSize > 0 {
 		return s.TargetFileSize
+	}
+	return 128 * 1024 * 1024 // 128MB
+}
+
+func (s SinkConfig) ToastCacheBytesOrDefault() int64 {
+	if s.ToastCacheBytes > 0 {
+		return s.ToastCacheBytes
 	}
 	return 128 * 1024 * 1024 // 128MB
 }

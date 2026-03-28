@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -22,6 +23,9 @@ type PartitionField struct {
 	Name           string // Partition field name (e.g. "created_at_day")
 	Transform      string // identity, year, month, day, hour, bucket, truncate
 	TransformParam int    // N for bucket[N], W for truncate[W]
+
+	// Cached column metadata for hot-path lookups (set by BuildPartitionSpec).
+	sourceCol *schema.Column
 }
 
 // PartitionSpec describes the partition spec for an Iceberg table.
@@ -128,6 +132,7 @@ func BuildPartitionSpec(exprs []string, ts *schema.TableSchema) (*PartitionSpec,
 			Name:           name,
 			Transform:      transform,
 			TransformParam: param,
+			sourceCol:      col,
 		})
 	}
 	return spec, nil
@@ -138,37 +143,80 @@ func (ps *PartitionSpec) IsUnpartitioned() bool {
 	return len(ps.Fields) == 0
 }
 
-// PartitionKey computes the partition key for a row.
-// Returns a string key suitable for use as a map key, and the individual partition values.
-func (ps *PartitionSpec) PartitionKey(row map[string]any, ts *schema.TableSchema) (string, map[string]any) {
+// PartitionKey computes the partition key string for a row.
+// Returns only the string key — use PartitionValues separately when the
+// partition value map is needed (e.g. on cache miss).
+func (ps *PartitionSpec) PartitionKey(row map[string]any, ts *schema.TableSchema) string {
 	if ps.IsUnpartitioned() {
-		return "", nil
+		return ""
 	}
 
-	values := make(map[string]any, len(ps.Fields))
-	parts := make([]string, len(ps.Fields))
+	var buf strings.Builder
 
 	for i, field := range ps.Fields {
-		col := findColumnByID(ts, field.SourceID)
+		if i > 0 {
+			buf.WriteByte('/')
+		}
+
+		col := field.sourceCol
 		if col == nil {
-			parts[i] = "__null__"
-			values[field.Name] = nil
+			col = findColumnByID(ts, field.SourceID)
+		}
+		if col == nil {
+			buf.WriteString("__null__")
 			continue
 		}
 
 		raw := row[col.Name]
 		if raw == nil {
-			parts[i] = "__null__"
-			values[field.Name] = nil
+			buf.WriteString("__null__")
 			continue
 		}
 
 		val := applyTransform(field.Transform, field.TransformParam, raw, col.PGType)
-		values[field.Name] = val
-		parts[i] = fmt.Sprintf("%v", val)
+		appendPartValue(&buf, val)
 	}
 
-	return strings.Join(parts, "/"), values
+	return buf.String()
+}
+
+// PartitionValues computes the partition value map for a row.
+// Only needed when persisting partition metadata (e.g. new partition creation).
+func (ps *PartitionSpec) PartitionValues(row map[string]any, ts *schema.TableSchema) map[string]any {
+	values := make(map[string]any, len(ps.Fields))
+	for _, field := range ps.Fields {
+		col := field.sourceCol
+		if col == nil {
+			col = findColumnByID(ts, field.SourceID)
+		}
+		if col == nil {
+			values[field.Name] = nil
+			continue
+		}
+		raw := row[col.Name]
+		if raw == nil {
+			values[field.Name] = nil
+			continue
+		}
+		values[field.Name] = applyTransform(field.Transform, field.TransformParam, raw, col.PGType)
+	}
+	return values
+}
+
+// appendPartValue appends a partition value to the builder without fmt.Sprintf.
+func appendPartValue(buf *strings.Builder, val any) {
+	switch v := val.(type) {
+	case int32:
+		buf.WriteString(strconv.FormatInt(int64(v), 10))
+	case int64:
+		buf.WriteString(strconv.FormatInt(v, 10))
+	case int:
+		buf.WriteString(strconv.Itoa(v))
+	case string:
+		buf.WriteString(v)
+	default:
+		fmt.Fprintf(buf, "%v", val)
+	}
 }
 
 // PartitionPath returns the S3 directory path component for a partition.
@@ -620,33 +668,26 @@ func formatUnscaled(unscaled *big.Int, scale int) string {
 }
 
 // toTime converts a value to time.Time for partition transforms.
+// Uses fastParseTimestamp (microseconds) to avoid time.Parse overhead.
 func toTime(v any, pgType string) time.Time {
 	switch x := v.(type) {
 	case time.Time:
 		return x
 	case string:
-		// Try date first.
 		if strings.ToLower(pgType) == "date" {
-			if t, err := time.Parse("2006-01-02", x); err == nil {
-				return t
+			if len(x) >= 10 && x[4] == '-' && x[7] == '-' {
+				year := atoi4(x[0:4])
+				month := atoi2(x[5:7])
+				day := atoi2(x[8:10])
+				if year >= 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+					return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+				}
 			}
+			return time.Time{}
 		}
-		// Try timestamp formats.
-		for _, layout := range []string{
-			time.RFC3339Nano,
-			time.RFC3339,
-			"2006-01-02 15:04:05.999999-07:00",
-			"2006-01-02 15:04:05.999999-07",
-			"2006-01-02 15:04:05.999999+00",
-			"2006-01-02 15:04:05-07:00",
-			"2006-01-02 15:04:05-07",
-			"2006-01-02 15:04:05+00",
-			"2006-01-02 15:04:05",
-			"2006-01-02",
-		} {
-			if t, err := time.Parse(layout, x); err == nil {
-				return t
-			}
+		us, ok := fastParseTimestamp(x)
+		if ok {
+			return time.Unix(us/1_000_000, (us%1_000_000)*1000)
 		}
 	}
 	return time.Time{}

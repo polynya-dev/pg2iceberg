@@ -81,7 +81,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	mem := newMemStorage()
 	cat := newMemCatalog()
 
-	snk := sink.NewSink(sinkCfg, pgCfg, cfg.Tables, "test", mem, cat)
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
 
 	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
@@ -270,7 +270,7 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 	mem := newGatedStorage()
 	cat := newMemCatalog()
 
-	snk := sink.NewSink(sinkCfg, pgCfg, cfg.Tables, "test", mem, cat)
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
 	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
@@ -419,7 +419,7 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 	mem := newMemStorage()
 	cat := newFailOnceCatalog()
 
-	snk := sink.NewSink(sinkCfg, pgCfg, cfg.Tables, "test", mem, cat)
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
 	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {

@@ -29,8 +29,11 @@ type LogicalSource struct {
 	replConn  *pgconn.PgConn
 	queryConn *pgx.Conn
 
-	// relations caches RelationMessage by OID for decoding tuples.
+	// relations caches RelationMessage by OID for schema change detection.
 	relations map[uint32]*pglogrepl.RelationMessageV2
+
+	// decoder is the zero-allocation WAL message decoder.
+	decoder *WALDecoder
 
 	// startLSN is the position to start streaming from.
 	startLSN pglogrepl.LSN
@@ -76,6 +79,7 @@ func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConf
 		tableCfgs:       tableCfgs,
 		tables:          make(map[string]*schema.TableSchema),
 		relations:       make(map[uint32]*pglogrepl.RelationMessageV2),
+		decoder:         NewWALDecoder(),
 		pipelineID:      pid,
 		standbyInterval: logicalCfg.StandbyIntervalDuration(),
 	}
@@ -270,19 +274,21 @@ func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyDa
 }
 
 func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, events chan<- ChangeEvent) error {
-	logicalMsg, err := pglogrepl.ParseV2(xld.WALData, false)
+	msg, err := l.decoder.Decode(xld.WALData)
 	if err != nil {
-		return fmt.Errorf("parse logical msg: %w", err)
+		return fmt.Errorf("decode WAL: %w", err)
 	}
 
 	walEnd := uint64(xld.WALStart) + uint64(len(xld.WALData))
 
-	switch m := logicalMsg.(type) {
-	case *pglogrepl.RelationMessageV2:
-		table := fqTable(m.Namespace, m.RelationName)
+	switch msg.Type {
+	case msgRelation:
+		rel := msg.Relation
+		pgRel := rel.ToRelationMessageV2()
+		table := fqTable(rel.Namespace, rel.RelationName)
 		if l.isTracked(table) {
-			if old, exists := l.relations[m.RelationID]; exists {
-				if diff := diffRelation(old, m); diff != nil {
+			if old, exists := l.relations[rel.RelationID]; exists {
+				if diff := diffRelation(old, pgRel); diff != nil {
 					diff.Table = table
 					log.Printf("[logical] schema change detected for %s: +%d columns, -%d columns, %d type changes",
 						table, len(diff.AddedColumns), len(diff.DroppedColumns), len(diff.TypeChanges))
@@ -299,25 +305,24 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 				}
 			}
 		}
-		l.relations[m.RelationID] = m
+		l.relations[rel.RelationID] = pgRel
 
-	case *pglogrepl.InsertMessageV2:
-		rel, ok := l.relations[m.RelationID]
+	case msgInsert:
+		rel, ok := l.relations[msg.RelationID]
 		if !ok {
-			return nil // skip unknown relation
+			return nil
 		}
 		table := fqTable(rel.Namespace, rel.RelationName)
 		if !l.isTracked(table) {
 			return nil
 		}
 		ts := l.schemaForRelation(rel)
-		after, _ := decodeTuple(rel, m.Tuple)
 
 		select {
 		case events <- ChangeEvent{
 			Table:              table,
 			Operation:          OpInsert,
-			After:              after,
+			After:              msg.After,
 			PK:                 ts.PK,
 			LSN:                walEnd,
 			SourceTimestamp:     l.currentTxCommitTime,
@@ -328,8 +333,8 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			return ctx.Err()
 		}
 
-	case *pglogrepl.UpdateMessageV2:
-		rel, ok := l.relations[m.RelationID]
+	case msgUpdate:
+		rel, ok := l.relations[msg.RelationID]
 		if !ok {
 			return nil
 		}
@@ -338,20 +343,15 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			return nil
 		}
 		ts := l.schemaForRelation(rel)
-
-		var before map[string]any
-		if m.OldTuple != nil {
-			before, _ = decodeTuple(rel, m.OldTuple)
-		}
-		after, unchangedCols := decodeTuple(rel, m.NewTuple)
+		unchangedCols := ExtractUnchangedCols(msg.After)
 
 		select {
 		case events <- ChangeEvent{
 			Table:              table,
 			Operation:          OpUpdate,
-			Before:             before,
+			Before:             msg.Before,
 			PK:                 ts.PK,
-			After:              after,
+			After:              msg.After,
 			LSN:                walEnd,
 			SourceTimestamp:     l.currentTxCommitTime,
 			ProcessingTimestamp: time.Now(),
@@ -362,8 +362,8 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			return ctx.Err()
 		}
 
-	case *pglogrepl.DeleteMessageV2:
-		rel, ok := l.relations[m.RelationID]
+	case msgDelete:
+		rel, ok := l.relations[msg.RelationID]
 		if !ok {
 			return nil
 		}
@@ -373,16 +373,11 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 		}
 		ts := l.schemaForRelation(rel)
 
-		var before map[string]any
-		if m.OldTuple != nil {
-			before, _ = decodeTuple(rel, m.OldTuple)
-		}
-
 		select {
 		case events <- ChangeEvent{
 			Table:              table,
 			Operation:          OpDelete,
-			Before:             before,
+			Before:             msg.Before,
 			PK:                 ts.PK,
 			LSN:                walEnd,
 			SourceTimestamp:     l.currentTxCommitTime,
@@ -393,33 +388,35 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			return ctx.Err()
 		}
 
-	case *pglogrepl.BeginMessage:
-		l.currentTxCommitTime = m.CommitTime
-		l.currentTxXID = m.Xid
+	case msgBegin:
+		l.currentTxCommitTime = msg.CommitTime
+		l.currentTxXID = msg.Xid
 		select {
 		case events <- ChangeEvent{
 			Operation:      OpBegin,
 			LSN:            walEnd,
-			TransactionID:  m.Xid,
-			SourceTimestamp: m.CommitTime,
+			TransactionID:  msg.Xid,
+			SourceTimestamp: msg.CommitTime,
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	case *pglogrepl.CommitMessage:
+
+	case msgCommit:
 		select {
 		case events <- ChangeEvent{
 			Operation:      OpCommit,
 			LSN:            walEnd,
 			TransactionID:  l.currentTxXID,
-			SourceTimestamp: m.CommitTime,
+			SourceTimestamp: msg.CommitTime,
 		}:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 		l.currentTxCommitTime = time.Time{}
 		l.currentTxXID = 0
-	case *pglogrepl.TruncateMessageV2:
+
+	case msgTruncate:
 		log.Printf("[logical] TRUNCATE detected (not yet handled)")
 	}
 
@@ -646,29 +643,6 @@ func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *sch
 	return ts
 }
 
-func decodeTuple(rel *pglogrepl.RelationMessageV2, tuple *pglogrepl.TupleData) (map[string]any, []string) {
-	if tuple == nil {
-		return nil, nil
-	}
-	row := make(map[string]any, len(tuple.Columns))
-	var unchangedCols []string
-	for i, col := range tuple.Columns {
-		if i >= len(rel.Columns) {
-			break
-		}
-		colName := rel.Columns[i].Name
-		switch col.DataType {
-		case 'n': // null
-			row[colName] = nil
-		case 'u': // unchanged TOAST column
-			row[colName] = nil
-			unchangedCols = append(unchangedCols, colName)
-		case 't': // text
-			row[colName] = string(col.Data)
-		}
-	}
-	return row, unchangedCols
-}
 
 // pgValueToString converts a pgx native Go value to its text representation,
 // matching the format produced by the WAL decoder (which always returns strings).

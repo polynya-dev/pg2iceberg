@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,6 +27,13 @@ func main() {
 	storeDir := flag.String("store-dir", "./pipelines", "file-based pipeline store directory (server mode, used if -store-dsn is not set)")
 
 	flag.Parse()
+
+	if os.Getenv("PPROF") != "" {
+		go func() {
+			log.Println("pprof listening on :6060")
+			http.ListenAndServe(":6060", nil)
+		}()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

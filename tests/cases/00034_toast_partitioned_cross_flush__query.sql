@@ -1,0 +1,1 @@
+SELECT id, region, label, length(payload) FROM iceberg.`default.e2e_toast_part_xflush` ORDER BY id, label
