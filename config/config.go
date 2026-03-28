@@ -85,6 +85,20 @@ type LogicalConfig struct {
 	PublicationName     string `yaml:"publication_name" json:"publication_name"`
 	SlotName            string `yaml:"slot_name" json:"slot_name"`
 	SnapshotConcurrency int    `yaml:"snapshot_concurrency" json:"snapshot_concurrency,omitempty"`
+	StandbyInterval     string `yaml:"standby_interval" json:"standby_interval,omitempty"`
+}
+
+// StandbyIntervalDuration returns the configured standby interval,
+// defaulting to 10s if not set or invalid.
+func (c LogicalConfig) StandbyIntervalDuration() time.Duration {
+	if c.StandbyInterval == "" {
+		return 10 * time.Second
+	}
+	d, err := time.ParseDuration(c.StandbyInterval)
+	if err != nil {
+		return 10 * time.Second
+	}
+	return d
 }
 
 // SnapshotConcurrencyOrDefault returns the configured snapshot concurrency,

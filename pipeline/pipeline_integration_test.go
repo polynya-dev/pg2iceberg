@@ -5,6 +5,7 @@ package pipeline_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -128,18 +129,22 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 		t.Errorf("flushedLSN should NOT advance on receive: got %d, want %d", ls.FlushedLSN(), flushedAfterSnapshot)
 	}
 
-	// Wait for standby update so PG's confirmed_flush_lsn reflects flushedLSN.
-	time.Sleep(12 * time.Second)
+	// Send standby now so PG's confirmed_flush_lsn reflects flushedLSN.
+	if err := ls.SendStandbyNow(ctx); err != nil {
+		t.Fatalf("send standby: %v", err)
+	}
+
+	// Wait for PG to process the standby update.
+	var confirmedBefore string
+	waitFor(t, 5*time.Second, func() bool {
+		_ = conn.QueryRow(ctx, `
+			SELECT confirmed_flush_lsn::text
+			FROM pg_replication_slots WHERE slot_name = 'test_slot'
+		`).Scan(&confirmedBefore)
+		return confirmedBefore != ""
+	})
 
 	// === Assertion 2: PG confirmed_flush_lsn is behind current WAL ===
-	var confirmedBefore string
-	err = conn.QueryRow(ctx, `
-		SELECT confirmed_flush_lsn::text
-		FROM pg_replication_slots WHERE slot_name = 'test_slot'
-	`).Scan(&confirmedBefore)
-	if err != nil {
-		t.Fatalf("query confirmed_flush_lsn: %v", err)
-	}
 
 	var lagBeforeFlush int64
 	err = conn.QueryRow(ctx, `
@@ -170,18 +175,22 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 		t.Errorf("flushedLSN should have advanced after flush: got %d, initial %d", ls.FlushedLSN(), flushedAfterSnapshot)
 	}
 
-	// Wait for standby update to propagate.
-	time.Sleep(12 * time.Second)
+	// Send standby now so PG's confirmed_flush_lsn reflects flushedLSN.
+	if err := ls.SendStandbyNow(ctx); err != nil {
+		t.Fatalf("send standby: %v", err)
+	}
+
+	// Wait for PG to advance confirmed_flush_lsn past the pre-flush value.
+	var confirmedAfter string
+	waitFor(t, 5*time.Second, func() bool {
+		_ = conn.QueryRow(ctx, `
+			SELECT confirmed_flush_lsn::text
+			FROM pg_replication_slots WHERE slot_name = 'test_slot'
+		`).Scan(&confirmedAfter)
+		return confirmedAfter != confirmedBefore
+	})
 
 	// === Assertion 4: PG confirmed_flush_lsn advanced ===
-	var confirmedAfter string
-	err = conn.QueryRow(ctx, `
-		SELECT confirmed_flush_lsn::text
-		FROM pg_replication_slots WHERE slot_name = 'test_slot'
-	`).Scan(&confirmedAfter)
-	if err != nil {
-		t.Fatalf("query confirmed_flush_lsn after flush: %v", err)
-	}
 	t.Logf("PG confirmed_flush_lsn: before=%s after=%s", confirmedBefore, confirmedAfter)
 
 	if confirmedAfter == confirmedBefore {
@@ -345,6 +354,155 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 		t.Errorf("flushedLSN (%d) should be < receivedLSN (%d): "+
 			"events received during flush should NOT be included in flushedLSN",
 			flushedAfterFirstFlush, receivedAfterFirstFlush)
+	}
+}
+
+// TestPipeline_FlushRetry_NoDuplicateData verifies that when a flush fails at
+// the catalog commit stage and is retried, the retry does not produce duplicate
+// data in Iceberg.
+//
+// The bug: RollingWriter.FlushAll() is non-destructive — serialized chunks stay
+// in the `completed` slice until Commit() is called. If Flush() fails after
+// FlushAll (e.g., catalog error), the next Flush() replays committedTxns into
+// writers AND FlushAll appends new chunks to the stale `completed` list.
+// The retry then uploads both old and new chunks, doubling the data.
+func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE test_events (
+			id SERIAL PRIMARY KEY,
+			value INTEGER NOT NULL
+		);
+		CREATE PUBLICATION test_pub FOR TABLE test_events;
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval: "1h",    // disable time-based flush
+		FlushRows:     15,      // flush after 15 data rows
+		FlushBytes:    1 << 30, // effectively disabled
+		Namespace:     "test_ns",
+		Warehouse:     "s3://test-bucket/",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.test_events"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        "test_slot",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newFailOnceCatalog()
+
+	snk := sink.NewSink(sinkCfg, pgCfg, cfg.Tables, "test", mem, cat)
+	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	ls, ok := p.Source().(*source.LogicalSource)
+	if !ok {
+		t.Fatal("pipeline source is not *LogicalSource")
+	}
+	flushedAfterSnapshot := ls.FlushedLSN()
+
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	// Insert 16 rows to trigger flush. The threshold is 15, checked after DML
+	// events. The 16th Insert sees TotalBuffered() = 15 (from 15 committed
+	// single-row txns) and triggers the flush. The catalog will reject it.
+	for i := 0; i < 16; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO test_events (value) VALUES ($1)", i); err != nil {
+			t.Fatalf("insert batch 1: %v", err)
+		}
+	}
+
+	// Wait for the first catalog commit to fail.
+	t.Log("waiting for first flush attempt (catalog failure)...")
+	select {
+	case <-cat.failedCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for first catalog commit")
+	}
+	t.Log("first flush failed as expected")
+
+	// Insert 1 more row. Its Insert DML event triggers the threshold check
+	// again (TotalBuffered >= 15 because committedTxns wasn't cleared after
+	// the failed flush). This causes a retry flush that should succeed.
+	if _, err := conn.Exec(ctx, "INSERT INTO test_events (value) VALUES ($1)", 100); err != nil {
+		t.Fatalf("insert trigger row: %v", err)
+	}
+
+	// Wait for flushedLSN to advance (second flush succeeds).
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > flushedAfterSnapshot })
+	t.Logf("second flush succeeded: flushedLSN=%d", ls.FlushedLSN())
+
+	// Count data parquet files uploaded to S3.
+	// The first (failed) attempt uploads 1 data file (orphaned in S3).
+	// The second (successful) attempt should upload 1 data file.
+	//
+	// BUG: The second attempt's FlushAll returns stale `completed` chunks from
+	// the first attempt PLUS new chunks from the replay, producing 2 data files
+	// in the retry (3 total). This means the committed Iceberg snapshot
+	// references duplicate data.
+	mem.mu.Lock()
+	var dataFileCount int
+	var dataFileKeys []string
+	for key := range mem.files {
+		if strings.Contains(key, "-data-") && strings.HasSuffix(key, ".parquet") {
+			dataFileCount++
+			dataFileKeys = append(dataFileKeys, key)
+		}
+	}
+	mem.mu.Unlock()
+
+	t.Logf("data parquet files in S3: %d", dataFileCount)
+	for _, k := range dataFileKeys {
+		t.Logf("  %s", k)
+	}
+
+	// Expected: 2 data files (1 orphan from failed attempt + 1 from successful retry).
+	// With the bug: 3 data files (1 orphan + 2 from retry including stale duplicate).
+	if dataFileCount > 2 {
+		t.Errorf("expected at most 2 data parquet files, got %d: "+
+			"flush retry re-uploaded stale completed chunks, producing duplicate data",
+			dataFileCount)
 	}
 }
 
@@ -550,9 +708,27 @@ func (c *memCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSche
 	return currentSchemaID + 1, nil
 }
 
-// flushCounter wraps a *sink.Sink and counts flushes for test assertions.
-type flushCounter struct {
-	count atomic.Int64
+// failOnceCatalog wraps memCatalog and fails the first CommitTransaction call.
+// This simulates a transient catalog failure to test flush retry behavior.
+type failOnceCatalog struct {
+	*memCatalog
+	commitCalls atomic.Int32
+	failedCh    chan struct{} // closed when first commit fails
+	once        sync.Once
 }
 
-func (f *flushCounter) FlushCount() int64 { return f.count.Load() }
+func newFailOnceCatalog() *failOnceCatalog {
+	return &failOnceCatalog{
+		memCatalog: newMemCatalog(),
+		failedCh:   make(chan struct{}),
+	}
+}
+
+func (c *failOnceCatalog) CommitTransaction(ns string, commits []sink.TableCommit) error {
+	n := c.commitCalls.Add(1)
+	if n == 1 {
+		c.once.Do(func() { close(c.failedCh) })
+		return fmt.Errorf("simulated catalog failure")
+	}
+	return c.memCatalog.CommitTransaction(ns, commits)
+}

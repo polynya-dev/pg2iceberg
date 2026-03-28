@@ -212,6 +212,13 @@ func (rw *RollingWriter) Reset() {
 	rw.completed = nil
 }
 
+// DiscardCompleted clears completed chunks without touching active writer rows.
+// Used before flush retries to discard stale chunks from a prior failed flush
+// while preserving data written directly to the writer (e.g. snapshot rows).
+func (rw *RollingWriter) DiscardCompleted() {
+	rw.completed = nil
+}
+
 // Flush writes all buffered rows to a Parquet file and returns the bytes.
 func (w *ParquetWriter) Flush() ([]byte, int64, error) {
 	if len(w.rows) == 0 {

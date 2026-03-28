@@ -34,6 +34,7 @@ source:
   logical:
     publication_name: pg2iceberg_pub
     slot_name: pg2iceberg_slot
+    # standby_interval: 10s  # how often to send standby status to PG (default: 10s)
 
 sink:
   catalog_uri: http://localhost:8181

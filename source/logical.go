@@ -59,6 +59,10 @@ type LogicalSource struct {
 	// currentTxXID is the PostgreSQL transaction ID (XID) of the in-flight
 	// transaction, captured from BeginMessage.
 	currentTxXID uint32
+
+	// standbyInterval controls how often standby status updates are sent to PG.
+	// Defaults to 10s. Shorter values make confirmed_flush_lsn update faster.
+	standbyInterval time.Duration
 }
 
 func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig, tableCfgs []config.TableConfig, pipelineID ...string) *LogicalSource {
@@ -67,13 +71,19 @@ func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConf
 		pid = pipelineID[0]
 	}
 	return &LogicalSource{
-		pgCfg:      pgCfg,
-		cfg:        logicalCfg,
-		tableCfgs:  tableCfgs,
-		tables:     make(map[string]*schema.TableSchema),
-		relations:  make(map[uint32]*pglogrepl.RelationMessageV2),
-		pipelineID: pid,
+		pgCfg:           pgCfg,
+		cfg:             logicalCfg,
+		tableCfgs:       tableCfgs,
+		tables:          make(map[string]*schema.TableSchema),
+		relations:       make(map[uint32]*pglogrepl.RelationMessageV2),
+		pipelineID:      pid,
+		standbyInterval: logicalCfg.StandbyIntervalDuration(),
 	}
+}
+
+// SetStandbyInterval overrides the default 10s standby status interval.
+func (l *LogicalSource) SetStandbyInterval(d time.Duration) {
+	l.standbyInterval = d
 }
 
 // SetStartLSN restores position from a checkpoint.
@@ -188,7 +198,10 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 
 	log.Printf("[logical] streaming from LSN %s", l.startLSN)
 
-	standbyInterval := 10 * time.Second
+	standbyInterval := l.standbyInterval
+	if standbyInterval == 0 {
+		standbyInterval = 10 * time.Second
+	}
 	nextStandby := time.Now().Add(standbyInterval)
 
 	for {
@@ -542,6 +555,13 @@ func (l *LogicalSource) sendStandby(ctx context.Context) {
 	if err != nil {
 		log.Printf("[logical] standby status error: %v", err)
 	}
+}
+
+// SendStandbyNow sends a standby status update to PG immediately.
+// This is useful in tests to force PG to update confirmed_flush_lsn
+// without waiting for the next periodic heartbeat.
+func (l *LogicalSource) SendStandbyNow(ctx context.Context) error {
+	return pglogrepl.SendStandbyStatusUpdate(ctx, l.replConn, l.standbyStatus())
 }
 
 // Close terminates the replication connection and drops the slot if we created it.
