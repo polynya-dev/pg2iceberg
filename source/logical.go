@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/config"
@@ -33,8 +34,14 @@ type LogicalSource struct {
 
 	// startLSN is the position to start streaming from.
 	startLSN pglogrepl.LSN
-	// confirmedLSN is the last position we confirmed to PG.
-	confirmedLSN pglogrepl.LSN
+	// receivedLSN is the latest WAL position received from PG.
+	receivedLSN pglogrepl.LSN
+	// flushedLSN is the latest WAL position that has been durably written
+	// to Iceberg. Only this value is confirmed back to PG via standby
+	// status updates, so PG will not recycle WAL that hasn't been persisted.
+	// Accessed atomically: written by the pipeline goroutine (SetFlushedLSN),
+	// read by the capture goroutine (standbyStatus).
+	flushedLSN atomic.Uint64
 
 	// slotCreated tracks whether we created the slot (for cleanup).
 	slotCreated bool
@@ -72,7 +79,8 @@ func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConf
 // SetStartLSN restores position from a checkpoint.
 func (l *LogicalSource) SetStartLSN(lsn uint64) {
 	l.startLSN = pglogrepl.LSN(lsn)
-	l.confirmedLSN = pglogrepl.LSN(lsn)
+	l.receivedLSN = pglogrepl.LSN(lsn)
+	l.flushedLSN.Store(lsn)
 }
 
 // SetSnapshotComplete marks the initial snapshot as already done (from checkpoint).
@@ -85,9 +93,20 @@ func (l *LogicalSource) SetSnapshotedTables(tables map[string]bool) {
 	l.snapshotedTables = tables
 }
 
-// ConfirmedLSN returns the current confirmed LSN for checkpointing.
-func (l *LogicalSource) ConfirmedLSN() uint64 {
-	return uint64(l.confirmedLSN)
+// ReceivedLSN returns the latest WAL position received from PG.
+func (l *LogicalSource) ReceivedLSN() uint64 {
+	return uint64(l.receivedLSN)
+}
+
+// FlushedLSN returns the latest WAL position durably written to Iceberg.
+func (l *LogicalSource) FlushedLSN() uint64 {
+	return l.flushedLSN.Load()
+}
+
+// SetFlushedLSN advances the flushed position after a successful Iceberg write.
+// This is the position confirmed back to PG, so WAL before it can be recycled.
+func (l *LogicalSource) SetFlushedLSN(lsn uint64) {
+	l.flushedLSN.Store(lsn)
 }
 
 func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) error {
@@ -169,22 +188,32 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 
 	log.Printf("[logical] streaming from LSN %s", l.startLSN)
 
-	standbyTicker := time.NewTicker(10 * time.Second)
-	defer standbyTicker.Stop()
+	standbyInterval := 10 * time.Second
+	nextStandby := time.Now().Add(standbyInterval)
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case <-standbyTicker.C:
-			l.sendStandby(ctx)
-		default:
 		}
 
-		rawMsg, err := l.replConn.ReceiveMessage(ctx)
+		// Send standby status periodically so PG knows we're alive.
+		if time.Now().After(nextStandby) {
+			l.sendStandby(ctx)
+			nextStandby = time.Now().Add(standbyInterval)
+		}
+
+		// Use a short deadline for ReceiveMessage so we can periodically
+		// send standby updates even when no WAL data is arriving.
+		recvCtx, recvCancel := context.WithDeadline(ctx, nextStandby)
+		rawMsg, err := l.replConn.ReceiveMessage(recvCtx)
+		recvCancel()
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			// Timeout is expected — just loop back to send standby.
+			if recvCtx.Err() != nil {
+				continue
 			}
 			return fmt.Errorf("receive message: %w", err)
 		}
@@ -219,9 +248,9 @@ func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyDa
 			return err
 		}
 
-		// Track position for standby updates.
-		if xld.WALStart+pglogrepl.LSN(len(xld.WALData)) > l.confirmedLSN {
-			l.confirmedLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
+		// Track the latest WAL position received.
+		if xld.WALStart+pglogrepl.LSN(len(xld.WALData)) > l.receivedLSN {
+			l.receivedLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
 		}
 	}
 	return nil
@@ -408,7 +437,8 @@ func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 		lsn, err := pglogrepl.ParseLSN(result.ConsistentPoint)
 		if err == nil {
 			l.startLSN = lsn
-			l.confirmedLSN = lsn
+			l.receivedLSN = lsn
+			l.flushedLSN.Store(uint64(lsn))
 		}
 	}
 
@@ -483,14 +513,24 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string,
 	return nil
 }
 
-func (l *LogicalSource) sendStandby(ctx context.Context) {
-	err := pglogrepl.SendStandbyStatusUpdate(ctx, l.replConn, pglogrepl.StandbyStatusUpdate{
-		WALWritePosition: l.confirmedLSN,
-		WALFlushPosition: l.confirmedLSN,
-		WALApplyPosition: l.confirmedLSN,
+// standbyStatus builds the status update that will be sent to PG.
+// WALWritePosition uses receivedLSN so PG knows we're alive and reading,
+// but WALFlushPosition (which controls WAL recycling) uses flushedLSN.
+func (l *LogicalSource) standbyStatus() pglogrepl.StandbyStatusUpdate {
+	flushed := pglogrepl.LSN(l.flushedLSN.Load())
+	return pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: l.receivedLSN,
+		WALFlushPosition: flushed,
+		WALApplyPosition: flushed,
 		ClientTime:       time.Now(),
 		ReplyRequested:   false,
-	})
+	}
+}
+
+func (l *LogicalSource) sendStandby(ctx context.Context) {
+	// Only confirm the flushed LSN back to PG. This ensures PG will not
+	// recycle WAL that hasn't been durably written to Iceberg.
+	err := pglogrepl.SendStandbyStatusUpdate(ctx, l.replConn, l.standbyStatus())
 	if err != nil {
 		log.Printf("[logical] standby status error: %v", err)
 	}

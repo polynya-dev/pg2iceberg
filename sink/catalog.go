@@ -13,6 +13,16 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/schema"
 )
 
+// Catalog abstracts Iceberg catalog operations.
+type Catalog interface {
+	EnsureNamespace(ns string) error
+	LoadTable(ns, table string) (*TableMetadata, error)
+	CreateTable(ns, table string, ts *schema.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error)
+	CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error
+	CommitTransaction(ns string, commits []TableCommit) error
+	EvolveSchema(ns, table string, currentSchemaID int, newSchema *schema.TableSchema) (int, error)
+}
+
 // CatalogClient interacts with the Iceberg REST catalog.
 type CatalogClient struct {
 	baseURL string

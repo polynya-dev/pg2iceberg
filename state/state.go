@@ -107,3 +107,28 @@ func (s *FileStore) Save(pipelineID string, cp *Checkpoint) error {
 
 // Close is a no-op for FileStore.
 func (s *FileStore) Close() {}
+
+// MemStore is an in-memory CheckpointStore for testing.
+type MemStore struct {
+	checkpoints map[string]*Checkpoint
+}
+
+func NewMemStore() *MemStore {
+	return &MemStore{checkpoints: make(map[string]*Checkpoint)}
+}
+
+func (s *MemStore) Load(pipelineID string) (*Checkpoint, error) {
+	cp, ok := s.checkpoints[pipelineID]
+	if !ok {
+		return &Checkpoint{}, nil
+	}
+	return cp, nil
+}
+
+func (s *MemStore) Save(pipelineID string, cp *Checkpoint) error {
+	cp.UpdatedAt = time.Now()
+	s.checkpoints[pipelineID] = cp
+	return nil
+}
+
+func (s *MemStore) Close() {}

@@ -14,6 +14,12 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/metrics"
 )
 
+// ObjectStorage abstracts file upload and download operations.
+type ObjectStorage interface {
+	Upload(ctx context.Context, key string, data []byte) (string, error)
+	Download(ctx context.Context, key string) ([]byte, error)
+}
+
 // S3Client wraps the S3 SDK for uploading and downloading files.
 type S3Client struct {
 	client *s3.Client

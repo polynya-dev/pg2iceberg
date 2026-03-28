@@ -27,6 +27,19 @@ type txBuffer struct {
 	commitTS  time.Time // PG commit timestamp
 }
 
+// Option configures a Sink.
+type Option func(*Sink)
+
+// WithObjectStorage overrides the default S3 storage backend.
+func WithObjectStorage(s ObjectStorage) Option {
+	return func(snk *Sink) { snk.s3 = s }
+}
+
+// WithCatalog overrides the default REST catalog client.
+func WithCatalog(c Catalog) Option {
+	return func(snk *Sink) { snk.catalog = c }
+}
+
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
 type Sink struct {
 	cfg        config.SinkConfig
@@ -34,8 +47,8 @@ type Sink struct {
 	tableCfgs  []config.TableConfig
 	pipelineID string // for metrics labeling
 
-	catalog *CatalogClient
-	s3      *S3Client
+	catalog Catalog
+	s3      ObjectStorage
 
 	// Per-table state
 	tables map[string]*tableSink
@@ -84,37 +97,44 @@ type tableSink struct {
 	toastPending []toastPendingRow
 }
 
-func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig, pipelineID ...string) (*Sink, error) {
-	pid := ""
-	if len(pipelineID) > 0 {
-		pid = pipelineID[0]
-	}
-	var httpClient *http.Client
-	if cfg.CatalogAuth == "sigv4" {
-		transport, err := NewSigV4Transport(cfg.S3Region)
-		if err != nil {
-			return nil, fmt.Errorf("create sigv4 transport: %w", err)
-		}
-		httpClient = &http.Client{Transport: transport}
-	}
-	catalog := NewCatalogClient(cfg.CatalogURI, httpClient)
-
-	s3Client, err := NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
-	if err != nil {
-		return nil, fmt.Errorf("create s3 client: %w", err)
-	}
-
-	return &Sink{
+func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig, pipelineID string, opts ...Option) (*Sink, error) {
+	s := &Sink{
 		cfg:            cfg,
 		pgCfg:          pgCfg,
 		tableCfgs:      tableCfgs,
-		pipelineID:     pid,
-		catalog:        catalog,
-		s3:             s3Client,
+		pipelineID:     pipelineID,
 		tables:         make(map[string]*tableSink),
 		openTxns:       make(map[uint32]*txBuffer),
 		compactionDone: make(chan struct{}, 1),
-	}, nil
+	}
+
+	for _, o := range opts {
+		o(s)
+	}
+
+	// Create default catalog client if not injected.
+	if s.catalog == nil {
+		var httpClient *http.Client
+		if cfg.CatalogAuth == "sigv4" {
+			transport, err := NewSigV4Transport(cfg.S3Region)
+			if err != nil {
+				return nil, fmt.Errorf("create sigv4 transport: %w", err)
+			}
+			httpClient = &http.Client{Transport: transport}
+		}
+		s.catalog = NewCatalogClient(cfg.CatalogURI, httpClient)
+	}
+
+	// Create default S3 client if not injected.
+	if s.s3 == nil {
+		s3Client, err := NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
+		if err != nil {
+			return nil, fmt.Errorf("create s3 client: %w", err)
+		}
+		s.s3 = s3Client
+	}
+
+	return s, nil
 }
 
 // pgConnPool returns the shared connection pool for source PG lookups (TOAST resolution).
@@ -147,10 +167,10 @@ func (s *Sink) Close() {
 }
 
 // Catalog returns the catalog client (for use by compactor).
-func (s *Sink) Catalog() *CatalogClient { return s.catalog }
+func (s *Sink) Catalog() Catalog { return s.catalog }
 
 // S3 returns the S3 client (for use by compactor).
-func (s *Sink) S3() *S3Client { return s.s3 }
+func (s *Sink) S3() ObjectStorage { return s.s3 }
 
 // RegisterTable sets up writers for a table and ensures it exists in the catalog.
 func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error {

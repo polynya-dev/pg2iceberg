@@ -73,11 +73,24 @@ func NewPipeline(id string, cfg *config.Config) *Pipeline {
 	}
 }
 
+// WithSink overrides the sink for testing. Must be called before Start.
+func (p *Pipeline) WithSink(snk *sink.Sink) {
+	p.snk = snk
+}
+
+// WithCheckpointStore overrides the checkpoint store for testing. Must be called before Start.
+func (p *Pipeline) WithCheckpointStore(store state.CheckpointStore) {
+	p.store = store
+}
+
 // ID returns the pipeline identifier.
 func (p *Pipeline) ID() string { return p.id }
 
 // Config returns the pipeline configuration.
 func (p *Pipeline) Config() *config.Config { return p.cfg }
+
+// Source returns the pipeline's source (for testing/inspection).
+func (p *Pipeline) Source() source.Source { return p.src }
 
 // Status returns the current status and last error (if any).
 func (p *Pipeline) Status() (Status, error) {
@@ -106,7 +119,7 @@ func (p *Pipeline) Metrics() Metrics {
 	}
 
 	if ls, ok := p.src.(*source.LogicalSource); ok {
-		m.LSN = ls.ConfirmedLSN()
+		m.LSN = ls.FlushedLSN()
 	}
 
 	if !p.lastFlushAt.IsZero() {
@@ -193,12 +206,14 @@ func (p *Pipeline) setStatus(s Status, err error) {
 // setup performs all synchronous initialization: checkpoint, schema discovery,
 // sink registration, compactor start, and source creation.
 func (p *Pipeline) setup(ctx context.Context) error {
-	// Load checkpoint.
-	store, err := newCheckpointStore(ctx, p.cfg)
-	if err != nil {
-		return fmt.Errorf("create checkpoint store: %w", err)
+	// Load checkpoint (skip creation if already set via WithCheckpointStore).
+	if p.store == nil {
+		store, err := newCheckpointStore(ctx, p.cfg)
+		if err != nil {
+			return fmt.Errorf("create checkpoint store: %w", err)
+		}
+		p.store = store
 	}
-	p.store = store
 	cp, err := p.store.Load(p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
@@ -225,10 +240,12 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	}
 	pgConn.Close(ctx)
 
-	// Initialize sink.
-	p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres, p.cfg.Tables, p.id)
-	if err != nil {
-		return fmt.Errorf("create sink: %w", err)
+	// Initialize sink (skip if already set via WithSink).
+	if p.snk == nil {
+		p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres, p.cfg.Tables, p.id)
+		if err != nil {
+			return fmt.Errorf("create sink: %w", err)
+		}
 	}
 
 	for _, ts := range p.schemas {
@@ -320,7 +337,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				metrics.EventsBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBuffered()))
 				metrics.BytesBuffered.WithLabelValues(p.id).Set(float64(p.snk.TotalBufferedBytes()))
 				if ls, ok := p.src.(*source.LogicalSource); ok {
-					metrics.ConfirmedLSN.WithLabelValues(p.id).Set(float64(ls.ConfirmedLSN()))
+					metrics.ConfirmedLSN.WithLabelValues(p.id).Set(float64(ls.FlushedLSN()))
 				}
 			}
 		}
@@ -483,7 +500,8 @@ func (p *Pipeline) flushSnapshotTable(ctx context.Context, table string) error {
 	}
 	cp.SnapshotedTables[table] = true
 	if ls, ok := p.src.(*source.LogicalSource); ok {
-		cp.LSN = ls.ConfirmedLSN()
+		cp.LSN = ls.ReceivedLSN()
+		ls.SetFlushedLSN(cp.LSN)
 	}
 
 	if err := p.store.Save(p.id, cp); err != nil {
@@ -513,7 +531,8 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	cp.SnapshotComplete = true
 	cp.SnapshotedTables = nil // no longer needed once fully complete
 	if ls, ok := p.src.(*source.LogicalSource); ok {
-		cp.LSN = ls.ConfirmedLSN()
+		cp.LSN = ls.ReceivedLSN()
+		ls.SetFlushedLSN(cp.LSN)
 	}
 
 	if err := p.store.Save(p.id, cp); err != nil {
@@ -572,7 +591,8 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	switch p.cfg.Source.Mode {
 	case "logical":
 		if ls, ok := p.src.(*source.LogicalSource); ok {
-			cp.LSN = ls.ConfirmedLSN()
+			cp.LSN = ls.ReceivedLSN()
+			ls.SetFlushedLSN(cp.LSN)
 		}
 	}
 
