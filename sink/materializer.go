@@ -25,7 +25,7 @@ import (
 // the Sink (producer) and the Materializer (consumer). Created before both and
 // injected into each, avoiding a circular dependency.
 type ChangeEventBuffer struct {
-	events     map[string][]changeEvent
+	events     map[string][]ChangeEvent
 	snapshotID map[string]int64 // latest events table snapshot ID per table
 	mu         sync.Mutex
 }
@@ -33,14 +33,14 @@ type ChangeEventBuffer struct {
 // NewChangeEventBuffer creates a new empty event buffer.
 func NewChangeEventBuffer() *ChangeEventBuffer {
 	return &ChangeEventBuffer{
-		events:     make(map[string][]changeEvent),
+		events:     make(map[string][]ChangeEvent),
 		snapshotID: make(map[string]int64),
 	}
 }
 
 // PushEvents adds change events for a table. Called by the Sink after flush.
 // snapshotID is the events table snapshot that produced these events.
-func (b *ChangeEventBuffer) PushEvents(pgTable string, events []changeEvent, snapshotID int64) {
+func (b *ChangeEventBuffer) PushEvents(pgTable string, events []ChangeEvent, snapshotID int64) {
 	if b == nil {
 		return
 	}
@@ -53,7 +53,7 @@ func (b *ChangeEventBuffer) PushEvents(pgTable string, events []changeEvent, sna
 
 // Drain removes and returns all buffered events for a table,
 // along with the latest events snapshot ID.
-func (b *ChangeEventBuffer) Drain(pgTable string) ([]changeEvent, int64) {
+func (b *ChangeEventBuffer) Drain(pgTable string) ([]ChangeEvent, int64) {
 	if b == nil {
 		return nil, 0
 	}
@@ -70,7 +70,7 @@ func (b *ChangeEventBuffer) Drain(pgTable string) ([]changeEvent, int64) {
 // DrainAll removes and returns all buffered events for all tables at once,
 // along with the latest events snapshot ID per table. This ensures events
 // from the same Sink flush are consumed atomically across tables.
-func (b *ChangeEventBuffer) DrainAll() (map[string][]changeEvent, map[string]int64) {
+func (b *ChangeEventBuffer) DrainAll() (map[string][]ChangeEvent, map[string]int64) {
 	if b == nil {
 		return nil, nil
 	}
@@ -78,7 +78,7 @@ func (b *ChangeEventBuffer) DrainAll() (map[string][]changeEvent, map[string]int
 	defer b.mu.Unlock()
 	events := b.events
 	snapIDs := b.snapshotID
-	b.events = make(map[string][]changeEvent)
+	b.events = make(map[string][]ChangeEvent)
 	b.snapshotID = make(map[string]int64)
 	for pgTable := range events {
 		metrics.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
@@ -284,8 +284,8 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 	return nil
 }
 
-// changeEvent represents a parsed change event from the events table.
-type changeEvent struct {
+// ChangeEvent represents a parsed change event from the events table.
+type ChangeEvent struct {
 	op            string // "I", "U", "D"
 	lsn           int64
 	seq           int64
@@ -307,7 +307,7 @@ type preparedMaterialization struct {
 	fromBuffer     bool
 	bufSnapID      int64         // for checkpoint update (buffer path)
 	s3SnapID       int64         // for checkpoint update (S3 path)
-	events         []changeEvent // retained for metrics (event count, max LSN)
+	events         []ChangeEvent // retained for metrics (event count, max LSN)
 	dataCount      int
 	deleteCount    int
 	deleteRowCount int64
@@ -356,7 +356,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 // The caller is responsible for committing via CommitTransaction and then
 // calling applyPostCommit to finalize side effects.
 func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tableSink,
-	bufEvents []changeEvent, bufSnapID int64) (*preparedMaterialization, error) {
+	bufEvents []ChangeEvent, bufSnapID int64) (*preparedMaterialization, error) {
 
 	start := time.Now()
 	catalog := m.catalog
@@ -441,7 +441,7 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 	// Each bucket is independent so fold + serialize can run in parallel.
 	type eventBucket struct {
 		key        string
-		events     []changeEvent
+		events     []ChangeEvent
 		partValues map[string]any
 		partPath   string
 	}
@@ -1189,9 +1189,9 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 ObjectStorage, 
 	return dataFiles, nil
 }
 
-// readEvents reads event parquet files and parses them into changeEvent structs.
-func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files []DataFileInfo, srcSchema *schema.TableSchema) ([]changeEvent, error) {
-	var events []changeEvent
+// readEvents reads event parquet files and parses them into ChangeEvent structs.
+func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files []DataFileInfo, srcSchema *schema.TableSchema) ([]ChangeEvent, error) {
+	var events []ChangeEvent
 
 	// Build the events schema to read the parquet files.
 	eventsSchema := EventsTableSchema(srcSchema)
@@ -1220,7 +1220,7 @@ func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files [
 			if err != nil {
 				return nil, fmt.Errorf("parse _seq in %s: %w", df.Path, err)
 			}
-			ev := changeEvent{
+			ev := ChangeEvent{
 				op:  fmt.Sprintf("%v", row["_op"]),
 				lsn: lsn,
 				seq: seq,
