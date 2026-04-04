@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	toxiclient "github.com/Shopify/toxiproxy/v2/client"
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
@@ -19,6 +20,8 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/source"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/network"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush runs a real pipeline with
@@ -755,4 +758,369 @@ func (c *failOnceCatalog) CommitTransaction(ns string, commits []sink.TableCommi
 		return fmt.Errorf("simulated catalog failure")
 	}
 	return c.memCatalog.CommitTransaction(ns, commits)
+}
+
+// --- Retry test doubles and helpers ---
+
+// failNTimesStorage wraps memStorage and fails the first N Upload calls.
+type failNTimesStorage struct {
+	*memStorage
+	failCount   int
+	uploadCalls atomic.Int32
+	failedCh    chan struct{}
+	once        sync.Once
+}
+
+func newFailNTimesStorage(n int) *failNTimesStorage {
+	return &failNTimesStorage{
+		memStorage: newMemStorage(),
+		failCount:  n,
+		failedCh:   make(chan struct{}),
+	}
+}
+
+func (s *failNTimesStorage) Upload(ctx context.Context, key string, data []byte) (string, error) {
+	call := int(s.uploadCalls.Add(1))
+	if call <= s.failCount {
+		if call == s.failCount {
+			s.once.Do(func() { close(s.failedCh) })
+		}
+		return "", fmt.Errorf("simulated S3 upload failure (attempt %d)", call)
+	}
+	return s.memStorage.Upload(ctx, key, data)
+}
+
+// failNTimesCatalog wraps memCatalog and fails the first N CommitTransaction calls.
+type failNTimesCatalog struct {
+	*memCatalog
+	failCount   int
+	commitCalls atomic.Int32
+	failedCh    chan struct{}
+	once        sync.Once
+}
+
+func newFailNTimesCatalog(n int) *failNTimesCatalog {
+	return &failNTimesCatalog{
+		memCatalog: newMemCatalog(),
+		failCount:  n,
+		failedCh:   make(chan struct{}),
+	}
+}
+
+func (c *failNTimesCatalog) CommitTransaction(ns string, commits []sink.TableCommit) error {
+	call := int(c.commitCalls.Add(1))
+	if call <= c.failCount {
+		if call == c.failCount {
+			c.once.Do(func() { close(c.failedCh) })
+		}
+		return fmt.Errorf("simulated catalog failure (attempt %d)", call)
+	}
+	return c.memCatalog.CommitTransaction(ns, commits)
+}
+
+func newTestPipelineCfg(pgCfg config.PostgresConfig, slotName string) (*config.Config, config.SinkConfig) {
+	sinkCfg := config.SinkConfig{
+		FlushInterval: "1h",
+		FlushRows:     15,
+		FlushBytes:    1 << 30,
+		Namespace:     "test_ns",
+		Warehouse:     "s3://test-bucket/",
+	}
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.test_events"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        slotName,
+			},
+		},
+		Sink: sinkCfg,
+	}
+	return cfg, sinkCfg
+}
+
+func setupTestTable(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE test_events (
+			id SERIAL PRIMARY KEY,
+			value INTEGER NOT NULL
+		);
+		CREATE PUBLICATION test_pub FOR TABLE test_events;
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+}
+
+func insertRows(t *testing.T, ctx context.Context, dsn string, start, count int) {
+	t.Helper()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect for insert: %v", err)
+	}
+	defer conn.Close(ctx)
+	for i := start; i < start+count; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO test_events (value) VALUES ($1)", i); err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+	}
+}
+
+// --- Retry tests ---
+
+// TestRetry_S3UploadFailure verifies that when S3 uploads fail transiently
+// during flush, the retry logic in doFlush recovers and the pipeline continues.
+func TestRetry_S3UploadFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+	setupTestTable(t, ctx, pgCfg.DSN())
+
+	cfg, sinkCfg := newTestPipelineCfg(pgCfg, "test_slot_s3")
+
+	mem := newFailNTimesStorage(2)
+	cat := newMemCatalog()
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() { cancel(); <-p.Done() }()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+	ls := p.Source().(*source.LogicalSource)
+	lsnAfterSnapshot := ls.FlushedLSN()
+
+	insertRows(t, ctx, pgCfg.DSN(), 0, 16)
+
+	select {
+	case <-mem.failedCh:
+		t.Log("S3 upload failures occurred as expected")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for S3 upload failures")
+	}
+
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > lsnAfterSnapshot })
+	t.Logf("flushedLSN advanced: %d -> %d", lsnAfterSnapshot, ls.FlushedLSN())
+
+	status, pErr := p.Status()
+	if status != pipeline.StatusRunning {
+		t.Errorf("expected StatusRunning, got %s (err=%v)", status, pErr)
+	}
+}
+
+// TestRetry_CatalogCommitFailure verifies that when the catalog rejects
+// commit requests transiently, the retry logic recovers.
+func TestRetry_CatalogCommitFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+	setupTestTable(t, ctx, pgCfg.DSN())
+
+	cfg, sinkCfg := newTestPipelineCfg(pgCfg, "test_slot_cat")
+
+	mem := newMemStorage()
+	cat := newFailNTimesCatalog(3)
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() { cancel(); <-p.Done() }()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+	ls := p.Source().(*source.LogicalSource)
+	lsnAfterSnapshot := ls.FlushedLSN()
+
+	insertRows(t, ctx, pgCfg.DSN(), 0, 16)
+
+	select {
+	case <-cat.failedCh:
+		t.Log("catalog commit failures occurred as expected")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout waiting for catalog failures")
+	}
+
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > lsnAfterSnapshot })
+	t.Logf("flushedLSN advanced: %d -> %d", lsnAfterSnapshot, ls.FlushedLSN())
+
+	status, pErr := p.Status()
+	if status != pipeline.StatusRunning {
+		t.Errorf("expected StatusRunning, got %s (err=%v)", status, pErr)
+	}
+
+	totalCalls := int(cat.commitCalls.Load())
+	t.Logf("total CommitTransaction calls: %d (expected >= 4)", totalCalls)
+	if totalCalls < 4 {
+		t.Errorf("expected at least 4 commit calls (3 failed + 1 success), got %d", totalCalls)
+	}
+}
+
+// TestRetry_Toxiproxy_NetworkBlip verifies that the pipeline survives
+// network degradation between itself and Postgres.
+//
+// Setup: Postgres <-> Toxiproxy <-> Pipeline
+//
+// A latency toxic is injected on the proxy, adding 2s of delay to all packets.
+// Despite the degradation, the pipeline continues streaming and successfully
+// flushes data. After the toxic is removed, normal operation resumes.
+func TestRetry_Toxiproxy_NetworkBlip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	net, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("create network: %v", err)
+	}
+	defer net.Remove(ctx)
+
+	pgCtr, err := tcpostgres.Run(ctx,
+		"postgres:16-alpine",
+		tcpostgres.WithDatabase("testdb"),
+		tcpostgres.WithUsername("postgres"),
+		tcpostgres.WithPassword("postgres"),
+		tcpostgres.BasicWaitStrategies(),
+		testcontainers.WithCmd("postgres",
+			"-c", "wal_level=logical",
+			"-c", "max_replication_slots=4",
+			"-c", "max_wal_senders=4",
+		),
+		network.WithNetwork([]string{"postgres"}, net),
+	)
+	if err != nil {
+		t.Fatalf("start postgres: %v", err)
+	}
+	defer pgCtr.Terminate(ctx)
+
+	toxiCtr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "ghcr.io/shopify/toxiproxy:2.12.0",
+			ExposedPorts: []string{"8474/tcp", "15432/tcp"},
+			Networks:     []string{net.Name},
+			WaitingFor:   wait.ForHTTP("/version").WithPort("8474"),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start toxiproxy: %v", err)
+	}
+	defer toxiCtr.Terminate(ctx)
+
+	toxiHost, _ := toxiCtr.Host(ctx)
+	toxiAPIPort, _ := toxiCtr.MappedPort(ctx, "8474")
+	toxiClient := toxiclient.NewClient(fmt.Sprintf("%s:%s", toxiHost, toxiAPIPort.Port()))
+
+	proxy, err := toxiClient.CreateProxy("pg", "0.0.0.0:15432", "postgres:5432")
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+
+	toxiPGPort, _ := toxiCtr.MappedPort(ctx, "15432")
+	pgCfg := config.PostgresConfig{
+		Host:     toxiHost,
+		Port:     toxiPGPort.Int(),
+		Database: "testdb",
+		User:     "postgres",
+		Password: "postgres",
+	}
+
+	setupTestTable(t, ctx, pgCfg.DSN())
+
+	cfg, sinkCfg := newTestPipelineCfg(pgCfg, "test_slot_toxi")
+	sinkCfg.FlushRows = 20
+	cfg.Sink = sinkCfg
+
+	mem := newMemStorage()
+	cat := newMemCatalog()
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
+	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() { cancel(); <-p.Done() }()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+	ls := p.Source().(*source.LogicalSource)
+
+	// Phase 1: Confirm streaming works.
+	pgDirectHost, _ := pgCtr.Host(ctx)
+	pgDirectPort, _ := pgCtr.MappedPort(ctx, "5432")
+	directDSN := fmt.Sprintf("postgres://postgres:postgres@%s:%s/testdb", pgDirectHost, pgDirectPort.Port())
+	insertRows(t, ctx, directDSN, 0, 5)
+	waitFor(t, 10*time.Second, func() bool { return ls.ReceivedLSN() > 0 })
+	t.Logf("phase 1: streaming works, receivedLSN=%d", ls.ReceivedLSN())
+
+	// Phase 2: Inject 2s latency on downstream (PG -> pipeline).
+	t.Log("injecting latency toxic (2s)...")
+	_, err = proxy.AddToxic("lag", "latency", "downstream", 1, toxiclient.Attributes{
+		"latency": 2000,
+	})
+	if err != nil {
+		t.Fatalf("add toxic: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	// Phase 3: Insert rows under latency to trigger flush.
+	lsnBefore := ls.FlushedLSN()
+	t.Log("inserting rows under latency...")
+	insertRows(t, ctx, directDSN, 5, 16)
+
+	// Phase 4: Verify flush succeeds despite latency.
+	flushStart := time.Now()
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > lsnBefore })
+	flushDuration := time.Since(flushStart)
+	t.Logf("phase 4: flushed under latency in %s, flushedLSN=%d (was %d)",
+		flushDuration.Truncate(time.Millisecond), ls.FlushedLSN(), lsnBefore)
+
+	if flushDuration < 1*time.Second {
+		t.Errorf("flush completed too fast (%s) — toxic may not have been active", flushDuration)
+	}
+
+	// Phase 5: Remove toxic, verify pipeline is healthy.
+	t.Log("removing toxic...")
+	if err := proxy.RemoveToxic("lag"); err != nil {
+		t.Fatalf("remove toxic: %v", err)
+	}
+
+	status, pErr := p.Status()
+	if status != pipeline.StatusRunning {
+		t.Errorf("expected StatusRunning, got %s (err=%v)", status, pErr)
+	}
+
+	mem.mu.Lock()
+	fileCount := len(mem.files)
+	mem.mu.Unlock()
+	if fileCount == 0 {
+		t.Error("expected files in storage after flush, got 0")
+	}
+	t.Logf("storage has %d files after recovery", fileCount)
 }
