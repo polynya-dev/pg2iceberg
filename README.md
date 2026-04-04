@@ -15,6 +15,32 @@ graph LR
   OLAP[Snowflake<br />ClickHouse<br />etc.] -- Query --> ICE
 ```
 
+## How it works
+
+pg2iceberg can operate on query mode or logical replication mode.
+
+### Logical replication mode
+
+```mermaid
+graph LR
+  subgraph Postgres
+      TableA["Table A"]
+      TableB["Table B"]
+  end
+
+  subgraph Iceberg
+      WAL["Change Events (WAL)"] -->|Materializer| TargetA[Table A]
+      WAL["Change Events (WAL)"] -->|Materializer| TargetB[Table B]
+  end
+
+  TableA -->|Logical Replication| WAL
+  TableB -->|Logical Replication| WAL
+```
+
+On logical replication mode (the recommended mode), it replicates change events to an append-only Iceberg table, which acts as a WAL. Once change events are written to this table, the replication slot LSN can be safely advanced. Since append-only write to Iceberg is fast, this minimizes the likelihood of the source database retaining too much WAL.
+
+A materializer, which runs at a separate interval, will then take these change events and merge them into the target tables, which will have the same schema as the source tables. If you don't need near real-time replication, just set the materializer interval to something high (e.g. 1 hour), which will essentially make pg2iceberg behave like a batch replication tool.
+
 ## Quickstart
 
 ```sh
