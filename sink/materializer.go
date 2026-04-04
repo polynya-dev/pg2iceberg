@@ -154,7 +154,18 @@ func (m *Materializer) LastEventsSnapshots() map[string]int64 {
 
 // MaterializeAll runs a single materialization pass for all tables.
 // Called during graceful shutdown to ensure all flushed events are materialized.
+//
+// The in-memory ChangeEventBuffer is drained and discarded so that
+// MaterializeTable falls through to the S3 path, which reads event files
+// directly from the Iceberg events table. This is necessary because the
+// Run() goroutine may have drained the buffer but failed to materialize
+// (e.g. context cancelled), leaving a gap. The events table on S3 is the
+// authoritative record of all flushed events, so reading from it guarantees
+// nothing is skipped.
 func (m *Materializer) MaterializeAll(ctx context.Context) {
+	for pgTable := range m.tables {
+		m.buf.Drain(pgTable)
+	}
 	for pgTable, ts := range m.tables {
 		if err := m.MaterializeTable(ctx, pgTable, ts); err != nil {
 			metrics.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
@@ -293,16 +304,56 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		partPath   string
 	}
 
+	// File index for TOAST resolution and DELETE partition routing.
+	// Built once per cycle, shared read-only across buckets.
+	var fi *fileIndex
+	if matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
+		fi = m.fileIndexes[pgTable]
+		if fi == nil || fi.snapshotID != matTm.Metadata.CurrentSnapshotID {
+			fi, err = m.buildFileIndex(ctx, pgTable, ts, matTm)
+			if err != nil {
+				return fmt.Errorf("build file index: %w", err)
+			}
+			m.fileIndexes[pgTable] = fi
+		}
+	}
+
 	bucketMap := make(map[string]*eventBucket)
 	numShards := runtime.NumCPU()
 	if numShards < 2 {
 		numShards = 2
 	}
+
+	// For partitioned tables, DELETE events may lack partition columns (PG only
+	// sends PK in the Before tuple). Track PK→partition key so DELETEs can be
+	// routed to the correct bucket.
+	pkPartKey := make(map[string]string) // PK key → partition bucket key
+
 	for i := range events {
 		ev := &events[i]
 		var bKey string
 		if partitioned {
-			bKey = ts.partSpec.PartitionKey(ev.row, ts.srcSchema)
+			pkKey := buildPKKey(ev.row, pk)
+			if ev.op == "D" {
+				// DELETE events lack non-PK columns; use the partition
+				// recorded from the preceding INSERT/UPDATE.
+				if cached, ok := pkPartKey[pkKey]; ok {
+					bKey = cached
+				} else if fi != nil {
+					// Row was inserted in a previous cycle — look up its
+					// partition from the file index.
+					if filePath, ok := fi.pkToFile[pkKey]; ok {
+						bKey = extractPartBucketKey(filePath)
+					} else {
+						continue
+					}
+				} else {
+					continue
+				}
+			} else {
+				bKey = ts.partSpec.PartitionKey(ev.row, ts.srcSchema)
+				pkPartKey[pkKey] = bKey
+			}
 		} else {
 			pkKey := buildPKKey(ev.row, pk)
 			var h uint32
@@ -314,13 +365,31 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		b, ok := bucketMap[bKey]
 		if !ok {
 			b = &eventBucket{key: bKey}
-			if partitioned {
+			if partitioned && ev.op != "D" {
 				b.partValues = ts.partSpec.PartitionValues(ev.row, ts.srcSchema)
 				b.partPath = ts.partSpec.PartitionPath(b.partValues)
 			}
 			bucketMap[bKey] = b
 		}
+		// If a non-DELETE event arrives for a bucket that was created by a
+		// DELETE (no partValues yet), fill in the partition values now.
+		if partitioned && b.partValues == nil && ev.op != "D" {
+			b.partValues = ts.partSpec.PartitionValues(ev.row, ts.srcSchema)
+			b.partPath = ts.partSpec.PartitionPath(b.partValues)
+		}
 		b.events = append(b.events, *ev)
+	}
+
+	// Resolve partition values for DELETE-only buckets using the file index path.
+	if partitioned && fi != nil {
+		for bKey, b := range bucketMap {
+			if b.partValues != nil {
+				continue
+			}
+			// bKey is the partition key (e.g. "seq_truncate=0") extracted from file path.
+			b.partPath = bKey
+			b.partValues = ts.partSpec.ParsePartitionPath(bKey, ts.srcSchema)
+		}
 	}
 
 	buckets := make([]*eventBucket, 0, len(bucketMap))
@@ -345,19 +414,6 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		pending        []pendingFile
 		deleteRowCount int64
 		finalState     map[string]*pkState // needed for TOAST resolution
-	}
-
-	// File index for TOAST resolution (built once, shared read-only across buckets).
-	var fi *fileIndex
-	if matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
-		fi = m.fileIndexes[pgTable]
-		if fi == nil || fi.snapshotID != matTm.Metadata.CurrentSnapshotID {
-			fi, err = m.buildFileIndex(ctx, pgTable, ts, matTm)
-			if err != nil {
-				return fmt.Errorf("build file index: %w", err)
-			}
-			m.fileIndexes[pgTable] = fi
-		}
 	}
 
 	bucketResults := make([]bucketResult, len(buckets))
@@ -420,13 +476,20 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 						return fmt.Errorf("flush deletes: %w", err)
 					}
 					for j, chunk := range chunks {
-						key := fmt.Sprintf("%s/data/%s-eq-delete-%d.parquet", basePath, uuid.New().String(), j)
-						pf = append(pf, pendingFile{
-							key:              key,
+						var delKey string
+						dpf := pendingFile{
 							chunk:            chunk,
 							content:          2,
 							equalityFieldIDs: pkFieldIDs,
-						})
+						}
+						if partitioned {
+							delKey = fmt.Sprintf("%s/data/%s/%s-eq-delete-%d.parquet", basePath, b.partPath, uuid.New().String(), j)
+							dpf.partitionValues = ts.partSpec.PartitionAvroValue(b.partValues, ts.srcSchema)
+						} else {
+							delKey = fmt.Sprintf("%s/data/%s-eq-delete-%d.parquet", basePath, uuid.New().String(), j)
+						}
+						dpf.key = delKey
+						pf = append(pf, dpf)
 					}
 				}
 
@@ -1130,6 +1193,21 @@ func readParquetPKKeysFromReaderAt(r io.ReaderAt, size int64, pk []string) ([]st
 
 // buildPKKey creates a unique key for a row based on its PK columns.
 // Uses null byte as separator to avoid collisions.
+// extractPartBucketKey extracts the partition bucket key from a file path.
+// E.g. ".../data/seq_truncate=0/uuid-mat-0.parquet" → "seq_truncate=0"
+func extractPartBucketKey(filePath string) string {
+	idx := strings.Index(filePath, "/data/")
+	if idx < 0 {
+		return ""
+	}
+	afterData := filePath[idx+len("/data/"):]
+	slashIdx := strings.Index(afterData, "/")
+	if slashIdx < 0 {
+		return ""
+	}
+	return afterData[:slashIdx]
+}
+
 func buildPKKey(row map[string]any, pk []string) string {
 	if len(pk) == 1 {
 		return anyToString(row[pk[0]])

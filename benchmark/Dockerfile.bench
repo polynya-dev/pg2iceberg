@@ -13,6 +13,12 @@ COPY --from=build /bench-writer /usr/local/bin/bench-writer
 ENTRYPOINT ["bench-writer"]
 
 FROM alpine:3.21 AS bench-verify
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates curl unzip libstdc++ \
+    && ARCH=$(uname -m) \
+    && if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; else ARCH="amd64"; fi \
+    && curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v1.5.1/duckdb_cli-linux-${ARCH}-musl.zip" -o /tmp/duckdb.zip \
+    && unzip /tmp/duckdb.zip -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/duckdb \
+    && rm /tmp/duckdb.zip
 COPY --from=build /bench-verify /usr/local/bin/bench-verify
 ENTRYPOINT ["bench-verify"]

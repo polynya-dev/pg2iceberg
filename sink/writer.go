@@ -428,6 +428,9 @@ func buildParquetSchema(name string, columns []schema.Column) *parquet.Schema {
 		if col.IsNullable {
 			node = parquet.Optional(node)
 		}
+		// Iceberg requires PARQUET:field_id on each column so readers
+		// (DuckDB, Spark, etc.) can map columns by field ID, not name.
+		node = parquet.FieldID(node, col.FieldID)
 		group[col.Name] = node
 	}
 	return parquet.NewSchema(name, group)

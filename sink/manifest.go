@@ -82,6 +82,8 @@ func manifestEntrySchema(ts *schema.TableSchema, partSpec *PartitionSpec) string
 }`, partSchema)
 }
 
+// manifestListSchema is the Avro schema for Iceberg V2 manifest list files.
+// Per the V2 spec, added_snapshot_id and all count fields are required (non-nullable).
 const manifestListSchema = `{
   "type": "record",
   "name": "manifest_file",
@@ -92,13 +94,13 @@ const manifestListSchema = `{
     {"name": "content", "type": "int", "field-id": 517},
     {"name": "sequence_number", "type": "long", "default": 0, "field-id": 515},
     {"name": "min_sequence_number", "type": "long", "default": 0, "field-id": 516},
-    {"name": "added_snapshot_id", "type": ["null", "long"], "default": null, "field-id": 503},
-    {"name": "added_files_count", "type": ["null", "int"], "default": null, "field-id": 504},
-    {"name": "existing_files_count", "type": ["null", "int"], "default": null, "field-id": 505},
-    {"name": "deleted_files_count", "type": ["null", "int"], "default": null, "field-id": 506},
-    {"name": "added_rows_count", "type": ["null", "long"], "default": null, "field-id": 512},
-    {"name": "existing_rows_count", "type": ["null", "long"], "default": null, "field-id": 513},
-    {"name": "deleted_rows_count", "type": ["null", "long"], "default": null, "field-id": 514},
+    {"name": "added_snapshot_id", "type": "long", "field-id": 503},
+    {"name": "added_files_count", "type": "int", "field-id": 504},
+    {"name": "existing_files_count", "type": "int", "field-id": 505},
+    {"name": "deleted_files_count", "type": "int", "field-id": 506},
+    {"name": "added_rows_count", "type": "long", "field-id": 512},
+    {"name": "existing_rows_count", "type": "long", "field-id": 513},
+    {"name": "deleted_rows_count", "type": "long", "field-id": 514},
     {"name": "partitions", "type": ["null", {"type": "array", "items": {"type": "record", "name": "r508", "fields": [{"name": "contains_null", "type": "boolean", "field-id": 509}, {"name": "contains_nan", "type": ["null", "boolean"], "default": null, "field-id": 518}, {"name": "lower_bound", "type": ["null", "bytes"], "default": null, "field-id": 510}, {"name": "upper_bound", "type": ["null", "bytes"], "default": null, "field-id": 511}]}, "element-id": 508}], "default": null, "field-id": 507},
     {"name": "key_metadata", "type": ["null", "bytes"], "default": null, "field-id": 519}
   ]
@@ -191,21 +193,21 @@ func WriteManifestList(manifests []ManifestFileInfo) ([]byte, error) {
 	records := make([]any, len(manifests))
 	for i, m := range manifests {
 		records[i] = map[string]any{
-			"manifest_path":      m.Path,
-			"manifest_length":    m.Length,
-			"partition_spec_id":  int32(0),
-			"content":            int32(m.Content),
-			"sequence_number":    m.SequenceNumber,
+			"manifest_path":       m.Path,
+			"manifest_length":     m.Length,
+			"partition_spec_id":   int32(0),
+			"content":             int32(m.Content),
+			"sequence_number":     m.SequenceNumber,
 			"min_sequence_number": m.SequenceNumber,
-			"added_snapshot_id":  goavro.Union("long", m.SnapshotID),
-			"added_files_count":  goavro.Union("int", int32(m.AddedFiles)),
-			"existing_files_count": goavro.Union("int", int32(0)),
-			"deleted_files_count":  goavro.Union("int", int32(0)),
-			"added_rows_count":   goavro.Union("long", m.AddedRows),
-			"existing_rows_count": goavro.Union("long", int64(0)),
-			"deleted_rows_count":  goavro.Union("long", int64(0)),
-			"partitions":         nil,
-			"key_metadata":       nil,
+			"added_snapshot_id":   m.SnapshotID,
+			"added_files_count":   int32(m.AddedFiles),
+			"existing_files_count": int32(0),
+			"deleted_files_count":  int32(0),
+			"added_rows_count":    m.AddedRows,
+			"existing_rows_count": int64(0),
+			"deleted_rows_count":  int64(0),
+			"partitions":          nil,
+			"key_metadata":        nil,
 		}
 	}
 
@@ -242,15 +244,9 @@ func ReadManifestList(data []byte) ([]ManifestFileInfo, error) {
 			Length:         getInt64(m, "manifest_length"),
 			Content:        int(getInt32(m, "content")),
 			SequenceNumber: getInt64(m, "sequence_number"),
-		}
-		if sid := getUnionLong(m, "added_snapshot_id"); sid != nil {
-			mfi.SnapshotID = *sid
-		}
-		if ac := getUnionInt(m, "added_files_count"); ac != nil {
-			mfi.AddedFiles = int(*ac)
-		}
-		if ar := getUnionLong(m, "added_rows_count"); ar != nil {
-			mfi.AddedRows = *ar
+			SnapshotID:     getInt64(m, "added_snapshot_id"),
+			AddedFiles:     int(getInt32(m, "added_files_count")),
+			AddedRows:      getInt64(m, "added_rows_count"),
 		}
 		manifests = append(manifests, mfi)
 	}

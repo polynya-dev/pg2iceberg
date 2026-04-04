@@ -311,6 +311,38 @@ func (ps *PartitionSpec) PartitionAvroValue(partValues map[string]any, ts *schem
 	return result
 }
 
+// ParsePartitionPath reverses a partition path like "seq_truncate=0" back into
+// partition values. Used when the original row is not available (e.g. DELETE
+// events resolved from the file index).
+func (ps *PartitionSpec) ParsePartitionPath(path string, ts *schema.TableSchema) map[string]any {
+	values := make(map[string]any, len(ps.Fields))
+	parts := strings.Split(path, "/")
+	for _, part := range parts {
+		eqIdx := strings.Index(part, "=")
+		if eqIdx < 0 {
+			continue
+		}
+		name := part[:eqIdx]
+		valStr := part[eqIdx+1:]
+		for _, f := range ps.Fields {
+			if f.Name != name {
+				continue
+			}
+			if valStr == "__null__" {
+				values[name] = nil
+			} else {
+				// Parse as int64 for truncate/bucket transforms, string otherwise.
+				if n, err := strconv.ParseInt(valStr, 10, 64); err == nil {
+					values[name] = n
+				} else {
+					values[name] = valStr
+				}
+			}
+		}
+	}
+	return values
+}
+
 // --- helpers ---
 
 func findColumn(ts *schema.TableSchema, name string) *schema.Column {
