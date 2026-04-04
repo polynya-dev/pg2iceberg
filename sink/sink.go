@@ -27,7 +27,15 @@ type txBuffer struct {
 	commitTS  time.Time // PG commit timestamp
 }
 
+// EventBuffer receives change events from the sink after a successful flush.
+// Used to pass events to downstream consumers without S3 round-trips.
+type EventBuffer interface {
+	PushEvents(pgTable string, events []changeEvent, snapshotID int64)
+}
+
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
+// It writes append-only change events to an events table per source table.
+// A separate Materializer reads these events and produces flattened tables.
 type Sink struct {
 	cfg        config.SinkConfig
 	tableCfgs  []config.TableConfig
@@ -36,7 +44,8 @@ type Sink struct {
 	catalog Catalog
 	s3      ObjectStorage
 
-	// Per-table state
+	// Per-table state: keyed by PG table name (e.g. "public.orders").
+	// Each tableSink writes to the events table (e.g. "orders_events").
 	tables map[string]*tableSink
 
 	// Transaction tracking: buffers events per PG transaction so flushes
@@ -44,48 +53,53 @@ type Sink struct {
 	openTxns      map[uint32]*txBuffer // XID -> in-flight tx
 	committedTxns []*txBuffer          // txns that received Commit, in order
 
-	// Shared LRU cache for TOAST column resolution across all tables.
-	toastCache *toastCache
+	// Monotonically increasing sequence counter for ordering events within a flush.
+	seqCounter int64
 
-	// Backpressure: compactor signals when snapshots are cleaned up.
-	compactionDone chan struct{}
-	mu             sync.Mutex
+	// Optional event buffer for pushing events after flush (avoids S3 round-trips).
+	eventBuf EventBuffer
+
+	// pendingDirectEvents holds changeEvents from non-transactional writes
+	// (e.g., snapshot) that should be pushed to the event buffer after the
+	// next successful Flush. Keyed by PG table name.
+	pendingDirectEvents map[string][]changeEvent
+
+	mu sync.Mutex
 }
 
-// toastPendingRow holds a reference to a buffered row that has unchanged TOAST columns.
-type toastPendingRow struct {
-	row           map[string]any // reference to the buffered row (shared with writer)
-	unchangedCols []string       // columns that need to be fetched
-}
-
-// partitionedWriter holds data and delete writers for a single partition.
+// partitionedWriter holds the data writer for a single partition of the events table.
 type partitionedWriter struct {
 	dataWriter *RollingWriter
-	delWriter  *RollingWriter
 	partValues map[string]any // partition values for this partition (nil for unpartitioned)
 }
 
 type tableSink struct {
-	schema      *schema.TableSchema
-	icebergName string // table name in Iceberg catalog
-	partSpec    *PartitionSpec
-	targetSize  int64
-	schemaID    int // current Iceberg schema ID
+	// Source schema (user columns only).
+	srcSchema *schema.TableSchema
+	// Events table schema (metadata + user columns, all user cols nullable).
+	eventsSchema *schema.TableSchema
 
-	// Per-partition writers, keyed by partition key string ("" for unpartitioned).
+	icebergName       string // materialized table name in Iceberg (e.g. "orders")
+	eventsIcebergName string // events table name in Iceberg (e.g. "orders_events")
+	partSpec          *PartitionSpec // materialized table partition spec
+	eventsPartSpec    *PartitionSpec // events table partition spec
+	targetSize        int64
+	schemaID          int // current Iceberg schema ID (events table)
+	matSchemaID       int // materialized table schema ID
+
+	// Per-partition writers for the events table, keyed by partition key string ("" for unpartitioned).
 	partitions map[string]*partitionedWriter
 	totalRows  int
 
-	// toastPending tracks rows that have unchanged TOAST columns that
-	// could NOT be resolved from the shared toastCache. These need
-	// an Iceberg scan fallback (cold path, e.g. after restart).
-	toastPending []toastPendingRow
+	// Cached manifest lists to avoid re-downloading from S3 every flush/materialize cycle.
+	eventsManifests []ManifestFileInfo // events table manifests
+	matManifests    []ManifestFileInfo // materialized table manifests
 }
 
 // BuildSink creates a fully-wired Sink from config, constructing the default
 // S3 and catalog clients. Use NewSink when you need to inject custom
 // dependencies (e.g. in tests).
-func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string) (*Sink, error) {
+func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, eventBuf EventBuffer) (*Sink, error) {
 	var httpClient *http.Client
 	if cfg.CatalogAuth == "sigv4" {
 		transport, err := NewSigV4Transport(cfg.S3Region)
@@ -101,21 +115,22 @@ func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID
 		return nil, fmt.Errorf("create s3 client: %w", err)
 	}
 
-	return NewSink(cfg, tableCfgs, pipelineID, s3Client, catalog), nil
+	return NewSink(cfg, tableCfgs, pipelineID, s3Client, catalog, eventBuf), nil
 }
 
 // NewSink creates a Sink with the given dependencies.
-func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 ObjectStorage, catalog Catalog) *Sink {
+// eventBuf is optional — pass nil to disable in-memory event buffering.
+func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 ObjectStorage, catalog Catalog, eventBuf EventBuffer) *Sink {
 	return &Sink{
-		cfg:            cfg,
-		tableCfgs:      tableCfgs,
-		pipelineID:     pipelineID,
-		catalog:        catalog,
-		s3:             s3,
-		tables:         make(map[string]*tableSink),
-		openTxns:       make(map[uint32]*txBuffer),
-		toastCache:     newToastCache(cfg.ToastCacheBytesOrDefault()),
-		compactionDone: make(chan struct{}, 1),
+		cfg:                 cfg,
+		tableCfgs:           tableCfgs,
+		pipelineID:          pipelineID,
+		catalog:             catalog,
+		s3:                  s3,
+		eventBuf:            eventBuf,
+		tables:              make(map[string]*tableSink),
+		openTxns:            make(map[uint32]*txBuffer),
+		pendingDirectEvents: make(map[string][]changeEvent),
 	}
 }
 
@@ -125,14 +140,20 @@ func (s *Sink) Close() {}
 // Catalog returns the catalog client (for use by compactor).
 func (s *Sink) Catalog() Catalog { return s.catalog }
 
-// S3 returns the S3 client (for use by compactor).
+// S3 returns the S3 client.
 func (s *Sink) S3() ObjectStorage { return s.s3 }
 
-// RegisterTable sets up writers for a table and ensures it exists in the catalog.
+// Tables returns the per-table state map (shared with the materializer).
+func (s *Sink) Tables() map[string]*tableSink { return s.tables }
+
+// RegisterTable sets up writers for a table and ensures both the events table
+// and materialized table exist in the catalog. The sink writes to the events
+// table; the materializer reads from it and writes to the materialized table.
 func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error {
 	icebergTable := pgTableToIceberg(ts.Table)
+	eventsTable := EventsTableName(icebergTable)
 
-	// Build partition spec from config.
+	// Build partition spec from config (for materialized table).
 	var partExprs []string
 	for _, tc := range s.tableCfgs {
 		if tc.Name == ts.Table {
@@ -145,44 +166,71 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 		return fmt.Errorf("build partition spec: %w", err)
 	}
 
-	// Ensure namespace exists
+	// Ensure namespace exists.
 	if err := s.catalog.EnsureNamespace(s.cfg.Namespace); err != nil {
 		return fmt.Errorf("ensure namespace: %w", err)
 	}
 
-	// Load or create table in catalog
-	tm, err := s.catalog.LoadTable(s.cfg.Namespace, icebergTable)
+	// Create or load the materialized table (e.g. "orders").
+	matTm, err := s.catalog.LoadTable(s.cfg.Namespace, icebergTable)
 	if err != nil {
-		return fmt.Errorf("load table: %w", err)
+		return fmt.Errorf("load materialized table: %w", err)
+	}
+	var matSchemaID int
+	if matTm == nil {
+		location := fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, icebergTable)
+		matTm, err = s.catalog.CreateTable(s.cfg.Namespace, icebergTable, ts, location, partSpec)
+		if err != nil {
+			return fmt.Errorf("create materialized table: %w", err)
+		}
+		log.Printf("[sink] created materialized table %s.%s", s.cfg.Namespace, icebergTable)
+		matSchemaID = matTm.Metadata.CurrentSchemaID
+	} else {
+		log.Printf("[sink] using existing materialized table %s.%s", s.cfg.Namespace, icebergTable)
+		matSchemaID = matTm.Metadata.CurrentSchemaID
 	}
 
-	if tm == nil {
-		location := fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, icebergTable)
-		tm, err = s.catalog.CreateTable(s.cfg.Namespace, icebergTable, ts, location, partSpec)
+	// Build events table schema and partition spec.
+	eventsSchema := EventsTableSchema(ts)
+	eventsPartSpec, err := BuildPartitionSpec(
+		[]string{s.cfg.EventsPartitionOrDefault()}, eventsSchema)
+	if err != nil {
+		return fmt.Errorf("build events partition spec: %w", err)
+	}
+
+	eventsTm, err := s.catalog.LoadTable(s.cfg.Namespace, eventsTable)
+	if err != nil {
+		return fmt.Errorf("load events table: %w", err)
+	}
+	var eventsSchemaID int
+	if eventsTm == nil {
+		location := fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, eventsTable)
+		eventsTm, err = s.catalog.CreateTable(s.cfg.Namespace, eventsTable, eventsSchema, location, eventsPartSpec)
 		if err != nil {
-			return fmt.Errorf("create table: %w", err)
+			return fmt.Errorf("create events table: %w", err)
 		}
-		log.Printf("[sink] created Iceberg table %s.%s", s.cfg.Namespace, icebergTable)
+		log.Printf("[sink] created events table %s.%s (partition=%s)",
+			s.cfg.Namespace, eventsTable, s.cfg.EventsPartitionOrDefault())
+		eventsSchemaID = eventsTm.Metadata.CurrentSchemaID
 	} else {
-		log.Printf("[sink] using existing Iceberg table %s.%s", s.cfg.Namespace, icebergTable)
+		log.Printf("[sink] using existing events table %s.%s", s.cfg.Namespace, eventsTable)
+		eventsSchemaID = eventsTm.Metadata.CurrentSchemaID
 	}
 
 	targetSize := s.cfg.TargetFileSizeOrDefault()
 	tSink := &tableSink{
-		schema:      ts,
-		icebergName: icebergTable,
-		partSpec:    partSpec,
-		targetSize:  targetSize,
-		schemaID:    tm.Metadata.CurrentSchemaID,
-		partitions:  make(map[string]*partitionedWriter),
+		srcSchema:         ts,
+		eventsSchema:      eventsSchema,
+		icebergName:       icebergTable,
+		eventsIcebergName: eventsTable,
+		partSpec:          partSpec,
+		eventsPartSpec:    eventsPartSpec,
+		targetSize:        targetSize,
+		schemaID:          eventsSchemaID,
+		matSchemaID:       matSchemaID,
+		partitions:        make(map[string]*partitionedWriter),
 	}
-	// Pre-create the default (unpartitioned) writer if no partition spec.
-	if partSpec.IsUnpartitioned() {
-		tSink.partitions[""] = &partitionedWriter{
-			dataWriter: NewRollingDataWriter(ts, targetSize),
-			delWriter:  NewRollingDeleteWriter(ts, targetSize),
-		}
-	}
+
 	s.tables[ts.Table] = tSink
 	return nil
 }
@@ -195,7 +243,7 @@ func (s *Sink) UnregisterTable(pgTable string) {
 }
 
 // EvolveSchema applies a schema change to a table: updates the in-memory schema,
-// evolves the Iceberg table via the catalog, and rebuilds the Parquet writers.
+// evolves both the events and materialized Iceberg tables, and rebuilds writers.
 // The caller must flush all buffered data before calling this.
 func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.SchemaChange) error {
 	ts, ok := s.tables[pgTable]
@@ -203,14 +251,13 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		return fmt.Errorf("unregistered table: %s", pgTable)
 	}
 
-	// Apply diff to the in-memory schema, tracking whether anything
+	// Apply diff to the source schema, tracking whether anything
 	// actually changes at the Iceberg level.
 	icebergChanged := false
-	nextFieldID := ts.schema.MaxFieldID() + 1
+	nextFieldID := ts.srcSchema.MaxFieldID() + 1
 
-	// Add new columns (always nullable — safe default for evolution).
 	for _, col := range change.AddedColumns {
-		ts.schema.Columns = append(ts.schema.Columns, schema.Column{
+		ts.srcSchema.Columns = append(ts.srcSchema.Columns, schema.Column{
 			Name:       col.Name,
 			PGType:     col.PGType,
 			IsNullable: true,
@@ -220,26 +267,22 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		icebergChanged = true
 	}
 
-	// Drop columns — remove from active column list.
-	// Old Parquet files still reference old field IDs; Iceberg handles this.
 	for _, dropped := range change.DroppedColumns {
-		for i, col := range ts.schema.Columns {
+		for i, col := range ts.srcSchema.Columns {
 			if col.Name == dropped {
-				ts.schema.Columns = append(ts.schema.Columns[:i], ts.schema.Columns[i+1:]...)
+				ts.srcSchema.Columns = append(ts.srcSchema.Columns[:i], ts.srcSchema.Columns[i+1:]...)
 				icebergChanged = true
 				break
 			}
 		}
 	}
 
-	// Type changes — update PGType in-place. Only flag as changed if the
-	// Iceberg type actually differs (e.g. varchar→text both map to "string").
 	for _, tc := range change.TypeChanges {
-		for i, col := range ts.schema.Columns {
+		for i, col := range ts.srcSchema.Columns {
 			if col.Name == tc.Name {
 				oldIceberg := schema.IcebergType(col.PGType)
 				newIceberg := schema.IcebergType(tc.NewType)
-				ts.schema.Columns[i].PGType = tc.NewType
+				ts.srcSchema.Columns[i].PGType = tc.NewType
 				if oldIceberg != newIceberg {
 					icebergChanged = true
 				}
@@ -248,45 +291,48 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *source.
 		}
 	}
 
-	// Only call the catalog if the Iceberg schema actually changed.
-	// Some PG type changes (e.g. varchar→text) are no-ops at the Iceberg level.
 	if icebergChanged {
-		newSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.icebergName, ts.schemaID, ts.schema)
+		// Evolve materialized table.
+		newMatSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.icebergName, ts.matSchemaID, ts.srcSchema)
 		if err != nil {
-			return fmt.Errorf("catalog evolve schema for %s: %w", pgTable, err)
+			return fmt.Errorf("catalog evolve materialized schema for %s: %w", pgTable, err)
 		}
-		ts.schemaID = newSchemaID
+		ts.matSchemaID = newMatSchemaID
+
+		// Rebuild events schema and evolve events table.
+		ts.eventsSchema = EventsTableSchema(ts.srcSchema)
+		newEventsSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.eventsIcebergName, ts.schemaID, ts.eventsSchema)
+		if err != nil {
+			return fmt.Errorf("catalog evolve events schema for %s: %w", pgTable, err)
+		}
+		ts.schemaID = newEventsSchemaID
 	} else {
 		log.Printf("[sink] schema change for %s is a no-op at Iceberg level, skipping catalog evolution", pgTable)
 	}
 
-	// Rebuild writers with the new schema. Since the caller flushed first,
-	// all writers should be empty.
+	// Rebuild writers with the new events schema.
 	for key, pw := range ts.partitions {
 		ts.partitions[key] = &partitionedWriter{
-			dataWriter: NewRollingDataWriter(ts.schema, ts.targetSize),
-			delWriter:  NewRollingDeleteWriter(ts.schema, ts.targetSize),
+			dataWriter: NewRollingDataWriter(ts.eventsSchema, ts.targetSize),
 			partValues: pw.partValues,
 		}
 	}
 
-	log.Printf("[sink] evolved schema for %s to schema-id %d", pgTable, ts.schemaID)
+	log.Printf("[sink] evolved schema for %s to schema-id %d (events), %d (materialized)",
+		pgTable, ts.schemaID, ts.matSchemaID)
 	return nil
 }
 
-// getPartitionWriter returns the partitioned writer for a given row, creating it if needed.
-func (ts *tableSink) getPartitionWriter(row map[string]any) *partitionedWriter {
-	if ts.partSpec.IsUnpartitioned() {
-		return ts.partitions[""]
+// getEventsWriter returns the events writer for the given row's partition.
+func (ts *tableSink) getEventsWriter(row map[string]any) *partitionedWriter {
+	key := ""
+	if ts.eventsPartSpec != nil && !ts.eventsPartSpec.IsUnpartitioned() {
+		key = ts.eventsPartSpec.PartitionKey(row, ts.eventsSchema)
 	}
-
-	key := ts.partSpec.PartitionKey(row, ts.schema)
 	pw, ok := ts.partitions[key]
 	if !ok {
 		pw = &partitionedWriter{
-			dataWriter: NewRollingDataWriter(ts.schema, ts.targetSize),
-			delWriter:  NewRollingDeleteWriter(ts.schema, ts.targetSize),
-			partValues: ts.partSpec.PartitionValues(row, ts.schema),
+			dataWriter: NewRollingDataWriter(ts.eventsSchema, ts.targetSize),
 		}
 		ts.partitions[key] = pw
 	}
@@ -326,92 +372,81 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 		}
 	}
 	// Events without a transaction ID (e.g., snapshot) are written directly.
+	// Buffer for materializer — will be pushed after the next successful Flush.
+	if s.eventBuf != nil {
+		ce := s.toChangeEvent(event, s.seqCounter)
+		s.pendingDirectEvents[event.Table] = append(s.pendingDirectEvents[event.Table], ce)
+	}
 	return s.writeDirect(event)
 }
 
-// writeDirect writes an event directly to the per-table writers.
+// writeDirect writes a change event to the events table as an append-only row.
+// No TOAST resolution, no equality deletes — just append the event with metadata.
 func (s *Sink) writeDirect(event source.ChangeEvent) error {
 	ts, ok := s.tables[event.Table]
 	if !ok {
 		return fmt.Errorf("unregistered table: %s", event.Table)
 	}
 
+	// Reuse the source event's map directly — the source allocates a new map
+	// per event and doesn't retain references. Add metadata columns in-place
+	// to avoid a per-row map allocation.
+	var row map[string]any
 	switch event.Operation {
 	case source.OpInsert:
-		if event.After != nil {
-			pw := ts.getPartitionWriter(event.After)
-			if err := pw.dataWriter.Add(event.After); err != nil {
-				return err
-			}
-			ts.totalRows++
-			// Cache TOAST-able columns for future TOAST resolution.
-			// Skip for REPLICA IDENTITY FULL — PG sends complete rows, no TOAST markers.
-			if !ts.schema.ReplicaIdentityFull {
-				pkKey := buildPKKey(event.After, event.PK)
-				s.toastCache.put(event.Table, pkKey, event.After, ts.schema.Columns)
-			}
-		}
+		row = event.After
+		row["_op"] = "I"
 	case source.OpUpdate:
-		// Equality delete for old row (routed by old row's partition).
-		if event.Before != nil {
-			pkRow := extractPK(event.Before, event.PK)
-			pw := ts.getPartitionWriter(event.Before)
-			if err := pw.delWriter.Add(pkRow); err != nil {
-				return err
-			}
-		}
-		// Insert new row (routed by new row's partition).
-		if event.After != nil {
-			// Resolve TOAST from shared LRU cache (hot path).
-			// Skip for REPLICA IDENTITY FULL — PG sends complete rows, no TOAST markers.
-			if !ts.schema.ReplicaIdentityFull && len(event.UnchangedCols) > 0 {
-				pkKey := buildPKKey(event.After, event.PK)
-				if cached, ok := s.toastCache.get(event.Table, pkKey); ok {
-					for _, col := range event.UnchangedCols {
-						if val, exists := cached[col]; exists {
-							event.After[col] = val
-						}
-					}
-					// All TOAST cols resolved — no need for Iceberg fallback.
-					event.UnchangedCols = nil
-				}
-			}
-
-			pw := ts.getPartitionWriter(event.After)
-			if err := pw.dataWriter.Add(event.After); err != nil {
-				return err
-			}
-			ts.totalRows++
-
-			// If TOAST cols remain unresolved (cache miss), defer to Iceberg scan.
-			if len(event.UnchangedCols) > 0 {
-				ts.toastPending = append(ts.toastPending, toastPendingRow{
-					row:           event.After,
-					unchangedCols: event.UnchangedCols,
-				})
-			} else if !ts.schema.ReplicaIdentityFull {
-				// Cache the now-complete row.
-				pkKey := buildPKKey(event.After, event.PK)
-				s.toastCache.put(event.Table, pkKey, event.After, ts.schema.Columns)
-			}
+		row = event.After
+		row["_op"] = "U"
+		if len(event.UnchangedCols) > 0 {
+			row["_unchanged_cols"] = unchangedColsString(event.UnchangedCols)
 		}
 	case source.OpDelete:
-		if event.Before != nil {
-			pkRow := extractPK(event.Before, event.PK)
-			pw := ts.getPartitionWriter(event.Before)
-			if err := pw.delWriter.Add(pkRow); err != nil {
-				return err
-			}
-			// Remove from cache — row no longer exists.
-			if !ts.schema.ReplicaIdentityFull {
-				pkKey := buildPKKey(event.Before, event.PK)
-				s.toastCache.delete(event.Table, pkKey)
-			}
-		}
+		row = event.Before
+		row["_op"] = "D"
+	default:
+		return nil // ignore other operations
 	}
+
+	row["_lsn"] = int64(event.LSN)
+	row["_ts"] = event.SourceTimestamp
+	row["_seq"] = s.seqCounter
+	s.seqCounter++
+
+	pw := ts.getEventsWriter(row)
+	if err := pw.dataWriter.Add(row); err != nil {
+		return err
+	}
+	ts.totalRows++
 	return nil
 }
 
+// toChangeEvent converts a source.ChangeEvent into a materializer changeEvent,
+// using the given seq value. Reuses the source event's map directly — the source
+// allocates a fresh map per event so no copy is needed. The map is shared with
+// writeDirect (which adds metadata keys like _lsn, _op); the materializer only
+// accesses user columns by name so the extra keys are harmless.
+func (s *Sink) toChangeEvent(event source.ChangeEvent, seq int64) changeEvent {
+	ce := changeEvent{
+		lsn:           int64(event.LSN),
+		seq:           seq,
+		unchangedCols: event.UnchangedCols,
+	}
+
+	switch event.Operation {
+	case source.OpInsert:
+		ce.op = "I"
+		ce.row = event.After
+	case source.OpUpdate:
+		ce.op = "U"
+		ce.row = event.After
+	case source.OpDelete:
+		ce.op = "D"
+		ce.row = event.Before
+	}
+	return ce
+}
 
 // ShouldFlush checks if there are committed transactions ready to flush.
 func (s *Sink) ShouldFlush() bool {
@@ -433,11 +468,11 @@ func (s *Sink) TotalBufferedBytes() int64 {
 	var total int64
 	for _, ts := range s.tables {
 		for _, pw := range ts.partitions {
-			total += pw.dataWriter.EstimatedBytes() + pw.delWriter.EstimatedBytes()
+			total += pw.dataWriter.EstimatedBytes()
 		}
 	}
 	for _, tx := range s.committedTxns {
-		total += int64(len(tx.events)) * 128 // rough estimate per event
+		total += int64(len(tx.events)) * 128
 	}
 	for _, tx := range s.openTxns {
 		total += int64(len(tx.events)) * 128
@@ -445,75 +480,51 @@ func (s *Sink) TotalBufferedBytes() int64 {
 	return total
 }
 
-// CheckBackpressure blocks if the snapshot count exceeds MaxSnapshots,
-// waiting for compaction to reduce it. Returns nil when it's safe to proceed.
+// CheckBackpressure is a no-op in the events-based architecture.
+// Retained for interface compatibility with pipeline.go.
 func (s *Sink) CheckBackpressure(ctx context.Context) error {
-	if s.cfg.MaxSnapshots <= 0 {
-		return nil
-	}
-
-	for {
-		overLimit := false
-		for _, ts := range s.tables {
-			tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.icebergName)
-			if err != nil {
-				return fmt.Errorf("check backpressure: %w", err)
-			}
-			if tm != nil && len(tm.Metadata.Snapshots) >= s.cfg.MaxSnapshots {
-				overLimit = true
-				break
-			}
-		}
-		if !overLimit {
-			return nil
-		}
-
-		log.Printf("[sink] backpressure: snapshot limit (%d) reached, waiting for compaction...", s.cfg.MaxSnapshots)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-s.compactionDone:
-			// Compaction completed, re-check.
-		case <-time.After(5 * time.Second):
-			// Poll periodically in case we missed a signal.
-		}
-	}
-}
-
-// NotifyCompactionDone signals that compaction has completed (called by compactor).
-func (s *Sink) NotifyCompactionDone() {
-	select {
-	case s.compactionDone <- struct{}{}:
-	default:
-	}
+	return nil
 }
 
 // Flush replays committed transactions into writers, then flushes all tables
 // atomically: S3 uploads in parallel, followed by a single multi-table
 // catalog commit.
 func (s *Sink) Flush(ctx context.Context) error {
-	if len(s.committedTxns) == 0 {
+	hasPendingDirect := len(s.pendingDirectEvents) > 0
+	if len(s.committedTxns) == 0 && !hasPendingDirect {
 		return nil
 	}
 
-	// Discard stale completed chunks from a previous failed flush. Without
-	// this, FlushAll (which is non-destructive) would return both old chunks
-	// and new ones, producing duplicate data in Iceberg. We only clear
-	// completed chunks — active writer rows (e.g. snapshot data written via
-	// writeDirect) must be preserved.
-	// Note: toastCache (shared LRU) is NOT cleared here — it persists across
-	// flushes so TOAST columns can be resolved from rows inserted in prior batches.
+	// NOTE: seqCounter is NOT reset — it's a globally monotonic ordering key
+	// across flushes. The materializer sorts events by _seq to determine the
+	// correct application order. Using _lsn is unreliable because walEnd
+	// (walStart + len(walData)) varies with payload size.
+
+	// Discard stale completed chunks from a previous failed flush.
 	for _, ts := range s.tables {
 		for _, pw := range ts.partitions {
 			pw.dataWriter.DiscardCompleted()
-			pw.delWriter.DiscardCompleted()
 		}
-		ts.toastPending = nil
+	}
+
+	// Collect events per table for the materializer in-memory buffer.
+	// Start with pending direct events (snapshot rows written via writeDirect).
+	var bufferedEvents map[string][]changeEvent
+	if s.eventBuf != nil {
+		bufferedEvents = make(map[string][]changeEvent)
+		for pgTable, events := range s.pendingDirectEvents {
+			bufferedEvents[pgTable] = append(bufferedEvents[pgTable], events...)
+		}
 	}
 
 	// Drain committed transactions into per-table writers.
 	for _, tx := range s.committedTxns {
 		for _, event := range tx.events {
+			// Capture seq before writeDirect increments seqCounter.
+			if s.eventBuf != nil {
+				ce := s.toChangeEvent(event, s.seqCounter)
+				bufferedEvents[event.Table] = append(bufferedEvents[event.Table], ce)
+			}
 			if err := s.writeDirect(event); err != nil {
 				return fmt.Errorf("replay tx %d: %w", tx.xid, err)
 			}
@@ -521,16 +532,25 @@ func (s *Sink) Flush(ctx context.Context) error {
 	}
 
 	// Flush all tables: parallel S3 uploads + single atomic catalog commit.
-	if _, err := s.flushAllTables(ctx); err != nil {
+	snapshotIDs, err := s.flushAllTables(ctx)
+	if err != nil {
 		return err
 	}
 
-	// Clear committed transactions only after everything succeeded.
+	// Push events to materializer buffer only after successful S3 commit.
+	if s.eventBuf != nil {
+		for pgTable, events := range bufferedEvents {
+			s.eventBuf.PushEvents(pgTable, events, snapshotIDs[pgTable])
+		}
+	}
+
+	// Clear committed transactions and pending direct events.
 	s.committedTxns = nil
+	s.pendingDirectEvents = make(map[string][]changeEvent)
 	return nil
 }
 
-// preparedFlush holds everything needed to commit a table after S3 writes complete.
+// preparedFlush holds everything needed to commit an events table after S3 writes complete.
 type preparedFlush struct {
 	pgTable    string
 	ts         *tableSink
@@ -539,10 +559,8 @@ type preparedFlush struct {
 	commit     SnapshotCommit
 }
 
-// flushAllTables serializes, uploads, and commits data for all tables.
-// Parquet serialization and S3 uploads are parallelized across all partitions
-// of all tables using a single worker pool, then each table's metadata is
-// assembled and committed atomically.
+// flushAllTables serializes, uploads, and commits events for all tables.
+// Events are written to the events table (append-only, no deletes).
 func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	type tableInfo struct {
 		pgTable string
@@ -552,7 +570,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	for pgTable, ts := range s.tables {
 		hasData := false
 		for _, pw := range ts.partitions {
-			if pw.dataWriter.Len()+pw.delWriter.Len() > 0 {
+			if pw.dataWriter.Len() > 0 {
 				hasData = true
 				break
 			}
@@ -567,46 +585,28 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		return nil, nil
 	}
 
-	// Phase 0: Resolve TOAST for all tables (must happen before serialization).
-	for _, t := range tablesToFlush {
-		if len(t.ts.toastPending) > 0 {
-			if err := s.resolveToast(ctx, t.pgTable, t.ts); err != nil {
-				return nil, fmt.Errorf("resolve TOAST for %s: %w", t.pgTable, err)
-			}
-		}
-	}
-
-	// Phase 1: Serialize all partitions to Parquet + upload to S3 in parallel.
-	// Each task handles one partition (serialize parquet, then upload).
+	// Serialize + upload all event partitions in parallel.
 	var mu sync.Mutex
 	partResults := make(map[string][]uploadResult)
 
 	var tasks []worker.Task
 	for _, t := range tablesToFlush {
-		basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, t.ts.icebergName)
-		for _, pw := range t.ts.partitions {
+		basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, t.ts.eventsIcebergName)
+		for partKey, pw := range t.ts.partitions {
 			pw := pw
 			pgTable := t.pgTable
-			ts := t.ts
+			partKey := partKey
 
-			partPath := ""
-			if ts.partSpec != nil {
-				partPath = ts.partSpec.PartitionPath(pw.partValues)
-			}
-			avroPartValues := map[string]any{}
-			if ts.partSpec != nil && pw.partValues != nil {
-				avroPartValues = ts.partSpec.PartitionAvroValue(pw.partValues, ts.schema)
-			}
-
-			taskName := pgTable
-			if partPath != "" {
-				taskName = fmt.Sprintf("%s/%s", pgTable, partPath)
+			// Compute partition path for the S3 key.
+			var partPath string
+			if t.ts.eventsPartSpec != nil && !t.ts.eventsPartSpec.IsUnpartitioned() && partKey != "" {
+				partPath = partKey // partKey is already in "field=value" format
 			}
 
 			tasks = append(tasks, worker.Task{
-				Name: taskName,
+				Name: pgTable,
 				Fn: func(ctx context.Context, progress *worker.Progress) error {
-					uploads, err := serializePartition(pw, ts, basePath, partPath, avroPartValues)
+					uploads, err := serializeEventsPartition(pw, basePath, partPath)
 					if err != nil {
 						return err
 					}
@@ -632,11 +632,11 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		return nil, err
 	}
 
-	// Phase 2: Assemble metadata and commit all tables.
+	// Assemble metadata and commit all events tables.
 	prepared := make([]*preparedFlush, 0, len(tablesToFlush))
 	for _, t := range tablesToFlush {
 		results := partResults[t.pgTable]
-		pf, err := s.assembleTableCommit(ctx, t.pgTable, t.ts, results)
+		pf, err := s.assembleEventsCommit(ctx, t.pgTable, t.ts, results)
 		if err != nil {
 			return nil, err
 		}
@@ -646,7 +646,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	tableCommits := make([]TableCommit, len(prepared))
 	for i, pf := range prepared {
 		tableCommits[i] = TableCommit{
-			Table:             pf.ts.icebergName,
+			Table:             pf.ts.eventsIcebergName,
 			CurrentSnapshotID: pf.prevSnapID,
 			Snapshot:          pf.commit,
 		}
@@ -659,112 +659,38 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 	// All commits succeeded — finalize writers.
 	snapshotIDs := make(map[string]int64, len(prepared))
 	for _, pf := range prepared {
+		log.Printf("[sink] committed events snapshot %d for %s", pf.snapshotID, pf.pgTable)
 		snapshotIDs[pf.pgTable] = pf.snapshotID
 		for _, pw := range pf.ts.partitions {
 			pw.dataWriter.Commit()
-			pw.delWriter.Commit()
 		}
 		pf.ts.totalRows = 0
-		pf.ts.toastPending = nil
-		if !pf.ts.partSpec.IsUnpartitioned() {
-			for key := range pf.ts.partitions {
-				delete(pf.ts.partitions, key)
-			}
-		}
 	}
 
 	return snapshotIDs, nil
 }
 
-// prepareTableFlush serializes, uploads, and assembles metadata for a single
-// table. Used by the single-table flush path (flushTable).
-func (s *Sink) prepareTableFlush(ctx context.Context, pgTable string, ts *tableSink) (*preparedFlush, error) {
-	if len(ts.toastPending) > 0 {
-		if err := s.resolveToast(ctx, pgTable, ts); err != nil {
-			return nil, fmt.Errorf("resolve TOAST: %w", err)
-		}
-	}
-
-	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.icebergName)
-	results, err := s.serializeAndUploadPartitions(ctx, pgTable, ts, basePath)
-	if err != nil {
-		return nil, err
-	}
-	return s.assembleTableCommit(ctx, pgTable, ts, results)
-}
-
-// serializeAndUploadPartitions serializes all partitions to parquet and uploads
-// them to S3. Returns the upload results for all files.
-func (s *Sink) serializeAndUploadPartitions(ctx context.Context, pgTable string, ts *tableSink, basePath string) ([]uploadResult, error) {
-	var allResults []uploadResult
-	for _, pw := range ts.partitions {
-		partPath := ""
-		if ts.partSpec != nil {
-			partPath = ts.partSpec.PartitionPath(pw.partValues)
-		}
-		avroPartValues := map[string]any{}
-		if ts.partSpec != nil && pw.partValues != nil {
-			avroPartValues = ts.partSpec.PartitionAvroValue(pw.partValues, ts.schema)
-		}
-
-		uploads, err := serializePartition(pw, ts, basePath, partPath, avroPartValues)
-		if err != nil {
-			return nil, err
-		}
-
-		results, err := s.uploadFiles(ctx, uploads)
-		if err != nil {
-			return nil, err
-		}
-		allResults = append(allResults, results...)
-	}
-	return allResults, nil
-}
-
-// serializePartition flushes a single partition writer to parquet bytes.
-func serializePartition(pw *partitionedWriter, ts *tableSink, basePath, partPath string, avroPartValues map[string]any) ([]pendingUpload, error) {
+// serializeEventsPartition flushes an events partition writer to parquet bytes.
+func serializeEventsPartition(pw *partitionedWriter, basePath, partPath string) ([]pendingUpload, error) {
 	var uploads []pendingUpload
 
 	dataChunks, err := pw.dataWriter.FlushAll()
 	if err != nil {
-		return nil, fmt.Errorf("flush data: %w", err)
+		return nil, fmt.Errorf("flush events: %w", err)
 	}
 	for i, chunk := range dataChunks {
 		fileUUID := uuid.New().String()
 		var key string
 		if partPath != "" {
-			key = fmt.Sprintf("%s/data/%s/%s-data-%d.parquet", basePath, partPath, fileUUID, i)
+			key = fmt.Sprintf("%s/data/%s/%s-events-%d.parquet", basePath, partPath, fileUUID, i)
 		} else {
-			key = fmt.Sprintf("%s/data/%s-data-%d.parquet", basePath, fileUUID, i)
+			key = fmt.Sprintf("%s/data/%s-events-%d.parquet", basePath, fileUUID, i)
 		}
 		uploads = append(uploads, pendingUpload{
-			key:             key,
-			data:            chunk.Data,
-			content:         0,
-			recordCount:     chunk.RowCount,
-			partitionValues: avroPartValues,
-		})
-	}
-
-	delChunks, err := pw.delWriter.FlushAll()
-	if err != nil {
-		return nil, fmt.Errorf("flush deletes: %w", err)
-	}
-	for i, chunk := range delChunks {
-		fileUUID := uuid.New().String()
-		var key string
-		if partPath != "" {
-			key = fmt.Sprintf("%s/data/%s/%s-deletes-%d.parquet", basePath, partPath, fileUUID, i)
-		} else {
-			key = fmt.Sprintf("%s/data/%s-deletes-%d.parquet", basePath, fileUUID, i)
-		}
-		uploads = append(uploads, pendingUpload{
-			key:              key,
-			data:             chunk.Data,
-			content:          2,
-			recordCount:      chunk.RowCount,
-			equalityFieldIDs: ts.schema.PKFieldIDs(),
-			partitionValues:  avroPartValues,
+			key:         key,
+			data:        chunk.Data,
+			content:     0,
+			recordCount: chunk.RowCount,
 		})
 	}
 
@@ -792,6 +718,21 @@ func (s *Sink) uploadFiles(ctx context.Context, uploads []pendingUpload) ([]uplo
 	return results, nil
 }
 
+// extractPartDir extracts the partition directory from a data file URI.
+// E.g. "s3://bucket/.../data/_ts_day=2026-04-04/uuid.parquet" → "_ts_day=2026-04-04"
+func extractPartDir(uri string) string {
+	idx := strings.Index(uri, "/data/")
+	if idx < 0 {
+		return ""
+	}
+	afterData := uri[idx+len("/data/"):]
+	slashIdx := strings.Index(afterData, "/")
+	if slashIdx < 0 {
+		return "" // unpartitioned file
+	}
+	return afterData[:slashIdx]
+}
+
 // pendingUpload holds the data needed to upload a single Parquet file to S3.
 type pendingUpload struct {
 	key             string
@@ -808,75 +749,81 @@ type uploadResult struct {
 	pendingUpload
 }
 
-// assembleTableCommit takes already-uploaded file results and builds the
-// manifests, manifest list, and snapshot commit for a single table.
-func (s *Sink) assembleTableCommit(ctx context.Context, pgTable string, ts *tableSink, results []uploadResult) (*preparedFlush, error) {
+// assembleEventsCommit builds manifests, manifest list, and snapshot commit
+// for an events table (append-only, no deletes).
+func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tableSink, results []uploadResult) (*preparedFlush, error) {
 	now := time.Now()
 	snapshotID := now.UnixMilli()
-	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.icebergName)
+	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.eventsIcebergName)
 
-	// Separate uploaded files into data and delete lists.
-	var dataFiles, deleteFiles []DataFileInfo
+	eventsPartitioned := ts.eventsPartSpec != nil && !ts.eventsPartSpec.IsUnpartitioned()
+
+	var dataFiles []DataFileInfo
 	for _, r := range results {
-		fi := DataFileInfo{
-			Path:            r.uri,
-			FileSizeBytes:   int64(len(r.data)),
-			RecordCount:     r.recordCount,
-			Content:         r.content,
-			PartitionValues: r.partitionValues,
+		df := DataFileInfo{
+			Path:          r.uri,
+			FileSizeBytes: int64(len(r.data)),
+			RecordCount:   r.recordCount,
+			Content:       0,
 		}
-		if r.content == 2 {
-			fi.EqualityFieldIDs = r.equalityFieldIDs
-			deleteFiles = append(deleteFiles, fi)
-		} else {
-			dataFiles = append(dataFiles, fi)
+		if eventsPartitioned {
+			partPath := extractPartDir(r.uri)
+			if partPath != "" {
+				partValues := ts.eventsPartSpec.ParsePartitionPath(partPath, ts.eventsSchema)
+				df.PartitionValues = ts.eventsPartSpec.PartitionAvroValue(partValues, ts.eventsSchema)
+			}
 		}
+		dataFiles = append(dataFiles, df)
 	}
 
-	// Load current table metadata to get existing manifests.
-	tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.icebergName)
+	// Load current events table metadata.
+	tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.eventsIcebergName)
 	if err != nil {
-		return nil, fmt.Errorf("load table: %w", err)
+		return nil, fmt.Errorf("load events table: %w", err)
 	}
 
 	seqNum := tm.Metadata.LastSequenceNumber + 1
-	var existingManifests []ManifestFileInfo
 
-	if ml := tm.CurrentManifestList(); ml != "" {
-		mlKey, err := KeyFromURI(ml)
-		if err != nil {
-			return nil, fmt.Errorf("parse manifest list URI: %w", err)
-		}
-		mlData, err := s.s3.Download(ctx, mlKey)
-		if err != nil {
-			return nil, fmt.Errorf("download manifest list: %w", err)
-		}
-		existingManifests, err = ReadManifestList(mlData)
-		if err != nil {
-			return nil, fmt.Errorf("read manifest list: %w", err)
+	// Use cached manifests from previous cycle instead of re-downloading from S3.
+	// On first flush (cache empty), load from S3 if a manifest list exists.
+	if ts.eventsManifests == nil {
+		if ml := tm.CurrentManifestList(); ml != "" {
+			mlKey, err := KeyFromURI(ml)
+			if err != nil {
+				return nil, fmt.Errorf("parse manifest list URI: %w", err)
+			}
+			mlData, err := s.s3.Download(ctx, mlKey)
+			if err != nil {
+				return nil, fmt.Errorf("download manifest list: %w", err)
+			}
+			ts.eventsManifests, err = ReadManifestList(mlData)
+			if err != nil {
+				return nil, fmt.Errorf("read manifest list: %w", err)
+			}
 		}
 	}
+	existingManifests := ts.eventsManifests
 
-	// 4. Write data manifest (if we have data files).
+	// Write data manifest.
 	var manifestInfos []ManifestFileInfo
 	if len(dataFiles) > 0 {
 		entries := make([]ManifestEntry, len(dataFiles))
 		for i, df := range dataFiles {
 			entries[i] = ManifestEntry{
-				Status:     1, // added
+				Status:     1,
 				SnapshotID: snapshotID,
 				DataFile:   df,
 			}
 		}
-		manifestBytes, err := WriteManifest(ts.schema, entries, seqNum, 0, ts.partSpec)
+		manifestBytes, err := WriteManifest(ts.eventsSchema, entries, seqNum, 0, ts.eventsPartSpec)
 		if err != nil {
-			return nil, fmt.Errorf("write data manifest: %w", err)
+			return nil, fmt.Errorf("write events manifest: %w", err)
 		}
 
 		manifestKey := fmt.Sprintf("%s/metadata/%s-m0.avro", basePath, uuid.New().String())
 		manifestURI, err := s.s3.Upload(ctx, manifestKey, manifestBytes)
 		if err != nil {
-			return nil, fmt.Errorf("upload data manifest: %w", err)
+			return nil, fmt.Errorf("upload events manifest: %w", err)
 		}
 
 		var totalRows int64
@@ -886,7 +833,7 @@ func (s *Sink) assembleTableCommit(ctx context.Context, pgTable string, ts *tabl
 		manifestInfos = append(manifestInfos, ManifestFileInfo{
 			Path:           manifestURI,
 			Length:         int64(len(manifestBytes)),
-			Content:        0, // data
+			Content:        0,
 			SnapshotID:     snapshotID,
 			AddedFiles:     len(dataFiles),
 			AddedRows:      totalRows,
@@ -894,44 +841,9 @@ func (s *Sink) assembleTableCommit(ctx context.Context, pgTable string, ts *tabl
 		})
 	}
 
-	// 5. Write delete manifest (if we have delete files).
-	if len(deleteFiles) > 0 {
-		entries := make([]ManifestEntry, len(deleteFiles))
-		for i, df := range deleteFiles {
-			entries[i] = ManifestEntry{
-				Status:     1,
-				SnapshotID: snapshotID,
-				DataFile:   df,
-			}
-		}
-		manifestBytes, err := WriteManifest(ts.schema, entries, seqNum, 1, ts.partSpec)
-		if err != nil {
-			return nil, fmt.Errorf("write delete manifest: %w", err)
-		}
-
-		manifestKey := fmt.Sprintf("%s/metadata/%s-m1.avro", basePath, uuid.New().String())
-		manifestURI, err := s.s3.Upload(ctx, manifestKey, manifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("upload delete manifest: %w", err)
-		}
-
-		var totalRows int64
-		for _, df := range deleteFiles {
-			totalRows += df.RecordCount
-		}
-		manifestInfos = append(manifestInfos, ManifestFileInfo{
-			Path:           manifestURI,
-			Length:         int64(len(manifestBytes)),
-			Content:        1, // deletes
-			SnapshotID:     snapshotID,
-			AddedFiles:     len(deleteFiles),
-			AddedRows:      totalRows,
-			SequenceNumber: seqNum,
-		})
-	}
-
-	// 6. Write manifest list (existing + new manifests).
+	// Write manifest list (existing + new) and cache for next cycle.
 	allManifests := append(existingManifests, manifestInfos...)
+	ts.eventsManifests = allManifests
 	mlBytes, err := WriteManifestList(allManifests)
 	if err != nil {
 		return nil, fmt.Errorf("write manifest list: %w", err)
@@ -943,21 +855,12 @@ func (s *Sink) assembleTableCommit(ctx context.Context, pgTable string, ts *tabl
 		return nil, fmt.Errorf("upload manifest list: %w", err)
 	}
 
-	operation := "append"
-	if len(deleteFiles) > 0 {
-		operation = "overwrite"
-	}
-
-	dataCount := 0
+	eventCount := 0
 	for _, df := range dataFiles {
-		dataCount += int(df.RecordCount)
+		eventCount += int(df.RecordCount)
 	}
-	delCount := 0
-	for _, df := range deleteFiles {
-		delCount += int(df.RecordCount)
-	}
-	log.Printf("[sink] prepared snapshot %d for %s (seq=%d, data_rows=%d, delete_rows=%d, data_files=%d, delete_files=%d)",
-		snapshotID, pgTable, seqNum, dataCount, delCount, len(dataFiles), len(deleteFiles))
+	log.Printf("[sink] prepared events snapshot %d for %s (seq=%d, events=%d, files=%d)",
+		snapshotID, pgTable, seqNum, eventCount, len(dataFiles))
 
 	return &preparedFlush{
 		pgTable:    pgTable,
@@ -971,48 +874,12 @@ func (s *Sink) assembleTableCommit(ctx context.Context, pgTable string, ts *tabl
 			ManifestListPath: mlURI,
 			SchemaID:         ts.schemaID,
 			Summary: map[string]string{
-				"operation": operation,
+				"operation": "append",
 			},
 		},
 	}, nil
 }
 
-// flushTable prepares and commits a single table (e.g. single-table mode).
-func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) (int64, error) {
-	pf, err := s.prepareTableFlush(ctx, pgTable, ts)
-	if err != nil {
-		return 0, err
-	}
-
-	if err := s.catalog.CommitSnapshot(s.cfg.Namespace, ts.icebergName, pf.prevSnapID, pf.commit); err != nil {
-		return 0, fmt.Errorf("commit snapshot: %w", err)
-	}
-
-	log.Printf("[sink] committed snapshot %d for %s", pf.snapshotID, pgTable)
-
-	// Commit writers only after successful catalog commit.
-	for _, pw := range ts.partitions {
-		pw.dataWriter.Commit()
-		pw.delWriter.Commit()
-	}
-	ts.totalRows = 0
-	ts.toastPending = nil
-	if !ts.partSpec.IsUnpartitioned() {
-		for key := range ts.partitions {
-			delete(ts.partitions, key)
-		}
-	}
-
-	return pf.snapshotID, nil
-}
-
-func extractPK(row map[string]any, pk []string) map[string]any {
-	result := make(map[string]any, len(pk))
-	for _, col := range pk {
-		result[col] = row[col]
-	}
-	return result
-}
 
 // pgTableToIceberg converts "public.orders" to "orders" for the Iceberg table name.
 func pgTableToIceberg(pgTable string) string {

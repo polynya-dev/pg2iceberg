@@ -124,14 +124,21 @@ type SinkConfig struct {
 	FlushBytes     int64  `yaml:"flush_bytes" json:"flush_bytes,omitempty"`
 	TargetFileSize int64  `yaml:"target_file_size" json:"target_file_size,omitempty"`
 
-	// TOAST cache size (bytes). Shared LRU across all tables.
-	ToastCacheBytes int64 `yaml:"toast_cache_bytes" json:"toast_cache_bytes,omitempty"`
+	// Events table partition expression, e.g. "day(_ts)" or "month(_ts)".
+	// Defaults to "day(_ts)" if not set.
+	EventsPartition string `yaml:"events_partition" json:"events_partition,omitempty"`
 
-	// Compaction settings
-	CompactionInterval   string `yaml:"compaction_interval" json:"compaction_interval,omitempty"`
-	CompactionTargetSize int64  `yaml:"compaction_target_size" json:"compaction_target_size,omitempty"`
-	CompactionMinFiles   int    `yaml:"compaction_min_files" json:"compaction_min_files,omitempty"`
-	MaxSnapshots         int    `yaml:"max_snapshots" json:"max_snapshots,omitempty"`
+	// Materializer settings
+	MaterializerInterval       string `yaml:"materializer_interval" json:"materializer_interval,omitempty"`
+	MaterializerTargetFileSize int64  `yaml:"materializer_target_file_size" json:"materializer_target_file_size,omitempty"`
+	MaterializerConcurrency    int    `yaml:"materializer_concurrency" json:"materializer_concurrency,omitempty"`
+}
+
+func (s SinkConfig) EventsPartitionOrDefault() string {
+	if s.EventsPartition != "" {
+		return s.EventsPartition
+	}
+	return "day(_ts)"
 }
 
 func (s SinkConfig) FlushBytesOrDefault() int64 {
@@ -148,36 +155,34 @@ func (s SinkConfig) TargetFileSizeOrDefault() int64 {
 	return 128 * 1024 * 1024 // 128MB
 }
 
-func (s SinkConfig) ToastCacheBytesOrDefault() int64 {
-	if s.ToastCacheBytes > 0 {
-		return s.ToastCacheBytes
+func (s SinkConfig) MaterializerDuration() time.Duration {
+	if s.MaterializerInterval == "" {
+		return 10 * time.Second // default 10s
 	}
-	return 128 * 1024 * 1024 // 128MB
-}
-
-func (s SinkConfig) CompactionDuration() time.Duration {
-	if s.CompactionInterval == "" {
-		return 0 // disabled
-	}
-	d, err := time.ParseDuration(s.CompactionInterval)
+	d, err := time.ParseDuration(s.MaterializerInterval)
 	if err != nil {
-		return 0
+		return 10 * time.Second
 	}
 	return d
 }
 
-func (s SinkConfig) CompactionTargetSizeOrDefault() int64 {
-	if s.CompactionTargetSize > 0 {
-		return s.CompactionTargetSize
+// MaterializerTargetFileSizeOrDefault returns the target file size for
+// materialized table data and delete files. Default: 8MB.
+func (s SinkConfig) MaterializerTargetFileSizeOrDefault() int64 {
+	if s.MaterializerTargetFileSize > 0 {
+		return s.MaterializerTargetFileSize
 	}
-	return 256 * 1024 * 1024 // 256MB
+	return 8 * 1024 * 1024 // 8MB
 }
 
-func (s SinkConfig) CompactionMinFilesOrDefault() int {
-	if s.CompactionMinFiles > 0 {
-		return s.CompactionMinFiles
+// MaterializerConcurrencyOrDefault returns the configured materializer I/O
+// concurrency, defaulting to 16. Since this is I/O-bound (S3 range reads),
+// it should be higher than core count.
+func (s SinkConfig) MaterializerConcurrencyOrDefault() int {
+	if s.MaterializerConcurrency > 0 {
+		return s.MaterializerConcurrency
 	}
-	return 4
+	return 16
 }
 
 func (s SinkConfig) FlushDuration() time.Duration {
@@ -343,12 +348,11 @@ func (cfg *Config) Validate() error {
 			errs = append(errs, fmt.Sprintf("sink.flush_interval: invalid duration %q", cfg.Sink.FlushInterval))
 		}
 	}
-	if cfg.Sink.CompactionInterval != "" {
-		if _, err := time.ParseDuration(cfg.Sink.CompactionInterval); err != nil {
-			errs = append(errs, fmt.Sprintf("sink.compaction_interval: invalid duration %q", cfg.Sink.CompactionInterval))
+	if cfg.Sink.MaterializerInterval != "" {
+		if _, err := time.ParseDuration(cfg.Sink.MaterializerInterval); err != nil {
+			errs = append(errs, fmt.Sprintf("sink.materializer_interval: invalid duration %q", cfg.Sink.MaterializerInterval))
 		}
 	}
-
 	if cfg.Sink.FlushRows < 0 {
 		errs = append(errs, "sink.flush_rows: must be positive")
 	}

@@ -178,6 +178,11 @@ services:
       WAREHOUSE: s3://warehouse/
       NAMESPACE: benchmark
       TABLE: bench_events
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_S3_FORCE_PATH_STYLE: "true"
     depends_on:
       iceberg-rest:
         condition: service_healthy

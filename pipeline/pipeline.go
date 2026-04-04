@@ -58,6 +58,9 @@ type Pipeline struct {
 	bytesProcessed int64
 	lastWrittenLSN uint64 // LSN of the last event written to sink
 
+	materializer *sink.Materializer
+	eventBuf     *sink.ChangeEventBuffer
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	mu     sync.RWMutex
@@ -72,13 +75,16 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 		return nil, fmt.Errorf("create checkpoint store: %w", err)
 	}
 
-	snk, err := sink.BuildSink(cfg.Sink, cfg.Tables, id)
+	eventBuf := sink.NewChangeEventBuffer()
+	snk, err := sink.BuildSink(cfg.Sink, cfg.Tables, id, eventBuf)
 	if err != nil {
 		cpStore.Close()
 		return nil, fmt.Errorf("create sink: %w", err)
 	}
 
-	return NewPipeline(id, cfg, snk, cpStore), nil
+	p := NewPipeline(id, cfg, snk, cpStore)
+	p.eventBuf = eventBuf
+	return p, nil
 }
 
 // NewPipeline creates a Pipeline but does not start it.
@@ -255,16 +261,18 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		go p.monitorWALLag(ctx)
 	}
 
-	// Start compactor if configured.
-	compactionInterval := p.cfg.Sink.CompactionDuration()
-	if compactionInterval > 0 {
-		compactor := sink.NewCompactor(p.cfg.Sink, p.snk, p.schemas)
-		go compactor.Run(ctx)
-		log.Printf("[pipeline:%s] compactor started (interval=%s, target_size=%dMB, min_files=%d)",
-			p.id, compactionInterval,
-			p.cfg.Sink.CompactionTargetSizeOrDefault()/(1024*1024),
-			p.cfg.Sink.CompactionMinFilesOrDefault())
+	// Start materializer.
+	materializer := sink.NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.eventBuf)
+	// Restore materializer checkpoints.
+	if cp.MaterializerSnapshots != nil {
+		for pgTable, snapID := range cp.MaterializerSnapshots {
+			materializer.SetLastEventsSnapshot(pgTable, snapID)
+		}
 	}
+	go materializer.Run(ctx)
+	p.materializer = materializer
+	log.Printf("[pipeline:%s] materializer started (interval=%s)",
+		p.id, p.cfg.Sink.MaterializerDuration())
 
 	// Initialize source.
 	switch p.cfg.Source.Mode {
@@ -485,6 +493,14 @@ func (p *Pipeline) run(ctx context.Context) {
 				}
 				flushCancel()
 			}
+			// Run a final materialization pass so all flushed events are
+			// merged into the materialized tables before shutdown.
+			if p.materializer != nil {
+				matCtx, matCancel := context.WithTimeout(context.Background(), 60*time.Second)
+				p.materializer.MaterializeAll(matCtx)
+				matCancel()
+				log.Printf("[pipeline:%s] final materialization complete", p.id)
+			}
 			if err != nil && err != context.Canceled {
 				p.setStatus(StatusError, err)
 			}
@@ -631,6 +647,11 @@ func (p *Pipeline) flush(ctx context.Context) error {
 			cp.LSN = p.lastWrittenLSN
 			ls.SetFlushedLSN(cp.LSN)
 		}
+	}
+
+	// Persist materializer checkpoints.
+	if p.materializer != nil {
+		cp.MaterializerSnapshots = p.materializer.LastEventsSnapshots()
 	}
 
 	if err := p.store.Save(p.id, cp); err != nil {

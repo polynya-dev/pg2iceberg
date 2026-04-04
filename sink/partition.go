@@ -311,6 +311,43 @@ func (ps *PartitionSpec) PartitionAvroValue(partValues map[string]any, ts *schem
 	return result
 }
 
+// ParsePartitionPath reverses a partition path like "seq_truncate=0" back into
+// partition values. Used when the original row is not available (e.g. DELETE
+// events resolved from the file index).
+func (ps *PartitionSpec) ParsePartitionPath(path string, ts *schema.TableSchema) map[string]any {
+	values := make(map[string]any, len(ps.Fields))
+	parts := strings.Split(path, "/")
+	for _, part := range parts {
+		eqIdx := strings.Index(part, "=")
+		if eqIdx < 0 {
+			continue
+		}
+		name := part[:eqIdx]
+		valStr := part[eqIdx+1:]
+		for _, f := range ps.Fields {
+			if f.Name != name {
+				continue
+			}
+			if valStr == "__null__" {
+				values[name] = nil
+			} else {
+				avroType := partitionFieldAvroType(f.Transform, ts, f.SourceID)
+				switch avroType {
+				case "int":
+					n, _ := strconv.ParseInt(valStr, 10, 32)
+					values[name] = int32(n)
+				case "long":
+					n, _ := strconv.ParseInt(valStr, 10, 64)
+					values[name] = n
+				default:
+					values[name] = valStr
+				}
+			}
+		}
+	}
+	return values
+}
+
 // --- helpers ---
 
 func findColumn(ts *schema.TableSchema, name string) *schema.Column {
@@ -669,10 +706,19 @@ func formatUnscaled(unscaled *big.Int, scale int) string {
 
 // toTime converts a value to time.Time for partition transforms.
 // Uses fastParseTimestamp (microseconds) to avoid time.Parse overhead.
+// Also handles int64 (microseconds since epoch) and int32 (days since epoch)
+// for values roundtripped through parquet.
 func toTime(v any, pgType string) time.Time {
 	switch x := v.(type) {
 	case time.Time:
 		return x
+	case int64:
+		// Microseconds since epoch (from parquet timestamp roundtrip).
+		return time.Unix(x/1_000_000, (x%1_000_000)*1000).UTC()
+	case int32:
+		// Days since epoch (from parquet date roundtrip).
+		epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		return epoch.AddDate(0, 0, int(x))
 	case string:
 		if strings.ToLower(pgType) == "date" {
 			if len(x) >= 10 && x[4] == '-' && x[7] == '-' {

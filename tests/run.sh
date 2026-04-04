@@ -26,8 +26,9 @@
 # SQL files just use the actual table name directly.
 #
 # Usage:
-#   ./tests/run.sh                        # run all tests
+#   ./tests/run.sh                        # run all tests sequentially
 #   ./tests/run.sh 00001_basic_insert     # run a specific test
+#   PARALLEL=4 ./tests/run.sh             # run 4 tests concurrently
 
 set -euo pipefail
 
@@ -51,6 +52,9 @@ S3_SECRET_KEY="${S3_SECRET_KEY:-password}"
 FLUSH_INTERVAL="${FLUSH_INTERVAL:-3s}"
 FLUSH_ROWS="${FLUSH_ROWS:-10000}"
 NAMESPACE="default"
+
+# Parallelism: number of tests to run concurrently (1 = sequential).
+PARALLEL="${PARALLEL:-1}"
 
 passed=0
 failed=0
@@ -205,6 +209,7 @@ sink:
   s3_region: us-east-1
   flush_interval: ${FLUSH_INTERVAL}
   flush_rows: ${FLUSH_ROWS}
+  materializer_interval: 5s
 
 state:
   path: ${state_path}
@@ -282,6 +287,7 @@ run_test() {
         pg_exec "DROP TABLE IF EXISTS ${table:-__noop__} CASCADE;" >/dev/null 2>&1 || true
         pg_exec "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${slot:-__noop__}' AND NOT active;" >/dev/null 2>&1 || true
         curl -sf -X DELETE "${CATALOG_URI}/v1/namespaces/${NAMESPACE}/tables/${table:-__noop__}" >/dev/null 2>&1 || true
+        curl -sf -X DELETE "${CATALOG_URI}/v1/namespaces/${NAMESPACE}/tables/${table:-__noop__}_events" >/dev/null 2>&1 || true
     }
 
     cleanup_test() {
@@ -368,20 +374,29 @@ run_test() {
     fi
 
     # ── Verify via ClickHouse ──
-    ch_query "SYSTEM DROP SCHEMA CACHE FOR DATABASE iceberg" >/dev/null 2>&1 || true
-
     local query_sql
     query_sql="$(cat "$query_file")"
-
-    local actual
-    actual=$(ch_query "$query_sql" 2>&1) || true
 
     local expected
     expected="$(cat "$reference_file")"
 
+    # Retry query a few times — ClickHouse schema cache invalidation is async,
+    # so the first query after shutdown may still see stale (empty) state.
+    local actual=""
+    local retry=0
+    while [ $retry -lt 5 ]; do
+        ch_query "SYSTEM DROP SCHEMA CACHE FOR DATABASE iceberg" >/dev/null 2>&1 || true
+        sleep 1
+        actual=$(ch_query "$query_sql" 2>&1) || true
+        if [ "$actual" = "$expected" ]; then
+            break
+        fi
+        retry=$((retry + 1))
+    done
+
     if [ "$actual" = "$expected" ]; then
         echo "  PASS"
-        passed=$((passed + 1))
+        echo "PASS" > "${tmp_dir}/result"
     else
         echo "  FAIL"
         diff --color=auto -u \
@@ -392,8 +407,12 @@ run_test() {
             echo "  pg2iceberg log tail:"
             tail -10 "$pg2iceberg_log" | sed 's/^/    /'
         fi
-        failed=$((failed + 1))
-        errors+=("$test_name")
+        echo "FAIL" > "${tmp_dir}/result"
+    fi
+    # Preserve result dir for the collector (cleanup_test still runs on RETURN,
+    # but we copy the result out first).
+    if [ -n "${RESULT_DIR:-}" ]; then
+        cp "${tmp_dir}/result" "${RESULT_DIR}/${test_name}"
     fi
 }
 
@@ -425,10 +444,57 @@ main() {
         die "no tests found in $CASES_DIR"
     fi
 
-    for test_name in $tests; do
-        run_test "$test_name"
+    # Collect results from parallel runs in a shared temp directory.
+    RESULT_DIR=$(mktemp -d)
+    export RESULT_DIR
+
+    if [ "$PARALLEL" -le 1 ]; then
+        # Sequential mode.
+        for test_name in $tests; do
+            run_test "$test_name"
+            echo ""
+        done
+    else
+        # Parallel mode: run up to $PARALLEL tests concurrently.
+        local running=0
+        local pids=()
+        local pid_names=()
+
+        for test_name in $tests; do
+            run_test "$test_name" &
+            pids+=($!)
+            pid_names+=("$test_name")
+            running=$((running + 1))
+
+            # Throttle: wait for a slot when at max concurrency.
+            if [ $running -ge "$PARALLEL" ]; then
+                wait -n 2>/dev/null || true
+                running=$((running - 1))
+            fi
+        done
+
+        # Wait for remaining tests.
+        for pid in "${pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
         echo ""
+    fi
+
+    # ── Collect results ──
+    for result_file in "$RESULT_DIR"/*; do
+        [ -f "$result_file" ] || continue
+        local test_name
+        test_name="$(basename "$result_file")"
+        local result
+        result="$(cat "$result_file")"
+        if [ "$result" = "PASS" ]; then
+            passed=$((passed + 1))
+        else
+            failed=$((failed + 1))
+            errors+=("$test_name")
+        fi
     done
+    rm -rf "$RESULT_DIR"
 
     # ── Summary ──
     echo "=== Results: $passed passed, $failed failed ==="

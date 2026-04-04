@@ -145,52 +145,61 @@ var CatalogErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help:      "Total catalog operation errors.",
 }, []string{"operation"})
 
-// --- TOAST ---
+// --- Materializer ---
 
-var ToastLookupsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+var MaterializerDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Namespace: namespace,
-	Name:      "toast_lookups_total",
-	Help:      "Total TOAST resolution lookup queries.",
-}, []string{"pipeline", "table"})
-
-var ToastRowsResolvedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Namespace: namespace,
-	Name:      "toast_rows_resolved_total",
-	Help:      "Total rows resolved via TOAST lookups.",
-}, []string{"pipeline", "table"})
-
-var ToastLookupDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Namespace: namespace,
-	Name:      "toast_lookup_duration_seconds",
-	Help:      "Time taken for TOAST Iceberg scan lookups.",
-	Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
-}, []string{"pipeline", "table"})
-
-// --- Compaction ---
-
-var CompactionDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Namespace: namespace,
-	Name:      "compaction_duration_seconds",
-	Help:      "Time taken for compaction runs.",
-	Buckets:   []float64{0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
+	Name:      "materializer_duration_seconds",
+	Help:      "Time taken for a single materialization pass per table.",
+	Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120},
 }, []string{"table"})
 
-var CompactionRunsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+var MaterializerRunsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: namespace,
-	Name:      "compaction_runs_total",
-	Help:      "Total compaction runs.",
-}, []string{"table", "status"})
+	Name:      "materializer_runs_total",
+	Help:      "Total materialization runs by table and source (buffer or s3).",
+}, []string{"table", "source"})
 
-var CompactionInputRowsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+var MaterializerErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: namespace,
-	Name:      "compaction_input_rows_total",
-	Help:      "Total input rows processed during compaction.",
+	Name:      "materializer_errors_total",
+	Help:      "Total materialization errors.",
 }, []string{"table"})
 
-var CompactionDeletedRowsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+var MaterializerEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: namespace,
-	Name:      "compaction_deleted_rows_total",
-	Help:      "Total rows removed during compaction.",
+	Name:      "materializer_events_total",
+	Help:      "Total events materialized.",
+}, []string{"table"})
+
+var MaterializerDataFilesWrittenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "materializer_data_files_written_total",
+	Help:      "Total new data files written by the materializer.",
+}, []string{"table"})
+
+var MaterializerDeleteFilesWrittenTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "materializer_delete_files_written_total",
+	Help:      "Total equality delete files written by the materializer.",
+}, []string{"table"})
+
+var MaterializerDeleteRowsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "materializer_delete_rows_total",
+	Help:      "Total rows marked for deletion (UPDATEs + DELETEs).",
+}, []string{"table"})
+
+var MaterializerBufferSize = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: namespace,
+	Name:      "materializer_buffer_events",
+	Help:      "Number of change events pending materialization in the in-memory buffer.",
+}, []string{"table"})
+
+var MaterializerMaterializedLSN = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Namespace: namespace,
+	Name:      "materializer_materialized_lsn",
+	Help:      "Highest LSN that has been applied to the materialized table.",
 }, []string{"table"})
 
 // --- Snapshot ---

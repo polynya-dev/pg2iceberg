@@ -35,6 +35,10 @@ type Checkpoint struct {
 	// LastSequenceNumber is the Iceberg sequence number of the last commit.
 	LastSequenceNumber int64 `json:"last_sequence_number,omitempty"`
 
+	// MaterializerSnapshots tracks the last processed events table snapshot
+	// per table. Keyed by PG table name (e.g. "public.orders").
+	MaterializerSnapshots map[string]int64 `json:"materializer_snapshots,omitempty"`
+
 	// UpdatedAt is when this checkpoint was last saved.
 	UpdatedAt time.Time `json:"updated_at"`
 }

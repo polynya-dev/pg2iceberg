@@ -126,7 +126,7 @@
     {
       "title": "S3 Operation Duration",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 20 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
@@ -136,7 +136,7 @@
     {
       "title": "S3 Throughput",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 20 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
@@ -147,11 +147,22 @@
     {
       "title": "Catalog Operation Duration",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 20 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
         { "expr": "histogram_quantile(0.95, rate(pg2iceberg_catalog_operation_duration_seconds_bucket[5m]))", "legendFormat": "{{operation}} p95" }
+      ]
+    },
+    {
+      "title": "S3 & Catalog Errors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 }, "color": { "fixedColor": "red", "mode": "fixed" } }, "overrides": [] },
+      "targets": [
+        { "expr": "rate(pg2iceberg_s3_errors_total[1m])", "legendFormat": "s3 {{operation}}" },
+        { "expr": "rate(pg2iceberg_catalog_errors_total[1m])", "legendFormat": "catalog {{operation}}" }
       ]
     },
     {
@@ -174,48 +185,57 @@
       "targets": [{ "expr": "pg2iceberg_confirmed_lsn", "legendFormat": "{{pipeline}}" }]
     },
     {
-      "title": "TOAST Lookups",
+      "title": "Materializer Duration",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
-        { "expr": "rate(pg2iceberg_toast_lookups_total[1m])", "legendFormat": "lookups {{table}}" },
-        { "expr": "rate(pg2iceberg_toast_rows_resolved_total[1m])", "legendFormat": "rows {{table}}" }
+        { "expr": "histogram_quantile(0.50, rate(pg2iceberg_materializer_duration_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(pg2iceberg_materializer_duration_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(pg2iceberg_materializer_duration_seconds_bucket[5m]))", "legendFormat": "p99" }
       ]
     },
     {
-      "title": "TOAST Lookup Duration",
+      "title": "Materializer Runs & Errors",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 } }, "overrides": [{ "matcher": { "id": "byName", "options": "errors" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }] },
       "targets": [
-        { "expr": "histogram_quantile(0.5, rate(pg2iceberg_toast_lookup_duration_seconds_bucket[5m]))", "legendFormat": "{{table}} p50" },
-        { "expr": "histogram_quantile(0.95, rate(pg2iceberg_toast_lookup_duration_seconds_bucket[5m]))", "legendFormat": "{{table}} p95" },
-        { "expr": "histogram_quantile(0.99, rate(pg2iceberg_toast_lookup_duration_seconds_bucket[5m]))", "legendFormat": "{{table}} p99" }
+        { "expr": "rate(pg2iceberg_materializer_runs_total[1m])", "legendFormat": "{{table}} ({{source}})" },
+        { "expr": "rate(pg2iceberg_materializer_errors_total[1m])", "legendFormat": "errors {{table}}" }
       ]
     },
     {
-      "title": "Compaction Duration",
+      "title": "Materializer Events (rate)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
-        { "expr": "histogram_quantile(0.95, rate(pg2iceberg_compaction_duration_seconds_bucket[5m]))", "legendFormat": "{{table}} p95" }
+        { "expr": "rate(pg2iceberg_materializer_events_total[1m])", "legendFormat": "{{table}}" }
       ]
     },
     {
-      "title": "Compaction Rows",
+      "title": "Materializer Files Written",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 44 },
-
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 50 } }, "overrides": [] },
       "targets": [
-        { "expr": "rate(pg2iceberg_compaction_input_rows_total[5m])", "legendFormat": "input {{table}}" },
-        { "expr": "rate(pg2iceberg_compaction_deleted_rows_total[5m])", "legendFormat": "deleted {{table}}" }
+        { "expr": "rate(pg2iceberg_materializer_data_files_written_total[5m])", "legendFormat": "data {{table}}" },
+        { "expr": "rate(pg2iceberg_materializer_delete_files_written_total[5m])", "legendFormat": "delete {{table}}" }
+      ]
+    },
+    {
+      "title": "Materializer Delete Rows",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "expr": "rate(pg2iceberg_materializer_delete_rows_total[5m])", "legendFormat": "{{table}}" }
       ]
     },
     {
@@ -244,14 +264,31 @@
       "targets": [{ "expr": "pg2iceberg_snapshot_in_progress", "legendFormat": "{{pipeline}}" }]
     },
     {
-      "title": "S3 Errors",
+      "title": "Materializer Buffer Size",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 44 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 52 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "bars", "fillOpacity": 50 }, "color": { "fixedColor": "red", "mode": "fixed" } }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
       "targets": [
-        { "expr": "rate(pg2iceberg_s3_errors_total[1m])", "legendFormat": "{{operation}}" },
-        { "expr": "rate(pg2iceberg_catalog_errors_total[1m])", "legendFormat": "catalog {{operation}}" }
+        { "expr": "pg2iceberg_materializer_buffer_events", "legendFormat": "{{table}}" }
+      ]
+    },
+    {
+      "title": "Materialization Lag (LSN delta)",
+      "description": "Difference between the confirmed (flushed) LSN and the highest LSN applied to the materialized table. A growing gap means materialization is falling behind.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 60 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decbytes",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 16777216 }, { "color": "red", "value": 104857600 }] }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "pg2iceberg_confirmed_lsn - on() group_right pg2iceberg_materializer_materialized_lsn", "legendFormat": "{{table}} lag" }
       ]
     }
   ],

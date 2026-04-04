@@ -81,7 +81,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	mem := newMemStorage()
 	cat := newMemCatalog()
 
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
 
 	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
@@ -270,7 +270,7 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 	mem := newGatedStorage()
 	cat := newMemCatalog()
 
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
 	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
@@ -419,7 +419,7 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 	mem := newMemStorage()
 	cat := newFailOnceCatalog()
 
-	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
 	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
@@ -631,6 +631,30 @@ func (m *memStorage) Download(_ context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("not found: %s", key)
 	}
 	return data, nil
+}
+
+func (m *memStorage) DownloadRange(_ context.Context, key string, offset, length int64) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.files[key]
+	if !ok {
+		return nil, fmt.Errorf("not found: %s", key)
+	}
+	end := offset + length
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	return data[offset:end], nil
+}
+
+func (m *memStorage) StatObject(_ context.Context, key string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.files[key]
+	if !ok {
+		return 0, fmt.Errorf("not found: %s", key)
+	}
+	return int64(len(data)), nil
 }
 
 // memCatalog is an in-memory Catalog implementation for testing.

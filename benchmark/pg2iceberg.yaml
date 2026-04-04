@@ -29,7 +29,8 @@ sink:
   flush_interval: 10s
   flush_rows: 50000
   flush_bytes: 67108864
-  toast_cache_bytes: 4294967296
+  # toast_cache_bytes: 4294967296
+  materializer_interval: 30s
 
 state: {}
 

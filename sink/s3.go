@@ -18,6 +18,11 @@ import (
 type ObjectStorage interface {
 	Upload(ctx context.Context, key string, data []byte) (string, error)
 	Download(ctx context.Context, key string) ([]byte, error)
+	// DownloadRange reads a byte range from an object. offset is the start byte,
+	// length is the number of bytes to read.
+	DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+	// StatObject returns the size of an object in bytes.
+	StatObject(ctx context.Context, key string) (int64, error)
 }
 
 // S3Client wraps the S3 SDK for uploading and downloading files.
@@ -78,6 +83,63 @@ func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
 		metrics.S3BytesDownloadedTotal.Add(float64(len(data)))
 	}
 	return data, err
+}
+
+// DownloadRange reads a byte range from an S3 object.
+func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	start := time.Now()
+	out, err := c.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &c.bucket,
+		Key:    aws.String(key),
+		Range:  &rangeHeader,
+	})
+	metrics.S3OperationDurationSeconds.WithLabelValues("download_range").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.S3ErrorsTotal.WithLabelValues("download_range").Inc()
+		return nil, fmt.Errorf("download range %s: %w", key, err)
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err == nil {
+		metrics.S3BytesDownloadedTotal.Add(float64(len(data)))
+	}
+	return data, err
+}
+
+// StatObject returns the size of an S3 object in bytes.
+func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
+	start := time.Now()
+	out, err := c.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: &c.bucket,
+		Key:    aws.String(key),
+	})
+	metrics.S3OperationDurationSeconds.WithLabelValues("head").Observe(time.Since(start).Seconds())
+	if err != nil {
+		metrics.S3ErrorsTotal.WithLabelValues("head").Inc()
+		return 0, fmt.Errorf("head %s: %w", key, err)
+	}
+	return *out.ContentLength, nil
+}
+
+// s3ReaderAt implements io.ReaderAt using S3 range reads.
+// Used by pq.OpenFile to read only the parquet footer and needed column chunks.
+type s3ReaderAt struct {
+	ctx context.Context
+	s3  ObjectStorage
+	key string
+}
+
+func (r *s3ReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	data, err := r.s3.DownloadRange(r.ctx, r.key, off, int64(len(p)))
+	if err != nil {
+		return 0, err
+	}
+	n := copy(p, data)
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 // KeyFromURI extracts the S3 key from an s3://bucket/key URI.

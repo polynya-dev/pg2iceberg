@@ -12,11 +12,96 @@ import (
 	"github.com/parquet-go/parquet-go"
 )
 
+// colSizer holds precomputed per-column sizing info to avoid repeated string
+// comparisons in the hot path. fixedSize > 0 means the column has a known
+// fixed byte width; fixedSize == 0 means it's variable-length (text, json, etc.).
+type colSizer struct {
+	name      string
+	fixedSize int64 // 0 = variable-length
+}
+
+// buildColSizers precomputes sizing info from column types.
+func buildColSizers(columns []schema.Column) []colSizer {
+	sizers := make([]colSizer, len(columns))
+	for i, col := range columns {
+		sizers[i].name = col.Name
+		switch strings.ToLower(col.PGType) {
+		case "int2", "smallint", "int4", "integer", "serial", "float4", "real", "date":
+			sizers[i].fixedSize = 4
+		case "int8", "bigint", "bigserial", "float8", "double precision",
+			"timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
+			sizers[i].fixedSize = 8
+		case "bool", "boolean":
+			sizers[i].fixedSize = 1
+		}
+	}
+	return sizers
+}
+
+// colConverter holds precomputed conversion functions per column to avoid
+// strings.ToLower on every row in the parquet encoding hot path.
+type colConverter struct {
+	name     string
+	idx      int // parquet column index
+	nullable bool
+	convert  func(any) parquet.Value // converts a non-nil Go value to parquet
+	zero     parquet.Value           // zero value for non-nullable null
+}
+
+// buildColConverters precomputes parquet conversion functions for each column.
+func buildColConverters(columns []schema.Column, colOrder map[string]int) []colConverter {
+	converters := make([]colConverter, 0, len(columns))
+	for _, col := range columns {
+		idx, ok := colOrder[col.Name]
+		if !ok {
+			continue
+		}
+		cc := colConverter{
+			name:     col.Name,
+			idx:      idx,
+			nullable: col.IsNullable,
+		}
+		switch strings.ToLower(col.PGType) {
+		case "int2", "smallint":
+			cc.convert = func(v any) parquet.Value { return parquet.Int32Value(toInt32(v)) }
+			cc.zero = parquet.Int32Value(0)
+		case "int4", "integer", "serial":
+			cc.convert = func(v any) parquet.Value { return parquet.Int32Value(toInt32(v)) }
+			cc.zero = parquet.Int32Value(0)
+		case "int8", "bigint", "bigserial":
+			cc.convert = func(v any) parquet.Value { return parquet.Int64Value(toInt64(v)) }
+			cc.zero = parquet.Int64Value(0)
+		case "float4", "real":
+			cc.convert = func(v any) parquet.Value { return parquet.FloatValue(toFloat32(v)) }
+			cc.zero = parquet.FloatValue(0)
+		case "float8", "double precision":
+			cc.convert = func(v any) parquet.Value { return parquet.DoubleValue(toFloat64(v)) }
+			cc.zero = parquet.DoubleValue(0)
+		case "bool", "boolean":
+			cc.convert = func(v any) parquet.Value { return parquet.BooleanValue(toBool(v)) }
+			cc.zero = parquet.BooleanValue(false)
+		case "timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
+			cc.convert = func(v any) parquet.Value { return parquet.Int64Value(toTimestampMicros(v)) }
+			cc.zero = parquet.Int64Value(0)
+		case "date":
+			cc.convert = func(v any) parquet.Value { return parquet.Int32Value(toDateDays(v)) }
+			cc.zero = parquet.Int32Value(0)
+		default:
+			cc.convert = func(v any) parquet.Value { return parquet.ByteArrayValue([]byte(toString(v))) }
+			cc.zero = parquet.ByteArrayValue([]byte(""))
+		}
+		converters = append(converters, cc)
+	}
+	return converters
+}
+
 // ParquetWriter accumulates rows and flushes them as a Parquet file.
 type ParquetWriter struct {
-	tableSchema *schema.TableSchema
-	pqSchema    *parquet.Schema
-	columns     []schema.Column // columns to write (subset for delete files)
+	tableSchema   *schema.TableSchema
+	pqSchema      *parquet.Schema
+	columns       []schema.Column   // columns to write (subset for delete files)
+	colSizers     []colSizer        // precomputed per-column sizing
+	colConverters []colConverter     // precomputed parquet converters
 	// colOrder maps column name to its index in the parquet schema's leaf columns.
 	colOrder       map[string]int
 	rows           []map[string]any
@@ -35,12 +120,14 @@ func NewDataWriter(ts *schema.TableSchema) *ParquetWriter {
 	pqSchema := buildParquetSchema("data", ts.Columns)
 	colOrder := schemaColumnOrder(pqSchema)
 	w := &ParquetWriter{
-		tableSchema: ts,
-		pqSchema:    pqSchema,
-		columns:     ts.Columns,
-		colOrder:    colOrder,
-		rowBuf:      parquet.NewBuffer(pqSchema),
-		pqRow:       make(parquet.Row, len(colOrder)),
+		tableSchema:   ts,
+		pqSchema:      pqSchema,
+		columns:       ts.Columns,
+		colSizers:     buildColSizers(ts.Columns),
+		colConverters: buildColConverters(ts.Columns, colOrder),
+		colOrder:      colOrder,
+		rowBuf:        parquet.NewBuffer(pqSchema),
+		pqRow:         make(parquet.Row, len(colOrder)),
 	}
 	w.pqWriter = parquet.NewWriter(&w.outBuf)
 	return w
@@ -60,12 +147,14 @@ func NewDeleteWriter(ts *schema.TableSchema) *ParquetWriter {
 	pqSchema := buildParquetSchema("equality_delete", pkCols)
 	colOrder := schemaColumnOrder(pqSchema)
 	w := &ParquetWriter{
-		tableSchema: ts,
-		pqSchema:    pqSchema,
-		columns:     pkCols,
-		colOrder:    colOrder,
-		rowBuf:      parquet.NewBuffer(pqSchema),
-		pqRow:       make(parquet.Row, len(colOrder)),
+		tableSchema:   ts,
+		pqSchema:      pqSchema,
+		columns:       pkCols,
+		colSizers:     buildColSizers(pkCols),
+		colConverters: buildColConverters(pkCols, colOrder),
+		colOrder:      colOrder,
+		rowBuf:        parquet.NewBuffer(pqSchema),
+		pqRow:         make(parquet.Row, len(colOrder)),
 	}
 	w.pqWriter = parquet.NewWriter(&w.outBuf)
 	return w
@@ -82,7 +171,7 @@ func schemaColumnOrder(s *parquet.Schema) map[string]int {
 
 func (w *ParquetWriter) Add(row map[string]any) {
 	w.rows = append(w.rows, row)
-	w.estimatedBytes += estimateRowBytes(w.columns, row)
+	w.estimatedBytes += estimateRowBytes(w.colSizers, row)
 }
 
 func (w *ParquetWriter) Len() int {
@@ -104,33 +193,19 @@ func (w *ParquetWriter) Reset() {
 	w.estimatedBytes = 0
 }
 
-// estimateRowBytes returns a rough byte count for a row based on column types.
-func estimateRowBytes(columns []schema.Column, row map[string]any) int64 {
+// estimateRowBytes returns a rough byte count for a row using precomputed column sizers.
+func estimateRowBytes(sizers []colSizer, row map[string]any) int64 {
 	var size int64
-	for _, col := range columns {
-		v := row[col.Name]
+	for i := range sizers {
+		v := row[sizers[i].name]
 		if v == nil {
-			size += 1 // null bitmap
+			size++
 			continue
 		}
-		switch strings.ToLower(col.PGType) {
-		case "int2", "smallint", "int4", "integer", "serial":
-			size += 4
-		case "int8", "bigint", "bigserial":
-			size += 8
-		case "float4", "real":
-			size += 4
-		case "float8", "double precision":
-			size += 8
-		case "bool", "boolean":
-			size += 1
-		case "timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
-			size += 8
-		case "date":
-			size += 4
-		default:
-			// text, varchar, numeric, json, uuid, etc.
-			size += int64(len(toString(v))) + 4 // length prefix
+		if sizers[i].fixedSize > 0 {
+			size += sizers[i].fixedSize
+		} else {
+			size += int64(len(toString(v))) + 4
 		}
 	}
 	return size
@@ -279,25 +354,22 @@ func (w *ParquetWriter) Flush() ([]byte, int64, error) {
 
 // encodeRowInto populates the pre-allocated dst slice with parquet values.
 func (w *ParquetWriter) encodeRowInto(dst parquet.Row, data map[string]any) {
-	for _, col := range w.columns {
-		idx, ok := w.colOrder[col.Name]
-		if !ok {
-			continue
-		}
-		v := data[col.Name]
+	for i := range w.colConverters {
+		cc := &w.colConverters[i]
+		v := data[cc.name]
 		if v == nil {
-			if col.IsNullable {
-				dst[idx] = parquet.Value{}.Level(0, 0, idx)
+			if cc.nullable {
+				dst[cc.idx] = parquet.Value{}.Level(0, 0, cc.idx)
 			} else {
-				dst[idx] = zeroValue(col).Level(0, 0, idx)
+				dst[cc.idx] = cc.zero.Level(0, 0, cc.idx)
 			}
 			continue
 		}
-		pv := toParquetValue(col, v)
-		if col.IsNullable {
-			dst[idx] = pv.Level(0, 1, idx)
+		pv := cc.convert(v)
+		if cc.nullable {
+			dst[cc.idx] = pv.Level(0, 1, cc.idx)
 		} else {
-			dst[idx] = pv.Level(0, 0, idx)
+			dst[cc.idx] = pv.Level(0, 0, cc.idx)
 		}
 	}
 }
@@ -356,6 +428,9 @@ func buildParquetSchema(name string, columns []schema.Column) *parquet.Schema {
 		if col.IsNullable {
 			node = parquet.Optional(node)
 		}
+		// Iceberg requires PARQUET:field_id on each column so readers
+		// (DuckDB, Spark, etc.) can map columns by field ID, not name.
+		node = parquet.FieldID(node, col.FieldID)
 		group[col.Name] = node
 	}
 	return parquet.NewSchema(name, group)
@@ -465,6 +540,10 @@ func toTimestampMicros(v any) int64 {
 	switch x := v.(type) {
 	case time.Time:
 		return x.UnixMicro()
+	case int64:
+		return x // already microseconds since epoch (e.g. from parquet roundtrip)
+	case int32:
+		return int64(x)
 	case string:
 		us, _ := fastParseTimestamp(x)
 		return us
@@ -609,6 +688,10 @@ func toDateDays(v any) int32 {
 	switch x := v.(type) {
 	case time.Time:
 		return int32(x.Sub(epoch).Hours() / 24)
+	case int32:
+		return x // already days since epoch (e.g. from parquet roundtrip)
+	case int64:
+		return int32(x)
 	case string:
 		if t, err := time.Parse("2006-01-02", x); err == nil {
 			return int32(t.Sub(epoch).Hours() / 24)
