@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -109,7 +110,7 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, e
 	defer cleanup(ctx)
 	defer tx.Rollback(ctx)
 
-	rows, err := tx.Query(ctx, fmt.Sprintf("SELECT * FROM %s", tbl.Name))
+	rows, err := tx.Query(ctx, fmt.Sprintf("SELECT * FROM %s", pgx.Identifier(strings.Split(tbl.Name, ".")).Sanitize()))
 	if err != nil {
 		return fmt.Errorf("snapshot query %s: %w", tbl.Name, err)
 	}
