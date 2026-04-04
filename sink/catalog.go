@@ -78,10 +78,26 @@ func (tm *TableMetadata) CurrentManifestList() string {
 
 // EnsureNamespace creates a namespace if it doesn't exist.
 func (c *CatalogClient) EnsureNamespace(ns string) error {
+	// Check existence first — the Iceberg REST catalog's JdbcCatalog
+	// backend returns 500 (not 409) on concurrent create attempts due
+	// to a primary key constraint violation in the properties table.
+	req, err := http.NewRequest("HEAD", c.baseURL+fmt.Sprintf("/v1/namespaces/%s", ns), nil)
+	if err != nil {
+		return err
+	}
+	headResp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	headResp.Body.Close()
+	if headResp.StatusCode == 200 {
+		return nil
+	}
+
 	body := map[string]any{
 		"namespace": []string{ns},
 	}
-	resp, err := c.post(fmt.Sprintf("/v1/namespaces"), body)
+	resp, err := c.post("/v1/namespaces", body)
 	if err != nil {
 		return err
 	}
