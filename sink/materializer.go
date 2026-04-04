@@ -416,15 +416,15 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		finalState     map[string]*pkState // needed for TOAST resolution
 	}
 
+	// --- Phase 1a: Parallel fold (events → final state per PK) ---
 	bucketResults := make([]bucketResult, len(buckets))
 
-	bucketTasks := make([]worker.Task, len(buckets))
+	foldTasks := make([]worker.Task, len(buckets))
 	for i, b := range buckets {
 		i, b := i, b
-		bucketTasks[i] = worker.Task{
+		foldTasks[i] = worker.Task{
 			Name: b.key,
 			Fn: func(ctx context.Context, _ *worker.Progress) error {
-				// Fold events into final state per PK.
 				state := make(map[string]*pkState, len(b.events)/2)
 				for _, ev := range b.events {
 					pkKey := buildPKKey(ev.row, pk)
@@ -457,6 +457,87 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 					}
 				}
 				bucketResults[i].finalState = state
+				return nil
+			},
+		}
+	}
+
+	foldConcurrency := runtime.NumCPU()
+	if len(foldTasks) < foldConcurrency {
+		foldConcurrency = len(foldTasks)
+	}
+	if foldConcurrency < 1 {
+		foldConcurrency = 1
+	}
+	foldPool := worker.NewPool(foldConcurrency)
+	if _, err := foldPool.Run(ctx, foldTasks); err != nil {
+		return fmt.Errorf("fold: %w", err)
+	}
+
+	tFold := time.Since(start)
+
+	// --- Phase 1b: TOAST resolution (must run before serialization) ---
+	// Collect unresolved PKs across all buckets.
+	allFinalState := make(map[string]*pkState)
+	var allUnresolvedPKs []string
+	for _, r := range bucketResults {
+		for k, v := range r.finalState {
+			if v.op == "U" && len(v.unchangedCols) > 0 {
+				allUnresolvedPKs = append(allUnresolvedPKs, k)
+			}
+			allFinalState[k] = v
+		}
+	}
+
+	if len(allUnresolvedPKs) > 0 && fi != nil {
+		affectedFilePaths := fi.affectedFiles(allUnresolvedPKs)
+		resolved := 0
+		for path := range affectedFilePaths {
+			dfKey, err := KeyFromURI(path)
+			if err != nil {
+				continue
+			}
+			data, err := s3.Download(ctx, dfKey)
+			if err != nil {
+				log.Printf("[materializer] TOAST: failed to download %s: %v", path, err)
+				continue
+			}
+			rows, err := readParquetRows(data, ts.srcSchema)
+			if err != nil {
+				log.Printf("[materializer] TOAST: failed to read %s: %v", path, err)
+				continue
+			}
+			for _, row := range rows {
+				pkKey := buildPKKey(row, pk)
+				state, ok := allFinalState[pkKey]
+				if !ok || state.op != "U" || len(state.unchangedCols) == 0 {
+					continue
+				}
+				for _, col := range state.unchangedCols {
+					if val, exists := row[col]; exists {
+						state.row[col] = val
+					}
+				}
+				state.unchangedCols = nil
+				resolved++
+			}
+		}
+		if resolved > 0 {
+			log.Printf("[materializer] TOAST: resolved %d/%d rows for %s (%d files scanned)",
+				resolved, len(allUnresolvedPKs), pgTable, len(affectedFilePaths))
+		}
+	}
+
+	tToast := time.Since(start)
+
+	// --- Phase 1c: Parallel serialize (state → Parquet files) ---
+	serializeTasks := make([]worker.Task, len(buckets))
+	for i, b := range buckets {
+		i, b := i, b
+		serializeTasks[i] = worker.Task{
+			Name: b.key,
+			Fn: func(ctx context.Context, _ *worker.Progress) error {
+				state := bucketResults[i].finalState
 
 				// Serialize equality delete files.
 				var deleteRowCount int64
@@ -531,79 +612,20 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		}
 	}
 
-	foldConcurrency := runtime.NumCPU()
-	if len(bucketTasks) < foldConcurrency {
-		foldConcurrency = len(bucketTasks)
-	}
-	if foldConcurrency < 1 {
-		foldConcurrency = 1
-	}
-	bucketPool := worker.NewPool(foldConcurrency)
-	if _, err := bucketPool.Run(ctx, bucketTasks); err != nil {
-		return fmt.Errorf("fold+serialize: %w", err)
+	serializePool := worker.NewPool(foldConcurrency)
+	if _, err := serializePool.Run(ctx, serializeTasks); err != nil {
+		return fmt.Errorf("serialize: %w", err)
 	}
 
-	tFold := time.Since(start)
+	tSerialize := time.Since(start)
 
 	// Collect results from all buckets.
 	var pending []pendingFile
 	var deleteRowCount int64
-	var allUnresolvedPKs []string
-	allFinalState := make(map[string]*pkState)
-
 	for _, r := range bucketResults {
 		pending = append(pending, r.pending...)
 		deleteRowCount += r.deleteRowCount
-		for k, v := range r.finalState {
-			if v.op == "U" && len(v.unchangedCols) > 0 {
-				allUnresolvedPKs = append(allUnresolvedPKs, k)
-			}
-			allFinalState[k] = v
-		}
 	}
-
-	// TOAST resolution: download affected files for unresolved PKs.
-	if len(allUnresolvedPKs) > 0 && fi != nil {
-		affectedFilePaths := fi.affectedFiles(allUnresolvedPKs)
-		resolved := 0
-		for path := range affectedFilePaths {
-			dfKey, err := KeyFromURI(path)
-			if err != nil {
-				continue
-			}
-			data, err := s3.Download(ctx, dfKey)
-			if err != nil {
-				log.Printf("[materializer] TOAST: failed to download %s: %v", path, err)
-				continue
-			}
-			rows, err := readParquetRows(data, ts.srcSchema)
-			if err != nil {
-				log.Printf("[materializer] TOAST: failed to read %s: %v", path, err)
-				continue
-			}
-			for _, row := range rows {
-				pkKey := buildPKKey(row, pk)
-				state, ok := allFinalState[pkKey]
-				if !ok || state.op != "U" || len(state.unchangedCols) == 0 {
-					continue
-				}
-				for _, col := range state.unchangedCols {
-					if val, exists := row[col]; exists {
-						state.row[col] = val
-					}
-				}
-				state.unchangedCols = nil
-				resolved++
-			}
-		}
-		if resolved > 0 {
-			log.Printf("[materializer] TOAST: resolved %d/%d rows for %s (%d files scanned)",
-				resolved, len(allUnresolvedPKs), pgTable, len(affectedFilePaths))
-		}
-	}
-
-	tToast := time.Since(start)
-	tSerialize := tToast // fold+serialize ran together in parallel
 
 	// --- Phase 2: Upload all files in parallel (I/O-bound) ---
 	var deleteEntries []ManifestEntry
