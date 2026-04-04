@@ -433,23 +433,20 @@ func (p *Pipeline) run(ctx context.Context) {
 
 			if p.snk.TotalBuffered() >= flushRows {
 				if err := p.doFlush(ctx); err != nil {
-					p.setStatus(StatusError, fmt.Errorf("flush error: %w", err))
-					return
+					log.Printf("[pipeline:%s] flush error (will retry): %v", p.id, err)
 				}
 			}
 
 			if p.snk.TotalBufferedBytes() >= flushBytes {
 				if err := p.doFlush(ctx); err != nil {
-					p.setStatus(StatusError, fmt.Errorf("flush error: %w", err))
-					return
+					log.Printf("[pipeline:%s] flush error (will retry): %v", p.id, err)
 				}
 			}
 
 		case <-flushTicker.C:
 			if p.snk.ShouldFlush() {
 				if err := p.doFlush(ctx); err != nil {
-					p.setStatus(StatusError, fmt.Errorf("flush error: %w", err))
-					return
+					log.Printf("[pipeline:%s] flush error (will retry): %v", p.id, err)
 				}
 			}
 
