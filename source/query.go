@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/config"
@@ -83,9 +84,11 @@ func (q *QuerySource) poll(ctx context.Context, events chan<- ChangeEvent) error
 		ts := q.tables[tbl.Name]
 		watermark := q.watermarks[tbl.Name]
 
+		quotedTable := pgx.Identifier(strings.Split(tbl.Name, ".")).Sanitize()
+		quotedCol := pgx.Identifier{tbl.WatermarkColumn}.Sanitize()
 		query := fmt.Sprintf(
 			"SELECT * FROM %s WHERE %s > $1 ORDER BY %s ASC",
-			tbl.Name, tbl.WatermarkColumn, tbl.WatermarkColumn,
+			quotedTable, quotedCol, quotedCol,
 		)
 
 		rows, err := q.conn.Query(ctx, query, watermark)
