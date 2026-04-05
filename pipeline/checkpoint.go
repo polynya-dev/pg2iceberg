@@ -39,6 +39,11 @@ type Checkpoint struct {
 	// per table. Keyed by PG table name (e.g. "public.orders").
 	MaterializerSnapshots map[string]int64 `json:"materializer_snapshots,omitempty"`
 
+	// QueryWatermarks stores per-table watermarks for query mode.
+	// Keyed by PG table name (e.g. "public.orders"), values are RFC3339Nano timestamps.
+	// Replaces the single Watermark field which applied one value to all tables.
+	QueryWatermarks map[string]string `json:"query_watermarks,omitempty"`
+
 	// UpdatedAt is when this checkpoint was last saved.
 	UpdatedAt time.Time `json:"updated_at"`
 }
