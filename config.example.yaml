@@ -34,7 +34,9 @@ source:
   logical:
     publication_name: pg2iceberg_pub
     slot_name: pg2iceberg_slot
-    # standby_interval: 10s  # how often to send standby status to PG (default: 10s)
+    # standby_interval: 10s          # how often to send standby status to PG (default: 10s)
+    # snapshot_chunk_pages: 2048      # CTID pages per chunk during initial snapshot (default: 2048, ~16MB)
+    # snapshot_target_file_size: 134217728  # target parquet file size for snapshot writes (default: 128MB)
 
 sink:
   catalog_uri: http://localhost:8181
