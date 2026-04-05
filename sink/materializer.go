@@ -1,25 +1,17 @@
 package sink
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-	pq "github.com/parquet-go/parquet-go"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/metrics"
 	"github.com/pg2iceberg/pg2iceberg/schema"
-	"github.com/pg2iceberg/pg2iceberg/utils"
-	"github.com/pg2iceberg/pg2iceberg/worker"
 )
 
 // ChangeEventBuffer is a thread-safe buffer for change events, shared between
@@ -87,49 +79,6 @@ func (b *ChangeEventBuffer) DrainAll() (map[string][]ChangeEvent, map[string]int
 	return events, snapIDs
 }
 
-// fileIndex tracks which PKs live in which data files for a single table.
-// Used to resolve TOAST unchanged columns by downloading only the affected files.
-type fileIndex struct {
-	// pkToFile maps PK key → file path (the DataFileInfo.Path).
-	pkToFile map[string]string
-	// files maps file path → DataFileInfo.
-	files map[string]DataFileInfo
-	// filePKs maps file path → set of PK keys in that file.
-	filePKs map[string]map[string]bool
-	// snapshotID is the materialized table snapshot this index was built from.
-	snapshotID int64
-}
-
-func newFileIndex() *fileIndex {
-	return &fileIndex{
-		pkToFile: make(map[string]string),
-		files:    make(map[string]DataFileInfo),
-		filePKs:  make(map[string]map[string]bool),
-	}
-}
-
-// addFile registers all PKs in a file.
-func (fi *fileIndex) addFile(df DataFileInfo, pkKeys []string) {
-	fi.files[df.Path] = df
-	pks := make(map[string]bool, len(pkKeys))
-	for _, pk := range pkKeys {
-		fi.pkToFile[pk] = df.Path
-		pks[pk] = true
-	}
-	fi.filePKs[df.Path] = pks
-}
-
-// affectedFiles returns the set of file paths that contain any of the given PKs.
-func (fi *fileIndex) affectedFiles(pks []string) map[string]bool {
-	paths := make(map[string]bool)
-	for _, pk := range pks {
-		if path, ok := fi.pkToFile[pk]; ok {
-			paths[path] = true
-		}
-	}
-	return paths
-}
-
 // Materializer reads change events from events tables and applies them to
 // the materialized (flattened) tables using Merge-on-Read: equality delete
 // files mark old rows, new data files contain updated rows. A file index
@@ -145,24 +94,23 @@ type Materializer struct {
 	// Keyed by PG table name.
 	lastEventsSnapshot map[string]int64
 
-	// Per-table file index for TOAST resolution: tracks which PKs are in
-	// which data files so we only download files containing affected PKs.
-	fileIndexes map[string]*fileIndex
-}
-
-// NewMaterializer creates a new Materializer.
-// downloadWithRetry wraps an S3 download with exponential backoff for transient errors.
-func downloadWithRetry(ctx context.Context, s3 ObjectStorage, key string) ([]byte, error) {
-	var data []byte
-	err := utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
-		var err error
-		data, err = s3.Download(ctx, key)
-		return err
-	})
-	return data, err
+	// Per-table TableWriter for the shared write path (serialize → upload → manifest → commit).
+	tableWriters map[string]*iceberg.TableWriter
 }
 
 func NewMaterializer(cfg config.SinkConfig, catalog Catalog, s3 ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
+	writers := make(map[string]*iceberg.TableWriter, len(tables))
+	for pgTable, ts := range tables {
+		writers[pgTable] = iceberg.NewTableWriter(iceberg.TableWriteConfig{
+			Namespace:   cfg.Namespace,
+			IcebergName: ts.icebergName,
+			SrcSchema:   ts.srcSchema,
+			PartSpec:    ts.partSpec,
+			SchemaID:    ts.matSchemaID,
+			TargetSize:  cfg.MaterializerTargetFileSizeOrDefault(),
+			Concurrency: cfg.MaterializerConcurrencyOrDefault(),
+		}, catalog, s3)
+	}
 	return &Materializer{
 		cfg:                cfg,
 		catalog:            catalog,
@@ -170,7 +118,7 @@ func NewMaterializer(cfg config.SinkConfig, catalog Catalog, s3 ObjectStorage, t
 		tables:             tables,
 		buf:                buf,
 		lastEventsSnapshot: make(map[string]int64),
-		fileIndexes:        make(map[string]*fileIndex),
+		tableWriters:       writers,
 	}
 }
 
@@ -297,12 +245,12 @@ type ChangeEvent struct {
 // preparedMaterialization holds all artifacts produced by prepareTable,
 // ready to be committed atomically with other tables.
 type preparedMaterialization struct {
-	pgTable         string
-	ts              *tableSink
-	icebergName     string // ts.icebergName
-	prevSnapID      int64  // materialized table snapshot before this commit
-	commit          SnapshotCommit
-	newMatManifests []ManifestFileInfo // to update ts.matManifests after commit
+	pgTable     string
+	ts          *tableSink
+	icebergName string // ts.icebergName
+	prevSnapID  int64  // materialized table snapshot before this commit
+	commit      SnapshotCommit
+	prepared    *iceberg.PreparedCommit // for post-commit delegation to TableWriter
 
 	// Deferred side effects.
 	fromBuffer     bool
@@ -315,12 +263,10 @@ type preparedMaterialization struct {
 	bucketCount    int
 
 	// Timing phases for diagnostics.
-	start      time.Time
-	tDrain     time.Duration
-	tFold      time.Duration
-	tToast     time.Duration
-	tSerialize time.Duration
-	tUpload    time.Duration
+	start  time.Time
+	tDrain time.Duration
+	tFold  time.Duration
+	tToast time.Duration
 }
 
 // MaterializeTable reads new events for one table and applies them to the
@@ -350,9 +296,9 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	return nil
 }
 
-// prepareTable reads new events for one table, folds them, serializes to
-// Parquet, uploads to S3, and assembles manifests — but does NOT commit.
-// Returns nil if there is nothing to commit.
+// prepareTable reads new events for one table, folds them into final-state-per-PK,
+// resolves TOAST columns, then delegates the write path (serialize → upload →
+// manifest assembly) to the shared iceberg.TableWriter. Does NOT commit.
 //
 // The caller is responsible for committing via CommitTransaction and then
 // calling applyPostCommit to finalize side effects.
@@ -407,259 +353,97 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 		s3SnapID = currentSnapshotID
 	}
 
-	// Phase timing for diagnostics.
-	tDrain := time.Since(start)
-
 	pk := ts.srcSchema.PK
 	if len(pk) == 0 {
 		log.Printf("[materializer] skipping %s: no primary key", pgTable)
 		return nil, nil
 	}
 
-	// Load the materialized table metadata (needed for TOAST + commit).
-	matTm, err := catalog.LoadTable(ns, ts.icebergName)
-	if err != nil {
-		return nil, fmt.Errorf("load materialized table: %w", err)
+	tw := m.tableWriters[pgTable]
+
+	// Build/refresh file index for TOAST resolution and DELETE routing.
+	if _, err := tw.BuildFileIndex(ctx, pk); err != nil {
+		return nil, fmt.Errorf("build file index: %w", err)
 	}
 
-	var prevMatSnapID int64
-	if matTm != nil {
-		prevMatSnapID = matTm.Metadata.CurrentSnapshotID
-	}
-	seqNum := int64(1)
-	if matTm != nil {
-		seqNum = matTm.Metadata.LastSequenceNumber + 1
-	}
+	tDrain := time.Since(start)
 
-	now := time.Now()
-	snapshotID := now.UnixMilli()
-	basePath := fmt.Sprintf("%s.db/%s", ns, ts.icebergName)
-	targetSize := m.cfg.MaterializerTargetFileSizeOrDefault()
-	pkFieldIDs := ts.srcSchema.PKFieldIDs()
-	partitioned := ts.partSpec != nil && !ts.partSpec.IsUnpartitioned()
-
-	// --- Bucket events by partition key (or PK hash for unpartitioned) ---
-	// Each bucket is independent so fold + serialize can run in parallel.
-	type eventBucket struct {
-		key        string
-		events     []ChangeEvent
-		partValues map[string]any
-		partPath   string
-	}
-
-	// File index for TOAST resolution and DELETE partition routing.
-	// Built once per cycle, shared read-only across buckets.
-	var fi *fileIndex
-	if matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
-		fi = m.fileIndexes[pgTable]
-		if fi == nil || fi.snapshotID != matTm.Metadata.CurrentSnapshotID {
-			fi, err = m.buildFileIndex(ctx, pgTable, ts, matTm)
-			if err != nil {
-				return nil, fmt.Errorf("build file index: %w", err)
-			}
-			m.fileIndexes[pgTable] = fi
-		}
-	}
-
-	bucketMap := make(map[string]*eventBucket)
-	numShards := runtime.NumCPU()
-	if numShards < 2 {
-		numShards = 2
-	}
-
-	// For partitioned tables, DELETE events may lack partition columns (PG only
-	// sends PK in the Before tuple). Track PK→partition key so DELETEs can be
-	// routed to the correct bucket.
-	pkPartKey := make(map[string]string) // PK key → partition bucket key
-
-	for i := range events {
-		ev := &events[i]
-		var bKey string
-		if partitioned {
-			pkKey := buildPKKey(ev.row, pk)
-			if ev.op == "D" {
-				// DELETE events lack non-PK columns; use the partition
-				// recorded from the preceding INSERT/UPDATE.
-				if cached, ok := pkPartKey[pkKey]; ok {
-					bKey = cached
-				} else if fi != nil {
-					// Row was inserted in a previous cycle — look up its
-					// partition from the file index.
-					if filePath, ok := fi.pkToFile[pkKey]; ok {
-						bKey = extractPartBucketKey(filePath)
-					} else {
-						continue
-					}
-				} else {
-					continue
-				}
-			} else {
-				bKey = ts.partSpec.PartitionKey(ev.row, ts.srcSchema)
-				pkPartKey[pkKey] = bKey
-			}
-		} else {
-			pkKey := buildPKKey(ev.row, pk)
-			var h uint32
-			for j := 0; j < len(pkKey); j++ {
-				h = h*31 + uint32(pkKey[j])
-			}
-			bKey = strconv.Itoa(int(h % uint32(numShards)))
-		}
-		b, ok := bucketMap[bKey]
-		if !ok {
-			b = &eventBucket{key: bKey}
-			if partitioned && ev.op != "D" {
-				b.partValues = ts.partSpec.PartitionValues(ev.row, ts.srcSchema)
-				b.partPath = ts.partSpec.PartitionPath(b.partValues)
-			}
-			bucketMap[bKey] = b
-		}
-		// If a non-DELETE event arrives for a bucket that was created by a
-		// DELETE (no partValues yet), fill in the partition values now.
-		if partitioned && b.partValues == nil && ev.op != "D" {
-			b.partValues = ts.partSpec.PartitionValues(ev.row, ts.srcSchema)
-			b.partPath = ts.partSpec.PartitionPath(b.partValues)
-		}
-		b.events = append(b.events, *ev)
-	}
-
-	// Resolve partition values for DELETE-only buckets using the file index path.
-	if partitioned && fi != nil {
-		for bKey, b := range bucketMap {
-			if b.partValues != nil {
-				continue
-			}
-			// bKey is the partition key (e.g. "seq_truncate=0") extracted from file path.
-			b.partPath = bKey
-			b.partValues = ts.partSpec.ParsePartitionPath(bKey, ts.srcSchema)
-		}
-	}
-
-	buckets := make([]*eventBucket, 0, len(bucketMap))
-	for _, b := range bucketMap {
-		buckets = append(buckets, b)
-	}
-
-	// --- Parallel fold + serialize per bucket ---
+	// --- Flat fold: events → final state per PK ---
 	type pkState struct {
 		op            string
 		row           map[string]any
 		unchangedCols []string
 	}
-	type pendingFile struct {
-		key              string
-		chunk            FileChunk
-		content          int // 0=data, 2=equality delete
-		equalityFieldIDs []int
-		partitionValues  map[string]any
-	}
-	type bucketResult struct {
-		pending        []pendingFile
-		deleteRowCount int64
-		finalState     map[string]*pkState // needed for TOAST resolution
-	}
+	state := make(map[string]*pkState, len(events)/2+1)
+	for _, ev := range events {
+		pkKey := iceberg.BuildPKKey(ev.row, pk)
+		existing := state[pkKey]
 
-	// --- Phase 1a: Parallel fold (events → final state per PK) ---
-	bucketResults := make([]bucketResult, len(buckets))
-
-	foldTasks := make([]worker.Task, len(buckets))
-	for i, b := range buckets {
-		i, b := i, b
-		foldTasks[i] = worker.Task{
-			Name: b.key,
-			Fn: func(ctx context.Context, _ *worker.Progress) error {
-				state := make(map[string]*pkState, len(b.events)/2)
-				for _, ev := range b.events {
-					pkKey := buildPKKey(ev.row, pk)
-					existing := state[pkKey]
-
-					switch ev.op {
-					case "I":
-						state[pkKey] = &pkState{op: "I", row: ev.row}
-					case "U":
-						if existing != nil && len(ev.unchangedCols) > 0 {
-							merged := make(map[string]any, len(ev.row))
-							for k, v := range ev.row {
-								merged[k] = v
-							}
-							for _, col := range ev.unchangedCols {
-								if val, ok := existing.row[col]; ok {
-									merged[col] = val
-								}
-							}
-							state[pkKey] = &pkState{op: "U", row: merged}
-						} else {
-							state[pkKey] = &pkState{
-								op:            "U",
-								row:           ev.row,
-								unchangedCols: ev.unchangedCols,
-							}
-						}
-					case "D":
-						state[pkKey] = &pkState{op: "D", row: ev.row}
+		switch ev.op {
+		case "I":
+			state[pkKey] = &pkState{op: "I", row: ev.row}
+		case "U":
+			if existing != nil && len(ev.unchangedCols) > 0 {
+				merged := make(map[string]any, len(ev.row))
+				for k, v := range ev.row {
+					merged[k] = v
+				}
+				for _, col := range ev.unchangedCols {
+					if val, ok := existing.row[col]; ok {
+						merged[col] = val
 					}
 				}
-				bucketResults[i].finalState = state
-				return nil
-			},
+				state[pkKey] = &pkState{op: "U", row: merged}
+			} else {
+				state[pkKey] = &pkState{
+					op:            "U",
+					row:           ev.row,
+					unchangedCols: ev.unchangedCols,
+				}
+			}
+		case "D":
+			state[pkKey] = &pkState{op: "D", row: ev.row}
 		}
-	}
-
-	foldConcurrency := runtime.NumCPU()
-	if len(foldTasks) < foldConcurrency {
-		foldConcurrency = len(foldTasks)
-	}
-	if foldConcurrency < 1 {
-		foldConcurrency = 1
-	}
-	foldPool := worker.NewPool(foldConcurrency)
-	if _, err := foldPool.Run(ctx, foldTasks); err != nil {
-		return nil, fmt.Errorf("fold: %w", err)
 	}
 
 	tFold := time.Since(start)
 
-	// --- Phase 1b: TOAST resolution (must run before serialization) ---
-	// Collect unresolved PKs across all buckets.
-	allFinalState := make(map[string]*pkState)
+	// --- TOAST resolution ---
 	var allUnresolvedPKs []string
-	for _, r := range bucketResults {
-		for k, v := range r.finalState {
-			if v.op == "U" && len(v.unchangedCols) > 0 {
-				allUnresolvedPKs = append(allUnresolvedPKs, k)
-			}
-			allFinalState[k] = v
+	for k, v := range state {
+		if v.op == "U" && len(v.unchangedCols) > 0 {
+			allUnresolvedPKs = append(allUnresolvedPKs, k)
 		}
 	}
 
-	if len(allUnresolvedPKs) > 0 && fi != nil {
-		affectedFilePaths := fi.affectedFiles(allUnresolvedPKs)
+	if len(allUnresolvedPKs) > 0 && tw.FileIdx != nil {
+		affectedFilePaths := tw.FileIdx.AffectedFiles(allUnresolvedPKs)
 		resolved := 0
 		for path := range affectedFilePaths {
-			dfKey, err := KeyFromURI(path)
+			dfKey, err := iceberg.KeyFromURI(path)
 			if err != nil {
 				return nil, fmt.Errorf("TOAST: parse URI %s: %w", path, err)
 			}
-			data, err := downloadWithRetry(ctx, s3, dfKey)
+			data, err := iceberg.DownloadWithRetry(ctx, s3, dfKey)
 			if err != nil {
 				return nil, fmt.Errorf("TOAST: download %s: %w", path, err)
 			}
-			rows, err := readParquetRows(data, ts.srcSchema)
+			rows, err := iceberg.ReadParquetRows(data, ts.srcSchema)
 			if err != nil {
 				return nil, fmt.Errorf("TOAST: read %s: %w", path, err)
 			}
 			for _, row := range rows {
-				pkKey := buildPKKey(row, pk)
-				state, ok := allFinalState[pkKey]
-				if !ok || state.op != "U" || len(state.unchangedCols) == 0 {
+				pkKey := iceberg.BuildPKKey(row, pk)
+				s, ok := state[pkKey]
+				if !ok || s.op != "U" || len(s.unchangedCols) == 0 {
 					continue
 				}
-				for _, col := range state.unchangedCols {
+				for _, col := range s.unchangedCols {
 					if val, exists := row[col]; exists {
-						state.row[col] = val
+						s.row[col] = val
 					}
 				}
-				state.unchangedCols = nil
+				s.unchangedCols = nil
 				resolved++
 			}
 		}
@@ -671,168 +455,20 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 	tToast := time.Since(start)
 
-	// --- Phase 1c: Parallel serialize (state → Parquet files) ---
-	serializeTasks := make([]worker.Task, len(buckets))
-	for i, b := range buckets {
-		i, b := i, b
-		serializeTasks[i] = worker.Task{
-			Name: b.key,
-			Fn: func(ctx context.Context, _ *worker.Progress) error {
-				state := bucketResults[i].finalState
-
-				// Serialize equality delete files.
-				var deleteRowCount int64
-				deleteWriter := NewRollingDeleteWriter(ts.srcSchema, targetSize)
-				for _, s := range state {
-					if s.op == "U" || s.op == "D" {
-						if err := deleteWriter.Add(s.row); err != nil {
-							return fmt.Errorf("add delete row: %w", err)
-						}
-						deleteRowCount++
-					}
-				}
-				var pf []pendingFile
-				if deleteRowCount > 0 {
-					chunks, err := deleteWriter.FlushAll()
-					if err != nil {
-						return fmt.Errorf("flush deletes: %w", err)
-					}
-					for j, chunk := range chunks {
-						var delKey string
-						dpf := pendingFile{
-							chunk:            chunk,
-							content:          2,
-							equalityFieldIDs: pkFieldIDs,
-						}
-						if partitioned {
-							delKey = fmt.Sprintf("%s/data/%s/%s-eq-delete-%d.parquet", basePath, b.partPath, uuid.New().String(), j)
-							dpf.partitionValues = ts.partSpec.PartitionAvroValue(b.partValues, ts.srcSchema)
-						} else {
-							delKey = fmt.Sprintf("%s/data/%s-eq-delete-%d.parquet", basePath, uuid.New().String(), j)
-						}
-						dpf.key = delKey
-						pf = append(pf, dpf)
-					}
-				}
-
-				// Serialize data files.
-				dataWriter := NewRollingDataWriter(ts.srcSchema, targetSize)
-				for _, s := range state {
-					if s.op == "I" || s.op == "U" {
-						if err := dataWriter.Add(s.row); err != nil {
-							return fmt.Errorf("add data row: %w", err)
-						}
-					}
-				}
-				chunks, err := dataWriter.FlushAll()
-				if err != nil {
-					return fmt.Errorf("flush data: %w", err)
-				}
-				if partitioned {
-					avroPartValues := ts.partSpec.PartitionAvroValue(b.partValues, ts.srcSchema)
-					for j, chunk := range chunks {
-						key := fmt.Sprintf("%s/data/%s/%s-mat-%d.parquet", basePath, b.partPath, uuid.New().String(), j)
-						pf = append(pf, pendingFile{
-							key:             key,
-							chunk:           chunk,
-							content:         0,
-							partitionValues: avroPartValues,
-						})
-					}
-				} else {
-					for j, chunk := range chunks {
-						key := fmt.Sprintf("%s/data/%s-mat-%d.parquet", basePath, uuid.New().String(), j)
-						pf = append(pf, pendingFile{key: key, chunk: chunk, content: 0})
-					}
-				}
-
-				bucketResults[i].pending = pf
-				bucketResults[i].deleteRowCount = deleteRowCount
-				return nil
-			},
-		}
+	// --- Convert folded state to RowState and delegate to TableWriter ---
+	rowStates := make([]iceberg.RowState, 0, len(state))
+	for _, s := range state {
+		rowStates = append(rowStates, iceberg.RowState{
+			Op:  s.op,
+			Row: s.row,
+		})
 	}
 
-	serializePool := worker.NewPool(foldConcurrency)
-	if _, err := serializePool.Run(ctx, serializeTasks); err != nil {
-		return nil, fmt.Errorf("serialize: %w", err)
+	prepared, err := tw.Prepare(ctx, rowStates, pk)
+	if err != nil {
+		return nil, fmt.Errorf("prepare: %w", err)
 	}
-
-	tSerialize := time.Since(start)
-
-	// Collect results from all buckets.
-	var pending []pendingFile
-	var deleteRowCount int64
-	for _, r := range bucketResults {
-		pending = append(pending, r.pending...)
-		deleteRowCount += r.deleteRowCount
-	}
-
-	// --- Phase 2: Upload all files in parallel (I/O-bound) ---
-	var deleteEntries []ManifestEntry
-	var dataEntries []ManifestEntry
-
-	if len(pending) > 0 {
-		type uploadedFile struct {
-			uri string
-			pf  pendingFile
-		}
-
-		var mu sync.Mutex
-		var uploaded []uploadedFile
-
-		tasks := make([]worker.Task, len(pending))
-		for i, pf := range pending {
-			pf := pf
-			tasks[i] = worker.Task{
-				Name: pf.key,
-				Fn: func(ctx context.Context, _ *worker.Progress) error {
-					uri, err := s3.Upload(ctx, pf.key, pf.chunk.Data)
-					if err != nil {
-						return fmt.Errorf("upload %s: %w", pf.key, err)
-					}
-					mu.Lock()
-					uploaded = append(uploaded, uploadedFile{uri: uri, pf: pf})
-					mu.Unlock()
-					return nil
-				},
-			}
-		}
-
-		concurrency := m.cfg.MaterializerConcurrencyOrDefault()
-		if len(tasks) < concurrency {
-			concurrency = len(tasks)
-		}
-		pool := worker.NewPool(concurrency)
-		if _, err := pool.Run(ctx, tasks); err != nil {
-			return nil, fmt.Errorf("upload materialized files: %w", err)
-		}
-
-		for _, u := range uploaded {
-			entry := ManifestEntry{
-				Status:     1,
-				SnapshotID: snapshotID,
-				DataFile: DataFileInfo{
-					Path:             u.uri,
-					FileSizeBytes:    int64(len(u.pf.chunk.Data)),
-					RecordCount:      u.pf.chunk.RowCount,
-					Content:          u.pf.content,
-					EqualityFieldIDs: u.pf.equalityFieldIDs,
-					PartitionValues:  u.pf.partitionValues,
-				},
-			}
-			if u.pf.content == 0 {
-				dataEntries = append(dataEntries, entry)
-			} else {
-				deleteEntries = append(deleteEntries, entry)
-			}
-		}
-	}
-
-	tUpload := time.Since(start)
-
-	// Nothing to commit if no deletes and no data.
-	if len(deleteEntries) == 0 && len(dataEntries) == 0 {
+	if prepared == nil {
 		if fromBuffer && bufSnapID > 0 {
 			m.lastEventsSnapshot[pgTable] = bufSnapID
 		} else if s3SnapID > 0 {
@@ -841,127 +477,34 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 		return nil, nil
 	}
 
-	// --- Phase 3: Carry forward existing manifests and commit ---
-	// Use cached manifests from previous cycle. On first run (cache empty),
-	// load from S3 if a manifest list exists (crash recovery).
-	if ts.matManifests == nil && matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
-		var err error
-		ts.matManifests, err = m.loadExistingManifests(ctx, s3, matTm)
-		if err != nil {
-			return nil, fmt.Errorf("load existing manifests: %w", err)
-		}
-	}
-	existingManifests := ts.matManifests
-
-	var newManifests []ManifestFileInfo
-
-	// Write new data manifest (if we have data entries).
-	if len(dataEntries) > 0 {
-		manifestBytes, err := WriteManifest(ts.srcSchema, dataEntries, seqNum, 0, ts.partSpec)
-		if err != nil {
-			return nil, fmt.Errorf("write data manifest: %w", err)
-		}
-		manifestKey := fmt.Sprintf("%s/metadata/%s-mat-data.avro", basePath, uuid.New().String())
-		manifestURI, err := s3.Upload(ctx, manifestKey, manifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("upload data manifest: %w", err)
-		}
-		var totalRows int64
-		for _, e := range dataEntries {
-			totalRows += e.DataFile.RecordCount
-		}
-		newManifests = append(newManifests, ManifestFileInfo{
-			Path:           manifestURI,
-			Length:         int64(len(manifestBytes)),
-			Content:        0, // data
-			SnapshotID:     snapshotID,
-			AddedFiles:     len(dataEntries),
-			AddedRows:      totalRows,
-			SequenceNumber: seqNum,
-		})
-	}
-
-	// Write new delete manifest (if we have delete entries).
-	if len(deleteEntries) > 0 {
-		manifestBytes, err := WriteManifest(ts.srcSchema, deleteEntries, seqNum, 1, ts.partSpec)
-		if err != nil {
-			return nil, fmt.Errorf("write delete manifest: %w", err)
-		}
-		manifestKey := fmt.Sprintf("%s/metadata/%s-mat-deletes.avro", basePath, uuid.New().String())
-		manifestURI, err := s3.Upload(ctx, manifestKey, manifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("upload delete manifest: %w", err)
-		}
-		newManifests = append(newManifests, ManifestFileInfo{
-			Path:           manifestURI,
-			Length:         int64(len(manifestBytes)),
-			Content:        1, // deletes
-			SnapshotID:     snapshotID,
-			AddedFiles:     len(deleteEntries),
-			AddedRows:      deleteRowCount,
-			SequenceNumber: seqNum,
-		})
-	}
-
-	// Manifest list = existing manifests + new manifests.
-	// Do NOT update ts.matManifests yet — deferred to applyPostCommit.
-	allManifests := append(existingManifests, newManifests...)
-
-	mlBytes, err := WriteManifestList(allManifests)
-	if err != nil {
-		return nil, fmt.Errorf("write manifest list: %w", err)
-	}
-
-	mlKey := fmt.Sprintf("%s/metadata/snap-%d-0-manifest-list.avro", basePath, snapshotID)
-	mlURI, err := s3.Upload(ctx, mlKey, mlBytes)
-	if err != nil {
-		return nil, fmt.Errorf("upload manifest list: %w", err)
-	}
-
-	commit := SnapshotCommit{
-		SnapshotID:       snapshotID,
-		SequenceNumber:   seqNum,
-		TimestampMs:      now.UnixMilli(),
-		ManifestListPath: mlURI,
-		SchemaID:         ts.matSchemaID,
-		Summary: map[string]string{
-			"operation": "overwrite",
-		},
-	}
-
 	return &preparedMaterialization{
-		pgTable:         pgTable,
-		ts:              ts,
-		icebergName:     ts.icebergName,
-		prevSnapID:      prevMatSnapID,
-		commit:          commit,
-		newMatManifests: allManifests,
-		fromBuffer:      fromBuffer,
-		bufSnapID:       bufSnapID,
-		s3SnapID:        s3SnapID,
-		events:          events,
-		dataCount:       len(dataEntries),
-		deleteCount:     len(deleteEntries),
-		deleteRowCount:  deleteRowCount,
-		bucketCount:     len(buckets),
-		start:           start,
-		tDrain:          tDrain,
-		tFold:           tFold,
-		tToast:          tToast,
-		tSerialize:      tSerialize,
-		tUpload:         tUpload,
+		pgTable:     pgTable,
+		ts:          ts,
+		icebergName: ts.icebergName,
+		prevSnapID:  prepared.PrevSnapshotID,
+		commit:      prepared.Commit,
+		prepared:    prepared,
+		fromBuffer:  fromBuffer,
+		bufSnapID:   bufSnapID,
+		s3SnapID:    s3SnapID,
+		events:      events,
+		dataCount:   prepared.DataCount,
+		deleteCount: prepared.DeleteCount,
+		deleteRowCount: prepared.DeleteRowCount,
+		bucketCount:    prepared.BucketCount,
+		start:       start,
+		tDrain:      tDrain,
+		tFold:       tFold,
+		tToast:      tToast,
 	}, nil
 }
 
 // applyPostCommit finalizes side effects after a successful catalog commit.
 // Must be called only after CommitTransaction succeeds.
 func (m *Materializer) applyPostCommit(prep *preparedMaterialization) {
-	// Update manifest cache.
-	prep.ts.matManifests = prep.newMatManifests
-
-	// Invalidate the file index so it's rebuilt on next TOAST resolution.
-	if fi := m.fileIndexes[prep.pgTable]; fi != nil {
-		fi.snapshotID = 0
+	// Delegate manifest cache + file index invalidation to the TableWriter.
+	if tw, ok := m.tableWriters[prep.pgTable]; ok && prep.prepared != nil {
+		tw.ApplyPostCommit(prep.prepared)
 	}
 
 	// Update checkpoint.
@@ -995,146 +538,10 @@ func (m *Materializer) applyPostCommit(prep *preparedMaterialization) {
 	metrics.MaterializerDeleteFilesWrittenTotal.WithLabelValues(prep.pgTable).Add(float64(prep.deleteCount))
 	metrics.MaterializerDeleteRowsTotal.WithLabelValues(prep.pgTable).Add(float64(prep.deleteRowCount))
 
-	log.Printf("[materializer] materialized %s: %d events (%s), %d buckets, %d data files, %d delete files (%.1fs) [drain=%.0fms fold=%.0fms toast=%.0fms upload=%.0fms]",
+	log.Printf("[materializer] materialized %s: %d events (%s), %d buckets, %d data files, %d delete files (%.1fs) [drain=%.0fms fold=%.0fms toast=%.0fms]",
 		prep.pgTable, len(prep.events), source, prep.bucketCount, prep.dataCount, prep.deleteCount, duration.Seconds(),
 		float64(prep.tDrain.Milliseconds()), float64((prep.tFold-prep.tDrain).Milliseconds()),
-		float64((prep.tToast-prep.tFold).Milliseconds()),
-		float64((prep.tUpload-prep.tSerialize).Milliseconds()))
-}
-
-// loadExistingManifests reads all manifest file entries from the current
-// snapshot's manifest list. These are carried forward unchanged into the
-// new manifest list.
-func (m *Materializer) loadExistingManifests(ctx context.Context, s3 ObjectStorage, tm *TableMetadata) ([]ManifestFileInfo, error) {
-	mlURI := tm.CurrentManifestList()
-	if mlURI == "" {
-		return nil, nil
-	}
-
-	mlKey, err := KeyFromURI(mlURI)
-	if err != nil {
-		return nil, fmt.Errorf("parse manifest list URI: %w", err)
-	}
-	mlData, err := downloadWithRetry(ctx, s3, mlKey)
-	if err != nil {
-		return nil, fmt.Errorf("download manifest list: %w", err)
-	}
-	return ReadManifestList(mlData)
-}
-
-// buildFileIndex reads all data files for a materialized table and builds the
-// PK→file index. Called on startup or when the index is missing (crash recovery).
-func (m *Materializer) buildFileIndex(ctx context.Context, pgTable string, ts *tableSink, matTm *TableMetadata) (*fileIndex, error) {
-	fi := newFileIndex()
-	if matTm == nil || matTm.Metadata.CurrentSnapshotID == 0 {
-		return fi, nil
-	}
-	fi.snapshotID = matTm.Metadata.CurrentSnapshotID
-
-	allFiles, err := m.loadAllDataFiles(ctx, m.s3, matTm)
-	if err != nil {
-		return nil, fmt.Errorf("load data files for index: %w", err)
-	}
-
-	pk := ts.srcSchema.PK
-
-	// Process files in parallel with bounded concurrency using the worker pool.
-	maxConcurrency := m.cfg.MaterializerConcurrencyOrDefault()
-
-	type fileResult struct {
-		df     DataFileInfo
-		pkKeys []string
-	}
-
-	var (
-		mu          sync.Mutex
-		fileResults []fileResult
-	)
-
-	tasks := make([]worker.Task, 0, len(allFiles))
-	for _, df := range allFiles {
-		dfKey, err := KeyFromURI(df.Path)
-		if err != nil {
-			return nil, fmt.Errorf("parse data file URI %s: %w", df.Path, err)
-		}
-		tasks = append(tasks, worker.Task{
-			Name: dfKey,
-			Fn: func(ctx context.Context, _ *worker.Progress) error {
-				size, err := m.s3.StatObject(ctx, dfKey)
-				if err != nil {
-					return fmt.Errorf("stat %s: %w", df.Path, err)
-				}
-				ra := &iceberg.S3ReaderAt{Ctx: ctx, S3: m.s3, Key: dfKey}
-				pkKeys, err := readParquetPKKeysFromReaderAt(ra, size, pk)
-				if err != nil {
-					return fmt.Errorf("read PKs from %s: %w", df.Path, err)
-				}
-				mu.Lock()
-				fileResults = append(fileResults, fileResult{df: df, pkKeys: pkKeys})
-				mu.Unlock()
-				return nil
-			},
-		})
-	}
-
-	pool := worker.NewPool(maxConcurrency)
-	if _, err := pool.Run(ctx, tasks); err != nil {
-		return nil, fmt.Errorf("build file index: %w", err)
-	}
-
-	for _, r := range fileResults {
-		fi.addFile(r.df, r.pkKeys)
-	}
-
-	log.Printf("[materializer] built file index for %s: %d files, %d PKs", pgTable, len(fi.files), len(fi.pkToFile))
-	return fi, nil
-}
-
-// loadAllDataFiles returns all live data files from a table's current snapshot.
-func (m *Materializer) loadAllDataFiles(ctx context.Context, s3 ObjectStorage, tm *TableMetadata) ([]DataFileInfo, error) {
-	mlURI := tm.CurrentManifestList()
-	if mlURI == "" {
-		return nil, nil
-	}
-
-	mlKey, err := KeyFromURI(mlURI)
-	if err != nil {
-		return nil, fmt.Errorf("parse manifest list URI: %w", err)
-	}
-	mlData, err := downloadWithRetry(ctx, s3, mlKey)
-	if err != nil {
-		return nil, fmt.Errorf("download manifest list: %w", err)
-	}
-	manifestInfos, err := ReadManifestList(mlData)
-	if err != nil {
-		return nil, fmt.Errorf("read manifest list: %w", err)
-	}
-
-	var dataFiles []DataFileInfo
-	for _, mfi := range manifestInfos {
-		if mfi.Content != 0 {
-			continue
-		}
-		mKey, err := KeyFromURI(mfi.Path)
-		if err != nil {
-			return nil, fmt.Errorf("parse manifest URI %s: %w", mfi.Path, err)
-		}
-		mData, err := downloadWithRetry(ctx, s3, mKey)
-		if err != nil {
-			return nil, fmt.Errorf("download manifest %s: %w", mfi.Path, err)
-		}
-		entries, err := ReadManifest(mData)
-		if err != nil {
-			return nil, fmt.Errorf("read manifest %s: %w", mfi.Path, err)
-		}
-		for _, e := range entries {
-			if e.Status == 2 || e.DataFile.Content != 0 {
-				continue
-			}
-			dataFiles = append(dataFiles, e.DataFile)
-		}
-	}
-	return dataFiles, nil
+		float64((prep.tToast-prep.tFold).Milliseconds()))
 }
 
 // findNewEventFiles returns data files added to the events table since the
@@ -1149,7 +556,7 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 ObjectStorage, 
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest list URI: %w", err)
 	}
-	mlData, err := downloadWithRetry(ctx, s3, mlKey)
+	mlData, err := iceberg.DownloadWithRetry(ctx, s3, mlKey)
 	if err != nil {
 		return nil, fmt.Errorf("download manifest list: %w", err)
 	}
@@ -1172,7 +579,7 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 ObjectStorage, 
 		if err != nil {
 			return nil, fmt.Errorf("parse manifest URI %s: %w", mfi.Path, err)
 		}
-		mData, err := downloadWithRetry(ctx, s3, mKey)
+		mData, err := iceberg.DownloadWithRetry(ctx, s3, mKey)
 		if err != nil {
 			return nil, fmt.Errorf("download manifest %s: %w", mfi.Path, err)
 		}
@@ -1202,12 +609,12 @@ func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files [
 		if err != nil {
 			return nil, fmt.Errorf("parse event file URI %s: %w", df.Path, err)
 		}
-		data, err := downloadWithRetry(ctx, s3, key)
+		data, err := iceberg.DownloadWithRetry(ctx, s3, key)
 		if err != nil {
 			return nil, fmt.Errorf("download event file %s: %w", df.Path, err)
 		}
 
-		rows, err := readParquetRows(data, eventsSchema)
+		rows, err := iceberg.ReadParquetRows(data, eventsSchema)
 		if err != nil {
 			return nil, fmt.Errorf("read event file %s: %w", df.Path, err)
 		}
@@ -1248,196 +655,3 @@ func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files [
 	return events, nil
 }
 
-// readParquetRows reads a parquet file and returns rows as maps.
-func readParquetRows(data []byte, ts *schema.TableSchema) ([]map[string]any, error) {
-	reader := pq.NewReader(bytes.NewReader(data))
-
-	colNames := make([]string, len(reader.Schema().Fields()))
-	for i, f := range reader.Schema().Fields() {
-		colNames[i] = f.Name()
-	}
-
-	var rows []map[string]any
-	rowBuf := make([]pq.Row, 1)
-	for {
-		n, err := reader.ReadRows(rowBuf)
-		if n == 0 {
-			break
-		}
-		if err != nil && n == 0 {
-			return nil, fmt.Errorf("read row: %w", err)
-		}
-
-		row := make(map[string]any, len(colNames))
-		for _, v := range rowBuf[0] {
-			colIdx := v.Column()
-			if colIdx >= 0 && colIdx < len(colNames) {
-				if v.IsNull() {
-					row[colNames[colIdx]] = nil
-				} else {
-					row[colNames[colIdx]] = parquetValueToGo(v)
-				}
-			}
-		}
-		rows = append(rows, row)
-	}
-
-	return rows, nil
-}
-
-// parquetValueToGo converts a parquet.Value to a Go native type.
-func parquetValueToGo(v pq.Value) any {
-	switch v.Kind() {
-	case pq.Boolean:
-		return v.Boolean()
-	case pq.Int32:
-		return v.Int32()
-	case pq.Int64:
-		return v.Int64()
-	case pq.Float:
-		return v.Float()
-	case pq.Double:
-		return v.Double()
-	case pq.ByteArray, pq.FixedLenByteArray:
-		return string(v.ByteArray())
-	default:
-		return v.String()
-	}
-}
-
-// readParquetPKKeysFromReaderAt reads only PK columns from a parquet file via
-// an io.ReaderAt (backed by S3 range reads). Only the footer and PK column
-// chunks are fetched — non-PK column data is never read from storage.
-func readParquetPKKeysFromReaderAt(r io.ReaderAt, size int64, pk []string) ([]string, error) {
-	file, err := pq.OpenFile(r, size)
-	if err != nil {
-		return nil, fmt.Errorf("open parquet file: %w", err)
-	}
-
-	schema := file.Schema()
-
-	// Find PK column indices in the parquet schema.
-	pkColIdx := make(map[string]int, len(pk))
-	for i, f := range schema.Fields() {
-		for _, p := range pk {
-			if f.Name() == p {
-				pkColIdx[p] = i
-			}
-		}
-	}
-	if len(pkColIdx) != len(pk) {
-		return nil, fmt.Errorf("parquet schema missing PK columns: have %v, want %v", pkColIdx, pk)
-	}
-
-	var keys []string
-
-	for _, rg := range file.RowGroups() {
-		numRows := rg.NumRows()
-
-		// Read values from each PK column chunk.
-		pkValues := make(map[string][]string, len(pk))
-		for _, p := range pk {
-			idx := pkColIdx[p]
-			chunk := rg.ColumnChunks()[idx]
-			pages := chunk.Pages()
-
-			vals := make([]string, 0, numRows)
-			for {
-				page, err := pages.ReadPage()
-				if page == nil || err != nil {
-					break
-				}
-				pageValues := page.Values()
-				vBuf := make([]pq.Value, page.NumValues())
-				n, err := pageValues.ReadValues(vBuf)
-				if err != nil && err != io.EOF {
-					pages.Close()
-					return nil, fmt.Errorf("read PK values from %s column: %w", p, err)
-				}
-				for i := 0; i < n; i++ {
-					if vBuf[i].IsNull() {
-						vals = append(vals, "<nil>")
-					} else {
-						vals = append(vals, fmt.Sprintf("%v", parquetValueToGo(vBuf[i])))
-					}
-				}
-			}
-			pages.Close()
-			pkValues[p] = vals
-		}
-
-		// Build PK key strings.
-		nRows := int(numRows)
-		if len(pk) == 1 {
-			keys = append(keys, pkValues[pk[0]]...)
-		} else {
-			for i := 0; i < nRows; i++ {
-				var b strings.Builder
-				for j, col := range pk {
-					if j > 0 {
-						b.WriteByte(0)
-					}
-					if i < len(pkValues[col]) {
-						b.WriteString(pkValues[col][i])
-					}
-				}
-				keys = append(keys, b.String())
-			}
-		}
-	}
-
-	return keys, nil
-}
-
-// buildPKKey creates a unique key for a row based on its PK columns.
-// Uses null byte as separator to avoid collisions.
-// extractPartBucketKey extracts the partition bucket key from a file path.
-// E.g. ".../data/seq_truncate=0/uuid-mat-0.parquet" → "seq_truncate=0"
-func extractPartBucketKey(filePath string) string {
-	idx := strings.Index(filePath, "/data/")
-	if idx < 0 {
-		return ""
-	}
-	afterData := filePath[idx+len("/data/"):]
-	slashIdx := strings.Index(afterData, "/")
-	if slashIdx < 0 {
-		return ""
-	}
-	return afterData[:slashIdx]
-}
-
-func buildPKKey(row map[string]any, pk []string) string {
-	if len(pk) == 1 {
-		return anyToString(row[pk[0]])
-	}
-	var b strings.Builder
-	for i, col := range pk {
-		if i > 0 {
-			b.WriteByte(0)
-		}
-		b.WriteString(anyToString(row[col]))
-	}
-	return b.String()
-}
-
-// anyToString converts a value to string without reflection for common PK types.
-func anyToString(v any) string {
-	switch x := v.(type) {
-	case string:
-		return x
-	case int64:
-		return strconv.FormatInt(x, 10)
-	case int32:
-		return strconv.FormatInt(int64(x), 10)
-	case int:
-		return strconv.Itoa(x)
-	case float64:
-		return strconv.FormatFloat(x, 'f', -1, 64)
-	case []byte:
-		return string(x)
-	case nil:
-		return ""
-	default:
-		return fmt.Sprintf("%v", v)
-	}
-}
