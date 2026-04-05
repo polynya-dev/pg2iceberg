@@ -30,10 +30,10 @@ type txBuffer struct {
 // EventBuffer receives change events from the sink after a successful flush.
 // Used to pass events to downstream consumers without S3 round-trips.
 type EventBuffer interface {
-	PushEvents(pgTable string, events []matEvent, snapshotID int64)
+	PushEvents(pgTable string, events []MatEvent, snapshotID int64)
 }
 
-// Sink buffers matEvents and periodically flushes them to Iceberg.
+// Sink buffers MatEvents and periodically flushes them to Iceberg.
 // It writes append-only change events to an events table per source table.
 // A separate Materializer reads these events and produces flattened tables.
 type Sink struct {
@@ -59,10 +59,10 @@ type Sink struct {
 	// Optional event buffer for pushing events after flush (avoids S3 round-trips).
 	eventBuf EventBuffer
 
-	// pendingDirectEvents holds matEvents from non-transactional writes
+	// pendingDirectEvents holds MatEvents from non-transactional writes
 	// (e.g., snapshot) that should be pushed to the event buffer after the
 	// next successful Flush. Keyed by PG table name.
-	pendingDirectEvents map[string][]matEvent
+	pendingDirectEvents map[string][]MatEvent
 
 	mu sync.Mutex
 }
@@ -130,7 +130,7 @@ func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID s
 		eventBuf:            eventBuf,
 		tables:              make(map[string]*tableSink),
 		openTxns:            make(map[uint32]*txBuffer),
-		pendingDirectEvents: make(map[string][]matEvent),
+		pendingDirectEvents: make(map[string][]MatEvent),
 	}
 }
 
@@ -427,8 +427,8 @@ func (s *Sink) writeDirect(event postgres.ChangeEvent) error {
 // allocates a fresh map per event so no copy is needed. The map is shared with
 // writeDirect (which adds metadata keys like _lsn, _op); the materializer only
 // accesses user columns by name so the extra keys are harmless.
-func (s *Sink) toMatEvent(event postgres.ChangeEvent, seq int64) matEvent {
-	ce := matEvent{
+func (s *Sink) toMatEvent(event postgres.ChangeEvent, seq int64) MatEvent {
+	ce := MatEvent{
 		lsn:           int64(event.LSN),
 		seq:           seq,
 		unchangedCols: event.UnchangedCols,
@@ -509,9 +509,9 @@ func (s *Sink) Flush(ctx context.Context) error {
 
 	// Collect events per table for the materializer in-memory buffer.
 	// Start with pending direct events (snapshot rows written via writeDirect).
-	var bufferedEvents map[string][]matEvent
+	var bufferedEvents map[string][]MatEvent
 	if s.eventBuf != nil {
-		bufferedEvents = make(map[string][]matEvent)
+		bufferedEvents = make(map[string][]MatEvent)
 		for pgTable, events := range s.pendingDirectEvents {
 			bufferedEvents[pgTable] = append(bufferedEvents[pgTable], events...)
 		}
@@ -546,7 +546,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 
 	// Clear committed transactions and pending direct events.
 	s.committedTxns = nil
-	s.pendingDirectEvents = make(map[string][]matEvent)
+	s.pendingDirectEvents = make(map[string][]MatEvent)
 	return nil
 }
 

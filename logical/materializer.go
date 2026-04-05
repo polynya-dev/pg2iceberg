@@ -18,7 +18,7 @@ import (
 // the Sink (producer) and the Materializer (consumer). Created before both and
 // injected into each, avoiding a circular dependency.
 type ChangeEventBuffer struct {
-	events     map[string][]matEvent
+	events     map[string][]MatEvent
 	snapshotID map[string]int64 // latest events table snapshot ID per table
 	mu         sync.Mutex
 }
@@ -26,14 +26,14 @@ type ChangeEventBuffer struct {
 // NewChangeEventBuffer creates a new empty event buffer.
 func NewChangeEventBuffer() *ChangeEventBuffer {
 	return &ChangeEventBuffer{
-		events:     make(map[string][]matEvent),
+		events:     make(map[string][]MatEvent),
 		snapshotID: make(map[string]int64),
 	}
 }
 
 // PushEvents adds change events for a table. Called by the Sink after flush.
 // snapshotID is the events table snapshot that produced these events.
-func (b *ChangeEventBuffer) PushEvents(pgTable string, events []matEvent, snapshotID int64) {
+func (b *ChangeEventBuffer) PushEvents(pgTable string, events []MatEvent, snapshotID int64) {
 	if b == nil {
 		return
 	}
@@ -46,7 +46,7 @@ func (b *ChangeEventBuffer) PushEvents(pgTable string, events []matEvent, snapsh
 
 // Drain removes and returns all buffered events for a table,
 // along with the latest events snapshot ID.
-func (b *ChangeEventBuffer) Drain(pgTable string) ([]matEvent, int64) {
+func (b *ChangeEventBuffer) Drain(pgTable string) ([]MatEvent, int64) {
 	if b == nil {
 		return nil, 0
 	}
@@ -63,7 +63,7 @@ func (b *ChangeEventBuffer) Drain(pgTable string) ([]matEvent, int64) {
 // DrainAll removes and returns all buffered events for all tables at once,
 // along with the latest events snapshot ID per table. This ensures events
 // from the same Sink flush are consumed atomically across tables.
-func (b *ChangeEventBuffer) DrainAll() (map[string][]matEvent, map[string]int64) {
+func (b *ChangeEventBuffer) DrainAll() (map[string][]MatEvent, map[string]int64) {
 	if b == nil {
 		return nil, nil
 	}
@@ -71,7 +71,7 @@ func (b *ChangeEventBuffer) DrainAll() (map[string][]matEvent, map[string]int64)
 	defer b.mu.Unlock()
 	events := b.events
 	snapIDs := b.snapshotID
-	b.events = make(map[string][]matEvent)
+	b.events = make(map[string][]MatEvent)
 	b.snapshotID = make(map[string]int64)
 	for pgTable := range events {
 		pipeline.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
@@ -233,8 +233,8 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 	return nil
 }
 
-// matEvent represents a parsed change event from the events table.
-type matEvent struct {
+// MatEvent represents a parsed change event from the events table.
+type MatEvent struct {
 	op            string // "I", "U", "D"
 	lsn           int64
 	seq           int64
@@ -256,7 +256,7 @@ type preparedMaterialization struct {
 	fromBuffer     bool
 	bufSnapID      int64         // for checkpoint update (buffer path)
 	s3SnapID       int64         // for checkpoint update (S3 path)
-	events         []matEvent // retained for metrics (event count, max LSN)
+	events         []MatEvent // retained for metrics (event count, max LSN)
 	dataCount      int
 	deleteCount    int
 	deleteRowCount int64
@@ -303,7 +303,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 // The caller is responsible for committing via CommitTransaction and then
 // calling applyPostCommit to finalize side effects.
 func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tableSink,
-	bufEvents []matEvent, bufSnapID int64) (*preparedMaterialization, error) {
+	bufEvents []MatEvent, bufSnapID int64) (*preparedMaterialization, error) {
 
 	start := time.Now()
 	catalog := m.catalog
@@ -598,8 +598,8 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 iceberg.ObjectS
 }
 
 // readEvents reads event parquet files and parses them into ChangeEvent structs.
-func (m *Materializer) readEvents(ctx context.Context, s3 iceberg.ObjectStorage, files []iceberg.DataFileInfo, srcSchema *postgres.TableSchema) ([]matEvent, error) {
-	var events []matEvent
+func (m *Materializer) readEvents(ctx context.Context, s3 iceberg.ObjectStorage, files []iceberg.DataFileInfo, srcSchema *postgres.TableSchema) ([]MatEvent, error) {
+	var events []MatEvent
 
 	// Build the events schema to read the parquet files.
 	eventsSchema := iceberg.EventsTableSchema(srcSchema)
@@ -628,7 +628,7 @@ func (m *Materializer) readEvents(ctx context.Context, s3 iceberg.ObjectStorage,
 			if err != nil {
 				return nil, fmt.Errorf("parse _seq in %s: %w", df.Path, err)
 			}
-			ev := matEvent{
+			ev := MatEvent{
 				op:  fmt.Sprintf("%v", row["_op"]),
 				lsn: lsn,
 				seq: seq,
