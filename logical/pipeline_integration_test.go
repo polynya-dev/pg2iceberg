@@ -1,6 +1,6 @@
 //go:build integration
 
-package pipeline_test
+package logical_test
 
 import (
 	"context"
@@ -17,7 +17,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/sink"
-	"github.com/pg2iceberg/pg2iceberg/source"
+	"github.com/pg2iceberg/pg2iceberg/logical"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/network"
@@ -86,7 +86,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 
 	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
 
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -99,7 +99,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 	// Wait for pipeline to be running (snapshot complete).
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*source.LogicalSource)
+	ls, ok := p.Source().(*logical.LogicalSource)
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -274,7 +274,7 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 	cat := newMemCatalog()
 
 	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -286,7 +286,7 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*source.LogicalSource)
+	ls, ok := p.Source().(*logical.LogicalSource)
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -423,7 +423,7 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 	cat := newFailOnceCatalog()
 
 	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -435,7 +435,7 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*source.LogicalSource)
+	ls, ok := p.Source().(*logical.LogicalSource)
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -539,7 +539,7 @@ func (s *gatedStorage) Upload(ctx context.Context, key string, data []byte) (str
 	return s.memStorage.Upload(ctx, key, data)
 }
 
-func waitForStatus(t *testing.T, p *pipeline.Pipeline, target pipeline.Status, timeout time.Duration) {
+func waitForStatus(t *testing.T, p *logical.Pipeline, target pipeline.Status, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)
 	for {
@@ -638,7 +638,7 @@ func TestMaterializer_CrossTableAtomicCommit(t *testing.T) {
 
 	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
 
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 	p.SetEventBuf(eventBuf)
 
 	if err := p.Start(ctx); err != nil {
@@ -651,7 +651,7 @@ func TestMaterializer_CrossTableAtomicCommit(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	ls, ok := p.Source().(*source.LogicalSource)
+	ls, ok := p.Source().(*logical.LogicalSource)
 	if !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
@@ -873,7 +873,7 @@ func TestMaterializer_CrossTableAtomicCommit_RaceDrainAll(t *testing.T) {
 
 	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, gate)
 
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 	p.SetEventBuf(realBuf) // materializer uses the real buffer directly
 
 	if err := p.Start(ctx); err != nil {
@@ -886,7 +886,7 @@ func TestMaterializer_CrossTableAtomicCommit_RaceDrainAll(t *testing.T) {
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
-	if _, ok := p.Source().(*source.LogicalSource); !ok {
+	if _, ok := p.Source().(*logical.LogicalSource); !ok {
 		t.Fatal("pipeline source is not *LogicalSource")
 	}
 
@@ -1294,7 +1294,7 @@ func TestRetry_S3UploadFailure(t *testing.T) {
 	mem := newFailNTimesStorage(2)
 	cat := newMemCatalog()
 	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1302,7 +1302,7 @@ func TestRetry_S3UploadFailure(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*source.LogicalSource)
+	ls := p.Source().(*logical.LogicalSource)
 	lsnAfterSnapshot := ls.FlushedLSN()
 
 	insertRows(t, ctx, pgCfg.DSN(), 0, 16)
@@ -1342,7 +1342,7 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 	mem := newMemStorage()
 	cat := newFailNTimesCatalog(3)
 	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1350,7 +1350,7 @@ func TestRetry_CatalogCommitFailure(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*source.LogicalSource)
+	ls := p.Source().(*logical.LogicalSource)
 	lsnAfterSnapshot := ls.FlushedLSN()
 
 	insertRows(t, ctx, pgCfg.DSN(), 0, 16)
@@ -1458,7 +1458,7 @@ func TestRetry_Toxiproxy_NetworkBlip(t *testing.T) {
 	mem := newMemStorage()
 	cat := newMemCatalog()
 	snk := sink.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, nil)
-	p := pipeline.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -1466,7 +1466,7 @@ func TestRetry_Toxiproxy_NetworkBlip(t *testing.T) {
 	defer func() { cancel(); <-p.Done() }()
 
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
-	ls := p.Source().(*source.LogicalSource)
+	ls := p.Source().(*logical.LogicalSource)
 
 	// Phase 1: Confirm streaming works.
 	pgDirectHost, _ := pgCtr.Host(ctx)

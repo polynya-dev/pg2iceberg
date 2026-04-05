@@ -1,7 +1,9 @@
+// Package source defines the shared types for change data capture.
+// These types are used by both the logical and query pipelines,
+// as well as the sink and pipeline packages.
 package source
 
 import (
-	"context"
 	"time"
 )
 
@@ -95,12 +97,3 @@ type ChangeEvent struct {
 	SchemaChange *SchemaChange
 }
 
-// Source captures change events from PostgreSQL.
-type Source interface {
-	// Capture starts emitting change events into the channel.
-	// Blocks until ctx is cancelled or a fatal error occurs.
-	Capture(ctx context.Context, events chan<- ChangeEvent) error
-
-	// Close performs graceful cleanup (e.g. drop replication slot).
-	Close() error
-}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/logical"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/query"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -50,20 +51,13 @@ func main() {
 	}
 }
 
-// runner is the common interface for both pipeline modes.
-type runner interface {
-	Done() <-chan struct{}
-	Status() (pipeline.Status, error)
-	Metrics() pipeline.Metrics
-}
-
 func runSingle(ctx context.Context, configPath string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	var r runner
+	var r pipeline.Pipeline
 
 	switch cfg.Source.Mode {
 	case "query":
@@ -76,15 +70,15 @@ func runSingle(ctx context.Context, configPath string) error {
 		}
 		r = qp
 
-	default: // "logical" or unspecified — use the existing pipeline
-		p, err := pipeline.BuildPipeline(ctx, "default", cfg)
+	default: // "logical" or unspecified
+		lp, err := logical.BuildPipeline(ctx, "default", cfg)
 		if err != nil {
-			return fmt.Errorf("build pipeline: %w", err)
+			return fmt.Errorf("build logical pipeline: %w", err)
 		}
-		if err := p.Start(ctx); err != nil {
+		if err := lp.Start(ctx); err != nil {
 			return err
 		}
-		r = p
+		r = lp
 	}
 
 	// Start a lightweight metrics server.
@@ -101,7 +95,7 @@ func runSingle(ctx context.Context, configPath string) error {
 	return nil
 }
 
-func startMetricsServer(ctx context.Context, addr string, r runner) {
+func startMetricsServer(ctx context.Context, addr string, r pipeline.Pipeline) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r2 *http.Request) {
