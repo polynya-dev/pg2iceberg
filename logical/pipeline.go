@@ -253,6 +253,19 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	}
 	p.src.SetSnapshotComplete(cp.SnapshotComplete)
 	p.src.SetSnapshotedTables(cp.SnapshotedTables)
+
+	// Configure direct-to-Iceberg snapshot writes.
+	p.src.SetSnapshotDeps(&SnapshotDeps{
+		Catalog:    p.snk.Catalog(),
+		S3:         p.snk.S3(),
+		SinkCfg:    p.cfg.Sink,
+		LogicalCfg: p.cfg.Source.Logical,
+		TableCfgs:  p.cfg.Tables,
+		Schemas:    p.schemas,
+		Store:      p.store,
+		PipelineID: p.id,
+	})
+
 	if !cp.SnapshotComplete {
 		p.setStatus(pipeline.StatusSnapshotting, nil)
 		pipeline.SnapshotInProgress.WithLabelValues(p.id).Set(1)
@@ -483,40 +496,30 @@ func (p *Pipeline) doFlush(ctx context.Context) error {
 }
 
 func (p *Pipeline) flushSnapshotTable(ctx context.Context, table string) error {
-	flushedBytes := p.snk.TotalBufferedBytes()
-	if err := p.snk.Flush(ctx); err != nil {
-		return fmt.Errorf("snapshot table flush: %w", err)
-	}
-	p.bytesProcessed += flushedBytes
-
-	cp, err := p.store.Load(p.id)
-	if err != nil {
-		return fmt.Errorf("load checkpoint: %w", err)
-	}
-
-	cp.Mode = "logical"
-	if cp.SnapshotedTables == nil {
-		cp.SnapshotedTables = make(map[string]bool)
-	}
-	cp.SnapshotedTables[table] = true
-	cp.LSN = p.lastWrittenLSN
-	p.src.SetFlushedLSN(cp.LSN)
-
-	if err := p.store.Save(p.id, cp); err != nil {
-		return fmt.Errorf("save checkpoint: %w", err)
+	// With direct-to-Iceberg snapshot writes, per-chunk checkpointing is handled
+	// inside the Snapshotter. If there are still buffered events in the Sink
+	// (legacy path), flush them.
+	if p.snk.ShouldFlush() {
+		flushedBytes := p.snk.TotalBufferedBytes()
+		if err := p.snk.Flush(ctx); err != nil {
+			return fmt.Errorf("snapshot table flush: %w", err)
+		}
+		p.bytesProcessed += flushedBytes
 	}
 
-	pipeline.SnapshotTablesCompleted.WithLabelValues(p.id).Inc()
-	log.Printf("[logical:%s] snapshot table %s complete, checkpoint saved", p.id, table)
+	log.Printf("[logical:%s] snapshot table %s complete", p.id, table)
 	return nil
 }
 
 func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
-	flushedBytes := p.snk.TotalBufferedBytes()
-	if err := p.snk.Flush(ctx); err != nil {
-		return fmt.Errorf("snapshot flush: %w", err)
+	// Flush any remaining buffered events (legacy path).
+	if p.snk.ShouldFlush() {
+		flushedBytes := p.snk.TotalBufferedBytes()
+		if err := p.snk.Flush(ctx); err != nil {
+			return fmt.Errorf("snapshot flush: %w", err)
+		}
+		p.bytesProcessed += flushedBytes
 	}
-	p.bytesProcessed += flushedBytes
 
 	cp, err := p.store.Load(p.id)
 	if err != nil {
@@ -526,11 +529,17 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	cp.Mode = "logical"
 	cp.SnapshotComplete = true
 	cp.SnapshotedTables = nil
+	cp.SnapshotChunks = nil
 	cp.LSN = p.lastWrittenLSN
 	p.src.SetFlushedLSN(cp.LSN)
 
 	if err := p.store.Save(p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
+	}
+
+	// Invalidate materializer file indices so they pick up snapshot-written files.
+	if p.materializer != nil {
+		p.materializer.InvalidateFileIndices()
 	}
 
 	p.setStatus(pipeline.StatusRunning, nil)

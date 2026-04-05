@@ -67,6 +67,11 @@ type LogicalSource struct {
 	// standbyInterval controls how often standby status updates are sent to PG.
 	// Defaults to 10s. Shorter values make confirmed_flush_lsn update faster.
 	standbyInterval time.Duration
+
+	// snapshotDeps holds dependencies for direct-to-Iceberg snapshot writes.
+	// When set, the snapshot bypasses the events table and writes directly
+	// to materialized tables.
+	snapshotDeps *SnapshotDeps
 }
 
 func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig, tableCfgs []config.TableConfig, pipelineID ...string) *LogicalSource {
@@ -106,6 +111,12 @@ func (l *LogicalSource) SetSnapshotComplete(done bool) {
 // SetSnapshotedTables restores per-table snapshot progress from checkpoint.
 func (l *LogicalSource) SetSnapshotedTables(tables map[string]bool) {
 	l.snapshotedTables = tables
+}
+
+// SetSnapshotDeps configures the snapshot to write directly to materialized
+// Iceberg tables, bypassing the events table.
+func (l *LogicalSource) SetSnapshotDeps(deps *SnapshotDeps) {
+	l.snapshotDeps = deps
 }
 
 // ReceivedLSN returns the latest WAL position received from PG.
@@ -175,7 +186,7 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- postgres.Chan
 	// a plain REPEATABLE READ transaction — duplicates are safe because the
 	// sink merges on PK.
 	if !l.snapshotComplete {
-		if err := l.snapshotTables(ctx, snapshotName, events); err != nil {
+		if err := l.snapshotTables(ctx, snapshotName); err != nil {
 			return fmt.Errorf("initial snapshot: %w", err)
 		}
 		// Signal to the pipeline that the snapshot is done so it can persist
@@ -475,11 +486,16 @@ func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 	return result.SnapshotName, nil
 }
 
-// snapshotTables performs an initial full-table copy for all tracked tables.
+// snapshotTables performs an initial full-table copy for all tracked tables
+// using CTID range chunks, writing directly to materialized Iceberg tables.
 // When snapshotName is non-empty (fresh slot), each per-table transaction is
 // pinned to the exported snapshot. On crash recovery (empty snapshotName),
 // a plain REPEATABLE READ transaction is used instead.
-func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string, events chan<- postgres.ChangeEvent) error {
+func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string) error {
+	if l.snapshotDeps == nil {
+		return fmt.Errorf("snapshot deps not set; call SetSnapshotDeps before Capture")
+	}
+
 	var tables []SnapshotTable
 	for _, tc := range l.tableCfgs {
 		if tc.SkipSnapshot {
@@ -532,9 +548,9 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string,
 		return tx, cleanup, nil
 	}
 
-	snap := NewSnapshotter(tables, txFactory, l.cfg.SnapshotConcurrencyOrDefault(), l.pipelineID)
+	snap := NewSnapshotter(tables, txFactory, l.cfg.SnapshotConcurrencyOrDefault(), *l.snapshotDeps)
 	log.Printf("[logical] snapshot: %d tables, concurrency=%d", len(tables), l.cfg.SnapshotConcurrencyOrDefault())
-	if _, err := snap.Run(ctx, events); err != nil {
+	if _, err := snap.Run(ctx); err != nil {
 		return err
 	}
 

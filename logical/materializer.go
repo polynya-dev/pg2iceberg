@@ -98,6 +98,17 @@ type Materializer struct {
 	tableWriters map[string]*iceberg.TableWriter
 }
 
+// InvalidateFileIndices forces all table writers to rebuild their file indices
+// on the next materialization cycle. Called after the snapshot phase completes
+// so the materializer picks up rows written directly to materialized tables.
+func (m *Materializer) InvalidateFileIndices() {
+	for _, tw := range m.tableWriters {
+		if tw.FileIdx != nil {
+			tw.FileIdx.SnapshotID = 0
+		}
+	}
+}
+
 // SyncTableWriter updates the TableWriter's schema after a schema evolution.
 func (m *Materializer) SyncTableWriter(pgTable string) {
 	ts, ok := m.tables[pgTable]

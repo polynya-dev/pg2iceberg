@@ -82,10 +82,12 @@ func (q QueryConfig) PollDuration() time.Duration {
 }
 
 type LogicalConfig struct {
-	PublicationName     string `yaml:"publication_name" json:"publication_name"`
-	SlotName            string `yaml:"slot_name" json:"slot_name"`
-	SnapshotConcurrency int    `yaml:"snapshot_concurrency" json:"snapshot_concurrency,omitempty"`
-	StandbyInterval     string `yaml:"standby_interval" json:"standby_interval,omitempty"`
+	PublicationName        string `yaml:"publication_name" json:"publication_name"`
+	SlotName               string `yaml:"slot_name" json:"slot_name"`
+	SnapshotConcurrency    int    `yaml:"snapshot_concurrency" json:"snapshot_concurrency,omitempty"`
+	SnapshotChunkPages     int    `yaml:"snapshot_chunk_pages" json:"snapshot_chunk_pages,omitempty"`
+	SnapshotTargetFileSize int64  `yaml:"snapshot_target_file_size" json:"snapshot_target_file_size,omitempty"`
+	StandbyInterval        string `yaml:"standby_interval" json:"standby_interval,omitempty"`
 }
 
 // StandbyIntervalDuration returns the configured standby interval,
@@ -108,6 +110,24 @@ func (c LogicalConfig) SnapshotConcurrencyOrDefault() int {
 		return c.SnapshotConcurrency
 	}
 	return runtime.GOMAXPROCS(0)
+}
+
+// SnapshotChunkPagesOrDefault returns the configured CTID chunk size in pages.
+// Default: 2048 pages (~16MB at 8KB/page).
+func (c LogicalConfig) SnapshotChunkPagesOrDefault() int {
+	if c.SnapshotChunkPages > 0 {
+		return c.SnapshotChunkPages
+	}
+	return 2048
+}
+
+// SnapshotTargetFileSizeOrDefault returns the target Parquet file size for
+// snapshot writes. Default: 128MB (larger than streaming since this is bulk).
+func (c LogicalConfig) SnapshotTargetFileSizeOrDefault() int64 {
+	if c.SnapshotTargetFileSize > 0 {
+		return c.SnapshotTargetFileSize
+	}
+	return 128 * 1024 * 1024
 }
 
 type SinkConfig struct {

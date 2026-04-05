@@ -25,6 +25,386 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// TestPipeline_SnapshotThenStream runs a full pipeline lifecycle:
+//  1. Snapshot phase writes existing rows directly to the materialized table
+//  2. Pipeline transitions to streaming (WAL replication)
+//  3. New inserts during streaming flow through events table → materializer
+//  4. Updates to snapshotted rows are materialized correctly
+//
+// This verifies the complete snapshot→stream handoff including:
+//   - Direct-to-Iceberg snapshot writes (bypassing events table)
+//   - File index invalidation after snapshot (materializer picks up snapshot data)
+//   - Materializer handles mixed snapshot + streaming data
+func TestPipeline_SnapshotThenStream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	// Create table and insert seed data BEFORE replication starts.
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE products (
+			id    SERIAL PRIMARY KEY,
+			name  TEXT NOT NULL,
+			price INTEGER NOT NULL
+		);
+		CREATE PUBLICATION test_pub FOR TABLE products;
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	const snapshotRows = 50
+	for i := 1; i <= snapshotRows; i++ {
+		_, err = conn.Exec(ctx, "INSERT INTO products (name, price) VALUES ($1, $2)",
+			fmt.Sprintf("product-%d", i), i*100)
+		if err != nil {
+			t.Fatalf("seed insert %d: %v", i, err)
+		}
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            5,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.products"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        "test_slot_snapstream",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	eventBuf := logical.NewChangeEventBuffer()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	store := pipeline.NewMemCheckpointStore()
+	p := logical.NewPipeline("test", cfg, snk, store)
+	p.SetEventBuf(eventBuf)
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	// Wait for snapshot to complete and pipeline to transition to streaming.
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+	t.Log("pipeline running — snapshot complete, streaming started")
+
+	// === Assertion 1: Snapshot data was written directly to materialized table ===
+	// The materialized table should have snapshot data. The events table should
+	// have NO snapshot data (snapshot bypasses events table).
+	matTm, err := cat.LoadTable("test_ns", "products")
+	if err != nil {
+		t.Fatalf("load materialized table: %v", err)
+	}
+	if matTm == nil || matTm.Metadata.CurrentSnapshotID == 0 {
+		t.Fatal("expected materialized table to have snapshot data from direct snapshot write")
+	}
+	t.Logf("materialized table has %d snapshots after snapshot phase", len(matTm.Metadata.Snapshots))
+
+	// Verify the materialized table has the right number of rows.
+	matRows := countDataRows(t, ctx, mem, matTm)
+	if matRows != snapshotRows {
+		t.Errorf("materialized table: expected %d rows from snapshot, got %d", snapshotRows, matRows)
+	}
+	t.Logf("materialized table has %d rows after snapshot", matRows)
+
+	// === Phase 2: Insert new rows during streaming ===
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	const streamInserts = 10
+	for i := 1; i <= streamInserts; i++ {
+		_, err = conn.Exec(ctx, "INSERT INTO products (name, price) VALUES ($1, $2)",
+			fmt.Sprintf("new-product-%d", i), i*200)
+		if err != nil {
+			t.Fatalf("stream insert %d: %v", i, err)
+		}
+	}
+
+	// Wait for the new rows to be flushed to events table.
+	ls := p.Source()
+	flushedBefore := ls.FlushedLSN()
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > flushedBefore })
+	t.Logf("streaming events flushed: flushedLSN=%d", ls.FlushedLSN())
+
+	// Wait for materializer to process ALL streaming events.
+	// The materializer may need multiple cycles to process all 10 inserts.
+	expectedTotal := int64(snapshotRows + streamInserts)
+	waitFor(t, 30*time.Second, func() bool {
+		matTm, _ = cat.LoadTable("test_ns", "products")
+		return countDataRows(t, ctx, mem, matTm) >= expectedTotal
+	})
+	t.Logf("materializer committed %d times", len(cat.matCommits()))
+
+	// === Assertion 2: Materialized table now has snapshot + streaming rows ===
+	matTm, _ = cat.LoadTable("test_ns", "products")
+	matRows = countDataRows(t, ctx, mem, matTm)
+	if matRows != expectedTotal {
+		t.Errorf("materialized table: expected %d total rows (snapshot + streaming), got %d", expectedTotal, matRows)
+	}
+	t.Logf("materialized table has %d rows after streaming (snapshot=%d + stream=%d)", matRows, snapshotRows, streamInserts)
+
+	// === Phase 3: Update a snapshotted row during streaming ===
+	_, err = conn.Exec(ctx, "UPDATE products SET price = 9999 WHERE id = 1")
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	// Wait for the update to be flushed and materialized.
+	flushedBefore = ls.FlushedLSN()
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > flushedBefore })
+
+	matCommitsBefore := len(cat.matCommits())
+	waitFor(t, 30*time.Second, func() bool {
+		return len(cat.matCommits()) > matCommitsBefore
+	})
+
+	// === Assertion 3: Row count unchanged (update, not insert) ===
+	// With MoR, an update adds an equality delete + a new data file.
+	// Total data rows across all files may include the old + new row,
+	// but the logical row count is unchanged. We verify the materializer
+	// produced delete files.
+	matTm, _ = cat.LoadTable("test_ns", "products")
+	hasDeletes := countDeleteFiles(t, ctx, mem, matTm) > 0
+	if !hasDeletes {
+		t.Error("expected equality delete files after updating a snapshotted row")
+	}
+	t.Logf("materializer produced delete files for update — MoR working correctly")
+
+	// === Assertion 4: Checkpoint is clean ===
+	cp, _ := store.Load("test")
+	if !cp.SnapshotComplete {
+		t.Error("expected SnapshotComplete=true in checkpoint")
+	}
+	if len(cp.SnapshotChunks) != 0 {
+		t.Errorf("expected empty SnapshotChunks, got %v", cp.SnapshotChunks)
+	}
+	t.Logf("checkpoint: SnapshotComplete=%v, LSN=%d", cp.SnapshotComplete, cp.LSN)
+
+	// === Assertion 5: No data loss — verify every row is present in Parquet ===
+	// Read back all data files from the materialized table and collect all rows.
+	// After MoR: data files contain both old and new versions. The equality
+	// deletes logically remove old versions but the data files still contain them.
+	// We read ALL data file rows and apply delete dedup to get the logical view.
+	matTm, _ = cat.LoadTable("test_ns", "products")
+	allRows := readAllDataFileRows(t, ctx, mem, matTm)
+	t.Logf("total rows across all data files: %d", len(allRows))
+
+	// Build a set of all IDs present in data files.
+	idSet := make(map[int32]bool)
+	for _, row := range allRows {
+		if id, ok := row["id"].(int32); ok {
+			idSet[id] = true
+		}
+	}
+
+	// Verify all snapshot rows are present.
+	for i := int32(1); i <= snapshotRows; i++ {
+		if !idSet[i] {
+			t.Errorf("data loss: snapshot row id=%d missing from materialized data files", i)
+		}
+	}
+
+	// Verify all stream-inserted rows are present.
+	for i := int32(snapshotRows + 1); i <= int32(snapshotRows+streamInserts); i++ {
+		if !idSet[i] {
+			t.Errorf("data loss: stream-inserted row id=%d missing from materialized data files", i)
+		}
+	}
+
+	// Verify the updated row has the new price in at least one data file row.
+	foundUpdatedPrice := false
+	for _, row := range allRows {
+		if id, ok := row["id"].(int32); ok && id == 1 {
+			if price, ok := row["price"].(int32); ok && price == 9999 {
+				foundUpdatedPrice = true
+				break
+			}
+		}
+	}
+	if !foundUpdatedPrice {
+		t.Error("data loss: updated row id=1 with price=9999 not found in materialized data files")
+	}
+
+	t.Logf("no data loss: all %d IDs present, update applied correctly", len(idSet))
+}
+
+// countDataRows counts total data rows across all data files in a table's current snapshot.
+func countDataRows(t *testing.T, ctx context.Context, s3 *memStorage, tm *iceberg.TableMetadata) int64 {
+	t.Helper()
+	if tm == nil || tm.Metadata.CurrentSnapshotID == 0 {
+		return 0
+	}
+	mlURI := tm.CurrentManifestList()
+	if mlURI == "" {
+		return 0
+	}
+	mlKey, err := iceberg.KeyFromURI(mlURI)
+	if err != nil {
+		t.Fatalf("parse manifest list URI: %v", err)
+	}
+	mlData, err := s3.Download(ctx, mlKey)
+	if err != nil {
+		t.Fatalf("download manifest list: %v", err)
+	}
+	manifests, err := iceberg.ReadManifestList(mlData)
+	if err != nil {
+		t.Fatalf("read manifest list: %v", err)
+	}
+
+	var total int64
+	for _, mfi := range manifests {
+		if mfi.Content != 0 {
+			continue
+		}
+		mKey, err := iceberg.KeyFromURI(mfi.Path)
+		if err != nil {
+			t.Fatalf("parse manifest URI: %v", err)
+		}
+		mData, err := s3.Download(ctx, mKey)
+		if err != nil {
+			t.Fatalf("download manifest: %v", err)
+		}
+		entries, err := iceberg.ReadManifest(mData)
+		if err != nil {
+			t.Fatalf("read manifest: %v", err)
+		}
+		for _, e := range entries {
+			if e.DataFile.Content == 0 {
+				total += e.DataFile.RecordCount
+			}
+		}
+	}
+	return total
+}
+
+// readAllDataFileRows reads all rows from all data files in a table's current snapshot.
+// Returns the raw rows from Parquet — includes both old and new versions (MoR).
+func readAllDataFileRows(t *testing.T, ctx context.Context, s3 *memStorage, tm *iceberg.TableMetadata) []map[string]any {
+	t.Helper()
+	if tm == nil || tm.Metadata.CurrentSnapshotID == 0 {
+		return nil
+	}
+	mlURI := tm.CurrentManifestList()
+	if mlURI == "" {
+		return nil
+	}
+	mlKey, err := iceberg.KeyFromURI(mlURI)
+	if err != nil {
+		t.Fatalf("parse manifest list URI: %v", err)
+	}
+	mlData, err := s3.Download(ctx, mlKey)
+	if err != nil {
+		t.Fatalf("download manifest list: %v", err)
+	}
+	manifests, err := iceberg.ReadManifestList(mlData)
+	if err != nil {
+		t.Fatalf("read manifest list: %v", err)
+	}
+
+	var allRows []map[string]any
+	for _, mfi := range manifests {
+		if mfi.Content != 0 {
+			continue // skip delete manifests
+		}
+		mKey, err := iceberg.KeyFromURI(mfi.Path)
+		if err != nil {
+			t.Fatalf("parse manifest URI: %v", err)
+		}
+		mData, err := s3.Download(ctx, mKey)
+		if err != nil {
+			t.Fatalf("download manifest: %v", err)
+		}
+		entries, err := iceberg.ReadManifest(mData)
+		if err != nil {
+			t.Fatalf("read manifest: %v", err)
+		}
+		for _, e := range entries {
+			if e.DataFile.Content != 0 {
+				continue
+			}
+			dfKey, err := iceberg.KeyFromURI(e.DataFile.Path)
+			if err != nil {
+				t.Fatalf("parse data file URI: %v", err)
+			}
+			dfData, err := s3.Download(ctx, dfKey)
+			if err != nil {
+				t.Fatalf("download data file: %v", err)
+			}
+			rows, err := iceberg.ReadParquetRows(dfData, nil)
+			if err != nil {
+				t.Fatalf("read parquet rows: %v", err)
+			}
+			allRows = append(allRows, rows...)
+		}
+	}
+	return allRows
+}
+
+// countDeleteFiles counts equality delete files in a table's current snapshot.
+func countDeleteFiles(t *testing.T, ctx context.Context, s3 *memStorage, tm *iceberg.TableMetadata) int {
+	t.Helper()
+	if tm == nil || tm.Metadata.CurrentSnapshotID == 0 {
+		return 0
+	}
+	mlURI := tm.CurrentManifestList()
+	if mlURI == "" {
+		return 0
+	}
+	mlKey, err := iceberg.KeyFromURI(mlURI)
+	if err != nil {
+		t.Fatalf("parse manifest list URI: %v", err)
+	}
+	mlData, err := s3.Download(ctx, mlKey)
+	if err != nil {
+		t.Fatalf("download manifest list: %v", err)
+	}
+	manifests, err := iceberg.ReadManifestList(mlData)
+	if err != nil {
+		t.Fatalf("read manifest list: %v", err)
+	}
+
+	count := 0
+	for _, mfi := range manifests {
+		if mfi.Content == 1 {
+			count += mfi.AddedFiles
+		}
+	}
+	return count
+}
+
 // TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush runs a real pipeline with
 // Postgres logical replication and a real sink (backed by in-memory storage
 // and catalog stubs). It verifies that:

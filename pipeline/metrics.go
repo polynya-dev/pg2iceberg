@@ -222,6 +222,19 @@ var SnapshotInProgress = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help:      "Whether the pipeline is currently performing an initial snapshot (1=yes, 0=no).",
 }, []string{"pipeline"})
 
+var SnapshotChunksCompleted = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "snapshot_chunks_completed_total",
+	Help:      "Total CTID chunks completed during initial snapshot.",
+}, []string{"pipeline", "table"})
+
+var SnapshotChunkDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace: namespace,
+	Name:      "snapshot_chunk_duration_seconds",
+	Help:      "Time taken to snapshot a single CTID chunk (query + write + commit).",
+	Buckets:   []float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+}, []string{"pipeline", "table"})
+
 // --- Query mode ---
 
 var QueryPollTotal = promauto.NewCounterVec(prometheus.CounterOpts{
