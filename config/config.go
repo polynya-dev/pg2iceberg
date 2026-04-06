@@ -3,8 +3,10 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,11 +14,12 @@ import (
 )
 
 type Config struct {
-	Tables      []TableConfig `yaml:"tables" json:"tables"`
-	Source      SourceConfig  `yaml:"source" json:"source"`
-	Sink        SinkConfig    `yaml:"sink" json:"sink"`
-	State       StateConfig   `yaml:"state" json:"state"`
-	MetricsAddr string        `yaml:"metrics_addr" json:"metrics_addr,omitempty"`
+	Tables       []TableConfig `yaml:"tables" json:"tables"`
+	Source       SourceConfig  `yaml:"source" json:"source"`
+	Sink         SinkConfig    `yaml:"sink" json:"sink"`
+	State        StateConfig   `yaml:"state" json:"state"`
+	MetricsAddr  string        `yaml:"metrics_addr" json:"metrics_addr,omitempty"`
+	SnapshotOnly bool          `yaml:"snapshot_only" json:"snapshot_only,omitempty"`
 }
 
 // TableConfig describes a table to replicate.
@@ -237,8 +240,22 @@ func (cfg *Config) FindTable(name string) *TableConfig {
 	return nil
 }
 
-// Load reads a config from a YAML file.
+// Load reads a config from a YAML file, applies defaults, and validates.
 func Load(path string) (*Config, error) {
+	cfg, err := LoadYAML(path)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// LoadYAML reads and parses a YAML config file without applying defaults or validation.
+func LoadYAML(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -248,12 +265,128 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-
-	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
 	return &cfg, nil
+}
+
+// ParsePostgresURL parses a PostgreSQL connection URL into a PostgresConfig.
+// Accepts URLs like: postgresql://user:password@host:port/database
+func ParsePostgresURL(connURL string) (PostgresConfig, error) {
+	u, err := url.Parse(connURL)
+	if err != nil {
+		return PostgresConfig{}, fmt.Errorf("invalid postgres URL: %w", err)
+	}
+
+	pg := PostgresConfig{
+		Host:     u.Hostname(),
+		Database: strings.TrimPrefix(u.Path, "/"),
+		User:     u.User.Username(),
+	}
+
+	if p := u.Port(); p != "" {
+		port, err := strconv.Atoi(p)
+		if err != nil {
+			return PostgresConfig{}, fmt.Errorf("invalid port in postgres URL: %w", err)
+		}
+		pg.Port = port
+	}
+
+	if pw, ok := u.User.Password(); ok {
+		pg.Password = pw
+	}
+
+	return pg, nil
+}
+
+// ApplyEnv overrides config fields from environment variables.
+// Call this after loading YAML (if any) and before ApplyDefaults/Validate.
+func (cfg *Config) ApplyEnv() error {
+	// Postgres connection — URL first, then individual fields can override.
+	if v := os.Getenv("POSTGRES_URL"); v != "" {
+		pg, err := ParsePostgresURL(v)
+		if err != nil {
+			return err
+		}
+		cfg.Source.Postgres = pg
+	}
+	if v := os.Getenv("POSTGRES_HOST"); v != "" {
+		cfg.Source.Postgres.Host = v
+	}
+	if v := os.Getenv("POSTGRES_PORT"); v != "" {
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid POSTGRES_PORT: %w", err)
+		}
+		cfg.Source.Postgres.Port = port
+	}
+	if v := os.Getenv("POSTGRES_DATABASE"); v != "" {
+		cfg.Source.Postgres.Database = v
+	}
+	if v := os.Getenv("POSTGRES_USER"); v != "" {
+		cfg.Source.Postgres.User = v
+	}
+	if v := os.Getenv("POSTGRES_PASSWORD"); v != "" {
+		cfg.Source.Postgres.Password = v
+	}
+
+	if v := os.Getenv("MODE"); v != "" {
+		cfg.Source.Mode = v
+	}
+	if v := os.Getenv("TABLES"); v != "" {
+		cfg.Tables = ParseTables(v)
+	}
+	if v := os.Getenv("SLOT_NAME"); v != "" {
+		cfg.Source.Logical.SlotName = v
+	}
+	if v := os.Getenv("PUBLICATION_NAME"); v != "" {
+		cfg.Source.Logical.PublicationName = v
+	}
+
+	if v := os.Getenv("ICEBERG_CATALOG_URL"); v != "" {
+		cfg.Sink.CatalogURI = v
+	}
+	if v := os.Getenv("WAREHOUSE"); v != "" {
+		cfg.Sink.Warehouse = v
+	}
+	if v := os.Getenv("NAMESPACE"); v != "" {
+		cfg.Sink.Namespace = v
+	}
+	if v := os.Getenv("S3_ENDPOINT"); v != "" {
+		cfg.Sink.S3Endpoint = v
+	}
+	if v := os.Getenv("S3_ACCESS_KEY"); v != "" {
+		cfg.Sink.S3AccessKey = v
+	}
+	if v := os.Getenv("S3_SECRET_KEY"); v != "" {
+		cfg.Sink.S3SecretKey = v
+	}
+	if v := os.Getenv("S3_REGION"); v != "" {
+		cfg.Sink.S3Region = v
+	}
+
+	if v := os.Getenv("SNAPSHOT_ONLY"); v != "" {
+		cfg.SnapshotOnly = v == "1" || v == "true"
+	}
+
+	if v := os.Getenv("STATE_POSTGRES_URL"); v != "" {
+		cfg.State.PostgresURL = v
+	}
+	if v := os.Getenv("METRICS_ADDR"); v != "" {
+		cfg.MetricsAddr = v
+	}
+
+	return nil
+}
+
+// ParseTables splits a comma-separated table list into TableConfigs.
+func ParseTables(s string) []TableConfig {
+	var tables []TableConfig
+	for _, name := range strings.Split(s, ",") {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			tables = append(tables, TableConfig{Name: name})
+		}
+	}
+	return tables
 }
 
 // LoadJSON parses a config from JSON bytes (used by the API).
@@ -284,6 +417,12 @@ func (cfg *Config) ApplyDefaults() {
 	if cfg.Sink.S3Region == "" {
 		cfg.Sink.S3Region = "us-east-1"
 	}
+	if cfg.Source.Logical.SlotName == "" {
+		cfg.Source.Logical.SlotName = "pg2iceberg_slot"
+	}
+	if cfg.Source.Logical.PublicationName == "" {
+		cfg.Source.Logical.PublicationName = "pg2iceberg_pub"
+	}
 }
 
 // Validate checks that the config has all required fields and valid values.
@@ -307,12 +446,6 @@ func (cfg *Config) Validate() error {
 	}
 
 	// Source
-	switch cfg.Source.Mode {
-	case "logical", "query":
-	default:
-		errs = append(errs, fmt.Sprintf("source.mode: must be \"logical\" or \"query\", got %q", cfg.Source.Mode))
-	}
-
 	pg := cfg.Source.Postgres
 	if pg.Host == "" {
 		errs = append(errs, "source.postgres.host: required")
@@ -324,35 +457,36 @@ func (cfg *Config) Validate() error {
 		errs = append(errs, "source.postgres.user: required")
 	}
 
-	if cfg.Source.Mode == "logical" {
-		if cfg.Source.Logical.SlotName == "" {
-			errs = append(errs, "source.logical.slot_name: required for logical mode")
+	// In snapshot-only mode, mode-specific validation is skipped because
+	// the snapshot path doesn't use replication slots or watermark queries.
+	if !cfg.SnapshotOnly {
+		switch cfg.Source.Mode {
+		case "logical", "query":
+		default:
+			errs = append(errs, fmt.Sprintf("source.mode: must be \"logical\" or \"query\", got %q", cfg.Source.Mode))
 		}
-		if cfg.Source.Logical.PublicationName == "" {
-			errs = append(errs, "source.logical.publication_name: required for logical mode")
-		}
-	}
 
-	if cfg.Source.Mode == "query" {
-		if cfg.Source.Query.PollInterval != "" {
-			if _, err := time.ParseDuration(cfg.Source.Query.PollInterval); err != nil {
-				errs = append(errs, fmt.Sprintf("source.query.poll_interval: invalid duration %q", cfg.Source.Query.PollInterval))
+		if cfg.Source.Mode == "query" {
+			if cfg.Source.Query.PollInterval != "" {
+				if _, err := time.ParseDuration(cfg.Source.Query.PollInterval); err != nil {
+					errs = append(errs, fmt.Sprintf("source.query.poll_interval: invalid duration %q", cfg.Source.Query.PollInterval))
+				}
 			}
-		}
-		for i, t := range cfg.Tables {
-			if len(t.PrimaryKey) == 0 {
-				errs = append(errs, fmt.Sprintf("tables[%d].primary_key: required for query mode", i))
+			for i, t := range cfg.Tables {
+				if len(t.PrimaryKey) == 0 {
+					errs = append(errs, fmt.Sprintf("tables[%d].primary_key: required for query mode", i))
+				}
+				if t.WatermarkColumn == "" {
+					errs = append(errs, fmt.Sprintf("tables[%d].watermark_column: required for query mode", i))
+				}
 			}
-			if t.WatermarkColumn == "" {
-				errs = append(errs, fmt.Sprintf("tables[%d].watermark_column: required for query mode", i))
+			// Warn about logical-only settings that have no effect in query mode.
+			if cfg.Sink.EventsPartition != "" {
+				errs = append(errs, "sink.events_partition: not applicable in query mode (no events table)")
 			}
-		}
-		// Warn about logical-only settings that have no effect in query mode.
-		if cfg.Sink.EventsPartition != "" {
-			errs = append(errs, "sink.events_partition: not applicable in query mode (no events table)")
-		}
-		if cfg.Sink.MaterializerInterval != "" {
-			errs = append(errs, "sink.materializer_interval: not applicable in query mode (no materializer)")
+			if cfg.Sink.MaterializerInterval != "" {
+				errs = append(errs, "sink.materializer_interval: not applicable in query mode (no materializer)")
+			}
 		}
 	}
 

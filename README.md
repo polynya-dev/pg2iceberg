@@ -127,16 +127,32 @@ select * from rideshare.`rideshare.rides`
 
 You should see new rows added over time.
 
-## Usage
+### Environment variables
 
-Runs one pipeline from a config file:
+| Env var | CLI flag | Description |
+|---|---|---|
+| `POSTGRES_URL` | `--postgres-url` | PostgreSQL connection URL |
+| `POSTGRES_HOST` | | PostgreSQL host (overrides URL) |
+| `POSTGRES_PORT` | | PostgreSQL port (overrides URL) |
+| `POSTGRES_DATABASE` | | PostgreSQL database (overrides URL) |
+| `POSTGRES_USER` | | PostgreSQL user (overrides URL) |
+| `POSTGRES_PASSWORD` | | PostgreSQL password (overrides URL) |
+| `TABLES` | `--tables` | Comma-separated list of tables |
+| `MODE` | `--mode` | `logical` (default) or `query` |
+| `SLOT_NAME` | `--slot-name` | Replication slot (default: `pg2iceberg_slot`) |
+| `PUBLICATION_NAME` | `--publication-name` | Publication (default: `pg2iceberg_pub`) |
+| `ICEBERG_CATALOG_URL` | `--iceberg-catalog-url` | Iceberg REST catalog URL |
+| `WAREHOUSE` | `--warehouse` | Iceberg warehouse path |
+| `NAMESPACE` | `--namespace` | Iceberg namespace |
+| `S3_ENDPOINT` | `--s3-endpoint` | S3 endpoint URL |
+| `S3_ACCESS_KEY` | `--s3-access-key` | S3 access key |
+| `S3_SECRET_KEY` | `--s3-secret-key` | S3 secret key |
+| `S3_REGION` | `--s3-region` | S3 region (default: `us-east-1`) |
+| `SNAPSHOT_ONLY` | `--snapshot-only` | Exit after initial snapshot (default: `false`) |
+| `STATE_POSTGRES_URL` | `--state-postgres-url` | Separate Postgres for checkpoint storage |
+| `METRICS_ADDR` | `--metrics-addr` | Metrics server address (default: `:9090`) |
 
-```sh
-docker run -v ./config.yaml:/etc/pg2iceberg/config.yaml \
-  ghcr.io/pg2iceberg/pg2iceberg --config /etc/pg2iceberg/config.yaml
-```
-
-See [`example/single`](example/single) for a full working example.
+See config.example.yaml for the full config YAML.
 
 ## Checkpoint storage
 

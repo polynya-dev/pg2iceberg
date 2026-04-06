@@ -88,9 +88,15 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
-    volumes:
-      - ./config.yaml:/etc/pg2iceberg/config.yaml
-    command: ["--config", "/etc/pg2iceberg/config.yaml"]
+    environment:
+      POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/rideshare
+      TABLES: public.riders,public.drivers,public.rides,public.payments,public.ratings
+      ICEBERG_CATALOG_URL: http://iceberg-rest:8181
+      WAREHOUSE: s3://warehouse/
+      NAMESPACE: rideshare
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: admin
+      S3_SECRET_KEY: password
     ports:
       - "9091:9090"
     depends_on:
