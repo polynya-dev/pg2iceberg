@@ -38,6 +38,8 @@ func EventsTableSchema(src *postgres.TableSchema) *postgres.TableSchema {
 			PGType:     col.PGType,
 			IsNullable: true, // always nullable in events table
 			FieldID:    5 + col.FieldID,
+			Precision:  col.Precision,
+			Scale:      col.Scale,
 		})
 	}
 

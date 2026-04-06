@@ -9,6 +9,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/decimal128"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	apq "github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/compress"
@@ -39,6 +40,8 @@ func buildColSizers(columns []postgres.Column) []colSizer {
 			postgres.TimestampTZ, postgres.Timestamp,
 			postgres.Time, postgres.TimeTZ:
 			sizers[i].fixedSize = 8
+		case postgres.Numeric:
+			sizers[i].fixedSize = 16 // Decimal128
 		case postgres.Bool:
 			sizers[i].fixedSize = 1
 		}
@@ -152,6 +155,22 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 			ca.appendZero = func(b array.Builder) {
 				b.(*array.Time64Builder).Append(0)
 			}
+		case postgres.Numeric:
+			prec, scale := decimalPrecScale(col)
+			ca.appendVal = func(b array.Builder, v any) error {
+				n, err := ToDecimal128(v, prec, scale)
+				if err != nil {
+					// Value overflows the declared decimal precision — write NULL.
+					// This happens when PG precision > Iceberg's max of 38.
+					b.(*array.Decimal128Builder).AppendNull()
+					return nil
+				}
+				b.(*array.Decimal128Builder).Append(n)
+				return nil
+			}
+			ca.appendZero = func(b array.Builder) {
+				b.(*array.Decimal128Builder).Append(decimal128.Num{})
+			}
 		default:
 			// text, varchar, numeric, json, uuid, etc. → string
 			ca.appendVal = func(b array.Builder, v any) error {
@@ -165,9 +184,9 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 	return appenders
 }
 
-// pgToArrowType maps a PostgreSQL column type to an Arrow data type.
-func pgToArrowType(pgType postgres.Type) arrow.DataType {
-	switch pgType {
+// pgToArrowType maps a PostgreSQL column to an Arrow data type.
+func pgToArrowType(col postgres.Column) arrow.DataType {
+	switch col.PGType {
 	case postgres.Int2, postgres.Int4, postgres.OID:
 		return arrow.PrimitiveTypes.Int32
 	case postgres.Int8:
@@ -186,9 +205,28 @@ func pgToArrowType(pgType postgres.Type) arrow.DataType {
 		return arrow.FixedWidthTypes.Date32
 	case postgres.Time, postgres.TimeTZ:
 		return arrow.FixedWidthTypes.Time64us
+	case postgres.Numeric:
+		prec, scale := decimalPrecScale(col)
+		return &arrow.Decimal128Type{Precision: prec, Scale: scale}
 	default:
 		return arrow.BinaryTypes.String
 	}
+}
+
+// decimalPrecScale returns the Decimal128 precision and scale for a column,
+// clamped to Iceberg's max of 38.
+func decimalPrecScale(col postgres.Column) (int32, int32) {
+	prec, scale := int32(col.Precision), int32(col.Scale)
+	if prec <= 0 {
+		return 38, 38
+	}
+	if prec > 38 {
+		prec = 38
+	}
+	if scale > prec {
+		scale = prec
+	}
+	return prec, scale
 }
 
 // buildArrowSchema creates an Arrow schema from the column definitions.
@@ -197,7 +235,7 @@ func buildArrowSchema(columns []postgres.Column) *arrow.Schema {
 	for i, col := range columns {
 		fields[i] = arrow.Field{
 			Name:     col.Name,
-			Type:     pgToArrowType(col.PGType),
+			Type:     pgToArrowType(col),
 			Nullable: col.IsNullable,
 			Metadata: arrow.MetadataFrom(map[string]string{
 				fieldIDKey: strconv.Itoa(col.FieldID),
@@ -584,14 +622,16 @@ func ToTimestampMicros(v any) (int64, error) {
 // FastParseTimestamp parses the PG logical replication timestamp format directly
 // without going through time.Parse. Expected format:
 //
+//	"2006-01-02 15:04:05"               (no tz, timestamp without time zone)
+//	"2006-01-02 15:04:05.999999"        (no tz, with fractional seconds)
 //	"2006-01-02 15:04:05.999999+08"     (short tz)
 //	"2006-01-02 15:04:05.999999+08:00"  (long tz)
 //	"2006-01-02 15:04:05+08"            (no fractional seconds)
 //
 // Returns microseconds since Unix epoch and true if parsed successfully.
 func FastParseTimestamp(s string) (int64, bool) {
-	// Minimum: "2006-01-02 15:04:05+08" = 22 chars
-	if len(s) < 22 || s[4] != '-' || s[7] != '-' || s[10] != ' ' || s[13] != ':' || s[16] != ':' {
+	// Minimum: "2006-01-02 15:04:05" = 19 chars
+	if len(s) < 19 || s[4] != '-' || s[7] != '-' || s[10] != ' ' || s[13] != ':' || s[16] != ':' {
 		return 0, false
 	}
 
@@ -785,6 +825,17 @@ func fastParseTime(s string) (int64, bool) {
 	}
 
 	return int64(h)*3_600_000_000 + int64(m)*60_000_000 + int64(sec)*1_000_000 + int64(micros), true
+}
+
+// ToDecimal128 converts a value to an Arrow Decimal128 number with the given
+// precision and scale. Handles PG text representation of numeric values.
+func ToDecimal128(v any, prec, scale int32) (decimal128.Num, error) {
+	s := ToString(v)
+	n, err := decimal128.FromString(s, prec, scale)
+	if err != nil {
+		return decimal128.Num{}, fmt.Errorf("convert %q to decimal128(%d,%d): %w", s, prec, scale, err)
+	}
+	return n, nil
 }
 
 func ToString(v any) string {
