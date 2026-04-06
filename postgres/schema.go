@@ -138,18 +138,18 @@ func (c Column) IcebergType() (string, bool) {
 	}
 }
 
-const maxIcebergDecimalPrecision = 38
+const MaxDecimalPrecision = 38
 
 // icebergDecimal returns the Iceberg decimal type string for the given
-// precision and scale, clamping to Iceberg's maximum of decimal(38,38).
+// precision and scale.
 func icebergDecimal(precision, scale int) (string, bool) {
 	if precision <= 0 {
-		// Unconstrained PG numeric (up to 1000 digits), clamp to max
-		return fmt.Sprintf("decimal(%d,%d)", maxIcebergDecimalPrecision, maxIcebergDecimalPrecision), true
+		// Unconstrained PG numeric — use practical default.
+		return fmt.Sprintf("decimal(%d,%d)", MaxDecimalPrecision, 18), true
 	}
 	truncated := false
-	if precision > maxIcebergDecimalPrecision {
-		precision = maxIcebergDecimalPrecision
+	if precision > MaxDecimalPrecision {
+		precision = MaxDecimalPrecision
 		truncated = true
 	}
 	if scale > precision {
@@ -157,6 +157,21 @@ func icebergDecimal(precision, scale int) (string, bool) {
 		truncated = true
 	}
 	return fmt.Sprintf("decimal(%d,%d)", precision, scale), truncated
+}
+
+// Validate checks the schema for columns that cannot be safely represented
+// in Iceberg. It returns an error if any numeric column has precision > 38
+// (Iceberg's maximum). This should be called at pipeline startup to fail fast.
+func (ts *TableSchema) Validate() error {
+	for _, col := range ts.Columns {
+		if col.PGType == Numeric && col.Precision > MaxDecimalPrecision {
+			return fmt.Errorf(
+				"column %s.%s has type numeric(%d,%d) which exceeds Iceberg's max decimal precision of %d; "+
+					"reduce the column precision in PostgreSQL or exclude this table",
+				ts.Table, col.Name, col.Precision, col.Scale, MaxDecimalPrecision)
+		}
+	}
+	return nil
 }
 
 // TableSchema holds discovered schema for a single table.

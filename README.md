@@ -90,8 +90,9 @@ pg2iceberg maps PostgreSQL column types to Iceberg types automatically during sc
 | `bigint`, `bigserial` | `long` | |
 | `real` | `float` | |
 | `double precision` | `double` | |
-| `numeric(p,s)` | `decimal(p,s)` | Precision and scale clamped to 38 max |
-| `numeric` (unconstrained) | `decimal(38,38)` | Truncation warning logged |
+| `numeric(p,s)` where p ≤ 38 | `decimal(p,s)` | Precision preserved exactly |
+| `numeric(p,s)` where p > 38 | — | **Pipeline refuses to start** (see below) |
+| `numeric` (unconstrained) | `decimal(38,18)` | Warning logged; values that overflow will error |
 | `boolean` | `boolean` | |
 | `text`, `varchar`, `char`, `name` | `string` | |
 | `bytea` | `binary` | |
@@ -102,6 +103,8 @@ pg2iceberg maps PostgreSQL column types to Iceberg types automatically during sc
 | `uuid` | `uuid` | |
 | `json`, `jsonb` | `string` | |
 | Other (`inet`, `interval`, `xml`, ...) | `string` | Stored as text |
+
+**Decimal precision limit:** Iceberg supports a maximum decimal precision of 38. If a PostgreSQL table has a `numeric(p,s)` column where `p > 38`, pg2iceberg will **refuse to start** and log an error asking you to reduce the column precision or exclude the table. This is intentional — silently truncating high-precision values would cause data corruption. Unconstrained `numeric` columns (no precision specified) use `decimal(38,18)` as default; values exceeding 20 integer digits or 18 fractional digits will cause a write error.
 
 Support for `geometry` and `geography` types will be added soon!
 

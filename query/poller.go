@@ -47,6 +47,9 @@ func (p *Poller) Connect(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("discover schema for %s: %w", tbl.Name, err)
 		}
+		if err := ts.Validate(); err != nil {
+			return err
+		}
 		if len(tbl.PrimaryKey) > 0 {
 			ts.PK = tbl.PrimaryKey
 		}

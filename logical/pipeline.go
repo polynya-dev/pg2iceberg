@@ -221,6 +221,10 @@ func (p *Pipeline) setup(ctx context.Context) error {
 			pgConn.Close(ctx)
 			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
 		}
+		if err := ts.Validate(); err != nil {
+			pgConn.Close(ctx)
+			return err
+		}
 		p.schemas[tc.Name] = ts
 		log.Printf("[logical:%s] discovered schema for %s: %d columns, pk=%v", p.id, tc.Name, len(ts.Columns), ts.PK)
 	}

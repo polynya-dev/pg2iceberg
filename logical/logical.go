@@ -150,6 +150,9 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- postgres.Chan
 		if err != nil {
 			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
 		}
+		if err := ts.Validate(); err != nil {
+			return err
+		}
 		l.tables[tc.Name] = ts
 	}
 

@@ -160,10 +160,7 @@ func buildColAppenders(columns []postgres.Column) []colAppender {
 			ca.appendVal = func(b array.Builder, v any) error {
 				n, err := ToDecimal128(v, prec, scale)
 				if err != nil {
-					// Value overflows the declared decimal precision — write NULL.
-					// This happens when PG precision > Iceberg's max of 38.
-					b.(*array.Decimal128Builder).AppendNull()
-					return nil
+					return fmt.Errorf("column %s: %w", col.Name, err)
 				}
 				b.(*array.Decimal128Builder).Append(n)
 				return nil
@@ -218,7 +215,7 @@ func pgToArrowType(col postgres.Column) arrow.DataType {
 func decimalPrecScale(col postgres.Column) (int32, int32) {
 	prec, scale := int32(col.Precision), int32(col.Scale)
 	if prec <= 0 {
-		return 38, 38
+		return 38, 18
 	}
 	if prec > 38 {
 		prec = 38

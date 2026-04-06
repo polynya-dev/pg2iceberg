@@ -4,6 +4,7 @@ package postgres_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,7 +143,7 @@ func TestDiscoverSchema_AllTypes(t *testing.T) {
 		"col_oid":          {"int", postgres.OID, true, false},
 		"col_real":         {"float", postgres.Float4, true, false},
 		"col_double":       {"double", postgres.Float8, true, false},
-		"col_numeric":      {"decimal(38,38)", postgres.Numeric, true, true},
+		"col_numeric":      {"decimal(38,18)", postgres.Numeric, true, true},
 		"col_numeric_10_2": {"decimal(10,2)", postgres.Numeric, true, false},
 		"col_numeric_38_0": {"decimal(38,0)", postgres.Numeric, true, false},
 		"col_bool":         {"boolean", postgres.Bool, true, false},
@@ -303,8 +304,8 @@ func TestDiscoverSchema_CompositePK(t *testing.T) {
 	}
 }
 
-// TestDiscoverSchema_DecimalTruncation verifies that oversized decimal
-// precision is clamped to 38 and flagged as truncated.
+// TestDiscoverSchema_DecimalTruncation verifies that Validate() rejects
+// tables with numeric precision exceeding Iceberg's limit of 38.
 func TestDiscoverSchema_DecimalTruncation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -331,16 +332,12 @@ func TestDiscoverSchema_DecimalTruncation(t *testing.T) {
 		t.Fatalf("discover schema: %v", err)
 	}
 
-	valCol := ts.Columns[1]
-	if valCol.Name != "val" {
-		t.Fatalf("expected column 'val', got %q", valCol.Name)
+	// Validate should reject precision > 38.
+	err = ts.Validate()
+	if err == nil {
+		t.Fatal("expected Validate() to return error for NUMERIC(50,10)")
 	}
-
-	iceType, truncated := valCol.IcebergType()
-	if !truncated {
-		t.Error("expected truncated = true for NUMERIC(50,10)")
-	}
-	if iceType != "decimal(38,10)" {
-		t.Errorf("iceberg type = %q, want %q", iceType, "decimal(38,10)")
+	if !strings.Contains(err.Error(), "exceeds Iceberg") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
