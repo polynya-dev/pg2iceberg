@@ -104,9 +104,13 @@ pg2iceberg maps PostgreSQL column types to Iceberg types automatically during sc
 | `json`, `jsonb` | `string` | |
 | Other (`inet`, `interval`, `xml`, ...) | `string` | Stored as text |
 
-**Decimal precision limit:** Iceberg supports a maximum decimal precision of 38. If a PostgreSQL table has a `numeric(p,s)` column where `p > 38`, pg2iceberg will **refuse to start** and log an error asking you to reduce the column precision or exclude the table. This is intentional — silently truncating high-precision values would cause data corruption. Unconstrained `numeric` columns (no precision specified) use `decimal(38,18)` as default; values exceeding 20 integer digits or 18 fractional digits will cause a write error.
-
 Support for `geometry` and `geography` types will be added soon!
+
+### Decimal precision limit
+
+Iceberg supports a maximum decimal precision of 38. If a PostgreSQL table has a `numeric(p,s)` column where `p > 38`, pg2iceberg will fail on start, and also fail on schema evolution. This is intentional to avoid data corruption.
+
+Unconstrained `numeric` columns (no precision specified) use `decimal(38,18)` as default.
 
 ## Quickstart
 
