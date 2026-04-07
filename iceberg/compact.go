@@ -79,6 +79,16 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 		return nil, nil
 	}
 
+	// Skip if the last snapshot was already a compaction — no new data since then.
+	for _, snap := range matTm.Metadata.Snapshots {
+		if snap.SnapshotID == matTm.Metadata.CurrentSnapshotID {
+			if snap.Summary["operation"] == "replace" {
+				return nil, nil
+			}
+			break
+		}
+	}
+
 	// Use cached manifests if available (avoids S3 round-trip during streaming).
 	manifests := tw.manifests
 	if manifests == nil {
