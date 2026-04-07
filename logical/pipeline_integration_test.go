@@ -1719,7 +1719,7 @@ func setupTestTable(t *testing.T, ctx context.Context, dsn string) {
 			id SERIAL PRIMARY KEY,
 			value INTEGER NOT NULL
 		);
-docker	`)
+	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
