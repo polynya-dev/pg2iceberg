@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -232,6 +233,10 @@ func (c *CatalogClient) CreateTable(ns, table string, ts *postgres.TableSchema, 
 	if err := json.NewDecoder(resp.Body).Decode(&tm); err != nil {
 		return nil, fmt.Errorf("decode create response: %w", err)
 	}
+	if tm.MetadataLocation == "" {
+		return nil, fmt.Errorf("create table %s.%s: server returned 200 but no metadata-location (catalog may not support this endpoint)", ns, table)
+	}
+	log.Printf("[catalog] created table %s.%s (uuid=%s, location=%s)", ns, table, tm.Metadata.TableUUID, tm.Metadata.Location)
 	return &tm, nil
 }
 
