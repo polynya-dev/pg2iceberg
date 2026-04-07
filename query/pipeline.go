@@ -163,7 +163,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	p.setStatus(pipeline.StatusStarting, nil)
 
 	// Load checkpoint.
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
@@ -204,7 +204,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	}
 
 	// Ensure namespace exists.
-	if err := p.catalog.EnsureNamespace(p.cfg.Sink.Namespace); err != nil {
+	if err := p.catalog.EnsureNamespace(ctx, p.cfg.Sink.Namespace); err != nil {
 		return fmt.Errorf("ensure namespace: %w", err)
 	}
 
@@ -229,7 +229,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		}
 
 		// Create or load the materialized table.
-		matTm, err := p.catalog.LoadTable(p.cfg.Sink.Namespace, icebergName)
+		matTm, err := p.catalog.LoadTable(ctx, p.cfg.Sink.Namespace, icebergName)
 		if err != nil {
 			return fmt.Errorf("load table %s: %w", icebergName, err)
 		}
@@ -239,7 +239,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 			if iceberg.IsStorageURI(p.cfg.Sink.Warehouse) {
 				location = fmt.Sprintf("%s%s.db/%s", p.cfg.Sink.Warehouse, p.cfg.Sink.Namespace, icebergName)
 			}
-			matTm, err = p.catalog.CreateTable(p.cfg.Sink.Namespace, icebergName, ts, location, partSpec)
+			matTm, err = p.catalog.CreateTable(ctx, p.cfg.Sink.Namespace, icebergName, ts, location, partSpec)
 			if err != nil {
 				return fmt.Errorf("create table %s: %w", icebergName, err)
 			}
@@ -441,7 +441,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	}
 
 	// Atomic multi-table commit.
-	if err := p.catalog.CommitTransaction(p.cfg.Sink.Namespace, commits); err != nil {
+	if err := p.catalog.CommitTransaction(ctx, p.cfg.Sink.Namespace, commits); err != nil {
 		pipeline.QueryFlushErrorsTotal.WithLabelValues(p.id).Inc()
 		return fmt.Errorf("commit: %w", err)
 	}
@@ -474,7 +474,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = p.catalog.CommitSnapshot(p.cfg.Sink.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
+		err = p.catalog.CommitSnapshot(ctx, p.cfg.Sink.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
 		if err != nil {
 			log.Printf("[query:%s] compaction commit error for %s: %v", p.id, tp.pgTable, err)
 			continue
@@ -487,7 +487,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	p.lastFlushAt = time.Now()
 	p.mu.Unlock()
 
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
@@ -496,7 +496,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	for table, wm := range p.poller.Watermarks() {
 		cp.QueryWatermarks[table] = wm.Format(time.RFC3339Nano)
 	}
-	if err := p.store.Save(p.id, cp); err != nil {
+	if err := p.store.Save(ctx, p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 
@@ -614,7 +614,7 @@ func (p *Pipeline) runSnapshot(ctx context.Context) error {
 		p.poller.SetWatermark(table, fence)
 	}
 
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint after snapshot: %w", err)
 	}
@@ -626,7 +626,7 @@ func (p *Pipeline) runSnapshot(ctx context.Context) error {
 	for table, fence := range fences {
 		cp.QueryWatermarks[table] = fence.Format(time.RFC3339Nano)
 	}
-	if err := p.store.Save(p.id, cp); err != nil {
+	if err := p.store.Save(ctx, p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint after snapshot: %w", err)
 	}
 

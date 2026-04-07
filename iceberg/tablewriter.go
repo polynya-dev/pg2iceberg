@@ -154,7 +154,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	basePath := fmt.Sprintf("%s.db/%s", cfg.Namespace, cfg.IcebergName)
 
 	// Load materialized table metadata for commit.
-	matTm, err := tw.catalog.LoadTable(cfg.Namespace, cfg.IcebergName)
+	matTm, err := tw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
 	if err != nil {
 		return nil, fmt.Errorf("load materialized table: %w", err)
 	}
@@ -530,7 +530,7 @@ func (pc *PreparedCommit) ToTableCommit() TableCommit {
 // BuildFileIndex reads all data files for the materialized table and builds the
 // PK→file index. Returns the index or reuses the cached one if it's still current.
 func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIndex, error) {
-	matTm, err := tw.catalog.LoadTable(tw.cfg.Namespace, tw.cfg.IcebergName)
+	matTm, err := tw.catalog.LoadTable(ctx, tw.cfg.Namespace, tw.cfg.IcebergName)
 	if err != nil {
 		return nil, fmt.Errorf("load table for file index: %w", err)
 	}

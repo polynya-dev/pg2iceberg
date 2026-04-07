@@ -145,7 +145,7 @@ func TestQueryPipeline_SnapshotThenPoll(t *testing.T) {
 	t.Logf("materialized table has %d rows after polling", matRows)
 
 	// === Assertion 3: Checkpoint has watermark ===
-	cp, _ := store.Load("test")
+	cp, _ := store.Load(ctx, "test")
 	if cp.Mode != "query" {
 		t.Errorf("expected checkpoint mode=query, got %s", cp.Mode)
 	}

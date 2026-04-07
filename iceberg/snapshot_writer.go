@@ -161,7 +161,7 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 	}
 
 	// Load current table metadata for commit.
-	tm, err := sw.catalog.LoadTable(cfg.Namespace, cfg.IcebergName)
+	tm, err := sw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
 	if err != nil {
 		return 0, fmt.Errorf("load table: %w", err)
 	}
@@ -259,7 +259,7 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 		},
 	}
 
-	if err := sw.catalog.CommitSnapshot(cfg.Namespace, cfg.IcebergName, prevSnapID, commit); err != nil {
+	if err := sw.catalog.CommitSnapshot(ctx, cfg.Namespace, cfg.IcebergName, prevSnapID, commit); err != nil {
 		return 0, fmt.Errorf("commit snapshot: %w", err)
 	}
 

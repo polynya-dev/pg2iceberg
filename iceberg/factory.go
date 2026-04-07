@@ -59,7 +59,7 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 	if cfg.CatalogAuth == "sigv4" && IsStorageURI(configWarehouse) {
 		configWarehouse = ""
 	}
-	cc, err := catalogClient.GetConfig(configWarehouse)
+	cc, err := catalogClient.GetConfig(context.Background(), configWarehouse)
 	if err != nil {
 		log.Printf("[iceberg] GET /v1/config failed (non-fatal): %v", err)
 	} else if cc != nil {
@@ -106,7 +106,7 @@ func (ic *IcebergClients) EnsureStorage(ctx context.Context, ns, table string) e
 		return fmt.Errorf("S3 client not configured and credential mode is %q", ic.credentialMode)
 	}
 
-	tm, err := ic.catalogClient.LoadTable(ns, table)
+	tm, err := ic.catalogClient.LoadTable(ctx, ns, table)
 	if err != nil {
 		return fmt.Errorf("load table for vended credentials: %w", err)
 	}

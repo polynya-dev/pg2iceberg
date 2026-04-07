@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // PgCheckpointStore persists checkpoints to a PostgreSQL table under the _pg2iceberg schema.
@@ -97,7 +99,7 @@ func (s *PgCheckpointStore) migrate(ctx context.Context) error {
 			if err := json.Unmarshal(r.data, &cp); err != nil {
 				return fmt.Errorf("parse old checkpoint for %s: %w", r.id, err)
 			}
-			if err := s.Save(r.id, &cp); err != nil {
+			if err := s.Save(ctx, r.id, &cp); err != nil {
 				return fmt.Errorf("migrate checkpoint %s: %w", r.id, err)
 			}
 		}
@@ -136,8 +138,11 @@ func (s *PgCheckpointStore) createTable(ctx context.Context) error {
 }
 
 // Load reads the checkpoint for a pipeline. Returns a zero Checkpoint if no row exists.
-func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Checkpoint, error) {
+	ctx, span := tracer.Start(ctx, "checkpoint.Load", trace.WithAttributes(attribute.String("pipeline.id", pipelineID)))
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	var cp Checkpoint
@@ -185,8 +190,11 @@ func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 }
 
 // Save upserts the checkpoint for a pipeline.
-func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Checkpoint) error {
+	ctx, span := tracer.Start(ctx, "checkpoint.Save", trace.WithAttributes(attribute.String("pipeline.id", pipelineID)))
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	// Truncate to microsecond precision to match PostgreSQL's TIMESTAMPTZ,

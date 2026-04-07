@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,7 +12,13 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var tracer = otel.Tracer("pg2iceberg/checkpoint")
 
 // CheckpointVersion is the current schema version.
 // Increment when the checkpoint format changes in a backward-incompatible way.
@@ -211,8 +218,8 @@ func (cp *Checkpoint) clone() *Checkpoint {
 
 // CheckpointStore abstracts checkpoint persistence.
 type CheckpointStore interface {
-	Load(pipelineID string) (*Checkpoint, error)
-	Save(pipelineID string, cp *Checkpoint) error
+	Load(ctx context.Context, pipelineID string) (*Checkpoint, error)
+	Save(ctx context.Context, pipelineID string, cp *Checkpoint) error
 	Close()
 }
 
@@ -229,7 +236,10 @@ func NewFileCheckpointStore(path string) *FileCheckpointStore {
 }
 
 // Load reads the checkpoint from disk. Returns a zero Checkpoint if the file doesn't exist.
-func (s *FileCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
+func (s *FileCheckpointStore) Load(ctx context.Context, pipelineID string) (*Checkpoint, error) {
+	_, span := tracer.Start(ctx, "checkpoint.Load", trace.WithAttributes(attribute.String("pipeline.id", pipelineID)))
+	defer span.End()
+
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
 		return &Checkpoint{}, nil
@@ -250,7 +260,10 @@ func (s *FileCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 
 // Save writes the checkpoint to disk atomically (write tmp + rename).
 // It checks the on-disk revision to detect concurrent writes.
-func (s *FileCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
+func (s *FileCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Checkpoint) error {
+	_, span := tracer.Start(ctx, "checkpoint.Save", trace.WithAttributes(attribute.String("pipeline.id", pipelineID)))
+	defer span.End()
+
 	cp.UpdatedAt = time.Now()
 	expectedRevision := cp.Revision // before Seal increments
 	cp.Seal()
@@ -307,7 +320,10 @@ func NewMemCheckpointStore() *MemCheckpointStore {
 	return &MemCheckpointStore{checkpoints: make(map[string]*Checkpoint)}
 }
 
-func (s *MemCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
+func (s *MemCheckpointStore) Load(ctx context.Context, pipelineID string) (*Checkpoint, error) {
+	_, span := tracer.Start(ctx, "checkpoint.Load", trace.WithAttributes(attribute.String("pipeline.id", pipelineID)))
+	defer span.End()
+
 	cp, ok := s.checkpoints[pipelineID]
 	if !ok {
 		return &Checkpoint{}, nil
@@ -318,7 +334,10 @@ func (s *MemCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 	return cp.clone(), nil
 }
 
-func (s *MemCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
+func (s *MemCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Checkpoint) error {
+	_, span := tracer.Start(ctx, "checkpoint.Save", trace.WithAttributes(attribute.String("pipeline.id", pipelineID)))
+	defer span.End()
+
 	cp.UpdatedAt = time.Now()
 	cp.Seal()
 	s.checkpoints[pipelineID] = cp.clone()

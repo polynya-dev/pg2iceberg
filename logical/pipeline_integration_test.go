@@ -203,7 +203,7 @@ func TestPipeline_SnapshotThenStream(t *testing.T) {
 	t.Logf("materializer produced delete files for update — MoR working correctly")
 
 	// === Assertion 4: Checkpoint is clean ===
-	cp, _ := store.Load("test")
+	cp, _ := store.Load(ctx, "test")
 	if !cp.SnapshotComplete {
 		t.Error("expected SnapshotComplete=true in checkpoint")
 	}
@@ -483,7 +483,7 @@ func TestPipeline_SnapshotCheckpointLSN(t *testing.T) {
 	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
 
 	// Verify checkpoint has a non-zero LSN.
-	cp, err := store.Load("test")
+	cp, err := store.Load(ctx, "test")
 	if err != nil {
 		t.Fatalf("load checkpoint: %v", err)
 	}

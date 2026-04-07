@@ -206,7 +206,7 @@ func (p *Pipeline) setStatus(s pipeline.Status, err error) {
 }
 
 func (p *Pipeline) setup(ctx context.Context) error {
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
@@ -246,7 +246,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	var tableExistence []pipeline.TableExistence
 	for _, tc := range p.cfg.Tables {
 		icebergName := postgres.TableToIceberg(tc.Name)
-		matTm, err := p.snk.Catalog().LoadTable(p.cfg.Sink.Namespace, icebergName)
+		matTm, err := p.snk.Catalog().LoadTable(ctx, p.cfg.Sink.Namespace, icebergName)
 		if err != nil {
 			pgConn.Close(ctx)
 			return fmt.Errorf("probe table %s: %w", icebergName, err)
@@ -258,7 +258,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		}
 		// In logical mode, also check the events table.
 		eventsName := iceberg.EventsTableName(icebergName)
-		eventsTm, err := p.snk.Catalog().LoadTable(p.cfg.Sink.Namespace, eventsName)
+		eventsTm, err := p.snk.Catalog().LoadTable(ctx, p.cfg.Sink.Namespace, eventsName)
 		if err != nil {
 			pgConn.Close(ctx)
 			return fmt.Errorf("probe events table %s: %w", eventsName, err)
@@ -617,7 +617,7 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 		p.bytesProcessed += flushedBytes
 	}
 
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
@@ -636,7 +636,7 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	}
 
 	// Save checkpoint BEFORE advancing flushedLSN — see flush() for rationale.
-	if err := p.store.Save(p.id, cp); err != nil {
+	if err := p.store.Save(ctx, p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 
@@ -689,7 +689,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	p.lastFlushAt = time.Now()
 	p.mu.Unlock()
 
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint for update: %w", err)
 	}
@@ -706,7 +706,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	// recycles WAL that we haven't checkpointed. If we crash between save
 	// and SetFlushedLSN, the worst case is duplicate events (safe), not
 	// a data gap (unrecoverable).
-	if err := p.store.Save(p.id, cp); err != nil {
+	if err := p.store.Save(ctx, p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 

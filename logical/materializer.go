@@ -12,7 +12,13 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var matTracer = otel.Tracer("pg2iceberg/materializer")
 
 // ChangeEventBuffer is a thread-safe buffer for change events, shared between
 // the Sink (producer) and the Materializer (consumer). Created before both and
@@ -207,6 +213,9 @@ func (m *Materializer) Run(ctx context.Context) {
 // It drains all buffered events atomically, prepares each table, then
 // commits all prepared tables atomically via CommitTransaction.
 func (m *Materializer) materializeCycle(ctx context.Context) error {
+	ctx, span := matTracer.Start(ctx, "pg2iceberg.materialize")
+	defer span.End()
+
 	// Phase 1: Drain all tables atomically.
 	allEvents, allSnapIDs := m.buf.DrainAll()
 
@@ -218,7 +227,10 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 			// Abort entire cycle. Drained events are safe on S3 in the
 			// events tables; next cycle recovers via the S3 fallback path.
 			pipeline.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
-			return fmt.Errorf("prepare %s: %w", pgTable, err)
+			err = fmt.Errorf("prepare %s: %w", pgTable, err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
 		}
 		if prep != nil {
 			prepared = append(prepared, prep)
@@ -239,11 +251,14 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		}
 	}
 
-	if err := m.catalog.CommitTransaction(m.cfg.Namespace, commits); err != nil {
+	if err := m.catalog.CommitTransaction(ctx, m.cfg.Namespace, commits); err != nil {
 		for _, p := range prepared {
 			pipeline.MaterializerErrorsTotal.WithLabelValues(p.pgTable).Inc()
 		}
-		return fmt.Errorf("commit materialized transaction: %w", err)
+		err = fmt.Errorf("commit materialized transaction: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	// Phase 4: Apply side effects only after successful commit.
@@ -271,7 +286,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = m.catalog.CommitSnapshot(m.cfg.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
+		err = m.catalog.CommitSnapshot(ctx, m.cfg.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
 		if err != nil {
 			log.Printf("[materializer] compaction commit error for %s: %v", p.pgTable, err)
 			continue
@@ -332,7 +347,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		return nil
 	}
 
-	err = m.catalog.CommitTransaction(m.cfg.Namespace, []iceberg.TableCommit{{
+	err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, []iceberg.TableCommit{{
 		Table:             prep.icebergName,
 		CurrentSnapshotID: prep.prevSnapID,
 		Snapshot:          prep.commit,
@@ -354,6 +369,9 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tableSink,
 	bufEvents []MatEvent, bufSnapID int64) (*preparedMaterialization, error) {
 
+	ctx, span := matTracer.Start(ctx, "pg2iceberg.materialize.table", trace.WithAttributes(attribute.String("table", pgTable)))
+	defer span.End()
+
 	start := time.Now()
 	catalog := m.catalog
 	s3 := m.s3
@@ -365,9 +383,12 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 	var s3SnapID int64
 	if !fromBuffer {
 		// No in-memory events — fall back to S3 (crash recovery path).
-		eventsTm, err := catalog.LoadTable(ns, ts.eventsIcebergName)
+		eventsTm, err := catalog.LoadTable(ctx, ns, ts.eventsIcebergName)
 		if err != nil {
-			return nil, fmt.Errorf("load events table: %w", err)
+			err = fmt.Errorf("load events table: %w", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return nil, err
 		}
 		if eventsTm == nil || eventsTm.Metadata.CurrentSnapshotID == 0 {
 			return nil, nil // no events yet
@@ -382,7 +403,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 		newFiles, err := m.findNewEventFiles(ctx, s3, eventsTm, lastProcessed)
 		if err != nil {
-			return nil, fmt.Errorf("find new event files: %w", err)
+			err = fmt.Errorf("find new event files: %w", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return nil, err
 		}
 		if len(newFiles) == 0 {
 			m.lastEventsSnapshot[pgTable] = currentSnapshotID
@@ -391,7 +415,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 		events, err = m.readEvents(ctx, s3, newFiles, ts.srcSchema)
 		if err != nil {
-			return nil, fmt.Errorf("read events: %w", err)
+			err = fmt.Errorf("read events: %w", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return nil, err
 		}
 		if len(events) == 0 {
 			m.lastEventsSnapshot[pgTable] = currentSnapshotID
@@ -412,7 +439,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 	// Build/refresh file index for TOAST resolution and DELETE routing.
 	if _, err := tw.BuildFileIndex(ctx, pk); err != nil {
-		return nil, fmt.Errorf("build file index: %w", err)
+		err = fmt.Errorf("build file index: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
 
 	tDrain := time.Since(start)
@@ -471,15 +501,24 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 		for path := range affectedFilePaths {
 			dfKey, err := iceberg.KeyFromURI(path)
 			if err != nil {
-				return nil, fmt.Errorf("TOAST: parse URI %s: %w", path, err)
+				err = fmt.Errorf("TOAST: parse URI %s: %w", path, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return nil, err
 			}
 			data, err := iceberg.DownloadWithRetry(ctx, s3, dfKey)
 			if err != nil {
-				return nil, fmt.Errorf("TOAST: download %s: %w", path, err)
+				err = fmt.Errorf("TOAST: download %s: %w", path, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return nil, err
 			}
 			rows, err := iceberg.ReadParquetRows(data, ts.srcSchema)
 			if err != nil {
-				return nil, fmt.Errorf("TOAST: read %s: %w", path, err)
+				err = fmt.Errorf("TOAST: read %s: %w", path, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return nil, err
 			}
 			for _, row := range rows {
 				pkKey := iceberg.BuildPKKey(row, pk)
@@ -515,7 +554,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 	prepared, err := tw.Prepare(ctx, rowStates, pk)
 	if err != nil {
-		return nil, fmt.Errorf("prepare: %w", err)
+		err = fmt.Errorf("prepare: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
 	if prepared == nil {
 		if fromBuffer && bufSnapID > 0 {

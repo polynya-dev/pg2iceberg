@@ -13,7 +13,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var s3tracer = otel.Tracer("pg2iceberg/s3")
 
 // ObjectStorage abstracts file upload and download operations.
 type ObjectStorage interface {
@@ -69,6 +75,12 @@ func NewIAMS3Client(ctx context.Context, region, warehouse string) (*S3Client, e
 
 // Upload writes data to an S3 key and returns the full s3:// URI.
 func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string, error) {
+	ctx, span := s3tracer.Start(ctx, "s3.Upload", trace.WithAttributes(
+		attribute.String("s3.key", key),
+		attribute.Int("s3.size_bytes", len(data)),
+	))
+	defer span.End()
+
 	start := time.Now()
 	_, err := c.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &c.bucket,
@@ -78,6 +90,8 @@ func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string,
 	pipeline.S3OperationDurationSeconds.WithLabelValues("upload").Observe(time.Since(start).Seconds())
 	if err != nil {
 		pipeline.S3ErrorsTotal.WithLabelValues("upload").Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return "", fmt.Errorf("upload %s: %w", key, err)
 	}
 	pipeline.S3BytesUploadedTotal.Add(float64(len(data)))
@@ -86,6 +100,11 @@ func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string,
 
 // Download reads an S3 object.
 func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
+	ctx, span := s3tracer.Start(ctx, "s3.Download", trace.WithAttributes(
+		attribute.String("s3.key", key),
+	))
+	defer span.End()
+
 	start := time.Now()
 	out, err := c.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &c.bucket,
@@ -94,6 +113,8 @@ func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
 	pipeline.S3OperationDurationSeconds.WithLabelValues("download").Observe(time.Since(start).Seconds())
 	if err != nil {
 		pipeline.S3ErrorsTotal.WithLabelValues("download").Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("download %s: %w", key, err)
 	}
 	defer out.Body.Close()
@@ -101,11 +122,22 @@ func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
 	if err == nil {
 		pipeline.S3BytesDownloadedTotal.Add(float64(len(data)))
 	}
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 	return data, err
 }
 
 // DownloadRange reads a byte range from an S3 object.
 func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	ctx, span := s3tracer.Start(ctx, "s3.DownloadRange", trace.WithAttributes(
+		attribute.String("s3.key", key),
+		attribute.Int64("s3.offset", offset),
+		attribute.Int64("s3.length", length),
+	))
+	defer span.End()
+
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 	start := time.Now()
 	out, err := c.client.GetObject(ctx, &s3.GetObjectInput{
@@ -116,6 +148,8 @@ func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length
 	pipeline.S3OperationDurationSeconds.WithLabelValues("download_range").Observe(time.Since(start).Seconds())
 	if err != nil {
 		pipeline.S3ErrorsTotal.WithLabelValues("download_range").Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("download range %s: %w", key, err)
 	}
 	defer out.Body.Close()
@@ -123,11 +157,20 @@ func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length
 	if err == nil {
 		pipeline.S3BytesDownloadedTotal.Add(float64(len(data)))
 	}
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 	return data, err
 }
 
 // StatObject returns the size of an S3 object in bytes.
 func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
+	ctx, span := s3tracer.Start(ctx, "s3.StatObject", trace.WithAttributes(
+		attribute.String("s3.key", key),
+	))
+	defer span.End()
+
 	start := time.Now()
 	out, err := c.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: &c.bucket,
@@ -136,6 +179,8 @@ func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
 	pipeline.S3OperationDurationSeconds.WithLabelValues("head").Observe(time.Since(start).Seconds())
 	if err != nil {
 		pipeline.S3ErrorsTotal.WithLabelValues("head").Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return 0, fmt.Errorf("head %s: %w", key, err)
 	}
 	return *out.ContentLength, nil

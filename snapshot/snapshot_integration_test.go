@@ -155,7 +155,7 @@ func TestSnapshotter_DirectWrite(t *testing.T) {
 	t.Logf("snapshots committed: %d", len(tm.Metadata.Snapshots))
 
 	// Verify checkpoint.
-	cp, err := store.Load("test")
+	cp, err := store.Load(ctx, "test")
 	if err != nil {
 		t.Fatalf("load checkpoint: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 	}
 
 	// Pre-seed the checkpoint to simulate partial completion (chunk 0 done).
-	if err := store.Save("test", &pipeline.Checkpoint{
+	if err := store.Save(ctx, "test", &pipeline.Checkpoint{
 		Mode:           "logical",
 		SnapshotChunks: map[string]int{"public.items": 0},
 	}); err != nil {
@@ -297,7 +297,7 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 
 	// Should still have fewer rows than a full snapshot since chunk 0 data is missing,
 	// but more importantly: checkpoint should be clean.
-	cp, err := store.Load("test")
+	cp, err := store.Load(ctx, "test")
 	if err != nil {
 		t.Fatalf("load checkpoint: %v", err)
 	}
@@ -432,7 +432,7 @@ func TestSnapshotter_CrashAfterChunkCommit(t *testing.T) {
 	t.Logf("run 1 crashed as expected: %v", err)
 
 	// Check: chunk 0 is checkpointed, chunk 1's data is in Iceberg but not checkpointed.
-	cp, err := crashStore.inner.Load("test")
+	cp, err := crashStore.inner.Load(ctx, "test")
 	if err != nil {
 		t.Fatalf("load checkpoint: %v", err)
 	}
@@ -504,16 +504,16 @@ type crashAfterNSaves struct {
 	crashAt   int
 }
 
-func (s *crashAfterNSaves) Load(id string) (*pipeline.Checkpoint, error) {
-	return s.inner.Load(id)
+func (s *crashAfterNSaves) Load(ctx context.Context, id string) (*pipeline.Checkpoint, error) {
+	return s.inner.Load(ctx, id)
 }
 
-func (s *crashAfterNSaves) Save(id string, cp *pipeline.Checkpoint) error {
+func (s *crashAfterNSaves) Save(ctx context.Context, id string, cp *pipeline.Checkpoint) error {
 	s.saveCount++
 	if s.saveCount == s.crashAt {
 		return fmt.Errorf("simulated crash after save %d", s.saveCount)
 	}
-	return s.inner.Save(id, cp)
+	return s.inner.Save(ctx, id, cp)
 }
 
 func (s *crashAfterNSaves) Close() {
@@ -619,7 +619,7 @@ func TestSnapshotter_EmptyTable(t *testing.T) {
 	}
 
 	// Checkpoint should still mark the table as complete.
-	cp, _ := store.Load("test")
+	cp, _ := store.Load(ctx, "test")
 	if !cp.SnapshotedTables["public.empty_tbl"] {
 		t.Error("expected empty_tbl in SnapshotedTables")
 	}
@@ -734,7 +734,7 @@ func TestSnapshotter_MultiTable(t *testing.T) {
 		}
 	}
 
-	cp, _ := store.Load("test")
+	cp, _ := store.Load(ctx, "test")
 	if !cp.SnapshotedTables["public.t1"] {
 		t.Error("expected t1 in SnapshotedTables")
 	}
@@ -892,7 +892,7 @@ func TestSnapshotter_CTIDChunking(t *testing.T) {
 	}
 
 	// Verify checkpoint: table complete, no leftover chunk state.
-	cp, _ := store.Load("test")
+	cp, _ := store.Load(ctx, "test")
 	if !cp.SnapshotedTables["public.big_tbl"] {
 		t.Error("expected big_tbl in SnapshotedTables")
 	}

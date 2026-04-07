@@ -8,7 +8,13 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -18,6 +24,8 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
 )
+
+var snapTracer = otel.Tracer("pg2iceberg/snapshot")
 
 // TxFactory creates a new transaction for snapshot queries. Each table gets
 // its own transaction so tables can be snapshotted in parallel. The caller
@@ -53,6 +61,7 @@ type Snapshotter struct {
 	txFactory TxFactory
 	pool      *utils.Pool // table-level concurrency (CPU-bound work)
 	deps      Deps
+	cpMu      sync.Mutex // serializes checkpoint saves across concurrent tables
 }
 
 // NewSnapshotter creates a Snapshotter for the given tables.
@@ -81,6 +90,11 @@ func (s *Snapshotter) Workers() []utils.Status {
 // materialized Iceberg tables. Each CTID chunk gets its own Iceberg commit
 // and checkpoint update.
 func (s *Snapshotter) Run(ctx context.Context) ([]utils.Result, error) {
+	ctx, span := snapTracer.Start(ctx, "pg2iceberg.snapshot", trace.WithAttributes(
+		attribute.Int("snapshot.table_count", len(s.tables)),
+	))
+	defer span.End()
+
 	tasks := make([]utils.Task, len(s.tables))
 	for i, tbl := range s.tables {
 		tbl := tbl
@@ -98,12 +112,21 @@ func (s *Snapshotter) Run(ctx context.Context) ([]utils.Result, error) {
 			log.Printf("[snapshot] emitted %d rows for %s", r.Rows, r.Task)
 		}
 	}
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
 	return results, err
 }
 
 // snapshotOneTable copies all rows from a single table using CTID range chunks.
 // Each chunk is: query PG → accumulate rows in memory → commit to Iceberg → checkpoint.
 func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress *utils.Progress) error {
+	ctx, span := snapTracer.Start(ctx, "pg2iceberg.snapshot.table", trace.WithAttributes(
+		attribute.String("table", tbl.Name),
+	))
+	defer span.End()
+
 	tx, cleanup, err := s.txFactory(ctx)
 	if err != nil {
 		return fmt.Errorf("create tx for %s: %w", tbl.Name, err)
@@ -124,7 +147,7 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress 
 	}
 
 	// Load checkpoint to determine which chunks to skip.
-	cp, err := s.deps.Store.Load(s.deps.PipelineID)
+	cp, err := s.deps.Store.Load(ctx, s.deps.PipelineID)
 	if err != nil {
 		return fmt.Errorf("load checkpoint for %s: %w", tbl.Name, err)
 	}
@@ -150,7 +173,7 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress 
 
 	// Get schema ID from catalog.
 	var schemaID int
-	matTm, err := s.deps.Catalog.LoadTable(s.deps.SinkCfg.Namespace, icebergName)
+	matTm, err := s.deps.Catalog.LoadTable(ctx, s.deps.SinkCfg.Namespace, icebergName)
 	if err != nil {
 		return fmt.Errorf("load materialized table %s: %w", icebergName, err)
 	}
@@ -182,18 +205,23 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress 
 			return fmt.Errorf("snapshot chunk %d for %s: %w", chunk.Index, tbl.Name, err)
 		}
 
-		// Checkpoint this chunk.
-		cp, err = s.deps.Store.Load(s.deps.PipelineID)
+		// Checkpoint this chunk. Serialized via mutex because multiple
+		// tables snapshot in parallel and share the same checkpoint.
+		s.cpMu.Lock()
+		cp, err = s.deps.Store.Load(ctx, s.deps.PipelineID)
 		if err != nil {
+			s.cpMu.Unlock()
 			return fmt.Errorf("load checkpoint after chunk %d: %w", chunk.Index, err)
 		}
 		if cp.SnapshotChunks == nil {
 			cp.SnapshotChunks = make(map[string]int)
 		}
 		cp.SnapshotChunks[tbl.Name] = chunk.Index
-		if err := s.deps.Store.Save(s.deps.PipelineID, cp); err != nil {
+		if err := s.deps.Store.Save(ctx, s.deps.PipelineID, cp); err != nil {
+			s.cpMu.Unlock()
 			return fmt.Errorf("save checkpoint after chunk %d: %w", chunk.Index, err)
 		}
+		s.cpMu.Unlock()
 
 		duration := time.Since(start)
 		pipeline.SnapshotChunksCompleted.WithLabelValues(s.deps.PipelineID, tbl.Name).Inc()
@@ -203,19 +231,22 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress 
 	}
 
 	// Mark table as complete in checkpoint.
-	cp, err = s.deps.Store.Load(s.deps.PipelineID)
+	s.cpMu.Lock()
+	cp, err = s.deps.Store.Load(ctx, s.deps.PipelineID)
 	if err != nil {
+		s.cpMu.Unlock()
 		return fmt.Errorf("load checkpoint for table complete: %w", err)
 	}
 	if cp.SnapshotedTables == nil {
 		cp.SnapshotedTables = make(map[string]bool)
 	}
 	cp.SnapshotedTables[tbl.Name] = true
-	// Clear chunk progress for this table.
 	delete(cp.SnapshotChunks, tbl.Name)
-	if err := s.deps.Store.Save(s.deps.PipelineID, cp); err != nil {
+	if err := s.deps.Store.Save(ctx, s.deps.PipelineID, cp); err != nil {
+		s.cpMu.Unlock()
 		return fmt.Errorf("save checkpoint table complete: %w", err)
 	}
+	s.cpMu.Unlock()
 
 	pipeline.SnapshotTablesCompleted.WithLabelValues(s.deps.PipelineID).Inc()
 	return nil
@@ -224,6 +255,12 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress 
 // snapshotChunk queries a single CTID range, accumulates rows in memory,
 // and commits to Iceberg.
 func (s *Snapshotter) snapshotChunk(ctx context.Context, tx pgx.Tx, tbl Table, sw *iceberg.SnapshotWriter, chunk ChunkRange, progress *utils.Progress) (int64, error) {
+	ctx, span := snapTracer.Start(ctx, "pg2iceberg.snapshot.chunk", trace.WithAttributes(
+		attribute.String("table", tbl.Name),
+		attribute.Int("chunk.index", chunk.Index),
+	))
+	defer span.End()
+
 	query := ChunkQuery(tbl.Name, chunk)
 	rows, err := tx.Query(ctx, query)
 	if err != nil {

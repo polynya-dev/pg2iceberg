@@ -14,8 +14,12 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 	"golang.org/x/sync/errgroup"
 )
+
+var eventsTracer = otel.Tracer("pg2iceberg/events")
 
 // txBuffer holds events for a single in-flight PG transaction.
 type txBuffer struct {
@@ -188,12 +192,12 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 	}
 
 	// Ensure namespace exists.
-	if err := s.catalog.EnsureNamespace(s.cfg.Namespace); err != nil {
+	if err := s.catalog.EnsureNamespace(ctx, s.cfg.Namespace); err != nil {
 		return fmt.Errorf("ensure namespace: %w", err)
 	}
 
 	// Create or load the materialized table (e.g. "orders").
-	matTm, err := s.catalog.LoadTable(s.cfg.Namespace, icebergTable)
+	matTm, err := s.catalog.LoadTable(ctx, s.cfg.Namespace, icebergTable)
 	if err != nil {
 		return fmt.Errorf("load materialized table: %w", err)
 	}
@@ -203,7 +207,7 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 		if iceberg.IsStorageURI(s.cfg.Warehouse) {
 			location = fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, icebergTable)
 		}
-		matTm, err = s.catalog.CreateTable(s.cfg.Namespace, icebergTable, ts, location, partSpec)
+		matTm, err = s.catalog.CreateTable(ctx, s.cfg.Namespace, icebergTable, ts, location, partSpec)
 		if err != nil {
 			return fmt.Errorf("create materialized table: %w", err)
 		}
@@ -222,7 +226,7 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 		return fmt.Errorf("build events partition spec: %w", err)
 	}
 
-	eventsTm, err := s.catalog.LoadTable(s.cfg.Namespace, eventsTable)
+	eventsTm, err := s.catalog.LoadTable(ctx, s.cfg.Namespace, eventsTable)
 	if err != nil {
 		return fmt.Errorf("load events table: %w", err)
 	}
@@ -232,7 +236,7 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 		if iceberg.IsStorageURI(s.cfg.Warehouse) {
 			location = fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, eventsTable)
 		}
-		eventsTm, err = s.catalog.CreateTable(s.cfg.Namespace, eventsTable, eventsSchema, location, eventsPartSpec)
+		eventsTm, err = s.catalog.CreateTable(ctx, s.cfg.Namespace, eventsTable, eventsSchema, location, eventsPartSpec)
 		if err != nil {
 			return fmt.Errorf("create events table: %w", err)
 		}
@@ -324,7 +328,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *postgre
 
 	if icebergChanged {
 		// Evolve materialized table.
-		newMatSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.icebergName, ts.matSchemaID, ts.srcSchema)
+		newMatSchemaID, err := s.catalog.EvolveSchema(ctx, s.cfg.Namespace, ts.icebergName, ts.matSchemaID, ts.srcSchema)
 		if err != nil {
 			return fmt.Errorf("catalog evolve materialized schema for %s: %w", pgTable, err)
 		}
@@ -332,7 +336,7 @@ func (s *Sink) EvolveSchema(ctx context.Context, pgTable string, change *postgre
 
 		// Rebuild events schema and evolve events table.
 		ts.eventsSchema = iceberg.EventsTableSchema(ts.srcSchema)
-		newEventsSchemaID, err := s.catalog.EvolveSchema(s.cfg.Namespace, ts.eventsIcebergName, ts.schemaID, ts.eventsSchema)
+		newEventsSchemaID, err := s.catalog.EvolveSchema(ctx, s.cfg.Namespace, ts.eventsIcebergName, ts.schemaID, ts.eventsSchema)
 		if err != nil {
 			return fmt.Errorf("catalog evolve events schema for %s: %w", pgTable, err)
 		}
@@ -540,6 +544,9 @@ func (s *Sink) CheckBackpressure(ctx context.Context) error {
 // atomically: S3 uploads in parallel, followed by a single multi-table
 // catalog commit.
 func (s *Sink) Flush(ctx context.Context) error {
+	ctx, span := eventsTracer.Start(ctx, "pg2iceberg.flush")
+	defer span.End()
+
 	hasPendingDirect := len(s.pendingDirectEvents) > 0
 	if len(s.committedTxns) == 0 && !hasPendingDirect {
 		return nil
@@ -621,7 +628,10 @@ func (s *Sink) Flush(ctx context.Context) error {
 			}
 			if err := s.writeDirect(event); err != nil {
 				restoreSeqState()
-				return fmt.Errorf("replay tx %d: %w", tx.xid, err)
+				err = fmt.Errorf("replay tx %d: %w", tx.xid, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return err
 			}
 		}
 	}
@@ -632,9 +642,12 @@ func (s *Sink) Flush(ctx context.Context) error {
 	actualWritten := s.seqCounter - savedSeqCounter
 	if actualWritten != expectedEvents {
 		restoreSeqState()
-		return fmt.Errorf("seq count mismatch: expected %d events to be written, "+
+		err := fmt.Errorf("seq count mismatch: expected %d events to be written, "+
 			"but seqCounter advanced by %d — possible silent event drop",
 			expectedEvents, actualWritten)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	// Validate global seq continuity before committing to Iceberg.
@@ -644,9 +657,12 @@ func (s *Sink) Flush(ctx context.Context) error {
 		expected := s.lastCommittedMaxSeq + 1
 		if s.flushMinSeq != expected {
 			restoreSeqState()
-			return fmt.Errorf("seq continuity violation: expected min_seq=%d (last committed max_seq=%d), "+
+			err := fmt.Errorf("seq continuity violation: expected min_seq=%d (last committed max_seq=%d), "+
 				"got min_seq=%d; this indicates WAL events were dropped — refusing to commit",
 				expected, s.lastCommittedMaxSeq, s.flushMinSeq)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
 		}
 	}
 
@@ -654,6 +670,8 @@ func (s *Sink) Flush(ctx context.Context) error {
 	snapshotIDs, err := s.flushAllTables(ctx)
 	if err != nil {
 		restoreSeqState()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
@@ -778,7 +796,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		}
 	}
 
-	if err := s.catalog.CommitTransaction(s.cfg.Namespace, tableCommits); err != nil {
+	if err := s.catalog.CommitTransaction(ctx, s.cfg.Namespace, tableCommits); err != nil {
 		return nil, fmt.Errorf("commit transaction: %w", err)
 	}
 
@@ -904,7 +922,7 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 	}
 
 	// Load current events table metadata.
-	tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.eventsIcebergName)
+	tm, err := s.catalog.LoadTable(ctx, s.cfg.Namespace, ts.eventsIcebergName)
 	if err != nil {
 		return nil, fmt.Errorf("load events table: %w", err)
 	}

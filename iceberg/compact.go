@@ -11,7 +11,12 @@ import (
 	pq "github.com/parquet-go/parquet-go"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var compactTracer = otel.Tracer("pg2iceberg/compact")
 
 // CompactionConfig holds thresholds that trigger compaction.
 type CompactionConfig struct {
@@ -66,12 +71,17 @@ func ReadParquetRowsFromReaderAt(r io.ReaderAt, size int64, schema *postgres.Tab
 // Returns nil if file counts are below thresholds (no compaction needed).
 // The caller must commit the returned PreparedCommit and call ApplyPostCommit.
 func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionConfig) (*PreparedCommit, error) {
+	ctx, span := compactTracer.Start(ctx, "pg2iceberg.compact", trace.WithAttributes(
+		attribute.String("iceberg.table", tw.cfg.IcebergName),
+	))
+	defer span.End()
+
 	cfg := tw.cfg
 	ns := cfg.Namespace
 	basePath := fmt.Sprintf("%s.db/%s", ns, cfg.IcebergName)
 
 	// Load current table state.
-	matTm, err := tw.catalog.LoadTable(ns, cfg.IcebergName)
+	matTm, err := tw.catalog.LoadTable(ctx, ns, cfg.IcebergName)
 	if err != nil {
 		return nil, fmt.Errorf("load table: %w", err)
 	}

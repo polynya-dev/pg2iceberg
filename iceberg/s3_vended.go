@@ -94,7 +94,7 @@ func (v *VendedS3Client) ensureFresh(ctx context.Context) error {
 		return nil
 	}
 
-	tm, err := v.catalog.LoadTable(v.namespace, v.table)
+	tm, err := v.catalog.LoadTable(ctx, v.namespace, v.table)
 	if err != nil {
 		return fmt.Errorf("refresh vended credentials: %w", err)
 	}
