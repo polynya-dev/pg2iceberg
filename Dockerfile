@@ -3,7 +3,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /pg2iceberg ./cmd/pg2iceberg
+ARG COMMIT_SHA=""
+RUN CGO_ENABLED=0 go build -ldflags "-X main.commitSHA=${COMMIT_SHA}" -o /pg2iceberg ./cmd/pg2iceberg
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates

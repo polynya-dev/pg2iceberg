@@ -627,11 +627,13 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	} else {
 		cp.LSN = p.src.FlushedLSN()
 	}
-	p.src.SetFlushedLSN(cp.LSN)
 
+	// Save checkpoint BEFORE advancing flushedLSN — see flush() for rationale.
 	if err := p.store.Save(p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
+
+	p.src.SetFlushedLSN(cp.LSN)
 
 	// Invalidate materializer file indices so they pick up snapshot-written files.
 	if p.materializer != nil {
@@ -687,15 +689,20 @@ func (p *Pipeline) flush(ctx context.Context) error {
 
 	cp.Mode = "logical"
 	cp.LSN = p.lastWrittenLSN
-	p.src.SetFlushedLSN(cp.LSN)
 
 	if p.materializer != nil {
 		cp.MaterializerSnapshots = p.materializer.LastEventsSnapshots()
 	}
 
+	// Save checkpoint BEFORE advancing flushedLSN. This ensures PG never
+	// recycles WAL that we haven't checkpointed. If we crash between save
+	// and SetFlushedLSN, the worst case is duplicate events (safe), not
+	// a data gap (unrecoverable).
 	if err := p.store.Save(p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
+
+	p.src.SetFlushedLSN(cp.LSN)
 
 	return nil
 }

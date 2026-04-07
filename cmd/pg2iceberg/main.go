@@ -24,7 +24,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Set at build time via: go build -ldflags "-X main.commitSHA=$(git rev-parse --short HEAD)"
+var commitSHA string
+
 func main() {
+	pipeline.CommitSHA = commitSHA
+
 	configPath := flag.String("config", "", "path to config file")
 
 	// Connection

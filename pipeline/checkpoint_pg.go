@@ -40,26 +40,97 @@ func (s *PgCheckpointStore) migrate(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf(
 			"create checkpoint schema: %w\n\n"+
-				"If the database user lacks CREATE privileges, run this manually:\n"+
-				"  CREATE SCHEMA IF NOT EXISTS _pg2iceberg;\n"+
-				"  CREATE TABLE IF NOT EXISTS _pg2iceberg.checkpoints (\n"+
-				"      pipeline_id TEXT PRIMARY KEY,\n"+
-				"      checkpoint  JSONB NOT NULL,\n"+
-				"      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()\n"+
-				"  );", err)
+				"If the database user lacks CREATE privileges, run the migration manually.\n"+
+				"See: https://pg2iceberg.dev/docs/state-store", err)
 	}
 
-	_, err = s.pool.Exec(ctx, `
+	// Migrate from v0 (JSONB blob) to v1 (columnar).
+	// Check if the old table exists with the JSONB column.
+	var hasOldTable bool
+	err = s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = '_pg2iceberg'
+			  AND table_name = 'checkpoints'
+			  AND column_name = 'checkpoint'
+			  AND data_type = 'jsonb'
+		)
+	`).Scan(&hasOldTable)
+	if err != nil {
+		return fmt.Errorf("check checkpoint table schema: %w", err)
+	}
+
+	if hasOldTable {
+		// Migrate existing data: read old rows, drop table, recreate with columns.
+		rows, err := s.pool.Query(ctx,
+			`SELECT pipeline_id, checkpoint FROM _pg2iceberg.checkpoints`)
+		if err != nil {
+			return fmt.Errorf("read old checkpoints: %w", err)
+		}
+		type oldRow struct {
+			id   string
+			data []byte
+		}
+		var oldRows []oldRow
+		for rows.Next() {
+			var r oldRow
+			if err := rows.Scan(&r.id, &r.data); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan old checkpoint: %w", err)
+			}
+			oldRows = append(oldRows, r)
+		}
+		rows.Close()
+
+		_, err = s.pool.Exec(ctx, `DROP TABLE _pg2iceberg.checkpoints`)
+		if err != nil {
+			return fmt.Errorf("drop old checkpoint table: %w", err)
+		}
+
+		if err := s.createTable(ctx); err != nil {
+			return err
+		}
+
+		// Re-insert old data into new schema.
+		for _, r := range oldRows {
+			var cp Checkpoint
+			if err := json.Unmarshal(r.data, &cp); err != nil {
+				return fmt.Errorf("parse old checkpoint for %s: %w", r.id, err)
+			}
+			if err := s.Save(r.id, &cp); err != nil {
+				return fmt.Errorf("migrate checkpoint %s: %w", r.id, err)
+			}
+		}
+		return nil
+	}
+
+	return s.createTable(ctx)
+}
+
+func (s *PgCheckpointStore) createTable(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS _pg2iceberg.checkpoints (
-			pipeline_id TEXT PRIMARY KEY,
-			checkpoint  JSONB NOT NULL,
-			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+			pipeline_id             TEXT PRIMARY KEY,
+			version                 INTEGER NOT NULL DEFAULT 1,
+			checksum                TEXT NOT NULL DEFAULT '',
+			written_by              TEXT NOT NULL DEFAULT '',
+			revision                BIGINT NOT NULL DEFAULT 0,
+			mode                    TEXT NOT NULL DEFAULT '',
+			lsn                     BIGINT NOT NULL DEFAULT 0,
+			watermark               TEXT NOT NULL DEFAULT '',
+			snapshot_complete       BOOLEAN NOT NULL DEFAULT FALSE,
+			last_snapshot_id        BIGINT NOT NULL DEFAULT 0,
+			last_sequence_number    BIGINT NOT NULL DEFAULT 0,
+			snapshoted_tables       JSONB,
+			snapshot_chunks         JSONB,
+			materializer_snapshots  JSONB,
+			query_watermarks        JSONB,
+			updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 		)
 	`)
 	if err != nil {
 		return fmt.Errorf("create checkpoint table: %w", err)
 	}
-
 	return nil
 }
 
@@ -68,11 +139,22 @@ func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	var data []byte
-	err := s.pool.QueryRow(ctx,
-		`SELECT checkpoint FROM _pg2iceberg.checkpoints WHERE pipeline_id = $1`,
-		pipelineID,
-	).Scan(&data)
+	var cp Checkpoint
+	var snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks []byte
+
+	err := s.pool.QueryRow(ctx, `
+		SELECT version, checksum, written_by, revision, mode, lsn, watermark,
+		       snapshot_complete, last_snapshot_id, last_sequence_number,
+		       snapshoted_tables, snapshot_chunks, materializer_snapshots,
+		       query_watermarks, updated_at
+		FROM _pg2iceberg.checkpoints
+		WHERE pipeline_id = $1
+	`, pipelineID).Scan(
+		&cp.Version, &cp.Checksum, &cp.WrittenBy, &cp.Revision, &cp.Mode, &cp.LSN, &cp.Watermark,
+		&cp.SnapshotComplete, &cp.LastSnapshotID, &cp.LastSequenceNumber,
+		&snapshotedTables, &snapshotChunks, &matSnapshots,
+		&queryWatermarks, &cp.UpdatedAt,
+	)
 
 	if err == pgx.ErrNoRows {
 		return &Checkpoint{}, nil
@@ -81,9 +163,22 @@ func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 		return nil, fmt.Errorf("load checkpoint: %w", err)
 	}
 
-	var cp Checkpoint
-	if err := json.Unmarshal(data, &cp); err != nil {
-		return nil, fmt.Errorf("parse checkpoint: %w", err)
+	// Unmarshal JSONB columns for map fields.
+	if len(snapshotedTables) > 0 {
+		json.Unmarshal(snapshotedTables, &cp.SnapshotedTables)
+	}
+	if len(snapshotChunks) > 0 {
+		json.Unmarshal(snapshotChunks, &cp.SnapshotChunks)
+	}
+	if len(matSnapshots) > 0 {
+		json.Unmarshal(matSnapshots, &cp.MaterializerSnapshots)
+	}
+	if len(queryWatermarks) > 0 {
+		json.Unmarshal(queryWatermarks, &cp.QueryWatermarks)
+	}
+
+	if err := cp.Verify(); err != nil {
+		return nil, err
 	}
 	return &cp, nil
 }
@@ -94,19 +189,60 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 	defer cancel()
 
 	cp.UpdatedAt = time.Now()
+	cp.Seal()
 
-	data, err := json.Marshal(cp)
-	if err != nil {
-		return fmt.Errorf("marshal checkpoint: %w", err)
+	snapshotedTables, _ := json.Marshal(cp.SnapshotedTables)
+	snapshotChunks, _ := json.Marshal(cp.SnapshotChunks)
+	matSnapshots, _ := json.Marshal(cp.MaterializerSnapshots)
+	queryWatermarks, _ := json.Marshal(cp.QueryWatermarks)
+
+	expectedRevision := cp.Revision - 1 // Seal() already incremented
+
+	if expectedRevision == 0 {
+		// First save — insert.
+		_, err := s.pool.Exec(ctx, `
+			INSERT INTO _pg2iceberg.checkpoints (
+				pipeline_id, version, checksum, written_by, revision, mode, lsn, watermark,
+				snapshot_complete, last_snapshot_id, last_sequence_number,
+				snapshoted_tables, snapshot_chunks, materializer_snapshots,
+				query_watermarks, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
+			ON CONFLICT (pipeline_id) DO UPDATE SET
+				version = $2, checksum = $3, written_by = $4, revision = $5,
+				mode = $6, lsn = $7, watermark = $8,
+				snapshot_complete = $9, last_snapshot_id = $10, last_sequence_number = $11,
+				snapshoted_tables = $12, snapshot_chunks = $13, materializer_snapshots = $14,
+				query_watermarks = $15, updated_at = now()
+			WHERE _pg2iceberg.checkpoints.revision = 0 OR _pg2iceberg.checkpoints.revision IS NULL
+		`, pipelineID, cp.Version, cp.Checksum, cp.WrittenBy, cp.Revision,
+			cp.Mode, cp.LSN, cp.Watermark,
+			cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber,
+			snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks)
+		if err != nil {
+			return fmt.Errorf("save checkpoint: %w", err)
+		}
+		return nil
 	}
 
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO _pg2iceberg.checkpoints (pipeline_id, checkpoint, updated_at)
-		VALUES ($1, $2, now())
-		ON CONFLICT (pipeline_id) DO UPDATE SET checkpoint = $2, updated_at = now()
-	`, pipelineID, data)
+	// Subsequent saves — optimistic concurrency check.
+	result, err := s.pool.Exec(ctx, `
+		UPDATE _pg2iceberg.checkpoints SET
+			version = $2, checksum = $3, written_by = $4, revision = $5,
+			mode = $6, lsn = $7, watermark = $8,
+			snapshot_complete = $9, last_snapshot_id = $10, last_sequence_number = $11,
+			snapshoted_tables = $12, snapshot_chunks = $13, materializer_snapshots = $14,
+			query_watermarks = $15, updated_at = now()
+		WHERE pipeline_id = $1 AND revision = $16
+	`, pipelineID, cp.Version, cp.Checksum, cp.WrittenBy, cp.Revision,
+		cp.Mode, cp.LSN, cp.Watermark,
+		cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber,
+		snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
+		expectedRevision)
 	if err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrConcurrentUpdate
 	}
 	return nil
 }
