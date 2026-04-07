@@ -5,7 +5,6 @@ CREATE TABLE e2e_partition_hour (
     created_at TIMESTAMPTZ NOT NULL
 );
 ALTER TABLE e2e_partition_hour REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_partition_hour FOR TABLE e2e_partition_hour;
 -- DATA --
 INSERT INTO e2e_partition_hour (id, name, created_at) VALUES
     (1, 'alice',   '2025-01-15 10:00:00+00'),

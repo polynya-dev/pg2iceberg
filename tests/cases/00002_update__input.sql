@@ -5,7 +5,6 @@ CREATE TABLE e2e_update (
     score INTEGER NOT NULL
 );
 ALTER TABLE e2e_update REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_update FOR TABLE e2e_update;
 -- DATA --
 INSERT INTO e2e_update (id, name, score) VALUES
     (1, 'alice', 10),

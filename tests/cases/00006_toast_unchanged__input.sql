@@ -9,7 +9,6 @@ ALTER TABLE e2e_toast_unchanged ALTER COLUMN payload SET STORAGE EXTERNAL;
 -- NOTE: deliberately NOT using REPLICA IDENTITY FULL.
 -- Default replica identity (using PK) means unchanged TOAST columns
 -- are sent as 'u' (unchanged) in the WAL stream.
-CREATE PUBLICATION pg2iceberg_pub_e2e_toast_unchanged FOR TABLE e2e_toast_unchanged;
 -- DATA --
 INSERT INTO e2e_toast_unchanged (id, label, payload) VALUES
     (1, 'row1', repeat('A', 100000)),

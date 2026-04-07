@@ -5,7 +5,6 @@ CREATE TABLE e2e_schema_widen_float (
     score REAL NOT NULL
 );
 ALTER TABLE e2e_schema_widen_float REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_widen_float FOR TABLE e2e_schema_widen_float;
 -- DATA --
 INSERT INTO e2e_schema_widen_float (id, name, score) VALUES
     (1, 'alice', 1.5),

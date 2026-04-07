@@ -5,7 +5,6 @@ CREATE TABLE e2e_toast_update_delete (
     payload TEXT NOT NULL
 );
 ALTER TABLE e2e_toast_update_delete ALTER COLUMN payload SET STORAGE EXTERNAL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_toast_update_delete FOR TABLE e2e_toast_update_delete;
 -- DATA --
 INSERT INTO e2e_toast_update_delete (id, label, payload) VALUES
     (1, 'keep', repeat('A', 100000)),

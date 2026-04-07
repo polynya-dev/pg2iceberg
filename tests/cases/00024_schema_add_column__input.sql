@@ -4,7 +4,6 @@ CREATE TABLE e2e_schema_add_column (
     name TEXT NOT NULL
 );
 ALTER TABLE e2e_schema_add_column REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_add_column FOR TABLE e2e_schema_add_column;
 -- DATA --
 INSERT INTO e2e_schema_add_column (id, name) VALUES
     (1, 'alice'),

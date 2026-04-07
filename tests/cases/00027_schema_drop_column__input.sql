@@ -6,7 +6,6 @@ CREATE TABLE e2e_schema_drop_col (
     amount NUMERIC(10,2) NOT NULL
 );
 ALTER TABLE e2e_schema_drop_col REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_drop_col FOR TABLE e2e_schema_drop_col;
 -- DATA --
 INSERT INTO e2e_schema_drop_col (id, name, temp, amount) VALUES
     (1, 'alice', 'x', 100.50),

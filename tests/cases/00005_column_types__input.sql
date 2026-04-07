@@ -43,7 +43,6 @@ CREATE TABLE e2e_column_types (
     col_inet         INET
 );
 ALTER TABLE e2e_column_types REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_column_types FOR TABLE e2e_column_types;
 -- DATA --
 INSERT INTO e2e_column_types (
     id,

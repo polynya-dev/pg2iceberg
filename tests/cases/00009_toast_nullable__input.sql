@@ -7,7 +7,6 @@ CREATE TABLE e2e_toast_nullable (
 );
 ALTER TABLE e2e_toast_nullable ALTER COLUMN bio SET STORAGE EXTERNAL;
 ALTER TABLE e2e_toast_nullable ALTER COLUMN payload SET STORAGE EXTERNAL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_toast_nullable FOR TABLE e2e_toast_nullable;
 -- DATA --
 INSERT INTO e2e_toast_nullable (id, label, bio, payload) VALUES
     (1, 'with_both', repeat('A', 100000), repeat('B', 100000)),

@@ -5,7 +5,6 @@ CREATE TABLE e2e_txn_insert (
     amount NUMERIC(10,2) NOT NULL
 );
 ALTER TABLE e2e_txn_insert REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_txn_insert FOR TABLE e2e_txn_insert;
 -- DATA --
 BEGIN;
 INSERT INTO e2e_txn_insert (id, name, amount) VALUES (1, 'alice', 100.00);

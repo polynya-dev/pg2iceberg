@@ -5,7 +5,6 @@ CREATE TABLE e2e_partition_identity (
     name TEXT NOT NULL
 );
 ALTER TABLE e2e_partition_identity REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_partition_identity FOR TABLE e2e_partition_identity;
 -- DATA --
 INSERT INTO e2e_partition_identity (id, region, name) VALUES
     (1, 'us-east', 'alice'),

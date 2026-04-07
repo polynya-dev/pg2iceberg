@@ -28,20 +28,9 @@ CREATE TABLE IF NOT EXISTS public.orders (
 ALTER TABLE public.orders REPLICA IDENTITY FULL;
 """
 
-PUBLICATION_SQL = """
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'pg2iceberg_pub') THEN
-        CREATE PUBLICATION pg2iceberg_pub FOR TABLE public.orders;
-    END IF;
-END $$;
-"""
-
-
 def setup(conn):
     with conn.cursor() as cur:
         cur.execute(DDL)
-        cur.execute(PUBLICATION_SQL)
     conn.commit()
     print("[setup] table and publication ready")
 

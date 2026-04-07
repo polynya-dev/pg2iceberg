@@ -5,7 +5,6 @@ CREATE TABLE e2e_partition_month (
     created_at TIMESTAMPTZ NOT NULL
 );
 ALTER TABLE e2e_partition_month REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_partition_month FOR TABLE e2e_partition_month;
 -- DATA --
 INSERT INTO e2e_partition_month (id, name, created_at) VALUES
     (1, 'alice',   '2025-01-15 10:00:00+00'),

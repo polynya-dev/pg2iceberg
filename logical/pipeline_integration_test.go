@@ -57,7 +57,6 @@ func TestPipeline_SnapshotThenStream(t *testing.T) {
 			name  TEXT NOT NULL,
 			price INTEGER NOT NULL
 		);
-		CREATE PUBLICATION test_pub FOR TABLE products;
 	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -432,7 +431,6 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 			id SERIAL PRIMARY KEY,
 			value INTEGER NOT NULL
 		);
-		CREATE PUBLICATION test_pub FOR TABLE test_events;
 	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -619,7 +617,6 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 			id SERIAL PRIMARY KEY,
 			value INTEGER NOT NULL
 		);
-		CREATE PUBLICATION test_pub FOR TABLE test_events;
 	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -770,7 +767,6 @@ func TestPipeline_FlushRetry_NoDuplicateData(t *testing.T) {
 			id SERIAL PRIMARY KEY,
 			value INTEGER NOT NULL
 		);
-		CREATE PUBLICATION test_pub FOR TABLE test_events;
 	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -981,7 +977,6 @@ func TestMaterializer_CrossTableAtomicCommit(t *testing.T) {
 			id SERIAL PRIMARY KEY,
 			order_id INTEGER NOT NULL
 		);
-		CREATE PUBLICATION test_pub FOR TABLE orders, payments;
 	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -1212,7 +1207,6 @@ func TestMaterializer_CrossTableAtomicCommit_RaceDrainAll(t *testing.T) {
 			id SERIAL PRIMARY KEY,
 			order_id INTEGER NOT NULL
 		);
-		CREATE PUBLICATION test_pub FOR TABLE orders, payments;
 	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -1633,7 +1627,6 @@ func setupTestTable(t *testing.T, ctx context.Context, dsn string) {
 			id SERIAL PRIMARY KEY,
 			value INTEGER NOT NULL
 		);
-		CREATE PUBLICATION test_pub FOR TABLE test_events;
 	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)

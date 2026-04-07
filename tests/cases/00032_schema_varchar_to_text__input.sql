@@ -5,7 +5,6 @@ CREATE TABLE e2e_schema_varchar (
     value INTEGER
 );
 ALTER TABLE e2e_schema_varchar REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_varchar FOR TABLE e2e_schema_varchar;
 -- DATA --
 INSERT INTO e2e_schema_varchar (id, name, value) VALUES
     (1, 'alice', 100),

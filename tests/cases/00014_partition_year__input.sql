@@ -5,7 +5,6 @@ CREATE TABLE e2e_partition_year (
     created_at TIMESTAMPTZ NOT NULL
 );
 ALTER TABLE e2e_partition_year REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_partition_year FOR TABLE e2e_partition_year;
 -- DATA --
 INSERT INTO e2e_partition_year (id, name, created_at) VALUES
     (1, 'alice',   '2023-06-15 10:00:00+00'),

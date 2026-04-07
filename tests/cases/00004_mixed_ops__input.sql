@@ -5,7 +5,6 @@ CREATE TABLE e2e_mixed_ops (
     status TEXT NOT NULL DEFAULT 'active'
 );
 ALTER TABLE e2e_mixed_ops REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_mixed_ops FOR TABLE e2e_mixed_ops;
 -- DATA --
 INSERT INTO e2e_mixed_ops (id, name, status) VALUES
     (1, 'alice', 'active'),

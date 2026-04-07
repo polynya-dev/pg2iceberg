@@ -15,9 +15,6 @@ ALTER TABLE bench_events ALTER COLUMN large_text SET STORAGE EXTERNAL;
 
 CREATE INDEX idx_bench_events_seq ON bench_events (seq);
 
--- Publication for pg2iceberg logical replication.
-CREATE PUBLICATION pg2iceberg_bench FOR TABLE bench_events;
-
 -- Operations log: bench-writer records every operation for verification.
 -- bench-verify replays this to compute expected state.
 CREATE TABLE bench_operations (

@@ -4,7 +4,6 @@ CREATE TABLE e2e_schema_add_default (
     name TEXT NOT NULL
 );
 ALTER TABLE e2e_schema_add_default REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_add_default FOR TABLE e2e_schema_add_default;
 -- DATA --
 INSERT INTO e2e_schema_add_default (id, name) VALUES
     (1, 'alice'),

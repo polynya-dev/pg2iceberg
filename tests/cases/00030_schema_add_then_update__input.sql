@@ -4,7 +4,6 @@ CREATE TABLE e2e_schema_add_upd (
     name TEXT NOT NULL
 );
 ALTER TABLE e2e_schema_add_upd REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_add_upd FOR TABLE e2e_schema_add_upd;
 -- DATA --
 INSERT INTO e2e_schema_add_upd (id, name) VALUES
     (1, 'alice'),

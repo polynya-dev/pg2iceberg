@@ -5,7 +5,6 @@ CREATE TABLE e2e_schema_rename (
     value INTEGER
 );
 ALTER TABLE e2e_schema_rename REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_rename FOR TABLE e2e_schema_rename;
 -- DATA --
 INSERT INTO e2e_schema_rename (id, name, value) VALUES
     (1, 'alice', 100),

@@ -5,7 +5,6 @@ CREATE TABLE e2e_partition_truncate_decimal (
     name TEXT NOT NULL
 );
 ALTER TABLE e2e_partition_truncate_decimal REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_partition_truncate_decimal FOR TABLE e2e_partition_truncate_decimal;
 -- DATA --
 INSERT INTO e2e_partition_truncate_decimal (id, price, name) VALUES
     (1, 10.65, 'alice'),

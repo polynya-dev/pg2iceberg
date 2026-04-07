@@ -5,7 +5,6 @@ CREATE TABLE e2e_partition_truncate_bigint (
     name TEXT NOT NULL
 );
 ALTER TABLE e2e_partition_truncate_bigint REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_partition_truncate_bigint FOR TABLE e2e_partition_truncate_bigint;
 -- DATA --
 INSERT INTO e2e_partition_truncate_bigint (id, amount, name) VALUES
     (1, 150, 'alice'),

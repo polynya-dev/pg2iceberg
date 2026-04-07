@@ -5,7 +5,6 @@ CREATE TABLE e2e_schema_widen_int (
     value INTEGER NOT NULL
 );
 ALTER TABLE e2e_schema_widen_int REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_widen_int FOR TABLE e2e_schema_widen_int;
 -- DATA --
 INSERT INTO e2e_schema_widen_int (id, name, value) VALUES
     (1, 'alice', 100),

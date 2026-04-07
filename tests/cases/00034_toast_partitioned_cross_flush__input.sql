@@ -6,7 +6,6 @@ CREATE TABLE e2e_toast_part_xflush (
     payload TEXT NOT NULL
 );
 ALTER TABLE e2e_toast_part_xflush ALTER COLUMN payload SET STORAGE EXTERNAL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_toast_part_xflush FOR TABLE e2e_toast_part_xflush;
 -- DATA --
 INSERT INTO e2e_toast_part_xflush (id, region, label, payload) VALUES
     (1, 'us', 'orig', repeat('A', 100000)),

@@ -5,7 +5,6 @@ CREATE TABLE e2e_initial_snapshot (
     amount NUMERIC(10,2) NOT NULL
 );
 ALTER TABLE e2e_initial_snapshot REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_initial_snapshot FOR TABLE e2e_initial_snapshot;
 
 -- Pre-existing rows: inserted BEFORE pg2iceberg starts.
 -- These should be captured by initial snapshot.

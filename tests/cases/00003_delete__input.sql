@@ -4,7 +4,6 @@ CREATE TABLE e2e_delete (
     name TEXT NOT NULL
 );
 ALTER TABLE e2e_delete REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_delete FOR TABLE e2e_delete;
 -- DATA --
 INSERT INTO e2e_delete (id, name) VALUES
     (1, 'alice'),

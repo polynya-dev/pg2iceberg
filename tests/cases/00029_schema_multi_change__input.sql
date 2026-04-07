@@ -6,7 +6,6 @@ CREATE TABLE e2e_schema_multi (
     value INTEGER
 );
 ALTER TABLE e2e_schema_multi REPLICA IDENTITY FULL;
-CREATE PUBLICATION pg2iceberg_pub_e2e_schema_multi FOR TABLE e2e_schema_multi;
 -- DATA --
 INSERT INTO e2e_schema_multi (id, name, temp, value) VALUES
     (1, 'alice', 'x', 100),
