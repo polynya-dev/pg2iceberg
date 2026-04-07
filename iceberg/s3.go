@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
@@ -45,6 +46,24 @@ func NewS3Client(endpoint, accessKey, secretKey, region, warehouse string) (*S3C
 		UsePathStyle: true,
 	})
 
+	return &S3Client{client: client, bucket: bucket}, nil
+}
+
+// NewIAMS3Client creates an S3 client using the default AWS credential chain
+// (environment variables, IAM role, etc.) — no explicit keys needed.
+func NewIAMS3Client(ctx context.Context, region, warehouse string) (*S3Client, error) {
+	u, err := url.Parse(warehouse)
+	if err != nil {
+		return nil, fmt.Errorf("parse warehouse URI: %w", err)
+	}
+	bucket := u.Host
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config: %w", err)
+	}
+
+	client := s3.NewFromConfig(cfg)
 	return &S3Client{client: client, bucket: bucket}, nil
 }
 

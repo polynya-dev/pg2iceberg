@@ -160,7 +160,13 @@ func (c *CatalogClient) EnsureNamespace(ns string) error {
 // LoadTable fetches table metadata from the catalog.
 func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 	start := time.Now()
-	resp, err := c.get(c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)))
+	req, err := http.NewRequest("GET", c.baseURL+c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Iceberg-Access-Delegation", "vended-credentials")
+	resp, err := c.client.Do(req)
 	pipeline.CatalogOperationDurationSeconds.WithLabelValues("load_table").Observe(time.Since(start).Seconds())
 	if err != nil {
 		pipeline.CatalogErrorsTotal.WithLabelValues("load_table").Inc()

@@ -559,9 +559,9 @@ func (cfg *Config) Validate() error {
 
 	// Validate credential_mode.
 	switch cfg.Sink.CredentialMode {
-	case "static", "vended":
+	case "static", "vended", "iam":
 	default:
-		errs = append(errs, fmt.Sprintf("sink.credential_mode: must be \"static\" or \"vended\", got %q", cfg.Sink.CredentialMode))
+		errs = append(errs, fmt.Sprintf("sink.credential_mode: must be \"static\", \"vended\", or \"iam\", got %q", cfg.Sink.CredentialMode))
 	}
 
 	// S3 fields and warehouse are only required in static credential mode.

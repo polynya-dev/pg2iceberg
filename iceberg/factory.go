@@ -54,7 +54,13 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 
 	if cfg.CredentialMode == "vended" {
 		// Attempt catalog config discovery for warehouse, prefix, and other defaults.
-		cc, err := catalogClient.GetConfig(cfg.Warehouse)
+		// For sigv4 (Glue), skip sending S3 URIs as the warehouse param — Glue
+		// expects a catalog identifier, not a storage path.
+		configWarehouse := cfg.Warehouse
+		if cfg.CatalogAuth == "sigv4" && IsStorageURI(configWarehouse) {
+			configWarehouse = ""
+		}
+		cc, err := catalogClient.GetConfig(configWarehouse)
 		if err != nil {
 			log.Printf("[iceberg] GET /v1/config failed (non-fatal): %v", err)
 		} else if cc != nil {
@@ -68,6 +74,13 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 				log.Printf("[iceberg] using catalog prefix: %s", prefix)
 			}
 		}
+	} else if cfg.CredentialMode == "iam" {
+		// Use the default AWS credential chain (IAM role, env vars, etc.).
+		s3Client, err := NewIAMS3Client(context.Background(), cfg.S3Region, cfg.Warehouse)
+		if err != nil {
+			return nil, fmt.Errorf("create iam s3 client: %w", err)
+		}
+		ic.S3 = s3Client
 	} else {
 		s3Client, err := NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
 		if err != nil {
