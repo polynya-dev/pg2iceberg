@@ -196,11 +196,11 @@ func (s SinkConfig) TargetFileSizeOrDefault() int64 {
 
 func (s SinkConfig) MaterializerDuration() time.Duration {
 	if s.MaterializerInterval == "" {
-		return 10 * time.Second // default 10s
+		return 30 * time.Second // default 30s
 	}
 	d, err := time.ParseDuration(s.MaterializerInterval)
 	if err != nil {
-		return 10 * time.Second
+		return 30 * time.Second
 	}
 	return d
 }
