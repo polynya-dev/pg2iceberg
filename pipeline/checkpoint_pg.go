@@ -189,7 +189,11 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cp.UpdatedAt = time.Now()
+	// Truncate to microsecond precision to match PostgreSQL's TIMESTAMPTZ,
+	// which discards nanoseconds. Without this, the checksum computed here
+	// (with nanoseconds) won't match the checksum recomputed after Load
+	// (without nanoseconds).
+	cp.UpdatedAt = time.Now().Truncate(time.Microsecond)
 	cp.Seal()
 
 	snapshotedTables, _ := json.Marshal(cp.SnapshotedTables)
