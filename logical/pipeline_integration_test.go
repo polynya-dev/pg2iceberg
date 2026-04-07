@@ -404,6 +404,98 @@ func countDeleteFiles(t *testing.T, ctx context.Context, s3 *memStorage, tm *ice
 	return count
 }
 
+// TestPipeline_SnapshotCheckpointLSN verifies that after the initial snapshot
+// completes, the checkpoint LSN is set to the slot's creation point (not 0).
+// This prevents the pipeline from streaming from LSN 0 on restart, which would
+// miss all WAL data between slot creation and the first CDC flush.
+func TestPipeline_SnapshotCheckpointLSN(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE items (
+			id    SERIAL PRIMARY KEY,
+			name  TEXT NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		_, err = conn.Exec(ctx, "INSERT INTO items (name) VALUES ($1)", fmt.Sprintf("item-%d", i))
+		if err != nil {
+			t.Fatalf("seed insert: %v", err)
+		}
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            100,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "1h", // disable materializer for this test
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.items"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_cplsn",
+				SlotName:        "test_slot_cplsn",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	eventBuf := logical.NewChangeEventBuffer()
+	store := pipeline.NewMemCheckpointStore()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	p := logical.NewPipeline("test", cfg, snk, store)
+	p.SetEventBuf(eventBuf)
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	// Wait for snapshot to complete.
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	// Verify checkpoint has a non-zero LSN.
+	cp, err := store.Load("test")
+	if err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	if !cp.SnapshotComplete {
+		t.Fatal("expected snapshot to be complete")
+	}
+	if cp.LSN == 0 {
+		t.Fatal("checkpoint LSN is 0 after snapshot; should be the slot creation LSN")
+	}
+	t.Logf("checkpoint LSN after snapshot: %d", cp.LSN)
+}
+
 // TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush runs a real pipeline with
 // Postgres logical replication and a real sink (backed by in-memory storage
 // and catalog stubs). It verifies that:
@@ -1627,7 +1719,7 @@ func setupTestTable(t *testing.T, ctx context.Context, dsn string) {
 			id SERIAL PRIMARY KEY,
 			value INTEGER NOT NULL
 		);
-	`)
+docker	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
 	}

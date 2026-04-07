@@ -242,7 +242,69 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		p.schemas[tc.Name] = ts
 		log.Printf("[logical:%s] discovered schema for %s: %d columns, pk=%v", p.id, tc.Name, len(ts.Columns), ts.PK)
 	}
+	// Probe Iceberg table existence before registration.
+	var tableExistence []pipeline.TableExistence
+	for _, tc := range p.cfg.Tables {
+		icebergName := postgres.TableToIceberg(tc.Name)
+		matTm, err := p.snk.Catalog().LoadTable(p.cfg.Sink.Namespace, icebergName)
+		if err != nil {
+			pgConn.Close(ctx)
+			return fmt.Errorf("probe table %s: %w", icebergName, err)
+		}
+		te := pipeline.TableExistence{PGTable: tc.Name, IcebergName: icebergName, Existed: matTm != nil}
+		if matTm != nil {
+			te.SnapshotID = matTm.Metadata.CurrentSnapshotID
+			te.SeqNum = matTm.Metadata.LastSequenceNumber
+		}
+		// In logical mode, also check the events table.
+		eventsName := iceberg.EventsTableName(icebergName)
+		eventsTm, err := p.snk.Catalog().LoadTable(p.cfg.Sink.Namespace, eventsName)
+		if err != nil {
+			pgConn.Close(ctx)
+			return fmt.Errorf("probe events table %s: %w", eventsName, err)
+		}
+		eventsTE := pipeline.TableExistence{PGTable: tc.Name, IcebergName: eventsName, Existed: eventsTm != nil}
+		if eventsTm != nil {
+			eventsTE.SnapshotID = eventsTm.Metadata.CurrentSnapshotID
+			eventsTE.SeqNum = eventsTm.Metadata.LastSequenceNumber
+		}
+		tableExistence = append(tableExistence, te, eventsTE)
+	}
+
+	// Probe replication slot.
+	var slotState *pipeline.SlotState
+	slotName := p.cfg.Source.Logical.SlotName
+	var slotExists bool
+	if err := pgConn.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+		slotName).Scan(&slotExists); err != nil {
+		pgConn.Close(ctx)
+		return fmt.Errorf("probe replication slot: %w", err)
+	}
+	slotState = &pipeline.SlotState{Exists: slotExists}
+	if slotExists {
+		var restartLSN, confirmedLSN int64
+		if err := pgConn.QueryRow(ctx,
+			"SELECT (restart_lsn - '0/0')::bigint, (confirmed_flush_lsn - '0/0')::bigint FROM pg_replication_slots WHERE slot_name = $1",
+			slotName).Scan(&restartLSN, &confirmedLSN); err != nil {
+			pgConn.Close(ctx)
+			return fmt.Errorf("query slot LSN: %w", err)
+		}
+		slotState.RestartLSN = uint64(restartLSN)
+		slotState.ConfirmedFlushLSN = uint64(confirmedLSN)
+	}
 	pgConn.Close(ctx)
+
+	// Validate startup state consistency.
+	if err := pipeline.ValidateStartup(pipeline.StartupValidation{
+		Checkpoint: cp,
+		Tables:     tableExistence,
+		Slot:       slotState,
+		ConfigMode: "logical",
+		SlotName:   slotName,
+	}); err != nil {
+		return err
+	}
 
 	for _, ts := range p.schemas {
 		if err := p.snk.RegisterTable(ctx, ts); err != nil {
@@ -558,7 +620,13 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	cp.SnapshotComplete = true
 	cp.SnapshotedTables = nil
 	cp.SnapshotChunks = nil
-	cp.LSN = p.lastWrittenLSN
+	// Use lastWrittenLSN if available (CDC events were flushed during snapshot),
+	// otherwise fall back to the source's flushed LSN (the slot creation point).
+	if p.lastWrittenLSN > 0 {
+		cp.LSN = p.lastWrittenLSN
+	} else {
+		cp.LSN = p.src.FlushedLSN()
+	}
 	p.src.SetFlushedLSN(cp.LSN)
 
 	if err := p.store.Save(p.id, cp); err != nil {
