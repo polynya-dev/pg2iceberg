@@ -458,6 +458,30 @@ func (p *Pipeline) flush(ctx context.Context) error {
 			p.id, tp.pgTable, tp.prepared.DataCount, tp.prepared.DeleteCount)
 	}
 
+	// Compaction: rewrite small files if thresholds exceeded.
+	cc := iceberg.CompactionConfig{
+		DataFileThreshold:   p.cfg.Sink.CompactionDataFilesOrDefault(),
+		DeleteFileThreshold: p.cfg.Sink.CompactionDeleteFilesOrDefault(),
+	}
+	for _, tp := range preps {
+		tw := p.writers[tp.pgTable]
+		ts := p.schemas[tp.pgTable]
+		compacted, err := tw.Compact(ctx, ts.PK, cc)
+		if err != nil {
+			log.Printf("[query:%s] compaction error for %s: %v", p.id, tp.pgTable, err)
+			continue
+		}
+		if compacted == nil {
+			continue
+		}
+		err = p.catalog.CommitSnapshot(p.cfg.Sink.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
+		if err != nil {
+			log.Printf("[query:%s] compaction commit error for %s: %v", p.id, tp.pgTable, err)
+			continue
+		}
+		tw.ApplyPostCommit(compacted)
+	}
+
 	// Checkpoint watermarks.
 	p.mu.Lock()
 	p.lastFlushAt = time.Now()

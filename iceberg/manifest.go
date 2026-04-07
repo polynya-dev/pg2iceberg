@@ -25,9 +25,10 @@ type DataFileInfo struct {
 
 // ManifestEntry represents a single entry in a manifest file.
 type ManifestEntry struct {
-	Status     int // 1 = added, 0 = existing, 2 = deleted
-	SnapshotID int64
-	DataFile   DataFileInfo
+	Status         int // 1 = added, 0 = existing, 2 = deleted
+	SnapshotID     int64
+	SequenceNumber int64 // file's sequence number (for equality delete ordering)
+	DataFile       DataFileInfo
 }
 
 // ManifestFileInfo describes a manifest file.
@@ -277,6 +278,9 @@ func ReadManifest(data []byte) ([]ManifestEntry, error) {
 		}
 		if sid := getUnionLong(m, "snapshot_id"); sid != nil {
 			entry.SnapshotID = *sid
+		}
+		if seq := getUnionLong(m, "sequence_number"); seq != nil {
+			entry.SequenceNumber = *seq
 		}
 
 		if df, ok := m["data_file"].(map[string]any); ok {

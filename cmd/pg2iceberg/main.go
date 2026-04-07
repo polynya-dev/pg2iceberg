@@ -50,6 +50,7 @@ func main() {
 
 	// Behavior
 	snapshotOnly := flag.Bool("snapshot-only", false, "exit after initial snapshot completes (env: SNAPSHOT_ONLY)")
+	compactOnly := flag.Bool("compact", false, "run one compaction pass on all tables and exit")
 
 	// State & metrics
 	statePostgresURL := flag.String("state-postgres-url", "", "PostgreSQL URL for state storage (env: STATE_POSTGRES_URL)")
@@ -102,7 +103,9 @@ func main() {
 	}
 
 	var runErr error
-	if cfg.SnapshotOnly {
+	if *compactOnly {
+		runErr = runCompact(ctx, cfg)
+	} else if cfg.SnapshotOnly {
 		runErr = runSnapshotOnly(ctx, cfg)
 	} else {
 		runErr = runPipeline(ctx, cfg)
@@ -414,6 +417,105 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 	}
 
 	log.Println("[snapshot] snapshot-only complete")
+	return nil
+}
+
+// runCompact performs a single compaction pass on all configured tables.
+func runCompact(ctx context.Context, cfg *config.Config) error {
+	log.Println("[compact] starting compaction")
+
+	// Discover schemas.
+	pgConn, err := pgx.Connect(ctx, cfg.Source.Postgres.DSN())
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+
+	schemas := make(map[string]*postgres.TableSchema)
+	for _, tc := range cfg.Tables {
+		ts, err := postgres.DiscoverSchema(ctx, pgConn, tc.Name)
+		if err != nil {
+			pgConn.Close(ctx)
+			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
+		}
+		schemas[tc.Name] = ts
+	}
+	pgConn.Close(ctx)
+
+	// Iceberg clients.
+	clients, err := iceberg.NewClients(cfg.Sink)
+	if err != nil {
+		return fmt.Errorf("create iceberg clients: %w", err)
+	}
+	catalog := clients.Catalog
+
+	// Ensure storage is available.
+	if clients.S3 == nil && len(cfg.Tables) > 0 {
+		firstTable := postgres.TableToIceberg(cfg.Tables[0].Name)
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, firstTable); err != nil {
+			return fmt.Errorf("ensure storage: %w", err)
+		}
+	}
+
+	cc := iceberg.CompactionConfig{
+		DataFileThreshold:   cfg.Sink.CompactionDataFilesOrDefault(),
+		DeleteFileThreshold: cfg.Sink.CompactionDeleteFilesOrDefault(),
+	}
+
+	var compacted int
+	for _, tc := range cfg.Tables {
+		ts := schemas[tc.Name]
+		icebergName := postgres.TableToIceberg(tc.Name)
+
+		var partExprs []string
+		if len(tc.Iceberg.Partition) > 0 {
+			partExprs = tc.Iceberg.Partition
+		}
+		partSpec, err := iceberg.BuildPartitionSpec(partExprs, ts)
+		if err != nil {
+			return fmt.Errorf("build partition spec for %s: %w", tc.Name, err)
+		}
+
+		// Load table to get schema ID.
+		matTm, err := catalog.LoadTable(cfg.Sink.Namespace, icebergName)
+		if err != nil {
+			return fmt.Errorf("load table %s: %w", icebergName, err)
+		}
+		if matTm == nil {
+			log.Printf("[compact] table %s does not exist, skipping", icebergName)
+			continue
+		}
+
+		tw := iceberg.NewTableWriter(iceberg.TableWriteConfig{
+			Namespace:   cfg.Sink.Namespace,
+			IcebergName: icebergName,
+			SrcSchema:   ts,
+			PartSpec:    partSpec,
+			SchemaID:    matTm.Metadata.CurrentSchemaID,
+			TargetSize:  cfg.Sink.MaterializerTargetFileSizeOrDefault(),
+			Concurrency: cfg.Sink.MaterializerConcurrencyOrDefault(),
+		}, catalog, clients.S3)
+
+		prepared, err := tw.Compact(ctx, ts.PK, cc)
+		if err != nil {
+			log.Printf("[compact] error compacting %s: %v", icebergName, err)
+			continue
+		}
+		if prepared == nil {
+			log.Printf("[compact] %s: below thresholds, skipping", icebergName)
+			continue
+		}
+
+		if err := catalog.CommitSnapshot(cfg.Sink.Namespace, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit); err != nil {
+			log.Printf("[compact] commit error for %s: %v", icebergName, err)
+			continue
+		}
+
+		log.Printf("[compact] %s: %d data + %d delete files -> %d files (%d rows deleted)",
+			icebergName, prepared.DataCount+prepared.DeleteCount, prepared.DeleteCount, prepared.BucketCount, prepared.DeleteRowCount)
+		compacted++
+	}
+
+	log.Printf("[compact] done, %d table(s) compacted", compacted)
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/big"
 	"strconv"
 	"strings"
 	"time"
@@ -29,8 +30,10 @@ func DownloadWithRetry(ctx context.Context, s3 ObjectStorage, key string) ([]byt
 func ReadParquetRows(data []byte, ts *postgres.TableSchema) ([]map[string]any, error) {
 	reader := pq.NewReader(bytes.NewReader(data))
 
-	colNames := make([]string, len(reader.Schema().Fields()))
-	for i, f := range reader.Schema().Fields() {
+	schema := reader.Schema()
+	fields := schema.Fields()
+	colNames := make([]string, len(fields))
+	for i, f := range fields {
 		colNames[i] = f.Name()
 	}
 
@@ -49,11 +52,7 @@ func ReadParquetRows(data []byte, ts *postgres.TableSchema) ([]map[string]any, e
 		for _, v := range rowBuf[0] {
 			colIdx := v.Column()
 			if colIdx >= 0 && colIdx < len(colNames) {
-				if v.IsNull() {
-					row[colNames[colIdx]] = nil
-				} else {
-					row[colNames[colIdx]] = parquetValueToGo(v)
-				}
+				row[colNames[colIdx]] = parquetValueWithField(v, fields[colIdx])
 			}
 		}
 		rows = append(rows, row)
@@ -63,6 +62,8 @@ func ReadParquetRows(data []byte, ts *postgres.TableSchema) ([]map[string]any, e
 }
 
 // parquetValueToGo converts a parquet.Value to a Go native type.
+// For FixedLenByteArray this returns raw bytes as string — use
+// parquetValueWithSchema for decimal-aware conversion.
 func parquetValueToGo(v pq.Value) any {
 	switch v.Kind() {
 	case pq.Boolean:
@@ -80,6 +81,52 @@ func parquetValueToGo(v pq.Value) any {
 	default:
 		return v.String()
 	}
+}
+
+// parquetValueWithField converts a parquet Value using its schema field
+// to properly decode types like decimals stored as FixedLenByteArray.
+func parquetValueWithField(v pq.Value, field pq.Field) any {
+	if v.IsNull() {
+		return nil
+	}
+	// Check for decimal logical type on FixedLenByteArray.
+	if v.Kind() == pq.FixedLenByteArray || v.Kind() == pq.ByteArray {
+		if lt := field.Type().LogicalType(); lt != nil && lt.Decimal != nil {
+			return decimalFromBytes(v.ByteArray(), int(lt.Decimal.Scale))
+		}
+		return string(v.ByteArray())
+	}
+	return parquetValueToGo(v)
+}
+
+// decimalFromBytes decodes a big-endian two's complement byte array into
+// a decimal string with the given scale.
+func decimalFromBytes(b []byte, scale int) string {
+	// Big-endian two's complement → big.Int.
+	n := new(big.Int).SetBytes(b)
+	// Check sign bit.
+	if len(b) > 0 && b[0]&0x80 != 0 {
+		// Negative: subtract 2^(8*len) to get the signed value.
+		twoN := new(big.Int).Lsh(big.NewInt(1), uint(len(b)*8))
+		n.Sub(n, twoN)
+	}
+	if scale <= 0 {
+		return n.String()
+	}
+	neg := n.Sign() < 0
+	abs := new(big.Int).Abs(n)
+	s := abs.String()
+	// Pad with leading zeros if needed.
+	for len(s) <= scale {
+		s = "0" + s
+	}
+	intPart := s[:len(s)-scale]
+	fracPart := s[len(s)-scale:]
+	result := intPart + "." + fracPart
+	if neg {
+		result = "-" + result
+	}
+	return result
 }
 
 // ReadParquetPKKeysFromReaderAt reads only PK columns from a parquet file via

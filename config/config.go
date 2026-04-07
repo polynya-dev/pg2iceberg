@@ -167,6 +167,10 @@ type SinkConfig struct {
 	MaterializerInterval       string `yaml:"materializer_interval" json:"materializer_interval,omitempty"`
 	MaterializerTargetFileSize int64  `yaml:"materializer_target_file_size" json:"materializer_target_file_size,omitempty"`
 	MaterializerConcurrency    int    `yaml:"materializer_concurrency" json:"materializer_concurrency,omitempty"`
+
+	// Compaction thresholds — compact when file counts exceed these.
+	CompactionDataFiles   int `yaml:"compaction_data_files" json:"compaction_data_files,omitempty"`
+	CompactionDeleteFiles int `yaml:"compaction_delete_files" json:"compaction_delete_files,omitempty"`
 }
 
 func (s SinkConfig) EventsPartitionOrDefault() string {
@@ -192,11 +196,11 @@ func (s SinkConfig) TargetFileSizeOrDefault() int64 {
 
 func (s SinkConfig) MaterializerDuration() time.Duration {
 	if s.MaterializerInterval == "" {
-		return 10 * time.Second // default 10s
+		return 30 * time.Second // default 30s
 	}
 	d, err := time.ParseDuration(s.MaterializerInterval)
 	if err != nil {
-		return 10 * time.Second
+		return 30 * time.Second
 	}
 	return d
 }
@@ -218,6 +222,20 @@ func (s SinkConfig) MaterializerConcurrencyOrDefault() int {
 		return s.MaterializerConcurrency
 	}
 	return 16
+}
+
+func (s SinkConfig) CompactionDataFilesOrDefault() int {
+	if s.CompactionDataFiles > 0 {
+		return s.CompactionDataFiles
+	}
+	return 20
+}
+
+func (s SinkConfig) CompactionDeleteFilesOrDefault() int {
+	if s.CompactionDeleteFiles > 0 {
+		return s.CompactionDeleteFiles
+	}
+	return 10
 }
 
 func (s SinkConfig) FlushDuration() time.Duration {

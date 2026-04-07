@@ -254,6 +254,31 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 	if len(prepared) > 1 {
 		log.Printf("[materializer] cycle complete: %d tables committed atomically", len(prepared))
 	}
+
+	// Phase 5: Compaction — rewrite small files if thresholds exceeded.
+	cc := iceberg.CompactionConfig{
+		DataFileThreshold:   m.cfg.CompactionDataFilesOrDefault(),
+		DeleteFileThreshold: m.cfg.CompactionDeleteFilesOrDefault(),
+	}
+	for _, p := range prepared {
+		tw := m.tableWriters[p.pgTable]
+		ts := m.tables[p.pgTable]
+		compacted, err := tw.Compact(ctx, ts.srcSchema.PK, cc)
+		if err != nil {
+			log.Printf("[materializer] compaction error for %s: %v", p.pgTable, err)
+			continue
+		}
+		if compacted == nil {
+			continue
+		}
+		err = m.catalog.CommitSnapshot(m.cfg.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
+		if err != nil {
+			log.Printf("[materializer] compaction commit error for %s: %v", p.pgTable, err)
+			continue
+		}
+		tw.ApplyPostCommit(compacted)
+	}
+
 	return nil
 }
 
