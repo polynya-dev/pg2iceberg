@@ -112,6 +112,15 @@ Iceberg supports a maximum decimal precision of 38. If a PostgreSQL table has a 
 
 Unconstrained `numeric` columns (no precision specified) use `decimal(38,18)` as default.
 
+## Supported Iceberg Catalogs
+
+Any catalogs that follows the Iceberg [REST Catalog spec](https://iceberg.apache.org/rest-catalog-spec/) should be supported by pg2iceberg. The following catalogs have been verified to work.
+
+| Catalog | Authentication | Vended Credentials? |
+|---|---|---|
+| Cloudflare R2 Data Catalog | Bearer | Yes |
+| AWS Glue | SigV4 with IAM | No |
+
 ## Quickstart
 
 ```sh
@@ -217,3 +226,62 @@ Input SQL is split into steps using markers:
 ```
 
 The table name, publication, and replication slot are auto-derived from the SQL.
+
+## Observability
+
+### OpenTelemetry Tracing
+
+pg2iceberg exports distributed traces via OTLP/gRPC. Set the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable to enable:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 pg2iceberg
+```
+
+When unset, tracing is a no-op with zero overhead.
+
+**Trace hierarchy:**
+
+```
+pg2iceberg.flush                           # events table flush cycle
+  pg2iceberg.flush.table {table}           # per events table (parallel across tables)
+    catalog.LoadTable {table} (cached)     # metadata cache hit (0ms)
+    pg2iceberg.upload                      # data + manifests + manifest list (all parallel)
+      s3.Upload {table} data
+      s3.Upload {table} metadata
+      s3.Upload {table} metadata
+  catalog.CommitTransaction                # atomic catalog commit
+    http POST /v1/transactions/commit      # actual HTTP round-trip (peer.service=iceberg-catalog)
+
+pg2iceberg.materialize                     # materialization cycle
+  pg2iceberg.materialize.table {table}     # per materialized table (parallel across tables)
+    catalog.LoadTable {table} (cached)
+    pg2iceberg.serialize                   # parquet encoding
+    pg2iceberg.upload                      # data + manifests + manifest list (all parallel)
+      s3.Upload {table} data
+      s3.Upload {table} metadata
+  catalog.CommitTransaction
+
+pg2iceberg.compact                         # only when thresholds exceeded
+  pg2iceberg.upload
+  catalog.CommitTransaction
+```
+
+**External services** identified via `peer.service` attribute:
+
+| Service | Spans |
+|---------|-------|
+| `iceberg-catalog` | `http GET/POST /v1/...` (REST catalog API calls) |
+| `s3` | `s3.Upload`, `s3.Download`, `s3.DownloadRange`, `s3.StatObject` |
+| `postgres` | `checkpoint.pg SELECT/UPDATE/UPSERT` |
+
+**SigNoz setup:** The `example/single/` directory includes a complete docker-compose with SigNoz, an OTel collector, and ClickHouse as the trace backend. Run `docker compose up` and open `http://localhost:3301` to view traces.
+
+### Prometheus Metrics
+
+pg2iceberg exposes Prometheus metrics on `:9090/metrics` (configurable via `metrics_addr` in config). Key metrics include:
+
+- `pg2iceberg_flush_duration_seconds` - events table flush latency
+- `pg2iceberg_materializer_duration_seconds` - materialization cycle latency
+- `pg2iceberg_catalog_operation_duration_seconds` - catalog API latency by operation
+- `pg2iceberg_replication_lag_bytes` - WAL lag from Postgres
+- `pg2iceberg_rows_processed_total` - rows replicated by table and operation
