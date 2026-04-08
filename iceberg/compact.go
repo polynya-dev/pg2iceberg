@@ -80,33 +80,48 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	ns := cfg.Namespace
 	basePath := fmt.Sprintf("%s.db/%s", ns, cfg.IcebergName)
 
-	// Load current table state.
-	matTm, err := tw.catalog.LoadTable(ctx, ns, cfg.IcebergName)
-	if err != nil {
-		return nil, fmt.Errorf("load table: %w", err)
-	}
-	if matTm == nil || matTm.Metadata.CurrentSnapshotID <= 0 {
-		return nil, nil
-	}
+	// Use cached table state if available, otherwise load from catalog.
+	currentSnapID := tw.lastSnapshotID
+	lastSeqNum := tw.lastSeqNum
+	if currentSnapID == 0 {
+		matTm, err := tw.catalog.LoadTable(ctx, ns, cfg.IcebergName)
+		if err != nil {
+			return nil, fmt.Errorf("load table: %w", err)
+		}
+		if matTm == nil || matTm.Metadata.CurrentSnapshotID <= 0 {
+			return nil, nil
+		}
+		currentSnapID = matTm.Metadata.CurrentSnapshotID
+		lastSeqNum = matTm.Metadata.LastSequenceNumber
 
-	// Skip if the last snapshot was already a compaction — no new data since then.
-	for _, snap := range matTm.Metadata.Snapshots {
-		if snap.SnapshotID == matTm.Metadata.CurrentSnapshotID {
-			if snap.Summary["operation"] == "replace" {
-				return nil, nil
+		// Check if last snapshot was compaction.
+		for _, snap := range matTm.Metadata.Snapshots {
+			if snap.SnapshotID == currentSnapID {
+				if snap.Summary["operation"] == "replace" {
+					return nil, nil
+				}
+				break
 			}
-			break
+		}
+
+		// Seed manifest cache.
+		if tw.manifests == nil {
+			tw.manifests, _ = tw.loadExistingManifests(ctx, matTm)
+		}
+	} else {
+		if currentSnapID <= 0 {
+			return nil, nil
+		}
+		// Skip if last commit was already a compaction.
+		if tw.lastOperation == "replace" {
+			return nil, nil
 		}
 	}
 
-	// Use cached manifests if available (avoids S3 round-trip during streaming).
+	// Use cached manifests.
 	manifests := tw.manifests
 	if manifests == nil {
-		var err error
-		manifests, err = tw.loadExistingManifests(ctx, matTm)
-		if err != nil {
-			return nil, fmt.Errorf("load manifests: %w", err)
-		}
+		return nil, nil
 	}
 
 	// Count data and delete files.
@@ -228,7 +243,7 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 
 	// Build a quick PK→file lookup if we have deletes.
 	affectedFiles := make(map[string]bool) // file paths that need rewriting
-	if len(deletePKSeq) > 0 && tw.FileIdx != nil && tw.FileIdx.SnapshotID == matTm.Metadata.CurrentSnapshotID {
+	if len(deletePKSeq) > 0 && tw.FileIdx != nil && tw.FileIdx.SnapshotID == currentSnapID {
 		// Use cached file index to find affected files.
 		pks := make([]string, 0, len(deletePKSeq))
 		for pk := range deletePKSeq {
@@ -262,7 +277,7 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 
 	now := time.Now()
 	snapshotID := now.UnixMilli()
-	seqNum := matTm.Metadata.LastSequenceNumber + 1
+	seqNum := lastSeqNum + 1
 
 	for _, df := range dataFiles {
 		if affectedFiles[df.Path] {
@@ -467,7 +482,7 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 
 	return &PreparedCommit{
 		IcebergName:    cfg.IcebergName,
-		PrevSnapshotID: matTm.Metadata.CurrentSnapshotID,
+		PrevSnapshotID: currentSnapID,
 		Commit:         commit,
 		NewManifests:   newManifests,
 		DataCount:      len(allEntries),

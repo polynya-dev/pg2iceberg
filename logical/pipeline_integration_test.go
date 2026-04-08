@@ -1195,15 +1195,39 @@ func TestMaterializer_CrossTableAtomicCommit(t *testing.T) {
 
 // trackingCatalog wraps memCatalog and records which tables are committed
 // together in each CommitTransaction call, distinguishing materialized table
-// commits from events table commits.
+// commits from events table commits. It also tracks LoadTable calls.
 type trackingCatalog struct {
 	*memCatalog
-	mu          sync.Mutex
-	commitCalls [][]string // each entry is the list of table names in one CommitTransaction call
+	mu            sync.Mutex
+	commitCalls   [][]string // each entry is the list of table names in one CommitTransaction call
+	loadTableLog  []string   // records every LoadTable call as "ns.table"
 }
 
 func newTrackingCatalog() *trackingCatalog {
 	return &trackingCatalog{memCatalog: newMemCatalog()}
+}
+
+func (c *trackingCatalog) LoadTable(ctx context.Context, ns, table string) (*iceberg.TableMetadata, error) {
+	c.mu.Lock()
+	c.loadTableLog = append(c.loadTableLog, ns+"."+table)
+	c.mu.Unlock()
+	return c.memCatalog.LoadTable(ctx, ns, table)
+}
+
+// loadTableCalls returns a copy of all LoadTable calls recorded so far.
+func (c *trackingCatalog) loadTableCalls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.loadTableLog))
+	copy(out, c.loadTableLog)
+	return out
+}
+
+// resetLoadTableLog clears the LoadTable call log.
+func (c *trackingCatalog) resetLoadTableLog() {
+	c.mu.Lock()
+	c.loadTableLog = nil
+	c.mu.Unlock()
 }
 
 func (c *trackingCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
@@ -1235,6 +1259,142 @@ func (c *trackingCatalog) matCommits() [][]string {
 		}
 	}
 	return result
+}
+
+// TestMaterializer_NoLoadTableAfterFirstCycle verifies that the materializer
+// does not call catalog.LoadTable after the first successful cycle. The
+// TableWriter caches snapshotID and seqNum from each commit, so subsequent
+// cycles should use cached values.
+func TestMaterializer_NoLoadTableAfterFirstCycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE products (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "1s",
+		FlushRows:            3,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.products"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        "test_slot_noload",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	eventBuf := logical.NewChangeEventBuffer()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p.SetEventBuf(eventBuf)
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	ls := p.Source()
+	if ls == nil {
+		t.Fatal("pipeline source is nil")
+	}
+
+	// Insert first batch — triggers flush + materialize cycle 1.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	for i := 0; i < 3; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO products (name) VALUES ($1)", fmt.Sprintf("item-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	// Wait for first materialization to complete.
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 1 })
+	t.Logf("first materialize cycle complete, matCommits=%d", len(cat.matCommits()))
+
+	// Reset LoadTable log AFTER the first cycle (which is allowed to call LoadTable).
+	cat.resetLoadTableLog()
+
+	// Insert second batch — triggers flush + materialize cycle 2.
+	for i := 3; i < 6; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO products (name) VALUES ($1)", fmt.Sprintf("item-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 2 })
+	t.Logf("second materialize cycle complete, matCommits=%d", len(cat.matCommits()))
+
+	// Insert third batch — triggers flush + materialize cycle 3.
+	for i := 6; i < 9; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO products (name) VALUES ($1)", fmt.Sprintf("item-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 3 })
+	t.Logf("third materialize cycle complete, matCommits=%d", len(cat.matCommits()))
+
+	// Check: LoadTable should NOT have been called by the materializer/TableWriter
+	// after the first cycle. The only LoadTable calls should be from the Sink
+	// (events table assembly), which uses "products_events".
+	calls := cat.loadTableCalls()
+	var matLoadCalls []string
+	for _, call := range calls {
+		// Filter out events table loads (from Sink.assembleEventsCommit) —
+		// those are expected and not part of this optimization.
+		if !strings.Contains(call, "_events") {
+			matLoadCalls = append(matLoadCalls, call)
+		}
+	}
+
+	if len(matLoadCalls) > 0 {
+		t.Errorf("expected zero LoadTable calls for materialized tables after first cycle, got %d: %v",
+			len(matLoadCalls), matLoadCalls)
+	} else {
+		t.Log("confirmed: no LoadTable calls for materialized tables after first cycle")
+	}
 }
 
 // Note: TestMaterializer_CrossTableAtomicCommit_RaceDrainAll was removed.

@@ -94,7 +94,7 @@ func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string,
 	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.Upload", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
 		attribute.Int("s3.size_bytes", len(data)),
-		attribute.String("peer.service", "s3"),
+		attribute.String("service.name", "s3"),
 	))
 	defer span.End()
 
@@ -119,7 +119,7 @@ func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string,
 func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
 	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.Download", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
-		attribute.String("peer.service", "s3"),
+		attribute.String("service.name", "s3"),
 	))
 	defer span.End()
 
@@ -153,7 +153,7 @@ func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length
 		attribute.String("s3.key", key),
 		attribute.Int64("s3.offset", offset),
 		attribute.Int64("s3.length", length),
-		attribute.String("peer.service", "s3"),
+		attribute.String("service.name", "s3"),
 	))
 	defer span.End()
 
@@ -187,7 +187,7 @@ func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length
 func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
 	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.StatObject", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
-		attribute.String("peer.service", "s3"),
+		attribute.String("service.name", "s3"),
 	))
 	defer span.End()
 

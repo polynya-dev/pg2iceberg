@@ -101,6 +101,12 @@ type TableWriter struct {
 	// Cached manifest list from previous cycle (carried forward).
 	manifests []ManifestFileInfo
 
+	// Cached table metadata from the last successful commit.
+	// Avoids a catalog.LoadTable round-trip on every materialize cycle.
+	lastSnapshotID int64
+	lastSeqNum     int64
+	lastOperation  string // "append" or "replace" (compaction)
+
 	// File index for DELETE partition routing and TOAST resolution.
 	FileIdx *FileIndex
 }
@@ -153,19 +159,21 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	partitioned := partSpec != nil && !partSpec.IsUnpartitioned()
 	basePath := fmt.Sprintf("%s.db/%s", cfg.Namespace, cfg.IcebergName)
 
-	// Load materialized table metadata for commit.
-	matTm, err := tw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
-	if err != nil {
-		return nil, fmt.Errorf("load materialized table: %w", err)
-	}
-
-	var prevMatSnapID int64
-	if matTm != nil {
-		prevMatSnapID = matTm.Metadata.CurrentSnapshotID
-	}
-	seqNum := int64(1)
-	if matTm != nil {
-		seqNum = matTm.Metadata.LastSequenceNumber + 1
+	// Use cached metadata if available (from a previous ApplyPostCommit),
+	// otherwise load from catalog (first cycle or after restart).
+	prevMatSnapID := tw.lastSnapshotID
+	seqNum := tw.lastSeqNum + 1
+	if tw.lastSnapshotID == 0 {
+		matTm, err := tw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
+		if err != nil {
+			return nil, fmt.Errorf("load materialized table: %w", err)
+		}
+		if matTm != nil {
+			prevMatSnapID = matTm.Metadata.CurrentSnapshotID
+			seqNum = matTm.Metadata.LastSequenceNumber + 1
+		} else {
+			seqNum = 1
+		}
 	}
 
 	now := time.Now()
@@ -417,10 +425,16 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 
 	// --- Manifest assembly ---
 	// Load cached manifests or fetch from S3 on first run.
-	if tw.manifests == nil && matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
-		tw.manifests, err = tw.loadExistingManifests(ctx, matTm)
+	if tw.manifests == nil && prevMatSnapID > 0 {
+		matTm, err := tw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
 		if err != nil {
-			return nil, fmt.Errorf("load existing manifests: %w", err)
+			return nil, fmt.Errorf("load table for manifests: %w", err)
+		}
+		if matTm != nil {
+			tw.manifests, err = tw.loadExistingManifests(ctx, matTm)
+			if err != nil {
+				return nil, fmt.Errorf("load existing manifests: %w", err)
+			}
 		}
 	}
 	existingManifests := tw.manifests
@@ -512,6 +526,9 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 // after a successful catalog commit. Must be called only after CommitTransaction succeeds.
 func (tw *TableWriter) ApplyPostCommit(pc *PreparedCommit) {
 	tw.manifests = pc.NewManifests
+	tw.lastSnapshotID = pc.Commit.SnapshotID
+	tw.lastSeqNum = pc.Commit.SequenceNumber
+	tw.lastOperation = pc.Commit.Summary["operation"]
 	// Invalidate file index so it's rebuilt on next cycle.
 	if tw.FileIdx != nil {
 		tw.FileIdx.SnapshotID = 0
@@ -530,25 +547,35 @@ func (pc *PreparedCommit) ToTableCommit() TableCommit {
 // BuildFileIndex reads all data files for the materialized table and builds the
 // PK→file index. Returns the index or reuses the cached one if it's still current.
 func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIndex, error) {
-	matTm, err := tw.catalog.LoadTable(ctx, tw.cfg.Namespace, tw.cfg.IcebergName)
-	if err != nil {
-		return nil, fmt.Errorf("load table for file index: %w", err)
-	}
-	if matTm == nil || matTm.Metadata.CurrentSnapshotID == 0 {
-		fi := NewFileIndex()
-		tw.FileIdx = fi
-		return fi, nil
+	// Use cached snapshot ID if available, otherwise load from catalog.
+	currentSnapID := tw.lastSnapshotID
+	if currentSnapID == 0 {
+		matTm, err := tw.catalog.LoadTable(ctx, tw.cfg.Namespace, tw.cfg.IcebergName)
+		if err != nil {
+			return nil, fmt.Errorf("load table for file index: %w", err)
+		}
+		if matTm == nil || matTm.Metadata.CurrentSnapshotID == 0 {
+			fi := NewFileIndex()
+			tw.FileIdx = fi
+			return fi, nil
+		}
+		currentSnapID = matTm.Metadata.CurrentSnapshotID
+		// Also seed the manifest cache from the catalog response.
+		if tw.manifests == nil {
+			tw.manifests, _ = tw.loadExistingManifests(ctx, matTm)
+		}
 	}
 
 	// Return cached index if still current.
-	if tw.FileIdx != nil && tw.FileIdx.SnapshotID == matTm.Metadata.CurrentSnapshotID {
+	if tw.FileIdx != nil && tw.FileIdx.SnapshotID == currentSnapID {
 		return tw.FileIdx, nil
 	}
 
 	fi := NewFileIndex()
-	fi.SnapshotID = matTm.Metadata.CurrentSnapshotID
+	fi.SnapshotID = currentSnapID
 
-	allFiles, err := tw.LoadAllDataFiles(ctx, matTm)
+	// Use cached manifests to enumerate data files (no catalog call needed).
+	allFiles, err := tw.loadDataFilesFromManifests(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load data files for index: %w", err)
 	}
@@ -606,6 +633,39 @@ func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIn
 }
 
 // LoadAllDataFiles returns all live data files from a table's current snapshot.
+// loadDataFilesFromManifests reads data files using cached manifests (tw.manifests).
+// Avoids a catalog.LoadTable round-trip.
+func (tw *TableWriter) loadDataFilesFromManifests(ctx context.Context) ([]DataFileInfo, error) {
+	if tw.manifests == nil {
+		return nil, nil
+	}
+	var dataFiles []DataFileInfo
+	for _, mfi := range tw.manifests {
+		if mfi.Content != 0 {
+			continue
+		}
+		mKey, err := KeyFromURI(mfi.Path)
+		if err != nil {
+			return nil, fmt.Errorf("parse manifest URI %s: %w", mfi.Path, err)
+		}
+		mData, err := DownloadWithRetry(ctx, tw.s3, mKey)
+		if err != nil {
+			return nil, fmt.Errorf("download manifest %s: %w", mfi.Path, err)
+		}
+		entries, err := ReadManifest(mData)
+		if err != nil {
+			return nil, fmt.Errorf("read manifest %s: %w", mfi.Path, err)
+		}
+		for _, e := range entries {
+			if e.Status == 2 || e.DataFile.Content != 0 {
+				continue
+			}
+			dataFiles = append(dataFiles, e.DataFile)
+		}
+	}
+	return dataFiles, nil
+}
+
 func (tw *TableWriter) LoadAllDataFiles(ctx context.Context, tm *TableMetadata) ([]DataFileInfo, error) {
 	mlURI := tm.CurrentManifestList()
 	if mlURI == "" {

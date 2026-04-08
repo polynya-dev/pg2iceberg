@@ -136,7 +136,7 @@ func (tm *TableMetadata) CurrentManifestList() string {
 func (c *CatalogClient) EnsureNamespace(ctx context.Context, ns string) error {
 	ctx, span := tracer.Start(ctx, "catalog.EnsureNamespace", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
-		attribute.String("peer.service", "iceberg"),
+		attribute.String("service.name", "iceberg"),
 	))
 	defer span.End()
 
@@ -177,7 +177,7 @@ func (c *CatalogClient) LoadTable(ctx context.Context, ns, table string) (*Table
 	ctx, span := tracer.Start(ctx, "catalog.LoadTable "+table, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
-		attribute.String("peer.service", "iceberg"),
+		attribute.String("service.name", "iceberg"),
 	))
 	defer span.End()
 
@@ -223,7 +223,7 @@ func (c *CatalogClient) CreateTable(ctx context.Context, ns, table string, ts *p
 	ctx, span := tracer.Start(ctx, "catalog.CreateTable "+table, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
-		attribute.String("peer.service", "iceberg"),
+		attribute.String("service.name", "iceberg"),
 	))
 	defer span.End()
 	icebergSchema := postgres.IcebergSchemaJSON(ts)
@@ -285,7 +285,7 @@ func (c *CatalogClient) CommitSnapshot(ctx context.Context, ns, table string, cu
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
 		attribute.Int64("iceberg.snapshot_id", snapshot.SnapshotID),
-		attribute.String("peer.service", "iceberg"),
+		attribute.String("service.name", "iceberg"),
 	))
 	defer span.End()
 
@@ -379,7 +379,7 @@ func (c *CatalogClient) CommitTransaction(ctx context.Context, ns string, commit
 	ctx, span := tracer.Start(ctx, "catalog.CommitTransaction", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.Int("iceberg.table_count", len(commits)),
-		attribute.String("peer.service", "iceberg"),
+		attribute.String("service.name", "iceberg"),
 	))
 	defer span.End()
 
@@ -475,7 +475,7 @@ func (c *CatalogClient) EvolveSchema(ctx context.Context, ns, table string, curr
 	ctx, span := tracer.Start(ctx, "catalog.EvolveSchema "+table, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
-		attribute.String("peer.service", "iceberg"),
+		attribute.String("service.name", "iceberg"),
 	))
 	defer span.End()
 

@@ -149,7 +149,7 @@ func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Check
 	var snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks []byte
 
 	_, dbSpan := tracer.Start(ctx, "checkpoint.pg SELECT", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
-		attribute.String("peer.service", "postgres"),
+		attribute.String("service.name", "postgres"),
 		attribute.String("db.system", "postgresql"),
 	))
 	err := s.pool.QueryRow(ctx, `
@@ -219,7 +219,7 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 	if expectedRevision == 0 {
 		// First save — insert.
 		_, dbSpan := tracer.Start(ctx, "checkpoint.pg UPSERT", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
-			attribute.String("peer.service", "postgres"),
+			attribute.String("service.name", "postgres"),
 			attribute.String("db.system", "postgresql"),
 		))
 		_, err := s.pool.Exec(ctx, `
@@ -250,7 +250,7 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 
 	// Subsequent saves — optimistic concurrency check.
 	_, dbSpan := tracer.Start(ctx, "checkpoint.pg UPDATE", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
-		attribute.String("peer.service", "postgres"),
+		attribute.String("service.name", "postgres"),
 		attribute.String("db.system", "postgresql"),
 	))
 	result, err := s.pool.Exec(ctx, `
