@@ -12,6 +12,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
+)
+
+var (
+	twTracer = otel.Tracer("pg2iceberg/tablewriter")
 )
 
 // RowState is the final state of a single PK after folding/dedup.
@@ -258,6 +266,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}
 
 	// --- Serialize per bucket (equality deletes + data files) ---
+	ctx, serSpan := twTracer.Start(ctx, "pg2iceberg.serialize", trace.WithAttributes(attribute.Int("buckets", len(buckets))))
 	results := make([]bucketResult, len(buckets))
 
 	serializeTasks := make([]utils.Task, len(buckets))
@@ -362,8 +371,10 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}
 	serializePool := utils.NewPool(concurrency)
 	if _, err := serializePool.Run(ctx, serializeTasks); err != nil {
+		serSpan.End()
 		return nil, fmt.Errorf("serialize: %w", err)
 	}
+	serSpan.End()
 
 	// Collect results.
 	var allPending []pendingFile
@@ -375,7 +386,8 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		allDeletedPKs = append(allDeletedPKs, r.deletedPKs...)
 	}
 
-	// --- Upload all files in parallel ---
+	// --- Upload all data files in parallel ---
+	ctx, uploadSpan := twTracer.Start(ctx, "pg2iceberg.upload.data", trace.WithAttributes(attribute.Int("files", len(allPending))))
 	var deleteEntries []ManifestEntry
 	var dataEntries []ManifestEntry
 	var newDataFiles []FileIndexEntry
@@ -441,6 +453,8 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		}
 	}
 
+	uploadSpan.End()
+
 	// Nothing to commit.
 	if len(deleteEntries) == 0 && len(dataEntries) == 0 {
 		return nil, nil
@@ -460,6 +474,15 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		}
 	}
 
+	// --- Manifest assembly + upload ---
+	ctx, metaSpan := twTracer.Start(ctx, "pg2iceberg.upload.metadata")
+	// Data manifest and delete manifest are independent — upload in parallel.
+	// Manifest list references their URIs, so it uploads after.
+	type manifestUpload struct {
+		key  string
+		data []byte
+	}
+	var manifestUploads []manifestUpload
 	var newManifests []ManifestFileInfo
 
 	if len(dataEntries) > 0 {
@@ -467,24 +490,16 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		if err != nil {
 			return nil, fmt.Errorf("write data manifest: %w", err)
 		}
-		manifestKey := fmt.Sprintf("%s/metadata/%s-mat-data.avro", basePath, uuid.New().String())
-		manifestURI, err := tw.s3.Upload(ctx, manifestKey, manifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("upload data manifest: %w", err)
-		}
 		var totalRows int64
 		for _, e := range dataEntries {
 			totalRows += e.DataFile.RecordCount
 		}
+		key := fmt.Sprintf("%s/metadata/%s-mat-data.avro", basePath, uuid.New().String())
 		newManifests = append(newManifests, ManifestFileInfo{
-			Path:           manifestURI,
-			Length:         int64(len(manifestBytes)),
-			Content:        0,
-			SnapshotID:     snapshotID,
-			AddedFiles:     len(dataEntries),
-			AddedRows:      totalRows,
-			SequenceNumber: seqNum,
+			Length: int64(len(manifestBytes)), Content: 0, SnapshotID: snapshotID,
+			AddedFiles: len(dataEntries), AddedRows: totalRows, SequenceNumber: seqNum,
 		})
+		manifestUploads = append(manifestUploads, manifestUpload{key: key, data: manifestBytes})
 	}
 
 	if len(deleteEntries) > 0 {
@@ -492,24 +507,37 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		if err != nil {
 			return nil, fmt.Errorf("write delete manifest: %w", err)
 		}
-		manifestKey := fmt.Sprintf("%s/metadata/%s-mat-deletes.avro", basePath, uuid.New().String())
-		manifestURI, err := tw.s3.Upload(ctx, manifestKey, manifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("upload delete manifest: %w", err)
-		}
+		key := fmt.Sprintf("%s/metadata/%s-mat-deletes.avro", basePath, uuid.New().String())
 		newManifests = append(newManifests, ManifestFileInfo{
-			Path:           manifestURI,
-			Length:         int64(len(manifestBytes)),
-			Content:        1,
-			SnapshotID:     snapshotID,
-			AddedFiles:     len(deleteEntries),
-			AddedRows:      totalDeleteRows,
-			SequenceNumber: seqNum,
+			Length: int64(len(manifestBytes)), Content: 1, SnapshotID: snapshotID,
+			AddedFiles: len(deleteEntries), AddedRows: totalDeleteRows, SequenceNumber: seqNum,
 		})
+		manifestUploads = append(manifestUploads, manifestUpload{key: key, data: manifestBytes})
 	}
 
-	allManifests := append(existingManifests, newManifests...)
+	// Upload manifests in parallel.
+	manifestURIs := make([]string, len(manifestUploads))
+	g, gctx := errgroup.WithContext(ctx)
+	for i, mu := range manifestUploads {
+		i, mu := i, mu
+		g.Go(func() error {
+			uri, uploadErr := tw.s3.Upload(gctx, mu.key, mu.data)
+			if uploadErr != nil {
+				return fmt.Errorf("upload %s: %w", mu.key, uploadErr)
+			}
+			manifestURIs[i] = uri
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, fmt.Errorf("upload manifests: %w", err)
+	}
+	for i := range newManifests {
+		newManifests[i].Path = manifestURIs[i]
+	}
 
+	// Manifest list references manifest URIs — must be sequential after manifests.
+	allManifests := append(existingManifests, newManifests...)
 	mlBytes, err := WriteManifestList(allManifests)
 	if err != nil {
 		return nil, fmt.Errorf("write manifest list: %w", err)
@@ -517,8 +545,10 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	mlKey := fmt.Sprintf("%s/metadata/snap-%d-0-manifest-list.avro", basePath, snapshotID)
 	mlURI, err := tw.s3.Upload(ctx, mlKey, mlBytes)
 	if err != nil {
+		metaSpan.End()
 		return nil, fmt.Errorf("upload manifest list: %w", err)
 	}
+	metaSpan.End()
 
 	commit := SnapshotCommit{
 		SnapshotID:       snapshotID,

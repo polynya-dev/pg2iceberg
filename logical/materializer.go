@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
@@ -254,40 +256,101 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 	var prepared []*preparedMaterialization
 
 	if hasBuffered {
-		// Normal path: only process tables that have buffered events.
+		// Normal path: prepare all tables with buffered events in parallel.
+		type tableInput struct {
+			pgTable string
+			ts      *tableSink
+			events  []MatEvent
+			snapID  int64
+		}
+		var inputs []tableInput
 		for pgTable, events := range allEvents {
 			ts := m.tables[pgTable]
 			if ts == nil {
 				continue
 			}
-			prep, err := m.prepareTable(ctx, pgTable, ts, events, allSnapIDs[pgTable])
-			if err != nil {
-				m.buf.Rollback()
-				pipeline.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
-				err = fmt.Errorf("prepare %s: %w", pgTable, err)
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return err
-			}
-			if prep != nil {
-				prepared = append(prepared, prep)
+			inputs = append(inputs, tableInput{pgTable, ts, events, allSnapIDs[pgTable]})
+		}
+
+		results := make([]*preparedMaterialization, len(inputs))
+		var prepErr error
+		var prepErrTable string
+		var mu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
+		for i, inp := range inputs {
+			i, inp := i, inp
+			g.Go(func() error {
+				prep, err := m.prepareTable(gctx, inp.pgTable, inp.ts, inp.events, inp.snapID)
+				if err != nil {
+					mu.Lock()
+					if prepErr == nil {
+						prepErr = err
+						prepErrTable = inp.pgTable
+					}
+					mu.Unlock()
+					return err
+				}
+				results[i] = prep
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			m.buf.Rollback()
+			pipeline.MaterializerErrorsTotal.WithLabelValues(prepErrTable).Inc()
+			err = fmt.Errorf("prepare %s: %w", prepErrTable, prepErr)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
+		}
+		for _, p := range results {
+			if p != nil {
+				prepared = append(prepared, p)
 			}
 		}
 	} else if !m.recovered {
-		// Startup recovery: check S3 for all tables to catch events
-		// flushed before a crash that were never materialized.
-		m.buf.Ack() // nothing pending
+		// Startup recovery: prepare all tables in parallel.
+		m.buf.Ack()
+		type tableInput struct {
+			pgTable string
+			ts      *tableSink
+		}
+		var inputs []tableInput
 		for pgTable, ts := range m.tables {
-			prep, err := m.prepareTable(ctx, pgTable, ts, nil, 0)
-			if err != nil {
-				pipeline.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
-				err = fmt.Errorf("recover %s: %w", pgTable, err)
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return err
-			}
-			if prep != nil {
-				prepared = append(prepared, prep)
+			inputs = append(inputs, tableInput{pgTable, ts})
+		}
+
+		results := make([]*preparedMaterialization, len(inputs))
+		var prepErr error
+		var prepErrTable string
+		var mu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
+		for i, inp := range inputs {
+			i, inp := i, inp
+			g.Go(func() error {
+				prep, err := m.prepareTable(gctx, inp.pgTable, inp.ts, nil, 0)
+				if err != nil {
+					mu.Lock()
+					if prepErr == nil {
+						prepErr = err
+						prepErrTable = inp.pgTable
+					}
+					mu.Unlock()
+					return err
+				}
+				results[i] = prep
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			pipeline.MaterializerErrorsTotal.WithLabelValues(prepErrTable).Inc()
+			err = fmt.Errorf("recover %s: %w", prepErrTable, prepErr)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
+		}
+		for _, p := range results {
+			if p != nil {
+				prepared = append(prepared, p)
 			}
 		}
 	} else {
