@@ -11,58 +11,68 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
-// CatalogWithCache extends Catalog with manifest cache operations.
-// Implemented by CachedCatalog; allows callers to read/write the shared
-// manifest cache without maintaining their own copies.
-type CatalogWithCache interface {
+// MetadataCache is the single interface all Iceberg consumers use.
+// It subsumes the Catalog interface and adds per-table caching for
+// manifests, data files, and the PK→file index. Commit methods
+// accept post-commit metadata in TableCommit and apply cache updates
+// atomically — callers never need manual Set calls after a commit.
+type MetadataCache interface {
 	Catalog
+
+	// Manifests returns the cached manifest list, or nil on cold start.
 	Manifests(ns, table string) []ManifestFileInfo
+	// SetManifests updates the manifest cache (used during cold-start seeding).
 	SetManifests(ns, table string, manifests []ManifestFileInfo)
+
+	// DataFiles returns cached parsed data file entries, or nil on cold start.
+	DataFiles(ns, table string) []DataFileInfo
+	// SetDataFiles updates the data file cache (used during cold-start seeding).
+	SetDataFiles(ns, table string, files []DataFileInfo)
+
+	// FileIndex returns the cached PK→file index, or nil if not yet built.
+	FileIndex(ns, table string) *FileIndex
+	// SetFileIndex stores a freshly-built file index (used on cold start).
+	SetFileIndex(ns, table string, idx *FileIndex)
 }
 
-// CachedCatalog wraps a CatalogClient with an in-memory write-through cache.
-//
-// pg2iceberg is a single-writer system: it is the only process mutating its
-// Iceberg tables. After cold start (the first LoadTable per table), every
-// subsequent LoadTable can be served from cache because we update the cache
-// after every successful write (CommitSnapshot, CommitTransaction, EvolveSchema,
-// CreateTable).
-//
-// Writes always go to the real catalog first; the cache is updated only after
-// the remote call succeeds. Reads return cached data on hit, falling through
-// to the real catalog on miss.
-type CachedCatalog struct {
-	inner *CatalogClient
-
-	mu         sync.RWMutex
-	tables     map[tableKey]*cachedTable
-	namespaces map[string]bool
-	maxTables  int // LRU eviction threshold
+// tableStore caches all Iceberg metadata for a single table.
+type tableStore struct {
+	tm         *TableMetadata     // from catalog LoadTable/CreateTable
+	manifests  []ManifestFileInfo // manifest list entries
+	dataFiles  []DataFileInfo     // parsed manifest entries (data content only)
+	fileIndex  *FileIndex         // PK→file mapping
+	lastAccess time.Time
 }
 
 type tableKey struct {
 	ns, table string
 }
 
-// cachedTable holds the subset of TableMetadata that callers need between
-// commits: snapshot ID, sequence number, schema ID, location, and the
-// manifest list. This is enough to avoid any LoadTable round-trip in
-// steady state.
-type cachedTable struct {
-	tm         *TableMetadata    // full metadata from last load/create/commit
-	manifests  []ManifestFileInfo // current manifest list (nil = not yet loaded)
-	lastAccess time.Time
+// MetadataStore implements MetadataCache with a write-through LRU cache
+// over a CatalogClient.
+//
+// pg2iceberg is a single-writer system: after cold start, every LoadTable
+// is a cache hit because we update the cache after every successful write.
+// CommitSnapshot and CommitTransaction apply all cache updates atomically
+// from the TableCommit metadata — no manual post-commit step needed.
+type MetadataStore struct {
+	inner *CatalogClient
+
+	mu         sync.RWMutex
+	tables     map[tableKey]*tableStore
+	namespaces map[string]bool
+	maxTables  int
 }
 
-// NewCachedCatalog creates a write-through cache over the given catalog client.
-// maxTables bounds memory; 0 means use default (100).
-func NewCachedCatalog(inner *CatalogClient, maxTables int) *CachedCatalog {
+// NewMetadataStore creates a write-through metadata cache.
+// maxTables bounds memory via LRU eviction; 0 means default (100).
+func NewMetadataStore(inner *CatalogClient, maxTables int) *MetadataStore {
 	if maxTables <= 0 {
 		maxTables = 100
 	}
-	return &CachedCatalog{
+	return &MetadataStore{
 		inner:      inner,
-		tables:     make(map[tableKey]*cachedTable),
+		tables:     make(map[tableKey]*tableStore),
 		namespaces: make(map[string]bool),
 		maxTables:  maxTables,
 	}
@@ -70,16 +80,16 @@ func NewCachedCatalog(inner *CatalogClient, maxTables int) *CachedCatalog {
 
 // Inner returns the underlying CatalogClient for operations that need
 // to bypass the cache (e.g. vended credential refresh).
-func (cc *CachedCatalog) Inner() *CatalogClient {
-	return cc.inner
+func (ms *MetadataStore) Inner() *CatalogClient {
+	return ms.inner
 }
 
-// --- Catalog interface implementation ---
+// --- Catalog interface ---
 
-func (cc *CachedCatalog) EnsureNamespace(ctx context.Context, ns string) error {
-	cc.mu.RLock()
-	known := cc.namespaces[ns]
-	cc.mu.RUnlock()
+func (ms *MetadataStore) EnsureNamespace(ctx context.Context, ns string) error {
+	ms.mu.RLock()
+	known := ms.namespaces[ns]
+	ms.mu.RUnlock()
 	if known {
 		_, span := tracer.Start(ctx, "catalog.EnsureNamespace (cached)", trace.WithAttributes(
 			attribute.String("iceberg.namespace", ns),
@@ -89,22 +99,22 @@ func (cc *CachedCatalog) EnsureNamespace(ctx context.Context, ns string) error {
 		return nil
 	}
 
-	if err := cc.inner.EnsureNamespace(ctx, ns); err != nil {
+	if err := ms.inner.EnsureNamespace(ctx, ns); err != nil {
 		return err
 	}
 
-	cc.mu.Lock()
-	cc.namespaces[ns] = true
-	cc.mu.Unlock()
+	ms.mu.Lock()
+	ms.namespaces[ns] = true
+	ms.mu.Unlock()
 	return nil
 }
 
-func (cc *CachedCatalog) LoadTable(ctx context.Context, ns, table string) (*TableMetadata, error) {
+func (ms *MetadataStore) LoadTable(ctx context.Context, ns, table string) (*TableMetadata, error) {
 	key := tableKey{ns, table}
 
-	cc.mu.RLock()
-	ct, ok := cc.tables[key]
-	cc.mu.RUnlock()
+	ms.mu.RLock()
+	ts, ok := ms.tables[key]
+	ms.mu.RUnlock()
 
 	if ok {
 		_, span := tracer.Start(ctx, "catalog.LoadTable "+table+" (cached)", trace.WithAttributes(
@@ -114,137 +124,182 @@ func (cc *CachedCatalog) LoadTable(ctx context.Context, ns, table string) (*Tabl
 		))
 		span.End()
 
-		cc.mu.Lock()
-		ct.lastAccess = time.Now()
-		cc.mu.Unlock()
-		return ct.tm, nil
+		ms.mu.Lock()
+		ts.lastAccess = time.Now()
+		ms.mu.Unlock()
+		return ts.tm, nil
 	}
 
-	// Cache miss — cold start path. The inner LoadTable creates its own span.
-	tm, err := cc.inner.LoadTable(ctx, ns, table)
+	// Cache miss — cold start.
+	tm, err := ms.inner.LoadTable(ctx, ns, table)
 	if err != nil {
 		return nil, err
 	}
 
 	if tm != nil {
-		cc.mu.Lock()
-		cc.putLocked(key, &cachedTable{tm: tm, lastAccess: time.Now()})
-		cc.mu.Unlock()
+		ms.mu.Lock()
+		ms.putLocked(key, &tableStore{tm: tm, lastAccess: time.Now()})
+		ms.mu.Unlock()
 	}
 
 	return tm, nil
 }
 
-func (cc *CachedCatalog) CreateTable(ctx context.Context, ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
-	tm, err := cc.inner.CreateTable(ctx, ns, table, ts, location, partSpec)
+func (ms *MetadataStore) CreateTable(ctx context.Context, ns, table string, schema *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
+	tm, err := ms.inner.CreateTable(ctx, ns, table, schema, location, partSpec)
 	if err != nil {
 		return nil, err
 	}
 
 	key := tableKey{ns, table}
-	cc.mu.Lock()
-	cc.putLocked(key, &cachedTable{tm: tm, lastAccess: time.Now()})
-	cc.mu.Unlock()
+	ms.mu.Lock()
+	ms.putLocked(key, &tableStore{
+		tm:        tm,
+		fileIndex: NewFileIndex(), // seed empty so incremental updates work from first commit
+		lastAccess: time.Now(),
+	})
+	ms.mu.Unlock()
 
 	return tm, nil
 }
 
-func (cc *CachedCatalog) CommitSnapshot(ctx context.Context, ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
-	if err := cc.inner.CommitSnapshot(ctx, ns, table, currentSnapshotID, snapshot); err != nil {
+// CommitSnapshot commits a snapshot and seamlessly updates all cached state
+// from the TableCommit metadata (manifests, data files, file index).
+func (ms *MetadataStore) CommitSnapshot(ctx context.Context, ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
+	if err := ms.inner.CommitSnapshot(ctx, ns, table, currentSnapshotID, snapshot); err != nil {
 		return err
 	}
 
-	// Update cache with the new snapshot state.
 	key := tableKey{ns, table}
-	cc.mu.Lock()
-	cc.applySnapshotLocked(key, snapshot)
-	cc.mu.Unlock()
+	ms.mu.Lock()
+	ms.applySnapshotLocked(key, snapshot)
+	ms.mu.Unlock()
 
 	return nil
 }
 
-func (cc *CachedCatalog) CommitTransaction(ctx context.Context, ns string, commits []TableCommit) error {
-	if err := cc.inner.CommitTransaction(ctx, ns, commits); err != nil {
+// CommitTransaction commits atomically and seamlessly updates all cached
+// state for every table in the transaction. Post-commit metadata from each
+// TableCommit (manifests, new data files, deleted PKs) is applied to the
+// cache — callers never need a separate "apply" step.
+func (ms *MetadataStore) CommitTransaction(ctx context.Context, ns string, commits []TableCommit) error {
+	if err := ms.inner.CommitTransaction(ctx, ns, commits); err != nil {
 		return err
 	}
 
-	cc.mu.Lock()
+	ms.mu.Lock()
 	for _, tc := range commits {
 		key := tableKey{ns, tc.Table}
-		cc.applySnapshotLocked(key, tc.Snapshot)
+		ms.applySnapshotLocked(key, tc.Snapshot)
+		ms.applyPostCommitLocked(key, tc)
 	}
-	cc.mu.Unlock()
+	ms.mu.Unlock()
 
 	return nil
 }
 
-func (cc *CachedCatalog) EvolveSchema(ctx context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
-	newID, err := cc.inner.EvolveSchema(ctx, ns, table, currentSchemaID, newSchema)
+func (ms *MetadataStore) EvolveSchema(ctx context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
+	newID, err := ms.inner.EvolveSchema(ctx, ns, table, currentSchemaID, newSchema)
 	if err != nil {
 		return 0, err
 	}
 
 	key := tableKey{ns, table}
-	cc.mu.Lock()
-	if ct, ok := cc.tables[key]; ok {
-		ct.tm.Metadata.CurrentSchemaID = newID
-		ct.lastAccess = time.Now()
+	ms.mu.Lock()
+	if ts, ok := ms.tables[key]; ok {
+		ts.tm.Metadata.CurrentSchemaID = newID
+		ts.lastAccess = time.Now()
 	}
-	cc.mu.Unlock()
+	ms.mu.Unlock()
 
 	return newID, nil
 }
 
-// --- Manifest cache ---
+// --- Metadata cache ---
 
-// Manifests returns the cached manifest list for a table, or nil if not cached.
-func (cc *CachedCatalog) Manifests(ns, table string) []ManifestFileInfo {
+func (ms *MetadataStore) Manifests(ns, table string) []ManifestFileInfo {
 	key := tableKey{ns, table}
-	cc.mu.RLock()
-	defer cc.mu.RUnlock()
-	if ct, ok := cc.tables[key]; ok {
-		return ct.manifests
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	if ts, ok := ms.tables[key]; ok {
+		return ts.manifests
 	}
 	return nil
 }
 
-// SetManifests updates the cached manifest list for a table.
-func (cc *CachedCatalog) SetManifests(ns, table string, manifests []ManifestFileInfo) {
+func (ms *MetadataStore) SetManifests(ns, table string, manifests []ManifestFileInfo) {
 	key := tableKey{ns, table}
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	if ct, ok := cc.tables[key]; ok {
-		ct.manifests = manifests
-		ct.lastAccess = time.Now()
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ts, ok := ms.tables[key]; ok {
+		ts.manifests = manifests
+		ts.lastAccess = time.Now()
 	}
 }
 
-// --- GetConfig pass-through ---
-
-func (cc *CachedCatalog) GetConfig(ctx context.Context, warehouse string) (*CatalogConfig, error) {
-	return cc.inner.GetConfig(ctx, warehouse)
+func (ms *MetadataStore) DataFiles(ns, table string) []DataFileInfo {
+	key := tableKey{ns, table}
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	if ts, ok := ms.tables[key]; ok {
+		return ts.dataFiles
+	}
+	return nil
 }
 
-// SetPrefix delegates to the inner CatalogClient.
-func (cc *CachedCatalog) SetPrefix(prefix string) {
-	cc.inner.SetPrefix(prefix)
+func (ms *MetadataStore) SetDataFiles(ns, table string, files []DataFileInfo) {
+	key := tableKey{ns, table}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ts, ok := ms.tables[key]; ok {
+		ts.dataFiles = files
+		ts.lastAccess = time.Now()
+	}
+}
+
+func (ms *MetadataStore) FileIndex(ns, table string) *FileIndex {
+	key := tableKey{ns, table}
+	ms.mu.RLock()
+	defer ms.mu.RUnlock()
+	if ts, ok := ms.tables[key]; ok {
+		return ts.fileIndex
+	}
+	return nil
+}
+
+func (ms *MetadataStore) SetFileIndex(ns, table string, idx *FileIndex) {
+	key := tableKey{ns, table}
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ts, ok := ms.tables[key]; ok {
+		ts.fileIndex = idx
+		ts.lastAccess = time.Now()
+	}
+}
+
+// --- GetConfig / SetPrefix pass-through ---
+
+func (ms *MetadataStore) GetConfig(ctx context.Context, warehouse string) (*CatalogConfig, error) {
+	return ms.inner.GetConfig(ctx, warehouse)
+}
+
+func (ms *MetadataStore) SetPrefix(prefix string) {
+	ms.inner.SetPrefix(prefix)
 }
 
 // --- Internal helpers ---
 
-// applySnapshotLocked updates cached table metadata after a successful commit.
-// Must be called with cc.mu held for writing.
-func (cc *CachedCatalog) applySnapshotLocked(key tableKey, snapshot SnapshotCommit) {
-	ct, ok := cc.tables[key]
+// applySnapshotLocked updates cached TableMetadata after a successful commit.
+func (ms *MetadataStore) applySnapshotLocked(key tableKey, snapshot SnapshotCommit) {
+	ts, ok := ms.tables[key]
 	if !ok {
 		return
 	}
-	ct.tm.Metadata.CurrentSnapshotID = snapshot.SnapshotID
-	ct.tm.Metadata.LastSequenceNumber = snapshot.SequenceNumber
-	ct.tm.Metadata.LastUpdatedMs = snapshot.TimestampMs
+	ts.tm.Metadata.CurrentSnapshotID = snapshot.SnapshotID
+	ts.tm.Metadata.LastSequenceNumber = snapshot.SequenceNumber
+	ts.tm.Metadata.LastUpdatedMs = snapshot.TimestampMs
 
-	// Append snapshot to the metadata snapshots list.
-	ct.tm.Metadata.Snapshots = append(ct.tm.Metadata.Snapshots, struct {
+	ts.tm.Metadata.Snapshots = append(ts.tm.Metadata.Snapshots, struct {
 		SnapshotID     int64             `json:"snapshot-id"`
 		TimestampMs    int64             `json:"timestamp-ms"`
 		ManifestList   string            `json:"manifest-list"`
@@ -260,35 +315,66 @@ func (cc *CachedCatalog) applySnapshotLocked(key tableKey, snapshot SnapshotComm
 		SequenceNumber: snapshot.SequenceNumber,
 	})
 
-	ct.lastAccess = time.Now()
+	ts.lastAccess = time.Now()
+}
+
+// applyPostCommitLocked updates manifests, data files, and file index
+// from a TableCommit's post-commit metadata. This is the seamless part:
+// callers put everything in TableCommit, the store applies it all.
+func (ms *MetadataStore) applyPostCommitLocked(key tableKey, tc TableCommit) {
+	ts, ok := ms.tables[key]
+	if !ok {
+		return
+	}
+
+	// Update manifest list.
+	if tc.NewManifests != nil {
+		ts.manifests = tc.NewManifests
+	}
+
+	// Update file index incrementally.
+	if ts.fileIndex != nil {
+		for _, pk := range tc.DeletedPKs {
+			if filePath, ok := ts.fileIndex.PkToFile[pk]; ok {
+				delete(ts.fileIndex.PkToFile, pk)
+				if pks, ok := ts.fileIndex.FilePKs[filePath]; ok {
+					delete(pks, pk)
+				}
+			}
+		}
+		for _, fe := range tc.NewDataFiles {
+			ts.fileIndex.AddFile(fe.DataFile, fe.PKKeys)
+		}
+		ts.fileIndex.SnapshotID = tc.Snapshot.SnapshotID
+	}
+
+	ts.lastAccess = time.Now()
 }
 
 // putLocked inserts a cache entry, evicting the LRU entry if at capacity.
-// Must be called with cc.mu held for writing.
-func (cc *CachedCatalog) putLocked(key tableKey, ct *cachedTable) {
-	cc.tables[key] = ct
+func (ms *MetadataStore) putLocked(key tableKey, ts *tableStore) {
+	ms.tables[key] = ts
 
-	if len(cc.tables) > cc.maxTables {
-		cc.evictLRULocked()
+	if len(ms.tables) > ms.maxTables {
+		ms.evictLRULocked()
 	}
 }
 
 // evictLRULocked removes the least recently accessed table entry.
-// Must be called with cc.mu held for writing.
-func (cc *CachedCatalog) evictLRULocked() {
+func (ms *MetadataStore) evictLRULocked() {
 	var oldestKey tableKey
 	var oldestTime time.Time
 	first := true
 
-	for k, ct := range cc.tables {
-		if first || ct.lastAccess.Before(oldestTime) {
+	for k, ts := range ms.tables {
+		if first || ts.lastAccess.Before(oldestTime) {
 			oldestKey = k
-			oldestTime = ct.lastAccess
+			oldestTime = ts.lastAccess
 			first = false
 		}
 	}
 
 	if !first {
-		delete(cc.tables, oldestKey)
+		delete(ms.tables, oldestKey)
 	}
 }

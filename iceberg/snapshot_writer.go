@@ -31,7 +31,7 @@ type SnapshotWriterConfig struct {
 // does not create its own goroutines or pools.
 type SnapshotWriter struct {
 	cfg     SnapshotWriterConfig
-	catalog CatalogWithCache
+	catalog MetadataCache
 	s3      ObjectStorage
 
 	// Per-partition writers, keyed by partition key string ("" for unpartitioned).
@@ -42,10 +42,11 @@ type snapshotPartition struct {
 	writer     *RollingWriter
 	partValues map[string]any
 	partPath   string
+	pkKeys     []string // PK keys for rows in this partition (for FileIndex seeding)
 }
 
 // NewSnapshotWriter creates a new snapshot writer.
-func NewSnapshotWriter(cfg SnapshotWriterConfig, catalog CatalogWithCache, s3 ObjectStorage) *SnapshotWriter {
+func NewSnapshotWriter(cfg SnapshotWriterConfig, catalog MetadataCache, s3 ObjectStorage) *SnapshotWriter {
 	return &SnapshotWriter{
 		cfg:        cfg,
 		catalog:    catalog,
@@ -54,7 +55,8 @@ func NewSnapshotWriter(cfg SnapshotWriterConfig, catalog CatalogWithCache, s3 Ob
 	}
 }
 
-// AddRow routes a row to the correct partition writer.
+// AddRow routes a row to the correct partition writer and tracks the PK
+// for FileIndex seeding.
 func (sw *SnapshotWriter) AddRow(row map[string]any) error {
 	key := ""
 	partitioned := sw.cfg.PartSpec != nil && !sw.cfg.PartSpec.IsUnpartitioned()
@@ -72,6 +74,11 @@ func (sw *SnapshotWriter) AddRow(row map[string]any) error {
 			sp.partPath = sw.cfg.PartSpec.PartitionPath(sp.partValues)
 		}
 		sw.partitions[key] = sp
+	}
+
+	// Track PK for FileIndex seeding (append-only, no deletes in snapshots).
+	if pk := sw.cfg.SrcSchema.PK; len(pk) > 0 {
+		sp.pkKeys = append(sp.pkKeys, BuildPKKey(row, pk))
 	}
 
 	return sp.writer.Add(row)
@@ -99,6 +106,7 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 		key             string
 		chunk           FileChunk
 		partitionValues map[string]any
+		pkKeys          []string // for FileIndex seeding
 	}
 
 	var pending []pendingFile
@@ -115,7 +123,13 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 		if partitioned && sp.partValues != nil {
 			avroPartValues = cfg.PartSpec.PartitionAvroValue(sp.partValues, cfg.SrcSchema)
 		}
+		// Distribute PKs across chunks proportionally by row count.
+		pkOffset := 0
 		for i, chunk := range chunks {
+			end := pkOffset + int(chunk.RowCount)
+			if end > len(sp.pkKeys) {
+				end = len(sp.pkKeys)
+			}
 			var fileKey string
 			if partitioned && sp.partPath != "" {
 				fileKey = fmt.Sprintf("%s/data/%s/%s-snap-%d.parquet", basePath, sp.partPath, uuid.New().String(), i)
@@ -126,7 +140,9 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 				key:             fileKey,
 				chunk:           chunk,
 				partitionValues: avroPartValues,
+				pkKeys:          sp.pkKeys[pkOffset:end],
 			})
+			pkOffset = end
 		}
 	}
 
@@ -194,20 +210,25 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 	now := time.Now()
 	snapshotID := now.UnixMilli()
 
-	// Build manifest entries from uploaded files.
+	// Build manifest entries and FileIndex entries from uploaded files.
 	entries := make([]ManifestEntry, len(uploaded))
+	var newDataFiles []FileIndexEntry
 	var totalRows int64
 	for i, u := range uploaded {
+		df := DataFileInfo{
+			Path:            u.uri,
+			FileSizeBytes:   int64(len(u.pf.chunk.Data)),
+			RecordCount:     u.pf.chunk.RowCount,
+			Content:         0,
+			PartitionValues: u.pf.partitionValues,
+		}
 		entries[i] = ManifestEntry{
 			Status:     1,
 			SnapshotID: snapshotID,
-			DataFile: DataFileInfo{
-				Path:            u.uri,
-				FileSizeBytes:   int64(len(u.pf.chunk.Data)),
-				RecordCount:     u.pf.chunk.RowCount,
-				Content:         0,
-				PartitionValues: u.pf.partitionValues,
-			},
+			DataFile:   df,
+		}
+		if len(u.pf.pkKeys) > 0 {
+			newDataFiles = append(newDataFiles, FileIndexEntry{DataFile: df, PKKeys: u.pf.pkKeys})
 		}
 		totalRows += u.pf.chunk.RowCount
 	}
@@ -258,12 +279,16 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 		},
 	}
 
-	if err := sw.catalog.CommitSnapshot(ctx, cfg.Namespace, cfg.IcebergName, prevSnapID, commit); err != nil {
+	tc := TableCommit{
+		Table:             cfg.IcebergName,
+		CurrentSnapshotID: prevSnapID,
+		Snapshot:          commit,
+		NewManifests:      allManifests,
+		NewDataFiles:      newDataFiles,
+	}
+	if err := sw.catalog.CommitTransaction(ctx, cfg.Namespace, []TableCommit{tc}); err != nil {
 		return 0, fmt.Errorf("commit snapshot: %w", err)
 	}
-
-	// Update catalog manifest cache for next chunk.
-	sw.catalog.SetManifests(cfg.Namespace, cfg.IcebergName, allManifests)
 
 	log.Printf("[snapshot-writer] committed %d rows (%d files) to %s.%s (snapshot=%d, seq=%d)",
 		totalRows, len(entries), cfg.Namespace, cfg.IcebergName, snapshotID, seqNum)

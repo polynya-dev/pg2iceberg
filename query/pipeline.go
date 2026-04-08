@@ -28,7 +28,7 @@ type Pipeline struct {
 	writers map[string]*iceberg.TableWriter // per-table Iceberg writer
 	schemas map[string]*postgres.TableSchema
 
-	catalog iceberg.CatalogWithCache
+	catalog iceberg.MetadataCache
 	s3      iceberg.ObjectStorage
 	store   pipeline.CheckpointStore
 
@@ -79,7 +79,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 }
 
 // NewPipeline creates a Pipeline with injected dependencies (for tests).
-func NewPipeline(id string, cfg *config.Config, s3 iceberg.ObjectStorage, catalog iceberg.CatalogWithCache, store pipeline.CheckpointStore) *Pipeline {
+func NewPipeline(id string, cfg *config.Config, s3 iceberg.ObjectStorage, catalog iceberg.MetadataCache, store pipeline.CheckpointStore) *Pipeline {
 	return &Pipeline{
 		id:      id,
 		cfg:     cfg,
@@ -449,9 +449,8 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	pipeline.QueryFlushTotal.WithLabelValues(p.id).Inc()
 	pipeline.QueryFlushDurationSeconds.WithLabelValues(p.id).Observe(time.Since(start).Seconds())
 
-	// Post-commit: update manifest caches + emit per-table metrics.
+	// Post-commit metrics (manifest/file-index updates handled by MetadataStore).
 	for _, tp := range preps {
-		p.writers[tp.pgTable].ApplyPostCommit(tp.prepared)
 		pipeline.QueryDataFilesWrittenTotal.WithLabelValues(p.id, tp.pgTable).Add(float64(tp.prepared.DataCount))
 		pipeline.QueryDeleteFilesWrittenTotal.WithLabelValues(p.id, tp.pgTable).Add(float64(tp.prepared.DeleteCount))
 		log.Printf("[query:%s] flushed %s: %d data files, %d delete files",
@@ -474,12 +473,11 @@ func (p *Pipeline) flush(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = p.catalog.CommitSnapshot(ctx, p.cfg.Sink.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
+		err = p.catalog.CommitTransaction(ctx, p.cfg.Sink.Namespace, []iceberg.TableCommit{compacted.ToTableCommit()})
 		if err != nil {
 			log.Printf("[query:%s] compaction commit error for %s: %v", p.id, tp.pgTable, err)
 			continue
 		}
-		tw.ApplyPostCommit(compacted)
 	}
 
 	// Checkpoint watermarks.

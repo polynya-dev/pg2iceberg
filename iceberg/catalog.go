@@ -366,11 +366,20 @@ type SnapshotCommit struct {
 }
 
 // TableCommit holds the data needed to commit a snapshot for one table
-// within a multi-table transaction.
+// within a multi-table transaction. It also carries post-commit cache
+// updates that the MetadataCache applies atomically after the real
+// catalog commit succeeds.
 type TableCommit struct {
 	Table             string
 	CurrentSnapshotID int64
 	Snapshot          SnapshotCommit
+
+	// Post-commit cache updates. These are applied by MetadataCache
+	// after the catalog write succeeds — callers never need to call
+	// SetManifests/SetFileIndex manually.
+	NewManifests []ManifestFileInfo // full manifest list after this commit
+	NewDataFiles []FileIndexEntry   // data files written (for incremental FileIndex)
+	DeletedPKs   []string           // PKs equality-deleted (for incremental FileIndex)
 }
 
 // CommitTransaction atomically commits snapshots to multiple tables using

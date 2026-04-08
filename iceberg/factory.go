@@ -12,7 +12,7 @@ import (
 
 // IcebergClients holds the catalog and storage clients needed by all pipelines.
 type IcebergClients struct {
-	Catalog CatalogWithCache
+	Catalog MetadataCache
 	S3      ObjectStorage // nil in vended mode until EnsureStorage is called
 
 	credentialMode string
@@ -44,7 +44,7 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 	}
 
 	catalogClient := NewCatalogClient(cfg.CatalogURI, httpClient)
-	cachedCatalog := NewCachedCatalog(catalogClient, 0)
+	cachedCatalog := NewMetadataStore(catalogClient, 0)
 
 	ic := &IcebergClients{
 		Catalog:        cachedCatalog,

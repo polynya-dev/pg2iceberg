@@ -34,11 +34,10 @@ func writeTestData(t *testing.T, ctx context.Context, tw *TableWriter, catalog *
 		if prepared == nil {
 			continue
 		}
-		err = catalog.CommitSnapshot(ctx, ns, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit)
+		err = catalog.CommitTransaction(ctx, ns, []TableCommit{prepared.ToTableCommit()})
 		if err != nil {
-			t.Fatalf("CommitSnapshot: %v", err)
+			t.Fatalf("CommitTransaction: %v", err)
 		}
-		tw.ApplyPostCommit(prepared)
 	}
 }
 
@@ -101,7 +100,7 @@ func (m *testCompactStorage) fileCount() int {
 	return len(m.files)
 }
 
-// testCompactCatalog is an in-memory CatalogWithCache for testing.
+// testCompactCatalog is an in-memory MetadataCache for testing.
 type testCompactCatalog struct {
 	mu        sync.Mutex
 	tables    map[string]*TableMetadata
@@ -167,6 +166,9 @@ func (c *testCompactCatalog) CommitTransaction(ctx context.Context, ns string, c
 		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
 		}
+		if tc.NewManifests != nil {
+			c.SetManifests(ns, tc.Table, tc.NewManifests)
+		}
 	}
 	return nil
 }
@@ -186,6 +188,11 @@ func (c *testCompactCatalog) SetManifests(ns, table string, manifests []Manifest
 	defer c.mu.Unlock()
 	c.manifests[ns+"."+table] = manifests
 }
+
+func (c *testCompactCatalog) DataFiles(ns, table string) []DataFileInfo   { return nil }
+func (c *testCompactCatalog) SetDataFiles(ns, table string, _ []DataFileInfo) {}
+func (c *testCompactCatalog) FileIndex(ns, table string) *FileIndex       { return nil }
+func (c *testCompactCatalog) SetFileIndex(ns, table string, _ *FileIndex) {}
 
 func TestCompact_MergesSmallFiles(t *testing.T) {
 	ctx := context.Background()
@@ -242,11 +249,10 @@ func TestCompact_MergesSmallFiles(t *testing.T) {
 	}
 
 	// Commit the compacted snapshot.
-	err = catalog.CommitSnapshot(ctx, ns, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit)
+	err = catalog.CommitTransaction(ctx, ns, []TableCommit{prepared.ToTableCommit()})
 	if err != nil {
-		t.Fatalf("CommitSnapshot: %v", err)
+		t.Fatalf("CommitTransaction: %v", err)
 	}
-	tw.ApplyPostCommit(prepared)
 
 	// Verify fewer files after compaction.
 	tm, _ = catalog.LoadTable(ctx, ns, "orders")
@@ -342,11 +348,10 @@ func TestCompact_AppliesDeletes_PreservesUpdates(t *testing.T) {
 		t.Fatal("expected compaction to run")
 	}
 
-	err = catalog.CommitSnapshot(ctx, ns, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit)
+	err = catalog.CommitTransaction(ctx, ns, []TableCommit{prepared.ToTableCommit()})
 	if err != nil {
-		t.Fatalf("CommitSnapshot: %v", err)
+		t.Fatalf("CommitTransaction: %v", err)
 	}
-	tw.ApplyPostCommit(prepared)
 
 	// Verify: no delete files after compaction.
 	tm, _ = catalog.LoadTable(ctx, ns, "orders")

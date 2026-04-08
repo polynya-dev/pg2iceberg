@@ -41,7 +41,7 @@ type Sink struct {
 	tableCfgs  []config.TableConfig
 	pipelineID string // for metrics labeling
 
-	catalog iceberg.CatalogWithCache
+	catalog iceberg.MetadataCache
 	s3      iceberg.ObjectStorage
 
 	// Per-table state: keyed by PG table name (e.g. "public.orders").
@@ -123,7 +123,7 @@ func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID
 
 // NewSink creates a Sink with the given dependencies.
 // eventBuf is optional — pass nil to disable in-memory event buffering.
-func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 iceberg.ObjectStorage, catalog iceberg.CatalogWithCache, eventBuf EventBuffer) *Sink {
+func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 iceberg.ObjectStorage, catalog iceberg.MetadataCache, eventBuf EventBuffer) *Sink {
 	return &Sink{
 		cfg:                 cfg,
 		tableCfgs:           tableCfgs,
@@ -157,7 +157,7 @@ func (s *Sink) Close() {}
 func (s *Sink) SetS3(s3 iceberg.ObjectStorage) { s.s3 = s3 }
 
 // Catalog returns the catalog client.
-func (s *Sink) Catalog() iceberg.CatalogWithCache { return s.catalog }
+func (s *Sink) Catalog() iceberg.MetadataCache { return s.catalog }
 
 // S3 returns the S3 client.
 func (s *Sink) S3() iceberg.ObjectStorage { return s.s3 }
@@ -676,11 +676,12 @@ func (s *Sink) Flush(ctx context.Context) error {
 
 // preparedFlush holds everything needed to commit an events table after S3 writes complete.
 type preparedFlush struct {
-	pgTable    string
-	ts         *tableSink
-	snapshotID int64
-	prevSnapID int64
-	commit     iceberg.SnapshotCommit
+	pgTable      string
+	ts           *tableSink
+	snapshotID   int64
+	prevSnapID   int64
+	commit       iceberg.SnapshotCommit
+	newManifests []iceberg.ManifestFileInfo // carried through to TableCommit for seamless cache update
 }
 
 // flushAllTables serializes, uploads, and commits events for all tables.
@@ -773,6 +774,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 			Table:             pf.ts.eventsIcebergName,
 			CurrentSnapshotID: pf.prevSnapID,
 			Snapshot:          pf.commit,
+			NewManifests:      pf.newManifests,
 		}
 	}
 
@@ -967,9 +969,9 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 		})
 	}
 
-	// Write manifest list (existing + new) and update catalog cache.
+	// Write manifest list (existing + new). Cache update happens seamlessly
+	// via TableCommit.NewManifests when CommitTransaction succeeds.
 	allManifests := append(existingManifests, manifestInfos...)
-	s.catalog.SetManifests(s.cfg.Namespace, ts.eventsIcebergName, allManifests)
 	mlBytes, err := iceberg.WriteManifestList(allManifests)
 	if err != nil {
 		return nil, fmt.Errorf("write manifest list: %w", err)
@@ -998,10 +1000,11 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 	}
 
 	return &preparedFlush{
-		pgTable:    pgTable,
-		ts:         ts,
-		snapshotID: snapshotID,
-		prevSnapID: tm.Metadata.CurrentSnapshotID,
+		pgTable:      pgTable,
+		ts:           ts,
+		snapshotID:   snapshotID,
+		prevSnapID:   tm.Metadata.CurrentSnapshotID,
+		newManifests: allManifests,
 		commit: iceberg.SnapshotCommit{
 			SnapshotID:       snapshotID,
 			SequenceNumber:   seqNum,

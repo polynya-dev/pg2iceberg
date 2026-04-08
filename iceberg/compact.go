@@ -69,7 +69,7 @@ func ReadParquetRowsFromReaderAt(r io.ReaderAt, size int64, schema *postgres.Tab
 
 // Compact rewrites all data and delete files into clean data-only files.
 // Returns nil if file counts are below thresholds (no compaction needed).
-// The caller must commit the returned PreparedCommit and call ApplyPostCommit.
+// The caller must commit via CommitSnapshot (which updates the MetadataCache).
 func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionConfig) (*PreparedCommit, error) {
 	ctx, span := compactTracer.Start(ctx, "pg2iceberg.compact", trace.WithAttributes(
 		attribute.String("iceberg.table", tw.cfg.IcebergName),
@@ -232,13 +232,14 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 
 	// Build a quick PK→file lookup if we have deletes.
 	affectedFiles := make(map[string]bool) // file paths that need rewriting
-	if len(deletePKSeq) > 0 && tw.FileIdx != nil && tw.FileIdx.SnapshotID == currentSnapID {
+	fileIdx := tw.catalog.FileIndex(ns, cfg.IcebergName)
+	if len(deletePKSeq) > 0 && fileIdx != nil && fileIdx.SnapshotID == currentSnapID {
 		// Use cached file index to find affected files.
 		pks := make([]string, 0, len(deletePKSeq))
 		for pk := range deletePKSeq {
 			pks = append(pks, pk)
 		}
-		affectedFiles = tw.FileIdx.AffectedFiles(pks)
+		affectedFiles = fileIdx.AffectedFiles(pks)
 		log.Printf("[compact] %s: %d/%d data files affected by deletes",
 			cfg.IcebergName, len(affectedFiles), len(dataFiles))
 	} else if len(deletePKSeq) > 0 {

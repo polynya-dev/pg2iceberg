@@ -467,6 +467,9 @@ func (c *memCatalog) CommitTransaction(ctx context.Context, ns string, commits [
 		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
 		}
+		if tc.NewManifests != nil {
+			c.SetManifests(ns, tc.Table, tc.NewManifests)
+		}
 	}
 	return nil
 }
@@ -486,3 +489,9 @@ func (c *memCatalog) SetManifests(ns, table string, manifests []iceberg.Manifest
 	defer c.mu.Unlock()
 	c.manifests[ns+"."+table] = manifests
 }
+
+func (c *memCatalog) DataFiles(ns, table string) []iceberg.DataFileInfo   { return nil }
+func (c *memCatalog) SetDataFiles(ns, table string, _ []iceberg.DataFileInfo) {}
+func (c *memCatalog) FileIndex(ns, table string) *iceberg.FileIndex       { return nil }
+func (c *memCatalog) SetFileIndex(ns, table string, _ *iceberg.FileIndex) {}
+

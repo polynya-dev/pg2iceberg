@@ -20,7 +20,7 @@ const (
 )
 
 // TableLoader is the subset of Catalog needed for credential refresh.
-// VendedS3Client uses this instead of the full Catalog or CatalogWithCache
+// VendedS3Client uses this instead of the full Catalog or MetadataCache
 // so that credential refresh always bypasses the metadata cache.
 type TableLoader interface {
 	LoadTable(ctx context.Context, ns, table string) (*TableMetadata, error)

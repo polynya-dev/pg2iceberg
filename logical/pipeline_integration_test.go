@@ -1499,18 +1499,20 @@ func (m *memStorage) StatObject(_ context.Context, key string) (int64, error) {
 	return int64(len(data)), nil
 }
 
-// memCatalog is an in-memory CatalogWithCache implementation for testing.
+// memCatalog is an in-memory MetadataCache implementation for testing.
 type memCatalog struct {
-	mu        sync.Mutex
-	tables    map[string]*iceberg.TableMetadata    // keyed by "ns.table"
-	manifests map[string][]iceberg.ManifestFileInfo // keyed by "ns.table"
-	nextID    int64
+	mu         sync.Mutex
+	tables     map[string]*iceberg.TableMetadata    // keyed by "ns.table"
+	manifests  map[string][]iceberg.ManifestFileInfo // keyed by "ns.table"
+	fileIdxs   map[string]*iceberg.FileIndex         // keyed by "ns.table"
+	nextID     int64
 }
 
 func newMemCatalog() *memCatalog {
 	return &memCatalog{
 		tables:    make(map[string]*iceberg.TableMetadata),
 		manifests: make(map[string][]iceberg.ManifestFileInfo),
+		fileIdxs:  make(map[string]*iceberg.FileIndex),
 		nextID: 1,
 	}
 }
@@ -1531,6 +1533,7 @@ func (c *memCatalog) CreateTable(_ context.Context, ns, table string, ts *postgr
 	tm.Metadata.FormatVersion = 2
 	tm.Metadata.Location = location
 	c.tables[ns+"."+table] = tm
+	c.fileIdxs[ns+"."+table] = iceberg.NewFileIndex() // seed empty for incremental updates
 	return tm, nil
 }
 
@@ -1568,6 +1571,25 @@ func (c *memCatalog) CommitTransaction(ctx context.Context, ns string, commits [
 		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
 		}
+		if tc.NewManifests != nil {
+			c.SetManifests(ns, tc.Table, tc.NewManifests)
+		}
+		// Apply incremental file index updates (mirrors MetadataStore behavior).
+		fi := c.FileIndex(ns, tc.Table)
+		if fi != nil {
+			for _, pk := range tc.DeletedPKs {
+				if filePath, ok := fi.PkToFile[pk]; ok {
+					delete(fi.PkToFile, pk)
+					if pks, ok := fi.FilePKs[filePath]; ok {
+						delete(pks, pk)
+					}
+				}
+			}
+			for _, fe := range tc.NewDataFiles {
+				fi.AddFile(fe.DataFile, fe.PKKeys)
+			}
+			fi.SnapshotID = tc.Snapshot.SnapshotID
+		}
 	}
 	return nil
 }
@@ -1586,6 +1608,21 @@ func (c *memCatalog) SetManifests(ns, table string, manifests []iceberg.Manifest
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.manifests[ns+"."+table] = manifests
+}
+
+func (c *memCatalog) DataFiles(ns, table string) []iceberg.DataFileInfo   { return nil }
+func (c *memCatalog) SetDataFiles(ns, table string, _ []iceberg.DataFileInfo) {}
+
+func (c *memCatalog) FileIndex(ns, table string) *iceberg.FileIndex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fileIdxs[ns+"."+table]
+}
+
+func (c *memCatalog) SetFileIndex(ns, table string, idx *iceberg.FileIndex) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fileIdxs[ns+"."+table] = idx
 }
 
 // failOnceCatalog wraps memCatalog and fails the first CommitTransaction call.
@@ -1975,4 +2012,295 @@ func TestRetry_Toxiproxy_NetworkBlip(t *testing.T) {
 		t.Error("expected files in storage after flush, got 0")
 	}
 	t.Logf("storage has %d files after recovery", fileCount)
+}
+
+// trackingStorage wraps memStorage and records read operations
+// (Download, DownloadRange, StatObject). Used to verify that
+// steady-state materialization does zero S3 reads.
+type trackingStorage struct {
+	*memStorage
+	mu        sync.Mutex
+	readLog   []string // e.g. "Download:key", "StatObject:key"
+}
+
+func newTrackingStorage() *trackingStorage {
+	return &trackingStorage{memStorage: newMemStorage()}
+}
+
+func (t *trackingStorage) Download(ctx context.Context, key string) ([]byte, error) {
+	t.mu.Lock()
+	t.readLog = append(t.readLog, "Download:"+key)
+	t.mu.Unlock()
+	return t.memStorage.Download(ctx, key)
+}
+
+func (t *trackingStorage) DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	t.mu.Lock()
+	t.readLog = append(t.readLog, fmt.Sprintf("DownloadRange:%s", key))
+	t.mu.Unlock()
+	return t.memStorage.DownloadRange(ctx, key, offset, length)
+}
+
+func (t *trackingStorage) StatObject(ctx context.Context, key string) (int64, error) {
+	t.mu.Lock()
+	t.readLog = append(t.readLog, "StatObject:"+key)
+	t.mu.Unlock()
+	return t.memStorage.StatObject(ctx, key)
+}
+
+func (t *trackingStorage) readOps() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, len(t.readLog))
+	copy(out, t.readLog)
+	return out
+}
+
+func (t *trackingStorage) resetReadLog() {
+	t.mu.Lock()
+	t.readLog = nil
+	t.mu.Unlock()
+}
+
+// TestMaterializer_ZeroS3ReadsAfterFirstCycle verifies that after the first
+// materialization cycle, subsequent cycles do NOT perform any S3 read operations
+// (Download, DownloadRange, StatObject). All reads should be served from the
+// CachedCatalog and the incrementally-updated FileIndex.
+//
+// TOAST resolution (which requires reading parquet files) is NOT tested here;
+// this test uses a simple schema with no TOAST columns.
+func TestMaterializer_ZeroS3ReadsAfterFirstCycle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE items (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "1s",
+		FlushRows:            3,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.items"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_s3reads",
+				SlotName:        "test_slot_s3reads",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newTrackingStorage()
+	cat := newTrackingCatalog()
+	eventBuf := logical.NewChangeEventBuffer()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p.SetEventBuf(eventBuf)
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	// --- Cycle 1: Insert first batch, wait for materialization ---
+	for i := 0; i < 3; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO items (name) VALUES ($1)", fmt.Sprintf("item-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 1 })
+	t.Logf("cycle 1 complete, S3 reads: %d", len(mem.readOps()))
+
+	// Reset the read log AFTER the first cycle. The first cycle is allowed
+	// to do S3 reads (cold start: manifest loading, file index building).
+	mem.resetReadLog()
+
+	// --- Cycle 2: Insert second batch ---
+	for i := 3; i < 6; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO items (name) VALUES ($1)", fmt.Sprintf("item-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 2 })
+	reads2 := mem.readOps()
+	t.Logf("cycle 2 S3 reads: %d %v", len(reads2), reads2)
+
+	// --- Cycle 3: Insert + update + delete ---
+	for i := 6; i < 9; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO items (name) VALUES ($1)", fmt.Sprintf("item-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	if _, err := conn.Exec(ctx, "UPDATE items SET name = 'updated' WHERE id = 1"); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := conn.Exec(ctx, "DELETE FROM items WHERE id = 2"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 3 })
+	reads3 := mem.readOps()
+	t.Logf("cycle 2+3 cumulative S3 reads: %d %v", len(reads3), reads3)
+
+	// Assert: ZERO S3 read operations after the first cycle.
+	// All catalog metadata is served from CachedCatalog, and the FileIndex
+	// is updated incrementally — no manifest downloads or parquet reads.
+	if len(reads3) > 0 {
+		t.Errorf("expected zero S3 reads after first cycle, got %d:\n", len(reads3))
+		for _, r := range reads3 {
+			t.Errorf("  %s", r)
+		}
+	} else {
+		t.Log("confirmed: zero S3 reads after first materialization cycle")
+	}
+}
+
+// TestPipeline_ZeroS3ReadsAfterSnapshot verifies that when replicating from
+// scratch (snapshot + CDC), the materializer NEVER performs S3 read operations
+// — not even on the first cycle. The SnapshotWriter seeds the FileIndex during
+// the snapshot phase, so the materializer's first BuildFileIndex is a cache hit.
+func TestPipeline_ZeroS3ReadsAfterSnapshot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	// Pre-populate PG table with rows that will be snapshotted.
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE widgets (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+		INSERT INTO widgets (name) SELECT 'widget-' || i FROM generate_series(1, 20) AS i;
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "1s",
+		FlushRows:            5,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.widgets"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_snapreads",
+				SlotName:        "test_slot_snapreads",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newTrackingStorage()
+	cat := newTrackingCatalog()
+	eventBuf := logical.NewChangeEventBuffer()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore())
+	p.SetEventBuf(eventBuf)
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	// Wait for snapshot to complete and pipeline to be running.
+	waitForStatus(t, p, pipeline.StatusRunning, 60*time.Second)
+	t.Log("snapshot complete, pipeline running")
+
+	// Reset the read log and record baseline commit count AFTER snapshot.
+	mem.resetReadLog()
+	baselineMatCommits := len(cat.matCommits())
+
+	// Insert rows to trigger CDC flush + materialization.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	for i := 0; i < 5; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO widgets (name) VALUES ($1)", fmt.Sprintf("new-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	// Wait for at least one NEW materialization commit (beyond the snapshot).
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) > baselineMatCommits })
+
+	reads := mem.readOps()
+	t.Logf("S3 reads after snapshot: %d", len(reads))
+
+	// Assert: ZERO S3 reads. The snapshot phase seeded the FileIndex and
+	// manifest cache, so the materializer's first cycle should be fully cached.
+	if len(reads) > 0 {
+		t.Errorf("expected zero S3 reads after snapshot, got %d:", len(reads))
+		for _, r := range reads {
+			t.Errorf("  %s", r)
+		}
+	} else {
+		t.Log("confirmed: zero S3 reads after snapshot (including first materialization cycle)")
+	}
 }

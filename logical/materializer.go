@@ -131,7 +131,7 @@ func (b *ChangeEventBuffer) Rollback() {
 // tracks PK→file mappings to resolve TOAST unchanged columns when needed.
 type Materializer struct {
 	cfg     config.SinkConfig
-	catalog iceberg.CatalogWithCache
+	catalog iceberg.MetadataCache
 	s3      iceberg.ObjectStorage
 	tables  map[string]*tableSink
 	buf     *ChangeEventBuffer
@@ -148,16 +148,12 @@ type Materializer struct {
 	recovered bool
 }
 
-// InvalidateFileIndices forces all table writers to rebuild their file indices
-// on the next materialization cycle. Called after the snapshot phase completes
-// so the materializer picks up rows written directly to materialized tables.
-func (m *Materializer) InvalidateFileIndices() {
-	for _, tw := range m.tableWriters {
-		if tw.FileIdx != nil {
-			tw.FileIdx.SnapshotID = 0
-		}
-	}
-}
+// InvalidateFileIndices is a no-op. The SnapshotWriter now seeds the FileIndex
+// via MetadataStore during CommitTransaction, so the materializer's first cycle
+// gets a fully-populated index without any S3 reads.
+//
+// Retained for interface compatibility with callers.
+func (m *Materializer) InvalidateFileIndices() {}
 
 // SyncTableWriter updates the TableWriter's schema after a schema evolution.
 func (m *Materializer) SyncTableWriter(pgTable string) {
@@ -172,7 +168,7 @@ func (m *Materializer) SyncTableWriter(pgTable string) {
 	tw.UpdateSchema(ts.srcSchema, ts.matSchemaID)
 }
 
-func NewMaterializer(cfg config.SinkConfig, catalog iceberg.CatalogWithCache, s3 iceberg.ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
+func NewMaterializer(cfg config.SinkConfig, catalog iceberg.MetadataCache, s3 iceberg.ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
 	writers := make(map[string]*iceberg.TableWriter, len(tables))
 	for pgTable, ts := range tables {
 		writers[pgTable] = iceberg.NewTableWriter(iceberg.TableWriteConfig{
@@ -307,13 +303,19 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		return nil
 	}
 
-	// Phase 3: Atomic multi-table commit.
+	// Phase 3: Atomic multi-table commit. TableCommit carries post-commit
+	// metadata (manifests, file index updates) that the MetadataStore
+	// applies seamlessly after the catalog write succeeds.
 	commits := make([]iceberg.TableCommit, len(prepared))
 	for i, p := range prepared {
-		commits[i] = iceberg.TableCommit{
-			Table:             p.icebergName,
-			CurrentSnapshotID: p.prevSnapID,
-			Snapshot:          p.commit,
+		if p.prepared != nil {
+			commits[i] = p.prepared.ToTableCommit()
+		} else {
+			commits[i] = iceberg.TableCommit{
+				Table:             p.icebergName,
+				CurrentSnapshotID: p.prevSnapID,
+				Snapshot:          p.commit,
+			}
 		}
 	}
 
@@ -359,12 +361,11 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = m.catalog.CommitSnapshot(ctx, m.cfg.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
+		err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, []iceberg.TableCommit{compacted.ToTableCommit()})
 		if err != nil {
 			log.Printf("[materializer] compaction commit error for %s: %v", p.pgTable, err)
 			continue
 		}
-		tw.ApplyPostCommit(compacted)
 	}
 
 	return nil
@@ -420,11 +421,15 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		return nil
 	}
 
-	err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, []iceberg.TableCommit{{
+	tc := iceberg.TableCommit{
 		Table:             prep.icebergName,
 		CurrentSnapshotID: prep.prevSnapID,
 		Snapshot:          prep.commit,
-	}})
+	}
+	if prep.prepared != nil {
+		tc = prep.prepared.ToTableCommit()
+	}
+	err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, []iceberg.TableCommit{tc})
 	if err != nil {
 		return fmt.Errorf("commit materialized snapshot: %w", err)
 	}
@@ -568,8 +573,9 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 		}
 	}
 
-	if len(allUnresolvedPKs) > 0 && tw.FileIdx != nil {
-		affectedFilePaths := tw.FileIdx.AffectedFiles(allUnresolvedPKs)
+	fileIdx := m.catalog.FileIndex(ns, ts.icebergName)
+	if len(allUnresolvedPKs) > 0 && fileIdx != nil {
+		affectedFilePaths := fileIdx.AffectedFiles(allUnresolvedPKs)
 		resolved := 0
 		for path := range affectedFilePaths {
 			dfKey, err := iceberg.KeyFromURI(path)
@@ -664,13 +670,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 }
 
 // applyPostCommit finalizes side effects after a successful catalog commit.
-// Must be called only after CommitTransaction succeeds.
+// Manifest cache and file index updates are handled seamlessly by the
+// MetadataStore during CommitTransaction — only checkpoints and metrics
+// need manual handling here.
 func (m *Materializer) applyPostCommit(prep *preparedMaterialization) {
-	// Delegate manifest cache + file index invalidation to the TableWriter.
-	if tw, ok := m.tableWriters[prep.pgTable]; ok && prep.prepared != nil {
-		tw.ApplyPostCommit(prep.prepared)
-	}
-
 	// Update checkpoint.
 	if prep.fromBuffer && prep.bufSnapID > 0 {
 		m.lastEventsSnapshot[prep.pgTable] = prep.bufSnapID

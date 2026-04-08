@@ -42,7 +42,7 @@ type Table struct {
 
 // Deps holds the dependencies needed for direct-to-Iceberg snapshot writes.
 type Deps struct {
-	Catalog    iceberg.CatalogWithCache
+	Catalog    iceberg.MetadataCache
 	S3         iceberg.ObjectStorage
 	SinkCfg    config.SinkConfig
 	LogicalCfg config.LogicalConfig
