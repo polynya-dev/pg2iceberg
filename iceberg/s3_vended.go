@@ -19,10 +19,18 @@ const (
 	refreshBuffer = 5 * time.Minute
 )
 
+// TableLoader is the subset of Catalog needed for credential refresh.
+// VendedS3Client uses this instead of the full Catalog or CatalogWithCache
+// so that credential refresh always bypasses the metadata cache.
+type TableLoader interface {
+	LoadTable(ctx context.Context, ns, table string) (*TableMetadata, error)
+}
+
 // VendedS3Client implements ObjectStorage using catalog-vended credentials.
-// It refreshes credentials by calling LoadTable when they approach expiry.
+// It refreshes credentials by calling LoadTable directly on the raw catalog
+// client (bypassing the cache) to obtain fresh temporary credentials.
 type VendedS3Client struct {
-	catalog   Catalog
+	catalog   TableLoader
 	namespace string
 	table     string // used for credential refresh via LoadTable
 
@@ -33,7 +41,7 @@ type VendedS3Client struct {
 
 // NewVendedS3Client creates an ObjectStorage client using vended credentials.
 // The bucket is extracted from tableLocation (e.g. "s3://bucket/path").
-func NewVendedS3Client(catalog Catalog, ns, table string, creds *VendedCreds, tableLocation string) (*VendedS3Client, error) {
+func NewVendedS3Client(catalog TableLoader, ns, table string, creds *VendedCreds, tableLocation string) (*VendedS3Client, error) {
 	inner, err := buildS3Client(creds, tableLocation)
 	if err != nil {
 		return nil, err

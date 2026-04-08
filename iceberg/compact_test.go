@@ -101,14 +101,18 @@ func (m *testCompactStorage) fileCount() int {
 	return len(m.files)
 }
 
-// testCompactCatalog is an in-memory Catalog for testing.
+// testCompactCatalog is an in-memory CatalogWithCache for testing.
 type testCompactCatalog struct {
-	mu     sync.Mutex
-	tables map[string]*TableMetadata
+	mu        sync.Mutex
+	tables    map[string]*TableMetadata
+	manifests map[string][]ManifestFileInfo
 }
 
 func newTestCatalog() *testCompactCatalog {
-	return &testCompactCatalog{tables: make(map[string]*TableMetadata)}
+	return &testCompactCatalog{
+		tables:    make(map[string]*TableMetadata),
+		manifests: make(map[string][]ManifestFileInfo),
+	}
 }
 
 func (c *testCompactCatalog) EnsureNamespace(_ context.Context, ns string) error { return nil }
@@ -169,6 +173,18 @@ func (c *testCompactCatalog) CommitTransaction(ctx context.Context, ns string, c
 
 func (c *testCompactCatalog) EvolveSchema(_ context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	return currentSchemaID + 1, nil
+}
+
+func (c *testCompactCatalog) Manifests(ns, table string) []ManifestFileInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.manifests[ns+"."+table]
+}
+
+func (c *testCompactCatalog) SetManifests(ns, table string, manifests []ManifestFileInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.manifests[ns+"."+table] = manifests
 }
 
 func TestCompact_MergesSmallFiles(t *testing.T) {

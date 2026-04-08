@@ -131,7 +131,7 @@ func (b *ChangeEventBuffer) Rollback() {
 // tracks PK→file mappings to resolve TOAST unchanged columns when needed.
 type Materializer struct {
 	cfg     config.SinkConfig
-	catalog iceberg.Catalog
+	catalog iceberg.CatalogWithCache
 	s3      iceberg.ObjectStorage
 	tables  map[string]*tableSink
 	buf     *ChangeEventBuffer
@@ -172,7 +172,7 @@ func (m *Materializer) SyncTableWriter(pgTable string) {
 	tw.UpdateSchema(ts.srcSchema, ts.matSchemaID)
 }
 
-func NewMaterializer(cfg config.SinkConfig, catalog iceberg.Catalog, s3 iceberg.ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
+func NewMaterializer(cfg config.SinkConfig, catalog iceberg.CatalogWithCache, s3 iceberg.ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
 	writers := make(map[string]*iceberg.TableWriter, len(tables))
 	for pgTable, ts := range tables {
 		writers[pgTable] = iceberg.NewTableWriter(iceberg.TableWriteConfig{

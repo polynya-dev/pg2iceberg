@@ -31,14 +31,11 @@ type SnapshotWriterConfig struct {
 // does not create its own goroutines or pools.
 type SnapshotWriter struct {
 	cfg     SnapshotWriterConfig
-	catalog Catalog
+	catalog CatalogWithCache
 	s3      ObjectStorage
 
 	// Per-partition writers, keyed by partition key string ("" for unpartitioned).
 	partitions map[string]*snapshotPartition
-
-	// Carried-forward manifests from prior commits.
-	manifests []ManifestFileInfo
 }
 
 type snapshotPartition struct {
@@ -48,7 +45,7 @@ type snapshotPartition struct {
 }
 
 // NewSnapshotWriter creates a new snapshot writer.
-func NewSnapshotWriter(cfg SnapshotWriterConfig, catalog Catalog, s3 ObjectStorage) *SnapshotWriter {
+func NewSnapshotWriter(cfg SnapshotWriterConfig, catalog CatalogWithCache, s3 ObjectStorage) *SnapshotWriter {
 	return &SnapshotWriter{
 		cfg:        cfg,
 		catalog:    catalog,
@@ -173,8 +170,9 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 		seqNum = tm.Metadata.LastSequenceNumber + 1
 	}
 
-	// Load existing manifests (on first commit only).
-	if sw.manifests == nil && tm != nil && tm.Metadata.CurrentSnapshotID > 0 {
+	// Load existing manifests from catalog cache (seed on cold start).
+	existingManifests := sw.catalog.Manifests(cfg.Namespace, cfg.IcebergName)
+	if existingManifests == nil && tm != nil && tm.Metadata.CurrentSnapshotID > 0 {
 		mlURI := tm.CurrentManifestList()
 		if mlURI != "" {
 			mlKey, err := KeyFromURI(mlURI)
@@ -185,10 +183,11 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 			if err != nil {
 				return 0, fmt.Errorf("download manifest list: %w", err)
 			}
-			sw.manifests, err = ReadManifestList(mlData)
+			existingManifests, err = ReadManifestList(mlData)
 			if err != nil {
 				return 0, fmt.Errorf("read manifest list: %w", err)
 			}
+			sw.catalog.SetManifests(cfg.Namespace, cfg.IcebergName, existingManifests)
 		}
 	}
 
@@ -234,7 +233,7 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 		SequenceNumber: seqNum,
 	}
 
-	allManifests := append(sw.manifests, newManifest)
+	allManifests := append(existingManifests, newManifest)
 
 	// Write manifest list.
 	mlBytes, err := WriteManifestList(allManifests)
@@ -263,8 +262,8 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("commit snapshot: %w", err)
 	}
 
-	// Update manifest cache for next chunk.
-	sw.manifests = allManifests
+	// Update catalog manifest cache for next chunk.
+	sw.catalog.SetManifests(cfg.Namespace, cfg.IcebergName, allManifests)
 
 	log.Printf("[snapshot-writer] committed %d rows (%d files) to %s.%s (snapshot=%d, seq=%d)",
 		totalRows, len(entries), cfg.Namespace, cfg.IcebergName, snapshotID, seqNum)

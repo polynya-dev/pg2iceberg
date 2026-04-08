@@ -28,7 +28,7 @@ type Pipeline struct {
 	writers map[string]*iceberg.TableWriter // per-table Iceberg writer
 	schemas map[string]*postgres.TableSchema
 
-	catalog iceberg.Catalog
+	catalog iceberg.CatalogWithCache
 	s3      iceberg.ObjectStorage
 	store   pipeline.CheckpointStore
 
@@ -79,7 +79,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 }
 
 // NewPipeline creates a Pipeline with injected dependencies (for tests).
-func NewPipeline(id string, cfg *config.Config, s3 iceberg.ObjectStorage, catalog iceberg.Catalog, store pipeline.CheckpointStore) *Pipeline {
+func NewPipeline(id string, cfg *config.Config, s3 iceberg.ObjectStorage, catalog iceberg.CatalogWithCache, store pipeline.CheckpointStore) *Pipeline {
 	return &Pipeline{
 		id:      id,
 		cfg:     cfg,

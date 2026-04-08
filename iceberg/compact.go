@@ -80,46 +80,35 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	ns := cfg.Namespace
 	basePath := fmt.Sprintf("%s.db/%s", ns, cfg.IcebergName)
 
-	// Use cached table state if available, otherwise load from catalog.
-	currentSnapID := tw.lastSnapshotID
-	lastSeqNum := tw.lastSeqNum
-	if currentSnapID == 0 {
-		matTm, err := tw.catalog.LoadTable(ctx, ns, cfg.IcebergName)
-		if err != nil {
-			return nil, fmt.Errorf("load table: %w", err)
-		}
-		if matTm == nil || matTm.Metadata.CurrentSnapshotID <= 0 {
-			return nil, nil
-		}
-		currentSnapID = matTm.Metadata.CurrentSnapshotID
-		lastSeqNum = matTm.Metadata.LastSequenceNumber
+	// Load table state from catalog cache (cache hit in steady state).
+	matTm, err := tw.catalog.LoadTable(ctx, ns, cfg.IcebergName)
+	if err != nil {
+		return nil, fmt.Errorf("load table: %w", err)
+	}
+	if matTm == nil || matTm.Metadata.CurrentSnapshotID <= 0 {
+		return nil, nil
+	}
+	currentSnapID := matTm.Metadata.CurrentSnapshotID
+	lastSeqNum := matTm.Metadata.LastSequenceNumber
 
-		// Check if last snapshot was compaction.
-		for _, snap := range matTm.Metadata.Snapshots {
-			if snap.SnapshotID == currentSnapID {
-				if snap.Summary["operation"] == "replace" {
-					return nil, nil
-				}
-				break
+	// Check if last snapshot was compaction — skip if so.
+	for _, snap := range matTm.Metadata.Snapshots {
+		if snap.SnapshotID == currentSnapID {
+			if snap.Summary["operation"] == "replace" {
+				return nil, nil
 			}
-		}
-
-		// Seed manifest cache.
-		if tw.manifests == nil {
-			tw.manifests, _ = tw.loadExistingManifests(ctx, matTm)
-		}
-	} else {
-		if currentSnapID <= 0 {
-			return nil, nil
-		}
-		// Skip if last commit was already a compaction.
-		if tw.lastOperation == "replace" {
-			return nil, nil
+			break
 		}
 	}
 
-	// Use cached manifests.
-	manifests := tw.manifests
+	// Seed manifest cache on cold start.
+	manifests := tw.catalog.Manifests(ns, cfg.IcebergName)
+	if manifests == nil {
+		manifests, _ = tw.loadExistingManifests(ctx, matTm)
+		if manifests != nil {
+			tw.catalog.SetManifests(ns, cfg.IcebergName, manifests)
+		}
+	}
 	if manifests == nil {
 		return nil, nil
 	}

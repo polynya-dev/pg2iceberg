@@ -41,7 +41,7 @@ type Sink struct {
 	tableCfgs  []config.TableConfig
 	pipelineID string // for metrics labeling
 
-	catalog iceberg.Catalog
+	catalog iceberg.CatalogWithCache
 	s3      iceberg.ObjectStorage
 
 	// Per-table state: keyed by PG table name (e.g. "public.orders").
@@ -107,9 +107,6 @@ type tableSink struct {
 	flushMaxSeq int64
 	flushSeqSet bool // true once at least one event has been written this batch
 
-	// Cached manifest lists to avoid re-downloading from S3 every flush/materialize cycle.
-	eventsManifests []iceberg.ManifestFileInfo // events table manifests
-	matManifests    []iceberg.ManifestFileInfo // materialized table manifests
 }
 
 // BuildSink creates a fully-wired Sink from config, constructing the default
@@ -126,7 +123,7 @@ func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID
 
 // NewSink creates a Sink with the given dependencies.
 // eventBuf is optional — pass nil to disable in-memory event buffering.
-func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 iceberg.ObjectStorage, catalog iceberg.Catalog, eventBuf EventBuffer) *Sink {
+func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 iceberg.ObjectStorage, catalog iceberg.CatalogWithCache, eventBuf EventBuffer) *Sink {
 	return &Sink{
 		cfg:                 cfg,
 		tableCfgs:           tableCfgs,
@@ -160,7 +157,7 @@ func (s *Sink) Close() {}
 func (s *Sink) SetS3(s3 iceberg.ObjectStorage) { s.s3 = s3 }
 
 // Catalog returns the catalog client.
-func (s *Sink) Catalog() iceberg.Catalog { return s.catalog }
+func (s *Sink) Catalog() iceberg.CatalogWithCache { return s.catalog }
 
 // S3 returns the S3 client.
 func (s *Sink) S3() iceberg.ObjectStorage { return s.s3 }
@@ -912,9 +909,10 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 
 	seqNum := tm.Metadata.LastSequenceNumber + 1
 
-	// Use cached manifests from previous cycle instead of re-downloading from S3.
-	// On first flush (cache empty), load from S3 if a manifest list exists.
-	if ts.eventsManifests == nil {
+	// Use cached manifests from the catalog cache instead of re-downloading from S3.
+	// On cold start (cache empty), load from S3 if a manifest list exists.
+	existingManifests := s.catalog.Manifests(s.cfg.Namespace, ts.eventsIcebergName)
+	if existingManifests == nil {
 		if ml := tm.CurrentManifestList(); ml != "" {
 			mlKey, err := iceberg.KeyFromURI(ml)
 			if err != nil {
@@ -924,13 +922,13 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 			if err != nil {
 				return nil, fmt.Errorf("download manifest list: %w", err)
 			}
-			ts.eventsManifests, err = iceberg.ReadManifestList(mlData)
+			existingManifests, err = iceberg.ReadManifestList(mlData)
 			if err != nil {
 				return nil, fmt.Errorf("read manifest list: %w", err)
 			}
+			s.catalog.SetManifests(s.cfg.Namespace, ts.eventsIcebergName, existingManifests)
 		}
 	}
-	existingManifests := ts.eventsManifests
 
 	// Write data manifest.
 	var manifestInfos []iceberg.ManifestFileInfo
@@ -969,9 +967,9 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 		})
 	}
 
-	// Write manifest list (existing + new) and cache for next cycle.
+	// Write manifest list (existing + new) and update catalog cache.
 	allManifests := append(existingManifests, manifestInfos...)
-	ts.eventsManifests = allManifests
+	s.catalog.SetManifests(s.cfg.Namespace, ts.eventsIcebergName, allManifests)
 	mlBytes, err := iceberg.WriteManifestList(allManifests)
 	if err != nil {
 		return nil, fmt.Errorf("write manifest list: %w", err)

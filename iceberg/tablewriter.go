@@ -95,17 +95,8 @@ func (fi *FileIndex) AffectedFiles(pks []string) map[string]bool {
 // merge-on-read: equality deletes for old PKs, data files for new rows.
 type TableWriter struct {
 	cfg     TableWriteConfig
-	catalog Catalog
+	catalog CatalogWithCache
 	s3      ObjectStorage
-
-	// Cached manifest list from previous cycle (carried forward).
-	manifests []ManifestFileInfo
-
-	// Cached table metadata from the last successful commit.
-	// Avoids a catalog.LoadTable round-trip on every materialize cycle.
-	lastSnapshotID int64
-	lastSeqNum     int64
-	lastOperation  string // "append" or "replace" (compaction)
 
 	// File index for DELETE partition routing and TOAST resolution.
 	FileIdx *FileIndex
@@ -118,7 +109,7 @@ func (tw *TableWriter) UpdateSchema(srcSchema *postgres.TableSchema, schemaID in
 }
 
 // NewTableWriter creates a new TableWriter.
-func NewTableWriter(cfg TableWriteConfig, catalog Catalog, s3 ObjectStorage) *TableWriter {
+func NewTableWriter(cfg TableWriteConfig, catalog CatalogWithCache, s3 ObjectStorage) *TableWriter {
 	return &TableWriter{
 		cfg:     cfg,
 		catalog: catalog,
@@ -159,21 +150,17 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	partitioned := partSpec != nil && !partSpec.IsUnpartitioned()
 	basePath := fmt.Sprintf("%s.db/%s", cfg.Namespace, cfg.IcebergName)
 
-	// Use cached metadata if available (from a previous ApplyPostCommit),
-	// otherwise load from catalog (first cycle or after restart).
-	prevMatSnapID := tw.lastSnapshotID
-	seqNum := tw.lastSeqNum + 1
-	if tw.lastSnapshotID == 0 {
-		matTm, err := tw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
-		if err != nil {
-			return nil, fmt.Errorf("load materialized table: %w", err)
-		}
-		if matTm != nil {
-			prevMatSnapID = matTm.Metadata.CurrentSnapshotID
-			seqNum = matTm.Metadata.LastSequenceNumber + 1
-		} else {
-			seqNum = 1
-		}
+	// Load table metadata from the catalog cache (cache hit in steady state,
+	// cold-start miss falls through to the real catalog).
+	var prevMatSnapID int64
+	seqNum := int64(1)
+	matTm, err := tw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
+	if err != nil {
+		return nil, fmt.Errorf("load materialized table: %w", err)
+	}
+	if matTm != nil {
+		prevMatSnapID = matTm.Metadata.CurrentSnapshotID
+		seqNum = matTm.Metadata.LastSequenceNumber + 1
 	}
 
 	now := time.Now()
@@ -424,20 +411,18 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}
 
 	// --- Manifest assembly ---
-	// Load cached manifests or fetch from S3 on first run.
-	if tw.manifests == nil && prevMatSnapID > 0 {
-		matTm, err := tw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
-		if err != nil {
-			return nil, fmt.Errorf("load table for manifests: %w", err)
-		}
+	// Load manifests from the catalog cache, or fetch from S3 on cold start.
+	existingManifests := tw.catalog.Manifests(cfg.Namespace, cfg.IcebergName)
+	if existingManifests == nil && prevMatSnapID > 0 {
 		if matTm != nil {
-			tw.manifests, err = tw.loadExistingManifests(ctx, matTm)
-			if err != nil {
-				return nil, fmt.Errorf("load existing manifests: %w", err)
+			var mErr error
+			existingManifests, mErr = tw.loadExistingManifests(ctx, matTm)
+			if mErr != nil {
+				return nil, fmt.Errorf("load existing manifests: %w", mErr)
 			}
+			tw.catalog.SetManifests(cfg.Namespace, cfg.IcebergName, existingManifests)
 		}
 	}
-	existingManifests := tw.manifests
 
 	var newManifests []ManifestFileInfo
 
@@ -522,13 +507,11 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}, nil
 }
 
-// ApplyPostCommit updates the manifest cache and invalidates the file index
-// after a successful catalog commit. Must be called only after CommitTransaction succeeds.
+// ApplyPostCommit updates the catalog manifest cache and invalidates the file
+// index after a successful catalog commit. Must be called only after
+// CommitTransaction succeeds.
 func (tw *TableWriter) ApplyPostCommit(pc *PreparedCommit) {
-	tw.manifests = pc.NewManifests
-	tw.lastSnapshotID = pc.Commit.SnapshotID
-	tw.lastSeqNum = pc.Commit.SequenceNumber
-	tw.lastOperation = pc.Commit.Summary["operation"]
+	tw.catalog.SetManifests(tw.cfg.Namespace, tw.cfg.IcebergName, pc.NewManifests)
 	// Invalidate file index so it's rebuilt on next cycle.
 	if tw.FileIdx != nil {
 		tw.FileIdx.SnapshotID = 0
@@ -547,22 +530,23 @@ func (pc *PreparedCommit) ToTableCommit() TableCommit {
 // BuildFileIndex reads all data files for the materialized table and builds the
 // PK→file index. Returns the index or reuses the cached one if it's still current.
 func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIndex, error) {
-	// Use cached snapshot ID if available, otherwise load from catalog.
-	currentSnapID := tw.lastSnapshotID
-	if currentSnapID == 0 {
-		matTm, err := tw.catalog.LoadTable(ctx, tw.cfg.Namespace, tw.cfg.IcebergName)
-		if err != nil {
-			return nil, fmt.Errorf("load table for file index: %w", err)
-		}
-		if matTm == nil || matTm.Metadata.CurrentSnapshotID == 0 {
-			fi := NewFileIndex()
-			tw.FileIdx = fi
-			return fi, nil
-		}
-		currentSnapID = matTm.Metadata.CurrentSnapshotID
-		// Also seed the manifest cache from the catalog response.
-		if tw.manifests == nil {
-			tw.manifests, _ = tw.loadExistingManifests(ctx, matTm)
+	// Load table metadata from catalog cache (cache hit in steady state).
+	matTm, err := tw.catalog.LoadTable(ctx, tw.cfg.Namespace, tw.cfg.IcebergName)
+	if err != nil {
+		return nil, fmt.Errorf("load table for file index: %w", err)
+	}
+	if matTm == nil || matTm.Metadata.CurrentSnapshotID == 0 {
+		fi := NewFileIndex()
+		tw.FileIdx = fi
+		return fi, nil
+	}
+	currentSnapID := matTm.Metadata.CurrentSnapshotID
+
+	// Seed the manifest cache on cold start.
+	if tw.catalog.Manifests(tw.cfg.Namespace, tw.cfg.IcebergName) == nil {
+		manifests, _ := tw.loadExistingManifests(ctx, matTm)
+		if manifests != nil {
+			tw.catalog.SetManifests(tw.cfg.Namespace, tw.cfg.IcebergName, manifests)
 		}
 	}
 
@@ -633,14 +617,15 @@ func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIn
 }
 
 // LoadAllDataFiles returns all live data files from a table's current snapshot.
-// loadDataFilesFromManifests reads data files using cached manifests (tw.manifests).
+// loadDataFilesFromManifests reads data files using the catalog's manifest cache.
 // Avoids a catalog.LoadTable round-trip.
 func (tw *TableWriter) loadDataFilesFromManifests(ctx context.Context) ([]DataFileInfo, error) {
-	if tw.manifests == nil {
+	manifests := tw.catalog.Manifests(tw.cfg.Namespace, tw.cfg.IcebergName)
+	if manifests == nil {
 		return nil, nil
 	}
 	var dataFiles []DataFileInfo
-	for _, mfi := range tw.manifests {
+	for _, mfi := range manifests {
 		if mfi.Content != 0 {
 			continue
 		}

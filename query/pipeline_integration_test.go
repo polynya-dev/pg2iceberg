@@ -403,12 +403,16 @@ func (m *memStorage) StatObject(_ context.Context, key string) (int64, error) {
 }
 
 type memCatalog struct {
-	mu     sync.Mutex
-	tables map[string]*iceberg.TableMetadata
+	mu        sync.Mutex
+	tables    map[string]*iceberg.TableMetadata
+	manifests map[string][]iceberg.ManifestFileInfo
 }
 
 func newMemCatalog() *memCatalog {
-	return &memCatalog{tables: make(map[string]*iceberg.TableMetadata)}
+	return &memCatalog{
+		tables:    make(map[string]*iceberg.TableMetadata),
+		manifests: make(map[string][]iceberg.ManifestFileInfo),
+	}
 }
 
 func (c *memCatalog) EnsureNamespace(_ context.Context, ns string) error { return nil }
@@ -469,4 +473,16 @@ func (c *memCatalog) CommitTransaction(ctx context.Context, ns string, commits [
 
 func (c *memCatalog) EvolveSchema(_ context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	return currentSchemaID + 1, nil
+}
+
+func (c *memCatalog) Manifests(ns, table string) []iceberg.ManifestFileInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.manifests[ns+"."+table]
+}
+
+func (c *memCatalog) SetManifests(ns, table string, manifests []iceberg.ManifestFileInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.manifests[ns+"."+table] = manifests
 }
