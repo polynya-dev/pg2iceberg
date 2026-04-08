@@ -2308,3 +2308,152 @@ func TestPipeline_ZeroS3ReadsAfterSnapshot(t *testing.T) {
 		t.Log("confirmed: zero S3 reads after snapshot (including first materialization cycle)")
 	}
 }
+
+// TestPipeline_SlotSurvivesShutdown verifies that the replication slot is NOT
+// dropped when the pipeline shuts down. The slot must persist so the pipeline
+// can resume from its last confirmed LSN without data loss.
+func TestPipeline_SlotSurvivesShutdown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE orders (
+			id    SERIAL PRIMARY KEY,
+			total INTEGER NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	slotName := "test_slot_survive"
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            5,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.orders"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_survive",
+				SlotName:        slotName,
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newMemCatalog()
+	eventBuf := logical.NewChangeEventBuffer()
+	cpStore := pipeline.NewMemCheckpointStore()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	p := logical.NewPipeline("test", cfg, snk, cpStore)
+	p.SetEventBuf(eventBuf)
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+
+	waitForStatus(t, p, pipeline.StatusRunning, 60*time.Second)
+
+	// Insert rows while pipeline is running to simulate active replication.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+
+	for i := 1; i <= 10; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	// Wait for at least one flush so the LSN advances.
+	waitFor(t, 30*time.Second, func() bool {
+		return p.Source().FlushedLSN() > 0
+	})
+	flushedLSN := p.Source().FlushedLSN()
+	t.Logf("flushed LSN before shutdown: %d", flushedLSN)
+
+	// Graceful shutdown.
+	if err := p.Stop(); err != nil {
+		t.Fatalf("stop pipeline: %v", err)
+	}
+
+	// Verify the slot still exists after shutdown.
+	var slotExists bool
+	var confirmedFlushLSN int64
+	err = conn.QueryRow(ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)", slotName,
+	).Scan(&slotExists)
+	if err != nil {
+		t.Fatalf("check slot existence: %v", err)
+	}
+	if !slotExists {
+		t.Fatal("replication slot was dropped on shutdown — this causes data loss")
+	}
+
+	err = conn.QueryRow(ctx,
+		"SELECT (confirmed_flush_lsn - '0/0')::bigint FROM pg_replication_slots WHERE slot_name = $1", slotName,
+	).Scan(&confirmedFlushLSN)
+	if err != nil {
+		t.Fatalf("query confirmed_flush_lsn: %v", err)
+	}
+	t.Logf("slot %q persists after shutdown, confirmed_flush_lsn=%d", slotName, confirmedFlushLSN)
+
+	// Insert more rows while the pipeline is down — these must not be lost.
+	for i := 11; i <= 15; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100); err != nil {
+			t.Fatalf("insert-while-down %d: %v", i, err)
+		}
+	}
+	conn.Close(ctx)
+
+	// Restart the pipeline and verify it resumes from the persisted slot.
+	// Reuse the same storage and catalog — they represent persistent Iceberg state.
+	eventBuf2 := logical.NewChangeEventBuffer()
+
+	snk2 := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf2)
+	p2 := logical.NewPipeline("test", cfg, snk2, cpStore)
+	p2.SetEventBuf(eventBuf2)
+
+	if err := p2.Start(ctx); err != nil {
+		t.Fatalf("restart pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p2.Done()
+	}()
+
+	waitForStatus(t, p2, pipeline.StatusRunning, 60*time.Second)
+
+	// The restarted pipeline should advance past where the first one stopped,
+	// proving it consumed the rows inserted while it was down.
+	waitFor(t, 30*time.Second, func() bool {
+		return p2.Source().FlushedLSN() > flushedLSN
+	})
+
+	t.Logf("restarted pipeline flushed LSN: %d (was %d before shutdown) — no data lost",
+		p2.Source().FlushedLSN(), flushedLSN)
+}

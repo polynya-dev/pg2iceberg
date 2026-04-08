@@ -47,9 +47,6 @@ type LogicalSource struct {
 	// read by the capture goroutine (standbyStatus).
 	flushedLSN atomic.Uint64
 
-	// slotCreated tracks whether we created the slot (for cleanup).
-	slotCreated bool
-
 	// snapshotComplete is set from the checkpoint to skip the initial snapshot.
 	snapshotComplete bool
 	// snapshotedTables tracks which tables already completed their snapshot
@@ -549,7 +546,6 @@ func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 		l.flushedLSN.Store(uint64(lsn))
 	}
 
-	l.slotCreated = true
 	log.Printf("[logical] created slot %q at LSN %s (snapshot %s)", l.cfg.SlotName, result.ConsistentPoint, result.SnapshotName)
 	return result.SnapshotName, nil
 }
@@ -652,9 +648,12 @@ func (l *LogicalSource) SendStandbyNow(ctx context.Context) error {
 	return pglogrepl.SendStandbyStatusUpdate(ctx, l.replConn, l.standbyStatus())
 }
 
-// Close terminates the replication connection and drops the slot if we created it.
+// Close terminates the replication connection. The replication slot is
+// intentionally never dropped — it must persist across restarts so the
+// pipeline can resume from its last confirmed LSN without data loss.
+// WAL accumulation from a long-lived slot should be managed via
+// PostgreSQL's max_slot_wal_keep_size and replication lag monitoring.
 func (l *LogicalSource) Close() error {
-	// Close the replication connection first so the slot becomes inactive.
 	if l.replConn != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := l.replConn.Close(ctx); err != nil {
@@ -665,30 +664,6 @@ func (l *LogicalSource) Close() error {
 		cancel()
 		l.replConn = nil
 	}
-
-	if !l.slotCreated {
-		return nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	conn, err := pgx.Connect(ctx, l.pgCfg.DSN())
-	if err != nil {
-		return fmt.Errorf("connect for cleanup: %w", err)
-	}
-	defer conn.Close(ctx)
-
-	// Slot should be inactive now since we closed replConn above.
-	_, err = conn.Exec(ctx,
-		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
-		l.cfg.SlotName,
-	)
-	if err != nil {
-		return fmt.Errorf("drop slot: %w", err)
-	}
-
-	log.Printf("[logical] dropped slot %q", l.cfg.SlotName)
 	return nil
 }
 
