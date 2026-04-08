@@ -63,13 +63,17 @@ func newMemStorage() *memStorage {
 	return &memStorage{files: make(map[string][]byte)}
 }
 
+func (m *memStorage) URIForKey(key string) string {
+	return fmt.Sprintf("s3://test-bucket/%s", key)
+}
+
 func (m *memStorage) Upload(_ context.Context, key string, data []byte) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.files[key] = cp
-	return fmt.Sprintf("s3://test-bucket/%s", key), nil
+	return m.URIForKey(key), nil
 }
 
 func (m *memStorage) Download(_ context.Context, key string) ([]byte, error) {
@@ -107,23 +111,27 @@ func (m *memStorage) StatObject(_ context.Context, key string) (int64, error) {
 }
 
 type memCatalog struct {
-	mu     sync.Mutex
-	tables map[string]*iceberg.TableMetadata
+	mu        sync.Mutex
+	tables    map[string]*iceberg.TableMetadata
+	manifests map[string][]iceberg.ManifestFileInfo
 }
 
 func newMemCatalog() *memCatalog {
-	return &memCatalog{tables: make(map[string]*iceberg.TableMetadata)}
+	return &memCatalog{
+		tables:    make(map[string]*iceberg.TableMetadata),
+		manifests: make(map[string][]iceberg.ManifestFileInfo),
+	}
 }
 
-func (c *memCatalog) EnsureNamespace(ns string) error { return nil }
+func (c *memCatalog) EnsureNamespace(_ context.Context, ns string) error { return nil }
 
-func (c *memCatalog) LoadTable(ns, table string) (*iceberg.TableMetadata, error) {
+func (c *memCatalog) LoadTable(_ context.Context, ns, table string) (*iceberg.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.tables[ns+"."+table], nil
 }
 
-func (c *memCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *iceberg.PartitionSpec) (*iceberg.TableMetadata, error) {
+func (c *memCatalog) CreateTable(_ context.Context, ns, table string, ts *postgres.TableSchema, location string, partSpec *iceberg.PartitionSpec) (*iceberg.TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tm := &iceberg.TableMetadata{}
@@ -133,7 +141,7 @@ func (c *memCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, loc
 	return tm, nil
 }
 
-func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, sc iceberg.SnapshotCommit) error {
+func (c *memCatalog) CommitSnapshot(_ context.Context, ns, table string, currentSnapshotID int64, sc iceberg.SnapshotCommit) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := ns + "." + table
@@ -159,18 +167,38 @@ func (c *memCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, s
 	return nil
 }
 
-func (c *memCatalog) CommitTransaction(ns string, commits []iceberg.TableCommit) error {
+func (c *memCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
 	for _, tc := range commits {
-		if err := c.CommitSnapshot(ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
+		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
+		}
+		if tc.NewManifests != nil {
+			c.SetManifests(ns, tc.Table, tc.NewManifests)
 		}
 	}
 	return nil
 }
 
-func (c *memCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
+func (c *memCatalog) EvolveSchema(_ context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	return currentSchemaID + 1, nil
 }
+
+func (c *memCatalog) Manifests(ns, table string) []iceberg.ManifestFileInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.manifests[ns+"."+table]
+}
+
+func (c *memCatalog) SetManifests(ns, table string, manifests []iceberg.ManifestFileInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.manifests[ns+"."+table] = manifests
+}
+
+func (c *memCatalog) DataFiles(ns, table string) []iceberg.DataFileInfo   { return nil }
+func (c *memCatalog) SetDataFiles(ns, table string, _ []iceberg.DataFileInfo) {}
+func (c *memCatalog) FileIndex(ns, table string) *iceberg.FileIndex       { return nil }
+func (c *memCatalog) SetFileIndex(ns, table string, _ *iceberg.FileIndex) {}
 
 // readAllDataFileRows reads all rows from all data files in a table's current snapshot.
 func readAllDataFileRows(t *testing.T, ctx context.Context, s3 *memStorage, tm *iceberg.TableMetadata) []map[string]any {

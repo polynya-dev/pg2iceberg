@@ -79,12 +79,12 @@ func TestPgCheckpointStore_SaveAndLoad(t *testing.T) {
 		LastSequenceNumber: 7,
 	}
 
-	if err := store.Save("test-pipeline", cp); err != nil {
+	if err := store.Save(ctx, "test-pipeline", cp); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
 	// Load it back and verify all fields.
-	loaded, err := store.Load("test-pipeline")
+	loaded, err := store.Load(ctx, "test-pipeline")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestPgCheckpointStore_LoadFreshReturnsZero(t *testing.T) {
 	}
 	defer store.Close()
 
-	loaded, err := store.Load("nonexistent")
+	loaded, err := store.Load(ctx, "nonexistent")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -177,24 +177,24 @@ func TestPgCheckpointStore_UpdatePreservesFields(t *testing.T) {
 
 	// First save.
 	cp := &Checkpoint{Mode: "logical", LSN: 1000, SeqCounter: 10}
-	if err := store.Save("p1", cp); err != nil {
+	if err := store.Save(ctx, "p1", cp); err != nil {
 		t.Fatalf("save 1: %v", err)
 	}
 
 	// Load, modify, save again.
-	loaded, err := store.Load("p1")
+	loaded, err := store.Load(ctx, "p1")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	loaded.LSN = 2000
 	loaded.SeqCounter = 50
 	loaded.MaterializerSnapshots = map[string]int64{"public.orders": 3000}
-	if err := store.Save("p1", loaded); err != nil {
+	if err := store.Save(ctx, "p1", loaded); err != nil {
 		t.Fatalf("save 2: %v", err)
 	}
 
 	// Verify updated values.
-	final, err := store.Load("p1")
+	final, err := store.Load(ctx, "p1")
 	if err != nil {
 		t.Fatalf("load 2: %v", err)
 	}
@@ -237,29 +237,29 @@ func TestPgCheckpointStore_ConcurrentUpdateDetected(t *testing.T) {
 
 	// Instance 1 saves.
 	cp := &Checkpoint{Mode: "logical", LSN: 1000}
-	if err := store1.Save("p1", cp); err != nil {
+	if err := store1.Save(ctx, "p1", cp); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
 	// Both load same revision.
-	loaded1, err := store1.Load("p1")
+	loaded1, err := store1.Load(ctx, "p1")
 	if err != nil {
 		t.Fatalf("load 1: %v", err)
 	}
-	loaded2, err := store2.Load("p1")
+	loaded2, err := store2.Load(ctx, "p1")
 	if err != nil {
 		t.Fatalf("load 2: %v", err)
 	}
 
 	// Instance 1 saves (advances revision).
 	loaded1.LSN = 2000
-	if err := store1.Save("p1", loaded1); err != nil {
+	if err := store1.Save(ctx, "p1", loaded1); err != nil {
 		t.Fatalf("save from instance 1: %v", err)
 	}
 
 	// Instance 2 tries to save with stale revision.
 	loaded2.LSN = 3000
-	err = store2.Save("p1", loaded2)
+	err = store2.Save(ctx, "p1", loaded2)
 	if err != ErrConcurrentUpdate {
 		t.Fatalf("expected ErrConcurrentUpdate, got: %v", err)
 	}
@@ -286,19 +286,19 @@ func TestPgCheckpointStore_MultiplePipelines(t *testing.T) {
 	cp1 := &Checkpoint{Mode: "logical", LSN: 100, SeqCounter: 10}
 	cp2 := &Checkpoint{Mode: "query", Watermark: "2026-01-01T00:00:00Z"}
 
-	if err := store.Save("pipeline-a", cp1); err != nil {
+	if err := store.Save(ctx, "pipeline-a", cp1); err != nil {
 		t.Fatalf("save a: %v", err)
 	}
-	if err := store.Save("pipeline-b", cp2); err != nil {
+	if err := store.Save(ctx, "pipeline-b", cp2); err != nil {
 		t.Fatalf("save b: %v", err)
 	}
 
 	// Load each and verify isolation.
-	loadedA, err := store.Load("pipeline-a")
+	loadedA, err := store.Load(ctx, "pipeline-a")
 	if err != nil {
 		t.Fatalf("load a: %v", err)
 	}
-	loadedB, err := store.Load("pipeline-b")
+	loadedB, err := store.Load(ctx, "pipeline-b")
 	if err != nil {
 		t.Fatalf("load b: %v", err)
 	}

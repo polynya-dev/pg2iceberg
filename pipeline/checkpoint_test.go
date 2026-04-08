@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -105,11 +106,11 @@ func TestFileCheckpointStore_SealAndVerify(t *testing.T) {
 		LSN:              5000,
 		SnapshotComplete: true,
 	}
-	if err := store.Save("test", cp); err != nil {
+	if err := store.Save(context.Background(), "test", cp); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
-	loaded, err := store.Load("test")
+	loaded, err := store.Load(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -131,7 +132,7 @@ func TestFileCheckpointStore_DetectsTamper(t *testing.T) {
 		LSN:              5000,
 		SnapshotComplete: true,
 	}
-	if err := store.Save("test", cp); err != nil {
+	if err := store.Save(context.Background(), "test", cp); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
@@ -140,7 +141,7 @@ func TestFileCheckpointStore_DetectsTamper(t *testing.T) {
 	tampered := []byte(string(data[:len(data)-10]) + "999999999}")
 	os.WriteFile(path, tampered, 0644)
 
-	_, err := store.Load("test")
+	_, err := store.Load(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected error after tampering")
 	}
@@ -156,29 +157,29 @@ func TestFileCheckpointStore_ConcurrentUpdateDetected(t *testing.T) {
 
 	// Instance 1 saves.
 	cp1 := &Checkpoint{Mode: "logical", LSN: 1000}
-	if err := store1.Save("test", cp1); err != nil {
+	if err := store1.Save(context.Background(), "test", cp1); err != nil {
 		t.Fatalf("save 1: %v", err)
 	}
 
 	// Both instances load the same revision.
-	loaded1, err := store1.Load("test")
+	loaded1, err := store1.Load(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("load 1: %v", err)
 	}
-	loaded2, err := store2.Load("test")
+	loaded2, err := store2.Load(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("load 2: %v", err)
 	}
 
 	// Instance 1 saves (advances revision).
 	loaded1.LSN = 2000
-	if err := store1.Save("test", loaded1); err != nil {
+	if err := store1.Save(context.Background(), "test", loaded1); err != nil {
 		t.Fatalf("save from instance 1: %v", err)
 	}
 
 	// Instance 2 tries to save with stale revision — should fail.
 	loaded2.LSN = 3000
-	err = store2.Save("test", loaded2)
+	err = store2.Save(context.Background(), "test", loaded2)
 	if err != ErrConcurrentUpdate {
 		t.Fatalf("expected ErrConcurrentUpdate, got: %v", err)
 	}
@@ -188,16 +189,16 @@ func TestCheckpoint_RevisionIncrements(t *testing.T) {
 	store := NewMemCheckpointStore()
 
 	cp := &Checkpoint{Mode: "logical", LSN: 100}
-	if err := store.Save("test", cp); err != nil {
+	if err := store.Save(context.Background(), "test", cp); err != nil {
 		t.Fatalf("save 1: %v", err)
 	}
 	if cp.Revision != 1 {
 		t.Fatalf("expected revision 1, got %d", cp.Revision)
 	}
 
-	loaded, _ := store.Load("test")
+	loaded, _ := store.Load(context.Background(), "test")
 	loaded.LSN = 200
-	if err := store.Save("test", loaded); err != nil {
+	if err := store.Save(context.Background(), "test", loaded); err != nil {
 		t.Fatalf("save 2: %v", err)
 	}
 	if loaded.Revision != 2 {
@@ -212,11 +213,11 @@ func TestMemCheckpointStore_SealAndVerify(t *testing.T) {
 		Mode: "logical",
 		LSN:  3000,
 	}
-	if err := store.Save("test", cp); err != nil {
+	if err := store.Save(context.Background(), "test", cp); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
-	loaded, err := store.Load("test")
+	loaded, err := store.Load(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}

@@ -28,7 +28,7 @@ type Pipeline struct {
 	writers map[string]*iceberg.TableWriter // per-table Iceberg writer
 	schemas map[string]*postgres.TableSchema
 
-	catalog iceberg.Catalog
+	catalog iceberg.MetadataCache
 	s3      iceberg.ObjectStorage
 	store   pipeline.CheckpointStore
 
@@ -79,7 +79,7 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 }
 
 // NewPipeline creates a Pipeline with injected dependencies (for tests).
-func NewPipeline(id string, cfg *config.Config, s3 iceberg.ObjectStorage, catalog iceberg.Catalog, store pipeline.CheckpointStore) *Pipeline {
+func NewPipeline(id string, cfg *config.Config, s3 iceberg.ObjectStorage, catalog iceberg.MetadataCache, store pipeline.CheckpointStore) *Pipeline {
 	return &Pipeline{
 		id:      id,
 		cfg:     cfg,
@@ -163,7 +163,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	p.setStatus(pipeline.StatusStarting, nil)
 
 	// Load checkpoint.
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
@@ -204,7 +204,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	}
 
 	// Ensure namespace exists.
-	if err := p.catalog.EnsureNamespace(p.cfg.Sink.Namespace); err != nil {
+	if err := p.catalog.EnsureNamespace(ctx, p.cfg.Sink.Namespace); err != nil {
 		return fmt.Errorf("ensure namespace: %w", err)
 	}
 
@@ -229,7 +229,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		}
 
 		// Create or load the materialized table.
-		matTm, err := p.catalog.LoadTable(p.cfg.Sink.Namespace, icebergName)
+		matTm, err := p.catalog.LoadTable(ctx, p.cfg.Sink.Namespace, icebergName)
 		if err != nil {
 			return fmt.Errorf("load table %s: %w", icebergName, err)
 		}
@@ -239,7 +239,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 			if iceberg.IsStorageURI(p.cfg.Sink.Warehouse) {
 				location = fmt.Sprintf("%s%s.db/%s", p.cfg.Sink.Warehouse, p.cfg.Sink.Namespace, icebergName)
 			}
-			matTm, err = p.catalog.CreateTable(p.cfg.Sink.Namespace, icebergName, ts, location, partSpec)
+			matTm, err = p.catalog.CreateTable(ctx, p.cfg.Sink.Namespace, icebergName, ts, location, partSpec)
 			if err != nil {
 				return fmt.Errorf("create table %s: %w", icebergName, err)
 			}
@@ -441,7 +441,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	}
 
 	// Atomic multi-table commit.
-	if err := p.catalog.CommitTransaction(p.cfg.Sink.Namespace, commits); err != nil {
+	if err := p.catalog.CommitTransaction(ctx, p.cfg.Sink.Namespace, commits); err != nil {
 		pipeline.QueryFlushErrorsTotal.WithLabelValues(p.id).Inc()
 		return fmt.Errorf("commit: %w", err)
 	}
@@ -449,9 +449,8 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	pipeline.QueryFlushTotal.WithLabelValues(p.id).Inc()
 	pipeline.QueryFlushDurationSeconds.WithLabelValues(p.id).Observe(time.Since(start).Seconds())
 
-	// Post-commit: update manifest caches + emit per-table metrics.
+	// Post-commit metrics (manifest/file-index updates handled by MetadataStore).
 	for _, tp := range preps {
-		p.writers[tp.pgTable].ApplyPostCommit(tp.prepared)
 		pipeline.QueryDataFilesWrittenTotal.WithLabelValues(p.id, tp.pgTable).Add(float64(tp.prepared.DataCount))
 		pipeline.QueryDeleteFilesWrittenTotal.WithLabelValues(p.id, tp.pgTable).Add(float64(tp.prepared.DeleteCount))
 		log.Printf("[query:%s] flushed %s: %d data files, %d delete files",
@@ -474,12 +473,11 @@ func (p *Pipeline) flush(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = p.catalog.CommitSnapshot(p.cfg.Sink.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
+		err = p.catalog.CommitTransaction(ctx, p.cfg.Sink.Namespace, []iceberg.TableCommit{compacted.ToTableCommit()})
 		if err != nil {
 			log.Printf("[query:%s] compaction commit error for %s: %v", p.id, tp.pgTable, err)
 			continue
 		}
-		tw.ApplyPostCommit(compacted)
 	}
 
 	// Checkpoint watermarks.
@@ -487,7 +485,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	p.lastFlushAt = time.Now()
 	p.mu.Unlock()
 
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
@@ -496,7 +494,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	for table, wm := range p.poller.Watermarks() {
 		cp.QueryWatermarks[table] = wm.Format(time.RFC3339Nano)
 	}
-	if err := p.store.Save(p.id, cp); err != nil {
+	if err := p.store.Save(ctx, p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 
@@ -614,7 +612,7 @@ func (p *Pipeline) runSnapshot(ctx context.Context) error {
 		p.poller.SetWatermark(table, fence)
 	}
 
-	cp, err := p.store.Load(p.id)
+	cp, err := p.store.Load(ctx, p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint after snapshot: %w", err)
 	}
@@ -626,7 +624,7 @@ func (p *Pipeline) runSnapshot(ctx context.Context) error {
 	for table, fence := range fences {
 		cp.QueryWatermarks[table] = fence.Format(time.RFC3339Nano)
 	}
-	if err := p.store.Save(p.id, cp); err != nil {
+	if err := p.store.Save(ctx, p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint after snapshot: %w", err)
 	}
 

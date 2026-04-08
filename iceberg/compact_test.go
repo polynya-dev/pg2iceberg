@@ -34,11 +34,10 @@ func writeTestData(t *testing.T, ctx context.Context, tw *TableWriter, catalog *
 		if prepared == nil {
 			continue
 		}
-		err = catalog.CommitSnapshot(ns, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit)
+		err = catalog.CommitTransaction(ctx, ns, []TableCommit{prepared.ToTableCommit()})
 		if err != nil {
-			t.Fatalf("CommitSnapshot: %v", err)
+			t.Fatalf("CommitTransaction: %v", err)
 		}
-		tw.ApplyPostCommit(prepared)
 	}
 }
 
@@ -52,13 +51,17 @@ func newTestStorage() *testCompactStorage {
 	return &testCompactStorage{files: make(map[string][]byte)}
 }
 
+func (m *testCompactStorage) URIForKey(key string) string {
+	return fmt.Sprintf("s3://test-bucket/%s", key)
+}
+
 func (m *testCompactStorage) Upload(_ context.Context, key string, data []byte) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.files[key] = cp
-	return fmt.Sprintf("s3://test-bucket/%s", key), nil
+	return m.URIForKey(key), nil
 }
 
 func (m *testCompactStorage) Download(_ context.Context, key string) ([]byte, error) {
@@ -101,25 +104,29 @@ func (m *testCompactStorage) fileCount() int {
 	return len(m.files)
 }
 
-// testCompactCatalog is an in-memory Catalog for testing.
+// testCompactCatalog is an in-memory MetadataCache for testing.
 type testCompactCatalog struct {
-	mu     sync.Mutex
-	tables map[string]*TableMetadata
+	mu        sync.Mutex
+	tables    map[string]*TableMetadata
+	manifests map[string][]ManifestFileInfo
 }
 
 func newTestCatalog() *testCompactCatalog {
-	return &testCompactCatalog{tables: make(map[string]*TableMetadata)}
+	return &testCompactCatalog{
+		tables:    make(map[string]*TableMetadata),
+		manifests: make(map[string][]ManifestFileInfo),
+	}
 }
 
-func (c *testCompactCatalog) EnsureNamespace(ns string) error { return nil }
+func (c *testCompactCatalog) EnsureNamespace(_ context.Context, ns string) error { return nil }
 
-func (c *testCompactCatalog) LoadTable(ns, table string) (*TableMetadata, error) {
+func (c *testCompactCatalog) LoadTable(_ context.Context, ns, table string) (*TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.tables[ns+"."+table], nil
 }
 
-func (c *testCompactCatalog) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
+func (c *testCompactCatalog) CreateTable(_ context.Context, ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tm := &TableMetadata{}
@@ -129,7 +136,7 @@ func (c *testCompactCatalog) CreateTable(ns, table string, ts *postgres.TableSch
 	return tm, nil
 }
 
-func (c *testCompactCatalog) CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
+func (c *testCompactCatalog) CommitSnapshot(_ context.Context, ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := ns + "." + table
@@ -158,18 +165,38 @@ func (c *testCompactCatalog) CommitSnapshot(ns, table string, currentSnapshotID 
 	return nil
 }
 
-func (c *testCompactCatalog) CommitTransaction(ns string, commits []TableCommit) error {
+func (c *testCompactCatalog) CommitTransaction(ctx context.Context, ns string, commits []TableCommit) error {
 	for _, tc := range commits {
-		if err := c.CommitSnapshot(ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
+		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
+		}
+		if tc.NewManifests != nil {
+			c.SetManifests(ns, tc.Table, tc.NewManifests)
 		}
 	}
 	return nil
 }
 
-func (c *testCompactCatalog) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
+func (c *testCompactCatalog) EvolveSchema(_ context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
 	return currentSchemaID + 1, nil
 }
+
+func (c *testCompactCatalog) Manifests(ns, table string) []ManifestFileInfo {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.manifests[ns+"."+table]
+}
+
+func (c *testCompactCatalog) SetManifests(ns, table string, manifests []ManifestFileInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.manifests[ns+"."+table] = manifests
+}
+
+func (c *testCompactCatalog) DataFiles(ns, table string) []DataFileInfo   { return nil }
+func (c *testCompactCatalog) SetDataFiles(ns, table string, _ []DataFileInfo) {}
+func (c *testCompactCatalog) FileIndex(ns, table string) *FileIndex       { return nil }
+func (c *testCompactCatalog) SetFileIndex(ns, table string, _ *FileIndex) {}
 
 func TestCompact_MergesSmallFiles(t *testing.T) {
 	ctx := context.Background()
@@ -179,7 +206,7 @@ func TestCompact_MergesSmallFiles(t *testing.T) {
 	ns := "test_ns"
 
 	// Create table.
-	catalog.CreateTable(ns, "orders", ts, "s3://test-bucket/test_ns.db/orders", nil)
+	catalog.CreateTable(ctx, ns, "orders", ts, "s3://test-bucket/test_ns.db/orders", nil)
 
 	tw := NewTableWriter(TableWriteConfig{
 		Namespace:   ns,
@@ -202,7 +229,7 @@ func TestCompact_MergesSmallFiles(t *testing.T) {
 	writeTestData(t, ctx, tw, catalog, s3, ns, batches, ts.PK)
 
 	// Verify we have many small files before compaction.
-	tm, _ := catalog.LoadTable(ns, "orders")
+	tm, _ := catalog.LoadTable(ctx, ns, "orders")
 	manifests, _ := ReadManifestList(mustDownload(t, ctx, s3, tm.CurrentManifestList()))
 	var dataFilesBefore int
 	for _, mfi := range manifests {
@@ -226,14 +253,13 @@ func TestCompact_MergesSmallFiles(t *testing.T) {
 	}
 
 	// Commit the compacted snapshot.
-	err = catalog.CommitSnapshot(ns, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit)
+	err = catalog.CommitTransaction(ctx, ns, []TableCommit{prepared.ToTableCommit()})
 	if err != nil {
-		t.Fatalf("CommitSnapshot: %v", err)
+		t.Fatalf("CommitTransaction: %v", err)
 	}
-	tw.ApplyPostCommit(prepared)
 
 	// Verify fewer files after compaction.
-	tm, _ = catalog.LoadTable(ns, "orders")
+	tm, _ = catalog.LoadTable(ctx, ns, "orders")
 	manifests, _ = ReadManifestList(mustDownload(t, ctx, s3, tm.CurrentManifestList()))
 	var dataFilesAfter int
 	var totalRows int64
@@ -260,7 +286,7 @@ func TestCompact_AppliesDeletes_PreservesUpdates(t *testing.T) {
 	catalog := newTestCatalog()
 	ns := "test_ns"
 
-	catalog.CreateTable(ns, "orders", ts, "s3://test-bucket/test_ns.db/orders", nil)
+	catalog.CreateTable(ctx, ns, "orders", ts, "s3://test-bucket/test_ns.db/orders", nil)
 
 	tw := NewTableWriter(TableWriteConfig{
 		Namespace:   ns,
@@ -304,7 +330,7 @@ func TestCompact_AppliesDeletes_PreservesUpdates(t *testing.T) {
 	}
 
 	// Count files before.
-	tm, _ := catalog.LoadTable(ns, "orders")
+	tm, _ := catalog.LoadTable(ctx, ns, "orders")
 	manifests, _ := ReadManifestList(mustDownload(t, ctx, s3, tm.CurrentManifestList()))
 	var dataBefore, deleteBefore int
 	for _, mfi := range manifests {
@@ -326,14 +352,13 @@ func TestCompact_AppliesDeletes_PreservesUpdates(t *testing.T) {
 		t.Fatal("expected compaction to run")
 	}
 
-	err = catalog.CommitSnapshot(ns, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit)
+	err = catalog.CommitTransaction(ctx, ns, []TableCommit{prepared.ToTableCommit()})
 	if err != nil {
-		t.Fatalf("CommitSnapshot: %v", err)
+		t.Fatalf("CommitTransaction: %v", err)
 	}
-	tw.ApplyPostCommit(prepared)
 
 	// Verify: no delete files after compaction.
-	tm, _ = catalog.LoadTable(ns, "orders")
+	tm, _ = catalog.LoadTable(ctx, ns, "orders")
 	manifests, _ = ReadManifestList(mustDownload(t, ctx, s3, tm.CurrentManifestList()))
 	var dataAfter, deleteAfter int
 	var totalRows int64
@@ -438,7 +463,7 @@ func TestCompact_BelowThreshold(t *testing.T) {
 	catalog := newTestCatalog()
 	ns := "test_ns"
 
-	catalog.CreateTable(ns, "orders", ts, "s3://test-bucket/test_ns.db/orders", nil)
+	catalog.CreateTable(ctx, ns, "orders", ts, "s3://test-bucket/test_ns.db/orders", nil)
 
 	tw := NewTableWriter(TableWriteConfig{
 		Namespace:   ns,

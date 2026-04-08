@@ -8,6 +8,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // PgCheckpointStore persists checkpoints to a PostgreSQL table under the _pg2iceberg schema.
@@ -97,7 +100,7 @@ func (s *PgCheckpointStore) migrate(ctx context.Context) error {
 			if err := json.Unmarshal(r.data, &cp); err != nil {
 				return fmt.Errorf("parse old checkpoint for %s: %w", r.id, err)
 			}
-			if err := s.Save(r.id, &cp); err != nil {
+			if err := s.Save(ctx, r.id, &cp); err != nil {
 				return fmt.Errorf("migrate checkpoint %s: %w", r.id, err)
 			}
 		}
@@ -136,13 +139,20 @@ func (s *PgCheckpointStore) createTable(ctx context.Context) error {
 }
 
 // Load reads the checkpoint for a pipeline. Returns a zero Checkpoint if no row exists.
-func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Checkpoint, error) {
+	ctx, span := tracer.Start(ctx, "checkpoint.Load", trace.WithAttributes(attribute.String("pipeline.id", pipelineID)))
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	var cp Checkpoint
 	var snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks []byte
 
+	_, dbSpan := tracer.Start(ctx, "checkpoint.pg SELECT", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		semconv.PeerService("postgres"),
+		attribute.String("db.system", "postgresql"),
+	))
 	err := s.pool.QueryRow(ctx, `
 		SELECT version, checksum, written_by, revision, mode, lsn, watermark,
 		       snapshot_complete, last_snapshot_id, last_sequence_number,
@@ -156,6 +166,7 @@ func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 		&cp.SeqCounter, &snapshotedTables, &snapshotChunks, &matSnapshots,
 		&queryWatermarks, &cp.UpdatedAt,
 	)
+	dbSpan.End()
 
 	if err == pgx.ErrNoRows {
 		return &Checkpoint{}, nil
@@ -185,8 +196,11 @@ func (s *PgCheckpointStore) Load(pipelineID string) (*Checkpoint, error) {
 }
 
 // Save upserts the checkpoint for a pipeline.
-func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Checkpoint) error {
+	ctx, span := tracer.Start(ctx, "checkpoint.Save", trace.WithAttributes(attribute.String("pipeline.id", pipelineID)))
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	// Truncate to microsecond precision to match PostgreSQL's TIMESTAMPTZ,
@@ -205,6 +219,10 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 
 	if expectedRevision == 0 {
 		// First save — insert.
+		_, dbSpan := tracer.Start(ctx, "checkpoint.pg UPSERT", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+			semconv.PeerService("postgres"),
+			attribute.String("db.system", "postgresql"),
+		))
 		_, err := s.pool.Exec(ctx, `
 			INSERT INTO _pg2iceberg.checkpoints (
 				pipeline_id, version, checksum, written_by, revision, mode, lsn, watermark,
@@ -224,6 +242,7 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 			cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber, cp.SeqCounter,
 			snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
 			cp.UpdatedAt)
+		dbSpan.End()
 		if err != nil {
 			return fmt.Errorf("save checkpoint: %w", err)
 		}
@@ -231,6 +250,10 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 	}
 
 	// Subsequent saves — optimistic concurrency check.
+	_, dbSpan := tracer.Start(ctx, "checkpoint.pg UPDATE", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		semconv.PeerService("postgres"),
+		attribute.String("db.system", "postgresql"),
+	))
 	result, err := s.pool.Exec(ctx, `
 		UPDATE _pg2iceberg.checkpoints SET
 			version = $2, checksum = $3, written_by = $4, revision = $5,
@@ -244,6 +267,7 @@ func (s *PgCheckpointStore) Save(pipelineID string, cp *Checkpoint) error {
 		cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber, cp.SeqCounter,
 		snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
 		cp.UpdatedAt, expectedRevision)
+	dbSpan.End()
 	if err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}

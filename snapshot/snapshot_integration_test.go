@@ -77,7 +77,7 @@ func TestSnapshotter_DirectWrite(t *testing.T) {
 	}
 
 	// Create the materialized table in the catalog.
-	_, err = catalog.CreateTable(sinkCfg.Namespace, "orders", ts,
+	_, err = catalog.CreateTable(ctx, sinkCfg.Namespace, "orders", ts,
 		fmt.Sprintf("%stest_ns.db/orders", sinkCfg.Warehouse), nil)
 	if err != nil {
 		t.Fatalf("create table in catalog: %v", err)
@@ -139,7 +139,7 @@ func TestSnapshotter_DirectWrite(t *testing.T) {
 	}
 
 	// Verify catalog has a snapshot.
-	tm, err := catalog.LoadTable(sinkCfg.Namespace, "orders")
+	tm, err := catalog.LoadTable(ctx, sinkCfg.Namespace, "orders")
 	if err != nil {
 		t.Fatalf("load table: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestSnapshotter_DirectWrite(t *testing.T) {
 	t.Logf("snapshots committed: %d", len(tm.Metadata.Snapshots))
 
 	// Verify checkpoint.
-	cp, err := store.Load("test")
+	cp, err := store.Load(ctx, "test")
 	if err != nil {
 		t.Fatalf("load checkpoint: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 		Warehouse: "s3://test-bucket/",
 	}
 
-	_, err = catalog.CreateTable(sinkCfg.Namespace, "items", ts,
+	_, err = catalog.CreateTable(ctx, sinkCfg.Namespace, "items", ts,
 		fmt.Sprintf("%stest_ns.db/items", sinkCfg.Warehouse), nil)
 	if err != nil {
 		t.Fatalf("create table: %v", err)
@@ -248,7 +248,7 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 	}
 
 	// Pre-seed the checkpoint to simulate partial completion (chunk 0 done).
-	if err := store.Save("test", &pipeline.Checkpoint{
+	if err := store.Save(ctx, "test", &pipeline.Checkpoint{
 		Mode:           "logical",
 		SnapshotChunks: map[string]int{"public.items": 0},
 	}); err != nil {
@@ -256,7 +256,7 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 	}
 
 	// Count snapshots before run.
-	tmBefore, _ := catalog.LoadTable(sinkCfg.Namespace, "items")
+	tmBefore, _ := catalog.LoadTable(ctx, sinkCfg.Namespace, "items")
 	snapshotsBefore := len(tmBefore.Metadata.Snapshots)
 
 	tables := []snapshot.Table{{Name: "public.items", Schema: ts}}
@@ -291,13 +291,13 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 	}
 
 	// Verify that chunk 0 was skipped (fewer snapshots committed than a full run).
-	tmAfter, _ := catalog.LoadTable(sinkCfg.Namespace, "items")
+	tmAfter, _ := catalog.LoadTable(ctx, sinkCfg.Namespace, "items")
 	snapshotsAfter := len(tmAfter.Metadata.Snapshots)
 	t.Logf("snapshots before=%d, after=%d (chunk 0 was skipped)", snapshotsBefore, snapshotsAfter)
 
 	// Should still have fewer rows than a full snapshot since chunk 0 data is missing,
 	// but more importantly: checkpoint should be clean.
-	cp, err := store.Load("test")
+	cp, err := store.Load(ctx, "test")
 	if err != nil {
 		t.Fatalf("load checkpoint: %v", err)
 	}
@@ -373,7 +373,7 @@ func TestSnapshotter_CrashAfterChunkCommit(t *testing.T) {
 		Warehouse: "s3://test-bucket/",
 	}
 
-	_, err = catalog.CreateTable(sinkCfg.Namespace, "orders", ts,
+	_, err = catalog.CreateTable(ctx, sinkCfg.Namespace, "orders", ts,
 		fmt.Sprintf("%stest_ns.db/orders", sinkCfg.Warehouse), nil)
 	if err != nil {
 		t.Fatalf("create table: %v", err)
@@ -432,13 +432,13 @@ func TestSnapshotter_CrashAfterChunkCommit(t *testing.T) {
 	t.Logf("run 1 crashed as expected: %v", err)
 
 	// Check: chunk 0 is checkpointed, chunk 1's data is in Iceberg but not checkpointed.
-	cp, err := crashStore.inner.Load("test")
+	cp, err := crashStore.inner.Load(ctx, "test")
 	if err != nil {
 		t.Fatalf("load checkpoint: %v", err)
 	}
 	t.Logf("checkpoint after crash: SnapshotChunks=%v", cp.SnapshotChunks)
 
-	tm, _ := catalog.LoadTable(sinkCfg.Namespace, "orders")
+	tm, _ := catalog.LoadTable(ctx, sinkCfg.Namespace, "orders")
 	snapshotsAfterCrash := len(tm.Metadata.Snapshots)
 	t.Logf("Iceberg snapshots after crash: %d", snapshotsAfterCrash)
 
@@ -459,12 +459,12 @@ func TestSnapshotter_CrashAfterChunkCommit(t *testing.T) {
 	// limitation: snapshot crash recovery can produce duplicates because the
 	// Iceberg append is not idempotent and there's no deduplication by PK
 	// in the snapshot path.
-	tmFinal, _ := catalog.LoadTable(sinkCfg.Namespace, "orders")
+	tmFinal, _ := catalog.LoadTable(ctx, sinkCfg.Namespace, "orders")
 	totalSnapshots := len(tmFinal.Metadata.Snapshots)
 	t.Logf("total Iceberg snapshots: %d (crash run: %d)", totalSnapshots, snapshotsAfterCrash)
 
 	// Expect duplicates: the crashed chunk's rows appear twice.
-	tmForCount, _ := catalog.LoadTable(sinkCfg.Namespace, "orders")
+	tmForCount, _ := catalog.LoadTable(ctx, sinkCfg.Namespace, "orders")
 	mlURI := tmForCount.CurrentManifestList()
 	mlKey, _ := iceberg.KeyFromURI(mlURI)
 	mlData, _ := s3.Download(ctx, mlKey)
@@ -504,16 +504,16 @@ type crashAfterNSaves struct {
 	crashAt   int
 }
 
-func (s *crashAfterNSaves) Load(id string) (*pipeline.Checkpoint, error) {
-	return s.inner.Load(id)
+func (s *crashAfterNSaves) Load(ctx context.Context, id string) (*pipeline.Checkpoint, error) {
+	return s.inner.Load(ctx, id)
 }
 
-func (s *crashAfterNSaves) Save(id string, cp *pipeline.Checkpoint) error {
+func (s *crashAfterNSaves) Save(ctx context.Context, id string, cp *pipeline.Checkpoint) error {
 	s.saveCount++
 	if s.saveCount == s.crashAt {
 		return fmt.Errorf("simulated crash after save %d", s.saveCount)
 	}
-	return s.inner.Save(id, cp)
+	return s.inner.Save(ctx, id, cp)
 }
 
 func (s *crashAfterNSaves) Close() {
@@ -561,7 +561,7 @@ func TestSnapshotter_EmptyTable(t *testing.T) {
 		Warehouse: "s3://test-bucket/",
 	}
 
-	_, err = catalog.CreateTable(sinkCfg.Namespace, "empty_tbl", ts,
+	_, err = catalog.CreateTable(ctx, sinkCfg.Namespace, "empty_tbl", ts,
 		fmt.Sprintf("%stest_ns.db/empty_tbl", sinkCfg.Warehouse), nil)
 	if err != nil {
 		t.Fatalf("create table: %v", err)
@@ -613,13 +613,13 @@ func TestSnapshotter_EmptyTable(t *testing.T) {
 	}
 
 	// No Iceberg snapshots should have been committed (no data to write).
-	tm, _ := catalog.LoadTable(sinkCfg.Namespace, "empty_tbl")
+	tm, _ := catalog.LoadTable(ctx, sinkCfg.Namespace, "empty_tbl")
 	if tm.Metadata.CurrentSnapshotID != 0 {
 		t.Errorf("expected no snapshot for empty table, got ID %d", tm.Metadata.CurrentSnapshotID)
 	}
 
 	// Checkpoint should still mark the table as complete.
-	cp, _ := store.Load("test")
+	cp, _ := store.Load(ctx, "test")
 	if !cp.SnapshotedTables["public.empty_tbl"] {
 		t.Error("expected empty_tbl in SnapshotedTables")
 	}
@@ -673,8 +673,8 @@ func TestSnapshotter_MultiTable(t *testing.T) {
 		Warehouse: "s3://test-bucket/",
 	}
 
-	catalog.CreateTable(sinkCfg.Namespace, "t1", ts1, "s3://test-bucket/test_ns.db/t1", nil)
-	catalog.CreateTable(sinkCfg.Namespace, "t2", ts2, "s3://test-bucket/test_ns.db/t2", nil)
+	catalog.CreateTable(ctx, sinkCfg.Namespace, "t1", ts1, "s3://test-bucket/test_ns.db/t1", nil)
+	catalog.CreateTable(ctx, sinkCfg.Namespace, "t2", ts2, "s3://test-bucket/test_ns.db/t2", nil)
 
 	deps := snapshot.Deps{
 		Catalog:    catalog,
@@ -734,7 +734,7 @@ func TestSnapshotter_MultiTable(t *testing.T) {
 		}
 	}
 
-	cp, _ := store.Load("test")
+	cp, _ := store.Load(ctx, "test")
 	if !cp.SnapshotedTables["public.t1"] {
 		t.Error("expected t1 in SnapshotedTables")
 	}
@@ -823,7 +823,7 @@ func TestSnapshotter_CTIDChunking(t *testing.T) {
 		Warehouse: "s3://test-bucket/",
 	}
 
-	_, err = catalog.CreateTable(sinkCfg.Namespace, "big_tbl", ts,
+	_, err = catalog.CreateTable(ctx, sinkCfg.Namespace, "big_tbl", ts,
 		fmt.Sprintf("%stest_ns.db/big_tbl", sinkCfg.Warehouse), nil)
 	if err != nil {
 		t.Fatalf("create table in catalog: %v", err)
@@ -881,7 +881,7 @@ func TestSnapshotter_CTIDChunking(t *testing.T) {
 	}
 
 	// Verify multiple Iceberg snapshots were committed (one per chunk).
-	tm, _ := catalog.LoadTable(sinkCfg.Namespace, "big_tbl")
+	tm, _ := catalog.LoadTable(ctx, sinkCfg.Namespace, "big_tbl")
 	if tm == nil {
 		t.Fatal("table not found in catalog")
 	}
@@ -892,7 +892,7 @@ func TestSnapshotter_CTIDChunking(t *testing.T) {
 	}
 
 	// Verify checkpoint: table complete, no leftover chunk state.
-	cp, _ := store.Load("test")
+	cp, _ := store.Load(ctx, "test")
 	if !cp.SnapshotedTables["public.big_tbl"] {
 		t.Error("expected big_tbl in SnapshotedTables")
 	}

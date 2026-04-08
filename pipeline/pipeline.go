@@ -46,7 +46,7 @@ type Metrics struct {
 func NewCheckpointStore(ctx context.Context, cfg *config.Config) (CheckpointStore, error) {
 	// Explicit file path: use file store (local dev).
 	if cfg.State.Path != "" {
-		return NewFileCheckpointStore(cfg.State.Path), nil
+		return NewCachedCheckpointStore(NewFileCheckpointStore(cfg.State.Path)), nil
 	}
 
 	// Explicit postgres URL, or fall back to source postgres.
@@ -54,5 +54,9 @@ func NewCheckpointStore(ctx context.Context, cfg *config.Config) (CheckpointStor
 	if url == "" {
 		url = cfg.Source.Postgres.DSN()
 	}
-	return NewPgCheckpointStore(ctx, url)
+	inner, err := NewPgCheckpointStore(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	return NewCachedCheckpointStore(inner), nil
 }

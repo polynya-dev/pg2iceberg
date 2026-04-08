@@ -21,6 +21,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/query"
 	"github.com/pg2iceberg/pg2iceberg/snapshot"
+	"github.com/pg2iceberg/pg2iceberg/tracing"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -105,6 +106,13 @@ func main() {
 	})
 	if err != nil {
 		log.Fatalf("fatal: %v", err)
+	}
+
+	shutdownTracing, err := tracing.Init(ctx, "pg2iceberg", commitSHA)
+	if err != nil {
+		log.Printf("warning: failed to initialize tracing: %v", err)
+	} else {
+		defer shutdownTracing(ctx)
 	}
 
 	var runErr error
@@ -281,7 +289,7 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 	defer cpStore.Close()
 
 	// Check if snapshot already completed.
-	cp, err := cpStore.Load("default")
+	cp, err := cpStore.Load(ctx, "default")
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
@@ -320,7 +328,7 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 	catalog := clients.Catalog
 
 	// Ensure namespace and create/load Iceberg tables.
-	if err := catalog.EnsureNamespace(cfg.Sink.Namespace); err != nil {
+	if err := catalog.EnsureNamespace(ctx, cfg.Sink.Namespace); err != nil {
 		return fmt.Errorf("ensure namespace: %w", err)
 	}
 
@@ -339,7 +347,7 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 			return fmt.Errorf("build partition spec for %s: %w", pgTable, err)
 		}
 
-		matTm, err := catalog.LoadTable(cfg.Sink.Namespace, icebergName)
+		matTm, err := catalog.LoadTable(ctx, cfg.Sink.Namespace, icebergName)
 		if err != nil {
 			return fmt.Errorf("load table %s: %w", icebergName, err)
 		}
@@ -348,7 +356,7 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 			if wh := clients.Warehouse(); wh != "" {
 				location = fmt.Sprintf("%s%s.db/%s", wh, cfg.Sink.Namespace, icebergName)
 			}
-			if _, err := catalog.CreateTable(cfg.Sink.Namespace, icebergName, ts, location, partSpec); err != nil {
+			if _, err := catalog.CreateTable(ctx, cfg.Sink.Namespace, icebergName, ts, location, partSpec); err != nil {
 				return fmt.Errorf("create table %s: %w", icebergName, err)
 			}
 			log.Printf("[snapshot] created table %s.%s", cfg.Sink.Namespace, icebergName)
@@ -410,14 +418,14 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 	}
 
 	// Mark snapshot complete.
-	cp, err = cpStore.Load("default")
+	cp, err = cpStore.Load(ctx, "default")
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
 	}
 	cp.SnapshotComplete = true
 	cp.SnapshotedTables = nil
 	cp.SnapshotChunks = nil
-	if err := cpStore.Save("default", cp); err != nil {
+	if err := cpStore.Save(ctx, "default", cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
 
@@ -481,7 +489,7 @@ func runCompact(ctx context.Context, cfg *config.Config) error {
 		}
 
 		// Load table to get schema ID.
-		matTm, err := catalog.LoadTable(cfg.Sink.Namespace, icebergName)
+		matTm, err := catalog.LoadTable(ctx, cfg.Sink.Namespace, icebergName)
 		if err != nil {
 			return fmt.Errorf("load table %s: %w", icebergName, err)
 		}
@@ -510,7 +518,7 @@ func runCompact(ctx context.Context, cfg *config.Config) error {
 			continue
 		}
 
-		if err := catalog.CommitSnapshot(cfg.Sink.Namespace, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit); err != nil {
+		if err := catalog.CommitSnapshot(ctx, cfg.Sink.Namespace, prepared.IcebergName, prepared.PrevSnapshotID, prepared.Commit); err != nil {
 			log.Printf("[compact] commit error for %s: %v", icebergName, err)
 			continue
 		}

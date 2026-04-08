@@ -11,7 +11,12 @@ import (
 	pq "github.com/parquet-go/parquet-go"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
+
+var compactTracer = otel.Tracer("pg2iceberg/compact")
 
 // CompactionConfig holds thresholds that trigger compaction.
 type CompactionConfig struct {
@@ -64,24 +69,26 @@ func ReadParquetRowsFromReaderAt(r io.ReaderAt, size int64, schema *postgres.Tab
 
 // Compact rewrites all data and delete files into clean data-only files.
 // Returns nil if file counts are below thresholds (no compaction needed).
-// The caller must commit the returned PreparedCommit and call ApplyPostCommit.
+// The caller must commit via CommitSnapshot (which updates the MetadataCache).
 func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionConfig) (*PreparedCommit, error) {
 	cfg := tw.cfg
 	ns := cfg.Namespace
 	basePath := fmt.Sprintf("%s.db/%s", ns, cfg.IcebergName)
 
-	// Load current table state.
-	matTm, err := tw.catalog.LoadTable(ns, cfg.IcebergName)
+	// Load table state from catalog cache (cache hit in steady state).
+	matTm, err := tw.catalog.LoadTable(ctx, ns, cfg.IcebergName)
 	if err != nil {
 		return nil, fmt.Errorf("load table: %w", err)
 	}
 	if matTm == nil || matTm.Metadata.CurrentSnapshotID <= 0 {
 		return nil, nil
 	}
+	currentSnapID := matTm.Metadata.CurrentSnapshotID
+	lastSeqNum := matTm.Metadata.LastSequenceNumber
 
-	// Skip if the last snapshot was already a compaction — no new data since then.
+	// Check if last snapshot was compaction — skip if so.
 	for _, snap := range matTm.Metadata.Snapshots {
-		if snap.SnapshotID == matTm.Metadata.CurrentSnapshotID {
+		if snap.SnapshotID == currentSnapID {
 			if snap.Summary["operation"] == "replace" {
 				return nil, nil
 			}
@@ -89,14 +96,16 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 		}
 	}
 
-	// Use cached manifests if available (avoids S3 round-trip during streaming).
-	manifests := tw.manifests
+	// Seed manifest cache on cold start.
+	manifests := tw.catalog.Manifests(ns, cfg.IcebergName)
 	if manifests == nil {
-		var err error
-		manifests, err = tw.loadExistingManifests(ctx, matTm)
-		if err != nil {
-			return nil, fmt.Errorf("load manifests: %w", err)
+		manifests, _ = tw.loadExistingManifests(ctx, matTm)
+		if manifests != nil {
+			tw.catalog.SetManifests(ns, cfg.IcebergName, manifests)
 		}
+	}
+	if manifests == nil {
+		return nil, nil
 	}
 
 	// Count data and delete files.
@@ -112,6 +121,14 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	if dataFileCount < cc.DataFileThreshold && deleteFileCount < cc.DeleteFileThreshold {
 		return nil, nil // below thresholds
 	}
+
+	// Only create a span when compaction actually runs.
+	ctx, span := compactTracer.Start(ctx, "pg2iceberg.compact", trace.WithAttributes(
+		attribute.String("iceberg.table", cfg.IcebergName),
+		attribute.Int("data_files", dataFileCount),
+		attribute.Int("delete_files", deleteFileCount),
+	))
+	defer span.End()
 
 	log.Printf("[compact] %s: %d data files, %d delete files — compacting", cfg.IcebergName, dataFileCount, deleteFileCount)
 
@@ -218,13 +235,14 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 
 	// Build a quick PK→file lookup if we have deletes.
 	affectedFiles := make(map[string]bool) // file paths that need rewriting
-	if len(deletePKSeq) > 0 && tw.FileIdx != nil && tw.FileIdx.SnapshotID == matTm.Metadata.CurrentSnapshotID {
+	fileIdx := tw.catalog.FileIndex(ns, cfg.IcebergName)
+	if len(deletePKSeq) > 0 && fileIdx != nil && fileIdx.SnapshotID == currentSnapID {
 		// Use cached file index to find affected files.
 		pks := make([]string, 0, len(deletePKSeq))
 		for pk := range deletePKSeq {
 			pks = append(pks, pk)
 		}
-		affectedFiles = tw.FileIdx.AffectedFiles(pks)
+		affectedFiles = fileIdx.AffectedFiles(pks)
 		log.Printf("[compact] %s: %d/%d data files affected by deletes",
 			cfg.IcebergName, len(affectedFiles), len(dataFiles))
 	} else if len(deletePKSeq) > 0 {
@@ -252,7 +270,7 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 
 	now := time.Now()
 	snapshotID := now.UnixMilli()
-	seqNum := matTm.Metadata.LastSequenceNumber + 1
+	seqNum := lastSeqNum + 1
 
 	for _, df := range dataFiles {
 		if affectedFiles[df.Path] {
@@ -356,87 +374,41 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 		return nil, fmt.Errorf("flush compacted data: %w", err)
 	}
 
-	// Upload compacted files.
-	type uploadResult struct {
-		uri string
-		idx int
-	}
-	uploadResults := make([]uploadResult, len(chunks))
-	uploadTasks := make([]utils.Task, len(chunks))
-
-	for i, chunk := range chunks {
-		i, chunk := i, chunk
-		key := fmt.Sprintf("%s/data/%s-compact-%d.parquet", basePath, uuid.New().String(), i)
-		uploadTasks[i] = utils.Task{
-			Name: key,
-			Fn: func(ctx context.Context, _ *utils.Progress) error {
-				uri, err := tw.s3.Upload(ctx, key, chunk.Data)
-				if err != nil {
-					return fmt.Errorf("upload %s: %w", key, err)
-				}
-				uploadResults[i] = uploadResult{uri: uri, idx: i}
-				return nil
-			},
-		}
-	}
-
-	uploadPool := utils.NewPool(concurrency)
-	if _, err := uploadPool.Run(ctx, uploadTasks); err != nil {
-		return nil, fmt.Errorf("upload compacted files: %w", err)
-	}
-
-	// Combine carried-forward entries + new compacted entries.
+	// Build entries using pre-computed URIs.
+	var dataUploads []PendingData
 	var newDataEntries []ManifestEntry
-	for i, ur := range uploadResults {
+	for i, chunk := range chunks {
+		key := fmt.Sprintf("%s/data/%s-compact-%d.parquet", basePath, uuid.New().String(), i)
 		newDataEntries = append(newDataEntries, ManifestEntry{
 			Status:     1,
 			SnapshotID: snapshotID,
 			DataFile: DataFileInfo{
-				Path:          ur.uri,
-				FileSizeBytes: int64(len(chunks[i].Data)),
-				RecordCount:   chunks[i].RowCount,
+				Path:          tw.s3.URIForKey(key),
+				FileSizeBytes: int64(len(chunk.Data)),
+				RecordCount:   chunk.RowCount,
 				Content:       0,
 			},
 		})
+		dataUploads = append(dataUploads, PendingData{Key: key, Data: chunk.Data})
 	}
 
 	allEntries := append(carriedEntries, newDataEntries...)
-	var totalNewRows int64
-	for _, e := range allEntries {
-		totalNewRows += e.DataFile.RecordCount
-	}
 
-	// Build new manifest (data only, no deletes).
+	// Build + upload everything in one parallel batch.
 	partSpec := cfg.PartSpec
-	manifestBytes, err := WriteManifest(ts, allEntries, seqNum, 0, partSpec)
+	bundle, err := BuildCommit(BuildCommitConfig{
+		S3: tw.s3, Schema: ts, PartSpec: partSpec, BasePath: basePath,
+		SnapshotID: snapshotID, SeqNum: seqNum, ExistingManifests: nil, // compaction replaces all manifests
+	}, []ManifestGroup{{Entries: allEntries, Content: 0}})
 	if err != nil {
-		return nil, fmt.Errorf("write compacted manifest: %w", err)
+		return nil, err
 	}
-	manifestKey := fmt.Sprintf("%s/metadata/%s-compact-data.avro", basePath, uuid.New().String())
-	manifestURI, err := tw.s3.Upload(ctx, manifestKey, manifestBytes)
-	if err != nil {
-		return nil, fmt.Errorf("upload compacted manifest: %w", err)
+	if err := UploadAll(ctx, tw.s3, dataUploads, bundle, concurrency); err != nil {
+		return nil, err
 	}
 
-	newManifests := []ManifestFileInfo{{
-		Path:           manifestURI,
-		Length:         int64(len(manifestBytes)),
-		Content:        0,
-		SnapshotID:     snapshotID,
-		AddedFiles:     len(allEntries),
-		AddedRows:      totalNewRows,
-		SequenceNumber: seqNum,
-	}}
-
-	mlBytes, err := WriteManifestList(newManifests)
-	if err != nil {
-		return nil, fmt.Errorf("write compacted manifest list: %w", err)
-	}
-	mlKey := fmt.Sprintf("%s/metadata/snap-%d-0-manifest-list.avro", basePath, snapshotID)
-	mlURI, err := tw.s3.Upload(ctx, mlKey, mlBytes)
-	if err != nil {
-		return nil, fmt.Errorf("upload compacted manifest list: %w", err)
-	}
+	mlURI := bundle.ManifestListURI
+	newManifests := bundle.NewManifests
 
 	deletedRows := totalRewriteRows - filteredRows
 	beforeFiles := dataFileCount + deleteFileCount
@@ -457,7 +429,7 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 
 	return &PreparedCommit{
 		IcebergName:    cfg.IcebergName,
-		PrevSnapshotID: matTm.Metadata.CurrentSnapshotID,
+		PrevSnapshotID: currentSnapID,
 		Commit:         commit,
 		NewManifests:   newManifests,
 		DataCount:      len(allEntries),

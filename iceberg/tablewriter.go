@@ -12,6 +12,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var (
+	twTracer = otel.Tracer("pg2iceberg/tablewriter")
 )
 
 // RowState is the final state of a single PK after folding/dedup.
@@ -40,11 +47,22 @@ type PreparedCommit struct {
 	Commit         SnapshotCommit
 	NewManifests   []ManifestFileInfo // updated manifest cache for post-commit
 
+	// For incremental FileIndex update after commit. Avoids full rebuild
+	// (and the S3 reads it entails) on every cycle.
+	NewDataFiles []FileIndexEntry // data files written in this commit
+	DeletedPKs   []string         // PKs equality-deleted in this commit
+
 	// Diagnostics.
 	DataCount      int
 	DeleteCount    int
 	DeleteRowCount int64
 	BucketCount    int
+}
+
+// FileIndexEntry pairs a data file with the PK keys it contains.
+type FileIndexEntry struct {
+	DataFile DataFileInfo
+	PKKeys   []string
 }
 
 // FileIndex tracks which PKs live in which data files for a single table.
@@ -95,14 +113,8 @@ func (fi *FileIndex) AffectedFiles(pks []string) map[string]bool {
 // merge-on-read: equality deletes for old PKs, data files for new rows.
 type TableWriter struct {
 	cfg     TableWriteConfig
-	catalog Catalog
+	catalog MetadataCache
 	s3      ObjectStorage
-
-	// Cached manifest list from previous cycle (carried forward).
-	manifests []ManifestFileInfo
-
-	// File index for DELETE partition routing and TOAST resolution.
-	FileIdx *FileIndex
 }
 
 // UpdateSchema updates the writer's schema after a schema evolution.
@@ -112,7 +124,7 @@ func (tw *TableWriter) UpdateSchema(srcSchema *postgres.TableSchema, schemaID in
 }
 
 // NewTableWriter creates a new TableWriter.
-func NewTableWriter(cfg TableWriteConfig, catalog Catalog, s3 ObjectStorage) *TableWriter {
+func NewTableWriter(cfg TableWriteConfig, catalog MetadataCache, s3 ObjectStorage) *TableWriter {
 	return &TableWriter{
 		cfg:     cfg,
 		catalog: catalog,
@@ -127,12 +139,14 @@ type pendingFile struct {
 	content          int // 0=data, 2=equality delete
 	equalityFieldIDs []int
 	partitionValues  map[string]any
+	pkKeys           []string // PK keys in this file (data files only, for incremental FileIndex)
 }
 
 // bucketResult holds the output of serialization for one partition bucket.
 type bucketResult struct {
 	pending        []pendingFile
 	deleteRowCount int64
+	deletedPKs     []string // PKs equality-deleted in this bucket
 }
 
 // Prepare takes the final state per PK (already folded/deduped), partitions it,
@@ -153,18 +167,16 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	partitioned := partSpec != nil && !partSpec.IsUnpartitioned()
 	basePath := fmt.Sprintf("%s.db/%s", cfg.Namespace, cfg.IcebergName)
 
-	// Load materialized table metadata for commit.
-	matTm, err := tw.catalog.LoadTable(cfg.Namespace, cfg.IcebergName)
+	// Load table metadata from the catalog cache (cache hit in steady state,
+	// cold-start miss falls through to the real catalog).
+	var prevMatSnapID int64
+	seqNum := int64(1)
+	matTm, err := tw.catalog.LoadTable(ctx, cfg.Namespace, cfg.IcebergName)
 	if err != nil {
 		return nil, fmt.Errorf("load materialized table: %w", err)
 	}
-
-	var prevMatSnapID int64
 	if matTm != nil {
 		prevMatSnapID = matTm.Metadata.CurrentSnapshotID
-	}
-	seqNum := int64(1)
-	if matTm != nil {
 		seqNum = matTm.Metadata.LastSequenceNumber + 1
 	}
 
@@ -188,6 +200,8 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		numShards = 2
 	}
 
+	fileIdx := tw.catalog.FileIndex(cfg.Namespace, cfg.IcebergName)
+
 	for i := range rows {
 		rs := &rows[i]
 		var bKey string
@@ -196,8 +210,8 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 			if rs.Op == "D" {
 				if cached, ok := pkPartKey[pkKey]; ok {
 					bKey = cached
-				} else if tw.FileIdx != nil {
-					if filePath, ok := tw.FileIdx.PkToFile[pkKey]; ok {
+				} else if fileIdx != nil {
+					if filePath, ok := fileIdx.PkToFile[pkKey]; ok {
 						bKey = ExtractPartBucketKey(filePath)
 					} else {
 						continue
@@ -235,7 +249,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}
 
 	// Resolve partition values for DELETE-only buckets using the file index path.
-	if partitioned && tw.FileIdx != nil {
+	if partitioned && fileIdx != nil {
 		for bKey, b := range bucketMap {
 			if b.partValues != nil {
 				continue
@@ -251,6 +265,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}
 
 	// --- Serialize per bucket (equality deletes + data files) ---
+	serCtx, serSpan := twTracer.Start(ctx, "pg2iceberg.serialize", trace.WithAttributes(attribute.Int("buckets", len(buckets))))
 	results := make([]bucketResult, len(buckets))
 
 	serializeTasks := make([]utils.Task, len(buckets))
@@ -261,6 +276,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 			Fn: func(ctx context.Context, _ *utils.Progress) error {
 				// Equality delete files for U/D rows.
 				var deleteRowCount int64
+				var deletedPKs []string
 				deleteWriter := NewRollingDeleteWriter(ts, targetSize)
 				for _, rs := range b.rows {
 					if rs.Op == "U" || rs.Op == "D" {
@@ -268,6 +284,7 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 							return fmt.Errorf("add delete row: %w", err)
 						}
 						deleteRowCount++
+						deletedPKs = append(deletedPKs, BuildPKKey(rs.Row, pk))
 					}
 				}
 				var pf []pendingFile
@@ -292,38 +309,53 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 					}
 				}
 
-				// Data files for I/U rows.
+				// Data files for I/U rows. Track PKs per file for incremental FileIndex.
 				dataWriter := NewRollingDataWriter(ts, targetSize)
+				var dataPKs []string
 				for _, rs := range b.rows {
 					if rs.Op == "I" || rs.Op == "U" {
 						if err := dataWriter.Add(rs.Row); err != nil {
 							return fmt.Errorf("add data row: %w", err)
 						}
+						dataPKs = append(dataPKs, BuildPKKey(rs.Row, pk))
 					}
 				}
 				chunks, err := dataWriter.FlushAll()
 				if err != nil {
 					return fmt.Errorf("flush data: %w", err)
 				}
+				// Distribute PKs across chunks proportionally by row count.
+				pkOffset := 0
 				if partitioned {
 					avroPartValues := partSpec.PartitionAvroValue(b.partValues, ts)
 					for j, chunk := range chunks {
+						end := pkOffset + int(chunk.RowCount)
+						if end > len(dataPKs) {
+							end = len(dataPKs)
+						}
 						key := fmt.Sprintf("%s/data/%s/%s-mat-%d.parquet", basePath, b.partPath, uuid.New().String(), j)
 						pf = append(pf, pendingFile{
 							key:             key,
 							chunk:           chunk,
 							content:         0,
 							partitionValues: avroPartValues,
+							pkKeys:          dataPKs[pkOffset:end],
 						})
+						pkOffset = end
 					}
 				} else {
 					for j, chunk := range chunks {
+						end := pkOffset + int(chunk.RowCount)
+						if end > len(dataPKs) {
+							end = len(dataPKs)
+						}
 						key := fmt.Sprintf("%s/data/%s-mat-%d.parquet", basePath, uuid.New().String(), j)
-						pf = append(pf, pendingFile{key: key, chunk: chunk, content: 0})
+						pf = append(pf, pendingFile{key: key, chunk: chunk, content: 0, pkKeys: dataPKs[pkOffset:end]})
+						pkOffset = end
 					}
 				}
 
-				results[i] = bucketResult{pending: pf, deleteRowCount: deleteRowCount}
+				results[i] = bucketResult{pending: pf, deleteRowCount: deleteRowCount, deletedPKs: deletedPKs}
 				return nil
 			},
 		}
@@ -337,153 +369,90 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		concurrency = 1
 	}
 	serializePool := utils.NewPool(concurrency)
-	if _, err := serializePool.Run(ctx, serializeTasks); err != nil {
+	if _, err := serializePool.Run(serCtx, serializeTasks); err != nil {
+		serSpan.End()
 		return nil, fmt.Errorf("serialize: %w", err)
 	}
+	serSpan.End()
 
 	// Collect results.
 	var allPending []pendingFile
 	var totalDeleteRows int64
+	var allDeletedPKs []string
 	for _, r := range results {
 		allPending = append(allPending, r.pending...)
 		totalDeleteRows += r.deleteRowCount
+		allDeletedPKs = append(allDeletedPKs, r.deletedPKs...)
 	}
 
-	// --- Upload all files in parallel ---
+	// --- Build manifest entries using pre-computed URIs ---
 	var deleteEntries []ManifestEntry
 	var dataEntries []ManifestEntry
+	var newDataFiles []FileIndexEntry
 
-	if len(allPending) > 0 {
-		type uploadedFile struct {
-			uri string
-			pf  pendingFile
+	for _, pf := range allPending {
+		df := DataFileInfo{
+			Path:             tw.s3.URIForKey(pf.key),
+			FileSizeBytes:    int64(len(pf.chunk.Data)),
+			RecordCount:      pf.chunk.RowCount,
+			Content:          pf.content,
+			EqualityFieldIDs: pf.equalityFieldIDs,
+			PartitionValues:  pf.partitionValues,
 		}
-
-		var mu sync.Mutex
-		var uploaded []uploadedFile
-
-		uploadTasks := make([]utils.Task, len(allPending))
-		for i, pf := range allPending {
-			pf := pf
-			uploadTasks[i] = utils.Task{
-				Name: pf.key,
-				Fn: func(ctx context.Context, _ *utils.Progress) error {
-					uri, err := tw.s3.Upload(ctx, pf.key, pf.chunk.Data)
-					if err != nil {
-						return fmt.Errorf("upload %s: %w", pf.key, err)
-					}
-					mu.Lock()
-					uploaded = append(uploaded, uploadedFile{uri: uri, pf: pf})
-					mu.Unlock()
-					return nil
-				},
+		entry := ManifestEntry{Status: 1, SnapshotID: snapshotID, DataFile: df}
+		if pf.content == 0 {
+			dataEntries = append(dataEntries, entry)
+			if len(pf.pkKeys) > 0 {
+				newDataFiles = append(newDataFiles, FileIndexEntry{DataFile: df, PKKeys: pf.pkKeys})
 			}
-		}
-
-		uploadConcurrency := tw.concurrency()
-		if len(uploadTasks) < uploadConcurrency {
-			uploadConcurrency = len(uploadTasks)
-		}
-		uploadPool := utils.NewPool(uploadConcurrency)
-		if _, err := uploadPool.Run(ctx, uploadTasks); err != nil {
-			return nil, fmt.Errorf("upload materialized files: %w", err)
-		}
-
-		for _, u := range uploaded {
-			entry := ManifestEntry{
-				Status:     1,
-				SnapshotID: snapshotID,
-				DataFile: DataFileInfo{
-					Path:             u.uri,
-					FileSizeBytes:    int64(len(u.pf.chunk.Data)),
-					RecordCount:      u.pf.chunk.RowCount,
-					Content:          u.pf.content,
-					EqualityFieldIDs: u.pf.equalityFieldIDs,
-					PartitionValues:  u.pf.partitionValues,
-				},
-			}
-			if u.pf.content == 0 {
-				dataEntries = append(dataEntries, entry)
-			} else {
-				deleteEntries = append(deleteEntries, entry)
-			}
+		} else {
+			deleteEntries = append(deleteEntries, entry)
 		}
 	}
 
-	// Nothing to commit.
 	if len(deleteEntries) == 0 && len(dataEntries) == 0 {
 		return nil, nil
 	}
 
-	// --- Manifest assembly ---
-	// Load cached manifests or fetch from S3 on first run.
-	if tw.manifests == nil && matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
-		tw.manifests, err = tw.loadExistingManifests(ctx, matTm)
-		if err != nil {
-			return nil, fmt.Errorf("load existing manifests: %w", err)
+	// --- Build + upload manifests + manifest list + data files in one batch ---
+	existingManifests := tw.catalog.Manifests(cfg.Namespace, cfg.IcebergName)
+	if existingManifests == nil && prevMatSnapID > 0 {
+		if matTm != nil {
+			var mErr error
+			existingManifests, mErr = tw.loadExistingManifests(ctx, matTm)
+			if mErr != nil {
+				return nil, fmt.Errorf("load existing manifests: %w", mErr)
+			}
+			tw.catalog.SetManifests(cfg.Namespace, cfg.IcebergName, existingManifests)
 		}
 	}
-	existingManifests := tw.manifests
 
-	var newManifests []ManifestFileInfo
-
+	var groups []ManifestGroup
 	if len(dataEntries) > 0 {
-		manifestBytes, err := WriteManifest(ts, dataEntries, seqNum, 0, partSpec)
-		if err != nil {
-			return nil, fmt.Errorf("write data manifest: %w", err)
-		}
-		manifestKey := fmt.Sprintf("%s/metadata/%s-mat-data.avro", basePath, uuid.New().String())
-		manifestURI, err := tw.s3.Upload(ctx, manifestKey, manifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("upload data manifest: %w", err)
-		}
-		var totalRows int64
-		for _, e := range dataEntries {
-			totalRows += e.DataFile.RecordCount
-		}
-		newManifests = append(newManifests, ManifestFileInfo{
-			Path:           manifestURI,
-			Length:         int64(len(manifestBytes)),
-			Content:        0,
-			SnapshotID:     snapshotID,
-			AddedFiles:     len(dataEntries),
-			AddedRows:      totalRows,
-			SequenceNumber: seqNum,
-		})
+		groups = append(groups, ManifestGroup{Entries: dataEntries, Content: 0})
 	}
-
 	if len(deleteEntries) > 0 {
-		manifestBytes, err := WriteManifest(ts, deleteEntries, seqNum, 1, partSpec)
-		if err != nil {
-			return nil, fmt.Errorf("write delete manifest: %w", err)
-		}
-		manifestKey := fmt.Sprintf("%s/metadata/%s-mat-deletes.avro", basePath, uuid.New().String())
-		manifestURI, err := tw.s3.Upload(ctx, manifestKey, manifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("upload delete manifest: %w", err)
-		}
-		newManifests = append(newManifests, ManifestFileInfo{
-			Path:           manifestURI,
-			Length:         int64(len(manifestBytes)),
-			Content:        1,
-			SnapshotID:     snapshotID,
-			AddedFiles:     len(deleteEntries),
-			AddedRows:      totalDeleteRows,
-			SequenceNumber: seqNum,
-		})
+		groups = append(groups, ManifestGroup{Entries: deleteEntries, Content: 1})
 	}
 
-	allManifests := append(existingManifests, newManifests...)
+	bundle, err := BuildCommit(BuildCommitConfig{
+		S3: tw.s3, Schema: ts, PartSpec: partSpec, BasePath: basePath,
+		SnapshotID: snapshotID, SeqNum: seqNum, ExistingManifests: existingManifests,
+	}, groups)
+	if err != nil {
+		return nil, err
+	}
 
-	mlBytes, err := WriteManifestList(allManifests)
-	if err != nil {
-		return nil, fmt.Errorf("write manifest list: %w", err)
+	dataUploads := make([]PendingData, len(allPending))
+	for i, pf := range allPending {
+		dataUploads[i] = PendingData{Key: pf.key, Data: pf.chunk.Data}
 	}
-	mlKey := fmt.Sprintf("%s/metadata/snap-%d-0-manifest-list.avro", basePath, snapshotID)
-	mlURI, err := tw.s3.Upload(ctx, mlKey, mlBytes)
-	if err != nil {
-		return nil, fmt.Errorf("upload manifest list: %w", err)
+	if err := UploadAll(ctx, tw.s3, dataUploads, bundle, tw.concurrency()); err != nil {
+		return nil, err
 	}
+
+	mlURI := bundle.ManifestListURI
+	allManifests := bundle.AllManifests
 
 	commit := SnapshotCommit{
 		SnapshotID:       snapshotID,
@@ -501,6 +470,8 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		PrevSnapshotID: prevMatSnapID,
 		Commit:         commit,
 		NewManifests:   allManifests,
+		NewDataFiles:   newDataFiles,
+		DeletedPKs:     allDeletedPKs,
 		DataCount:      len(dataEntries),
 		DeleteCount:    len(deleteEntries),
 		DeleteRowCount: totalDeleteRows,
@@ -508,47 +479,59 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	}, nil
 }
 
-// ApplyPostCommit updates the manifest cache and invalidates the file index
-// after a successful catalog commit. Must be called only after CommitTransaction succeeds.
-func (tw *TableWriter) ApplyPostCommit(pc *PreparedCommit) {
-	tw.manifests = pc.NewManifests
-	// Invalidate file index so it's rebuilt on next cycle.
-	if tw.FileIdx != nil {
-		tw.FileIdx.SnapshotID = 0
-	}
-}
-
-// ToTableCommit converts a PreparedCommit into a TableCommit for catalog.CommitTransaction.
+// ToTableCommit converts a PreparedCommit into a TableCommit that carries
+// all post-commit metadata. When passed to CommitTransaction, the
+// MetadataStore applies manifests, data files, and file index updates
+// seamlessly — no manual post-commit step needed.
 func (pc *PreparedCommit) ToTableCommit() TableCommit {
 	return TableCommit{
 		Table:             pc.IcebergName,
 		CurrentSnapshotID: pc.PrevSnapshotID,
 		Snapshot:          pc.Commit,
+		NewManifests:      pc.NewManifests,
+		NewDataFiles:      pc.NewDataFiles,
+		DeletedPKs:        pc.DeletedPKs,
 	}
 }
 
 // BuildFileIndex reads all data files for the materialized table and builds the
-// PK→file index. Returns the index or reuses the cached one if it's still current.
+// PK→file index. Returns the index from the MetadataCache if still current,
+// or builds a fresh one on cold start and stores it in the cache.
 func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIndex, error) {
-	matTm, err := tw.catalog.LoadTable(tw.cfg.Namespace, tw.cfg.IcebergName)
+	ns := tw.cfg.Namespace
+	name := tw.cfg.IcebergName
+
+	// Load table metadata from catalog cache (cache hit in steady state).
+	matTm, err := tw.catalog.LoadTable(ctx, ns, name)
 	if err != nil {
 		return nil, fmt.Errorf("load table for file index: %w", err)
 	}
 	if matTm == nil || matTm.Metadata.CurrentSnapshotID == 0 {
 		fi := NewFileIndex()
-		tw.FileIdx = fi
+		tw.catalog.SetFileIndex(ns, name, fi)
+		return fi, nil
+	}
+	currentSnapID := matTm.Metadata.CurrentSnapshotID
+
+	// Seed the manifest cache on cold start.
+	if tw.catalog.Manifests(ns, name) == nil {
+		manifests, _ := tw.loadExistingManifests(ctx, matTm)
+		if manifests != nil {
+			tw.catalog.SetManifests(ns, name, manifests)
+		}
+	}
+
+	// Return cached index if still current (updated incrementally by MetadataStore
+	// on each CommitTransaction — no S3 reads needed).
+	if fi := tw.catalog.FileIndex(ns, name); fi != nil && fi.SnapshotID == currentSnapID {
 		return fi, nil
 	}
 
-	// Return cached index if still current.
-	if tw.FileIdx != nil && tw.FileIdx.SnapshotID == matTm.Metadata.CurrentSnapshotID {
-		return tw.FileIdx, nil
-	}
-
+	// Cold start: build from scratch by reading manifests + parquet PK columns.
 	fi := NewFileIndex()
-	fi.SnapshotID = matTm.Metadata.CurrentSnapshotID
+	fi.SnapshotID = currentSnapID
 
-	allFiles, err := tw.LoadAllDataFiles(ctx, matTm)
+	allFiles, err := tw.loadDataFilesFromManifests(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load data files for index: %w", err)
 	}
@@ -600,12 +583,46 @@ func (tw *TableWriter) BuildFileIndex(ctx context.Context, pk []string) (*FileIn
 		fi.AddFile(r.df, r.pkKeys)
 	}
 
-	log.Printf("[tablewriter] built file index for %s: %d files, %d PKs", tw.cfg.IcebergName, len(fi.Files), len(fi.PkToFile))
-	tw.FileIdx = fi
+	log.Printf("[tablewriter] built file index for %s: %d files, %d PKs", name, len(fi.Files), len(fi.PkToFile))
+	tw.catalog.SetFileIndex(ns, name, fi)
 	return fi, nil
 }
 
 // LoadAllDataFiles returns all live data files from a table's current snapshot.
+// loadDataFilesFromManifests reads data files using the catalog's manifest cache.
+// Avoids a catalog.LoadTable round-trip.
+func (tw *TableWriter) loadDataFilesFromManifests(ctx context.Context) ([]DataFileInfo, error) {
+	manifests := tw.catalog.Manifests(tw.cfg.Namespace, tw.cfg.IcebergName)
+	if manifests == nil {
+		return nil, nil
+	}
+	var dataFiles []DataFileInfo
+	for _, mfi := range manifests {
+		if mfi.Content != 0 {
+			continue
+		}
+		mKey, err := KeyFromURI(mfi.Path)
+		if err != nil {
+			return nil, fmt.Errorf("parse manifest URI %s: %w", mfi.Path, err)
+		}
+		mData, err := DownloadWithRetry(ctx, tw.s3, mKey)
+		if err != nil {
+			return nil, fmt.Errorf("download manifest %s: %w", mfi.Path, err)
+		}
+		entries, err := ReadManifest(mData)
+		if err != nil {
+			return nil, fmt.Errorf("read manifest %s: %w", mfi.Path, err)
+		}
+		for _, e := range entries {
+			if e.Status == 2 || e.DataFile.Content != 0 {
+				continue
+			}
+			dataFiles = append(dataFiles, e.DataFile)
+		}
+	}
+	return dataFiles, nil
+}
+
 func (tw *TableWriter) LoadAllDataFiles(ctx context.Context, tm *TableMetadata) ([]DataFileInfo, error) {
 	mlURI := tm.CurrentManifestList()
 	if mlURI == "" {

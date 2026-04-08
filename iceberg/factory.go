@@ -12,7 +12,7 @@ import (
 
 // IcebergClients holds the catalog and storage clients needed by all pipelines.
 type IcebergClients struct {
-	Catalog Catalog
+	Catalog MetadataCache
 	S3      ObjectStorage // nil in vended mode until EnsureStorage is called
 
 	credentialMode string
@@ -44,9 +44,10 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 	}
 
 	catalogClient := NewCatalogClient(cfg.CatalogURI, httpClient)
+	cachedCatalog := NewMetadataStore(catalogClient, 0)
 
 	ic := &IcebergClients{
-		Catalog:        catalogClient,
+		Catalog:        cachedCatalog,
 		credentialMode: cfg.CredentialMode,
 		catalogClient:  catalogClient,
 		sinkCfg:        cfg,
@@ -59,7 +60,7 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 	if cfg.CatalogAuth == "sigv4" && IsStorageURI(configWarehouse) {
 		configWarehouse = ""
 	}
-	cc, err := catalogClient.GetConfig(configWarehouse)
+	cc, err := catalogClient.GetConfig(context.Background(), configWarehouse)
 	if err != nil {
 		log.Printf("[iceberg] GET /v1/config failed (non-fatal): %v", err)
 	} else if cc != nil {
@@ -106,7 +107,10 @@ func (ic *IcebergClients) EnsureStorage(ctx context.Context, ns, table string) e
 		return fmt.Errorf("S3 client not configured and credential mode is %q", ic.credentialMode)
 	}
 
-	tm, err := ic.catalogClient.LoadTable(ns, table)
+	// Use the cached catalog for the initial load (populates cache),
+	// but pass the raw catalogClient to VendedS3Client for credential
+	// refresh — those calls must bypass the cache to get fresh creds.
+	tm, err := ic.Catalog.LoadTable(ctx, ns, table)
 	if err != nil {
 		return fmt.Errorf("load table for vended credentials: %w", err)
 	}

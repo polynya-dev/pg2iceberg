@@ -8,19 +8,34 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// ChangeEventBuffer is a thread-safe buffer for change events, shared between
-// the Sink (producer) and the Materializer (consumer). Created before both and
-// injected into each, avoiding a circular dependency.
+var matTracer = otel.Tracer("pg2iceberg/materializer")
+
+// ChangeEventBuffer is an in-memory WAL for change events, shared between the
+// Sink (producer) and the Materializer (consumer). Events are only removed
+// after the materializer successfully commits, ensuring no data loss without
+// falling back to S3 reads.
 type ChangeEventBuffer struct {
 	events     map[string][]MatEvent
 	snapshotID map[string]int64 // latest events table snapshot ID per table
-	mu         sync.Mutex
+
+	// pending holds events read by the materializer but not yet committed.
+	// On Ack() they are discarded; on Rollback() they are prepended back.
+	pending     map[string][]MatEvent
+	pendingSnap map[string]int64
+
+	mu sync.Mutex
 }
 
 // NewChangeEventBuffer creates a new empty event buffer.
@@ -60,23 +75,56 @@ func (b *ChangeEventBuffer) Drain(pgTable string) ([]MatEvent, int64) {
 	return events, snapID
 }
 
-// DrainAll removes and returns all buffered events for all tables at once,
-// along with the latest events snapshot ID per table. This ensures events
-// from the same Sink flush are consumed atomically across tables.
-func (b *ChangeEventBuffer) DrainAll() (map[string][]MatEvent, map[string]int64) {
+// ReadAll atomically moves all buffered events to a pending area and returns
+// them. The events remain in pending until Ack (commit succeeded) or Rollback
+// (commit failed). New events pushed while pending are accumulated separately
+// and will be picked up in the next cycle.
+func (b *ChangeEventBuffer) ReadAll() (map[string][]MatEvent, map[string]int64) {
 	if b == nil {
 		return nil, nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	events := b.events
-	snapIDs := b.snapshotID
+	b.pending = b.events
+	b.pendingSnap = b.snapshotID
 	b.events = make(map[string][]MatEvent)
 	b.snapshotID = make(map[string]int64)
-	for pgTable := range events {
+	for pgTable := range b.pending {
 		pipeline.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
 	}
-	return events, snapIDs
+	return b.pending, b.pendingSnap
+}
+
+// Ack discards pending events after a successful materializer commit.
+func (b *ChangeEventBuffer) Ack() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pending = nil
+	b.pendingSnap = nil
+}
+
+// Rollback restores pending events to the front of the buffer after a
+// failed materializer cycle, so they are retried on the next cycle.
+func (b *ChangeEventBuffer) Rollback() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for table, events := range b.pending {
+		b.events[table] = append(events, b.events[table]...)
+		pipeline.MaterializerBufferSize.WithLabelValues(table).Set(float64(len(b.events[table])))
+	}
+	for table, snap := range b.pendingSnap {
+		if _, exists := b.snapshotID[table]; !exists {
+			b.snapshotID[table] = snap
+		}
+	}
+	b.pending = nil
+	b.pendingSnap = nil
 }
 
 // Materializer reads change events from events tables and applies them to
@@ -85,7 +133,7 @@ func (b *ChangeEventBuffer) DrainAll() (map[string][]MatEvent, map[string]int64)
 // tracks PK→file mappings to resolve TOAST unchanged columns when needed.
 type Materializer struct {
 	cfg     config.SinkConfig
-	catalog iceberg.Catalog
+	catalog iceberg.MetadataCache
 	s3      iceberg.ObjectStorage
 	tables  map[string]*tableSink
 	buf     *ChangeEventBuffer
@@ -96,18 +144,18 @@ type Materializer struct {
 
 	// Per-table TableWriter for the shared write path (serialize → upload → manifest → commit).
 	tableWriters map[string]*iceberg.TableWriter
+
+	// recovered is true after the first successful buffer-based cycle.
+	// Until then, the S3 fallback path runs to catch events from before a crash.
+	recovered bool
 }
 
-// InvalidateFileIndices forces all table writers to rebuild their file indices
-// on the next materialization cycle. Called after the snapshot phase completes
-// so the materializer picks up rows written directly to materialized tables.
-func (m *Materializer) InvalidateFileIndices() {
-	for _, tw := range m.tableWriters {
-		if tw.FileIdx != nil {
-			tw.FileIdx.SnapshotID = 0
-		}
-	}
-}
+// InvalidateFileIndices is a no-op. The SnapshotWriter now seeds the FileIndex
+// via MetadataStore during CommitTransaction, so the materializer's first cycle
+// gets a fully-populated index without any S3 reads.
+//
+// Retained for interface compatibility with callers.
+func (m *Materializer) InvalidateFileIndices() {}
 
 // SyncTableWriter updates the TableWriter's schema after a schema evolution.
 func (m *Materializer) SyncTableWriter(pgTable string) {
@@ -122,7 +170,7 @@ func (m *Materializer) SyncTableWriter(pgTable string) {
 	tw.UpdateSchema(ts.srcSchema, ts.matSchemaID)
 }
 
-func NewMaterializer(cfg config.SinkConfig, catalog iceberg.Catalog, s3 iceberg.ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
+func NewMaterializer(cfg config.SinkConfig, catalog iceberg.MetadataCache, s3 iceberg.ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
 	writers := make(map[string]*iceberg.TableWriter, len(tables))
 	for pgTable, ts := range tables {
 		writers[pgTable] = iceberg.NewTableWriter(iceberg.TableWriteConfig{
@@ -158,26 +206,15 @@ func (m *Materializer) LastEventsSnapshots() map[string]int64 {
 
 // MaterializeAll runs a single materialization pass for all tables.
 // Called during graceful shutdown to ensure all flushed events are materialized.
-//
-// The in-memory ChangeEventBuffer is drained and discarded so that
-// MaterializeAll runs two materialization cycles to ensure all events are
-// processed before shutdown. The first cycle processes any buffered events
-// atomically. The buffer is then drained to force the second cycle through
-// the S3 path, which reads event files directly from the Iceberg events
-// table. This is necessary because the Run() goroutine may have drained the
-// buffer but failed to materialize (e.g. context cancelled), leaving a gap.
-// The events table on S3 is the authoritative record of all flushed events,
-// so reading from it guarantees nothing is skipped.
+// The buffer WAL guarantees events are not lost on failure -- if cycle 1 fails
+// events are rolled back and retried in cycle 2.
 func (m *Materializer) MaterializeAll(ctx context.Context) {
-	// Cycle 1: process buffered events atomically.
 	if err := m.materializeCycle(ctx); err != nil {
-		log.Printf("[materializer] final cycle (buffer) error: %v", err)
-	}
-	// Discard remaining buffer to force S3 path.
-	m.buf.DrainAll()
-	// Cycle 2: catch anything via S3 fallback.
-	if err := m.materializeCycle(ctx); err != nil {
-		log.Printf("[materializer] final cycle (s3) error: %v", err)
+		log.Printf("[materializer] final cycle (1) error: %v", err)
+		// Retry — events were rolled back to buffer on failure.
+		if err := m.materializeCycle(ctx); err != nil {
+			log.Printf("[materializer] final cycle (2) error: %v", err)
+		}
 	}
 }
 
@@ -203,50 +240,166 @@ func (m *Materializer) Run(ctx context.Context) {
 	}
 }
 
-// materializeCycle runs a single materialization cycle for all tables.
-// It drains all buffered events atomically, prepares each table, then
-// commits all prepared tables atomically via CommitTransaction.
+// materializeCycle runs a single materialization cycle.
+// In normal operation it processes only tables with buffered events (WAL path).
+// On startup (before the first successful buffer cycle) it falls back to S3
+// to recover any events flushed before a crash.
 func (m *Materializer) materializeCycle(ctx context.Context) error {
-	// Phase 1: Drain all tables atomically.
-	allEvents, allSnapIDs := m.buf.DrainAll()
+	ctx, span := matTracer.Start(ctx, "pg2iceberg.materialize")
+	defer span.End()
 
-	// Phase 2: Prepare all tables.
+	// Phase 1: Read buffered events (they remain in pending until Ack/Rollback).
+	allEvents, allSnapIDs := m.buf.ReadAll()
+	hasBuffered := len(allEvents) > 0
+
+	// Phase 2: Prepare tables.
 	var prepared []*preparedMaterialization
-	for pgTable, ts := range m.tables {
-		prep, err := m.prepareTable(ctx, pgTable, ts, allEvents[pgTable], allSnapIDs[pgTable])
-		if err != nil {
-			// Abort entire cycle. Drained events are safe on S3 in the
-			// events tables; next cycle recovers via the S3 fallback path.
-			pipeline.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
-			return fmt.Errorf("prepare %s: %w", pgTable, err)
-		}
-		if prep != nil {
-			prepared = append(prepared, prep)
-		}
-	}
 
-	if len(prepared) == 0 {
+	if hasBuffered {
+		// Normal path: prepare all tables with buffered events in parallel.
+		type tableInput struct {
+			pgTable string
+			ts      *tableSink
+			events  []MatEvent
+			snapID  int64
+		}
+		var inputs []tableInput
+		for pgTable, events := range allEvents {
+			ts := m.tables[pgTable]
+			if ts == nil {
+				continue
+			}
+			inputs = append(inputs, tableInput{pgTable, ts, events, allSnapIDs[pgTable]})
+		}
+
+		results := make([]*preparedMaterialization, len(inputs))
+		var prepErr error
+		var prepErrTable string
+		var mu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
+		for i, inp := range inputs {
+			i, inp := i, inp
+			g.Go(func() error {
+				prep, err := m.prepareTable(gctx, inp.pgTable, inp.ts, inp.events, inp.snapID)
+				if err != nil {
+					mu.Lock()
+					if prepErr == nil {
+						prepErr = err
+						prepErrTable = inp.pgTable
+					}
+					mu.Unlock()
+					return err
+				}
+				results[i] = prep
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			m.buf.Rollback()
+			pipeline.MaterializerErrorsTotal.WithLabelValues(prepErrTable).Inc()
+			err = fmt.Errorf("prepare %s: %w", prepErrTable, prepErr)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
+		}
+		for _, p := range results {
+			if p != nil {
+				prepared = append(prepared, p)
+			}
+		}
+	} else if !m.recovered {
+		// Startup recovery: prepare all tables in parallel.
+		m.buf.Ack()
+		type tableInput struct {
+			pgTable string
+			ts      *tableSink
+		}
+		var inputs []tableInput
+		for pgTable, ts := range m.tables {
+			inputs = append(inputs, tableInput{pgTable, ts})
+		}
+
+		results := make([]*preparedMaterialization, len(inputs))
+		var prepErr error
+		var prepErrTable string
+		var mu sync.Mutex
+		g, gctx := errgroup.WithContext(ctx)
+		for i, inp := range inputs {
+			i, inp := i, inp
+			g.Go(func() error {
+				prep, err := m.prepareTable(gctx, inp.pgTable, inp.ts, nil, 0)
+				if err != nil {
+					mu.Lock()
+					if prepErr == nil {
+						prepErr = err
+						prepErrTable = inp.pgTable
+					}
+					mu.Unlock()
+					return err
+				}
+				results[i] = prep
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			pipeline.MaterializerErrorsTotal.WithLabelValues(prepErrTable).Inc()
+			err = fmt.Errorf("recover %s: %w", prepErrTable, prepErr)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return err
+		}
+		for _, p := range results {
+			if p != nil {
+				prepared = append(prepared, p)
+			}
+		}
+	} else {
+		m.buf.Ack() // nothing pending
 		return nil
 	}
 
-	// Phase 3: Atomic multi-table commit.
+	if len(prepared) == 0 {
+		if hasBuffered {
+			m.buf.Ack()
+		}
+		m.recovered = true
+		return nil
+	}
+
+	// Phase 3: Atomic multi-table commit. TableCommit carries post-commit
+	// metadata (manifests, file index updates) that the MetadataStore
+	// applies seamlessly after the catalog write succeeds.
 	commits := make([]iceberg.TableCommit, len(prepared))
 	for i, p := range prepared {
-		commits[i] = iceberg.TableCommit{
-			Table:             p.icebergName,
-			CurrentSnapshotID: p.prevSnapID,
-			Snapshot:          p.commit,
+		if p.prepared != nil {
+			commits[i] = p.prepared.ToTableCommit()
+		} else {
+			commits[i] = iceberg.TableCommit{
+				Table:             p.icebergName,
+				CurrentSnapshotID: p.prevSnapID,
+				Snapshot:          p.commit,
+			}
 		}
 	}
 
-	if err := m.catalog.CommitTransaction(m.cfg.Namespace, commits); err != nil {
+	if err := m.catalog.CommitTransaction(ctx, m.cfg.Namespace, commits); err != nil {
+		if hasBuffered {
+			m.buf.Rollback()
+		}
 		for _, p := range prepared {
 			pipeline.MaterializerErrorsTotal.WithLabelValues(p.pgTable).Inc()
 		}
-		return fmt.Errorf("commit materialized transaction: %w", err)
+		err = fmt.Errorf("commit materialized transaction: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
-	// Phase 4: Apply side effects only after successful commit.
+	// Phase 4: Success — remove events from buffer and apply side effects.
+	if hasBuffered {
+		m.buf.Ack()
+	}
+	m.recovered = true
 	for _, p := range prepared {
 		m.applyPostCommit(p)
 	}
@@ -271,12 +424,11 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = m.catalog.CommitSnapshot(m.cfg.Namespace, compacted.IcebergName, compacted.PrevSnapshotID, compacted.Commit)
+		err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, []iceberg.TableCommit{compacted.ToTableCommit()})
 		if err != nil {
 			log.Printf("[materializer] compaction commit error for %s: %v", p.pgTable, err)
 			continue
 		}
-		tw.ApplyPostCommit(compacted)
 	}
 
 	return nil
@@ -332,11 +484,15 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		return nil
 	}
 
-	err = m.catalog.CommitTransaction(m.cfg.Namespace, []iceberg.TableCommit{{
+	tc := iceberg.TableCommit{
 		Table:             prep.icebergName,
 		CurrentSnapshotID: prep.prevSnapID,
 		Snapshot:          prep.commit,
-	}})
+	}
+	if prep.prepared != nil {
+		tc = prep.prepared.ToTableCommit()
+	}
+	err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, []iceberg.TableCommit{tc})
 	if err != nil {
 		return fmt.Errorf("commit materialized snapshot: %w", err)
 	}
@@ -354,6 +510,9 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tableSink,
 	bufEvents []MatEvent, bufSnapID int64) (*preparedMaterialization, error) {
 
+	ctx, span := matTracer.Start(ctx, "pg2iceberg.materialize.table", trace.WithAttributes(attribute.String("table", pgTable)))
+	defer span.End()
+
 	start := time.Now()
 	catalog := m.catalog
 	s3 := m.s3
@@ -365,9 +524,12 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 	var s3SnapID int64
 	if !fromBuffer {
 		// No in-memory events — fall back to S3 (crash recovery path).
-		eventsTm, err := catalog.LoadTable(ns, ts.eventsIcebergName)
+		eventsTm, err := catalog.LoadTable(ctx, ns, ts.eventsIcebergName)
 		if err != nil {
-			return nil, fmt.Errorf("load events table: %w", err)
+			err = fmt.Errorf("load events table: %w", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return nil, err
 		}
 		if eventsTm == nil || eventsTm.Metadata.CurrentSnapshotID == 0 {
 			return nil, nil // no events yet
@@ -382,7 +544,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 		newFiles, err := m.findNewEventFiles(ctx, s3, eventsTm, lastProcessed)
 		if err != nil {
-			return nil, fmt.Errorf("find new event files: %w", err)
+			err = fmt.Errorf("find new event files: %w", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return nil, err
 		}
 		if len(newFiles) == 0 {
 			m.lastEventsSnapshot[pgTable] = currentSnapshotID
@@ -391,7 +556,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 		events, err = m.readEvents(ctx, s3, newFiles, ts.srcSchema)
 		if err != nil {
-			return nil, fmt.Errorf("read events: %w", err)
+			err = fmt.Errorf("read events: %w", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			return nil, err
 		}
 		if len(events) == 0 {
 			m.lastEventsSnapshot[pgTable] = currentSnapshotID
@@ -412,7 +580,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 	// Build/refresh file index for TOAST resolution and DELETE routing.
 	if _, err := tw.BuildFileIndex(ctx, pk); err != nil {
-		return nil, fmt.Errorf("build file index: %w", err)
+		err = fmt.Errorf("build file index: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
 
 	tDrain := time.Since(start)
@@ -465,21 +636,31 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 		}
 	}
 
-	if len(allUnresolvedPKs) > 0 && tw.FileIdx != nil {
-		affectedFilePaths := tw.FileIdx.AffectedFiles(allUnresolvedPKs)
+	fileIdx := m.catalog.FileIndex(ns, ts.icebergName)
+	if len(allUnresolvedPKs) > 0 && fileIdx != nil {
+		affectedFilePaths := fileIdx.AffectedFiles(allUnresolvedPKs)
 		resolved := 0
 		for path := range affectedFilePaths {
 			dfKey, err := iceberg.KeyFromURI(path)
 			if err != nil {
-				return nil, fmt.Errorf("TOAST: parse URI %s: %w", path, err)
+				err = fmt.Errorf("TOAST: parse URI %s: %w", path, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return nil, err
 			}
 			data, err := iceberg.DownloadWithRetry(ctx, s3, dfKey)
 			if err != nil {
-				return nil, fmt.Errorf("TOAST: download %s: %w", path, err)
+				err = fmt.Errorf("TOAST: download %s: %w", path, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return nil, err
 			}
 			rows, err := iceberg.ReadParquetRows(data, ts.srcSchema)
 			if err != nil {
-				return nil, fmt.Errorf("TOAST: read %s: %w", path, err)
+				err = fmt.Errorf("TOAST: read %s: %w", path, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return nil, err
 			}
 			for _, row := range rows {
 				pkKey := iceberg.BuildPKKey(row, pk)
@@ -515,7 +696,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 
 	prepared, err := tw.Prepare(ctx, rowStates, pk)
 	if err != nil {
-		return nil, fmt.Errorf("prepare: %w", err)
+		err = fmt.Errorf("prepare: %w", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
 	if prepared == nil {
 		if fromBuffer && bufSnapID > 0 {
@@ -549,13 +733,10 @@ func (m *Materializer) prepareTable(ctx context.Context, pgTable string, ts *tab
 }
 
 // applyPostCommit finalizes side effects after a successful catalog commit.
-// Must be called only after CommitTransaction succeeds.
+// Manifest cache and file index updates are handled seamlessly by the
+// MetadataStore during CommitTransaction — only checkpoints and metrics
+// need manual handling here.
 func (m *Materializer) applyPostCommit(prep *preparedMaterialization) {
-	// Delegate manifest cache + file index invalidation to the TableWriter.
-	if tw, ok := m.tableWriters[prep.pgTable]; ok && prep.prepared != nil {
-		tw.ApplyPostCommit(prep.prepared)
-	}
-
 	// Update checkpoint.
 	if prep.fromBuffer && prep.bufSnapID > 0 {
 		m.lastEventsSnapshot[prep.pgTable] = prep.bufSnapID

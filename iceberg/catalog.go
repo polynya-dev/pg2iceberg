@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,18 +12,26 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
+var tracer = otel.Tracer("pg2iceberg/catalog")
+
 // Catalog abstracts Iceberg catalog operations.
 type Catalog interface {
-	EnsureNamespace(ns string) error
-	LoadTable(ns, table string) (*TableMetadata, error)
-	CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error)
-	CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error
-	CommitTransaction(ns string, commits []TableCommit) error
-	EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error)
+	EnsureNamespace(ctx context.Context, ns string) error
+	LoadTable(ctx context.Context, ns, table string) (*TableMetadata, error)
+	CreateTable(ctx context.Context, ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error)
+	CommitSnapshot(ctx context.Context, ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error
+	CommitTransaction(ctx context.Context, ns string, commits []TableCommit) error
+	EvolveSchema(ctx context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error)
 }
 
 // CatalogClient interacts with the Iceberg REST catalog.
@@ -125,11 +134,16 @@ func (tm *TableMetadata) CurrentManifestList() string {
 }
 
 // EnsureNamespace creates a namespace if it doesn't exist.
-func (c *CatalogClient) EnsureNamespace(ns string) error {
+func (c *CatalogClient) EnsureNamespace(ctx context.Context, ns string) error {
+	ctx, span := tracer.Start(ctx, "catalog.EnsureNamespace", trace.WithAttributes(
+		attribute.String("iceberg.namespace", ns),
+	))
+	defer span.End()
+
 	// Check existence first — the Iceberg REST catalog's JdbcCatalog
 	// backend returns 500 (not 409) on concurrent create attempts due
 	// to a primary key constraint violation in the properties table.
-	req, err := http.NewRequest("HEAD", c.baseURL+c.v1Path(fmt.Sprintf("/namespaces/%s", ns)), nil)
+	req, err := http.NewRequestWithContext(ctx, "HEAD", c.baseURL+c.v1Path(fmt.Sprintf("/namespaces/%s", ns)), nil)
 	if err != nil {
 		return err
 	}
@@ -145,7 +159,7 @@ func (c *CatalogClient) EnsureNamespace(ns string) error {
 	body := map[string]any{
 		"namespace": []string{ns},
 	}
-	resp, err := c.post(c.v1Path("/namespaces"), body)
+	resp, err := c.post(ctx, c.v1Path("/namespaces"), body)
 	if err != nil {
 		return err
 	}
@@ -159,10 +173,18 @@ func (c *CatalogClient) EnsureNamespace(ns string) error {
 }
 
 // LoadTable fetches table metadata from the catalog.
-func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
+func (c *CatalogClient) LoadTable(ctx context.Context, ns, table string) (*TableMetadata, error) {
+	ctx, span := tracer.Start(ctx, "catalog.LoadTable "+table, trace.WithAttributes(
+		attribute.String("iceberg.namespace", ns),
+		attribute.String("iceberg.table", table),
+	))
+	defer span.End()
+
 	start := time.Now()
-	req, err := http.NewRequest("GET", c.baseURL+c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), nil)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -171,6 +193,8 @@ func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 	pipeline.CatalogOperationDurationSeconds.WithLabelValues("load_table").Observe(time.Since(start).Seconds())
 	if err != nil {
 		pipeline.CatalogErrorsTotal.WithLabelValues("load_table").Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -180,7 +204,10 @@ func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 	}
 	if resp.StatusCode != 200 {
 		pipeline.CatalogErrorsTotal.WithLabelValues("load_table").Inc()
-		return nil, c.readError(resp)
+		err := c.readError(resp)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
 
 	var tm TableMetadata
@@ -191,7 +218,12 @@ func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 }
 
 // CreateTable creates a new Iceberg table.
-func (c *CatalogClient) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
+func (c *CatalogClient) CreateTable(ctx context.Context, ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
+	ctx, span := tracer.Start(ctx, "catalog.CreateTable "+table, trace.WithAttributes(
+		attribute.String("iceberg.namespace", ns),
+		attribute.String("iceberg.table", table),
+	))
+	defer span.End()
 	icebergSchema := postgres.IcebergSchemaJSON(ts)
 
 	partitionSpec := map[string]any{
@@ -219,14 +251,19 @@ func (c *CatalogClient) CreateTable(ns, table string, ts *postgres.TableSchema, 
 		body["location"] = location
 	}
 
-	resp, err := c.post(c.v1Path(fmt.Sprintf("/namespaces/%s/tables", ns)), body)
+	resp, err := c.post(ctx, c.v1Path(fmt.Sprintf("/namespaces/%s/tables", ns)), body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, c.readError(resp)
+		err := c.readError(resp)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return nil, err
 	}
 
 	var tm TableMetadata
@@ -241,7 +278,14 @@ func (c *CatalogClient) CreateTable(ns, table string, ts *postgres.TableSchema, 
 }
 
 // CommitSnapshot commits a new snapshot to the table.
-func (c *CatalogClient) CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
+func (c *CatalogClient) CommitSnapshot(ctx context.Context, ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
+	ctx, span := tracer.Start(ctx, "catalog.CommitSnapshot "+table, trace.WithAttributes(
+		attribute.String("iceberg.namespace", ns),
+		attribute.String("iceberg.table", table),
+		attribute.Int64("iceberg.snapshot_id", snapshot.SnapshotID),
+	))
+	defer span.End()
+
 	defer func(start time.Time) {
 		pipeline.CatalogOperationDurationSeconds.WithLabelValues("commit_snapshot").Observe(time.Since(start).Seconds())
 	}(time.Now())
@@ -291,14 +335,19 @@ func (c *CatalogClient) CommitSnapshot(ns, table string, currentSnapshotID int64
 		"updates":      updates,
 	}
 
-	resp, err := c.post(c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), body)
+	resp, err := c.post(ctx, c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return c.readError(resp)
+		err := c.readError(resp)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 	return nil
 }
@@ -314,16 +363,31 @@ type SnapshotCommit struct {
 }
 
 // TableCommit holds the data needed to commit a snapshot for one table
-// within a multi-table transaction.
+// within a multi-table transaction. It also carries post-commit cache
+// updates that the MetadataCache applies atomically after the real
+// catalog commit succeeds.
 type TableCommit struct {
 	Table             string
 	CurrentSnapshotID int64
 	Snapshot          SnapshotCommit
+
+	// Post-commit cache updates. These are applied by MetadataCache
+	// after the catalog write succeeds — callers never need to call
+	// SetManifests/SetFileIndex manually.
+	NewManifests []ManifestFileInfo // full manifest list after this commit
+	NewDataFiles []FileIndexEntry   // data files written (for incremental FileIndex)
+	DeletedPKs   []string           // PKs equality-deleted (for incremental FileIndex)
 }
 
 // CommitTransaction atomically commits snapshots to multiple tables using
 // the Iceberg REST catalog's multi-table transaction endpoint.
-func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) error {
+func (c *CatalogClient) CommitTransaction(ctx context.Context, ns string, commits []TableCommit) error {
+	ctx, span := tracer.Start(ctx, "catalog.CommitTransaction", trace.WithAttributes(
+		attribute.String("iceberg.namespace", ns),
+		attribute.Int("iceberg.table_count", len(commits)),
+	))
+	defer span.End()
+
 	defer func(start time.Time) {
 		pipeline.CatalogOperationDurationSeconds.WithLabelValues("commit_transaction").Observe(time.Since(start).Seconds())
 	}(time.Now())
@@ -334,7 +398,7 @@ func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) erro
 	// Single table — use the normal commit path.
 	if len(commits) == 1 {
 		tc := commits[0]
-		return c.CommitSnapshot(ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot)
+		return c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot)
 	}
 
 	var tableChanges []map[string]any
@@ -392,14 +456,19 @@ func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) erro
 		"table-changes": tableChanges,
 	}
 
-	resp, err := c.post(c.v1Path("/transactions/commit"), body)
+	resp, err := c.post(ctx, c.v1Path("/transactions/commit"), body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 && resp.StatusCode != 204 {
-		return c.readError(resp)
+		err := c.readError(resp)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 	return nil
 }
@@ -407,7 +476,13 @@ func (c *CatalogClient) CommitTransaction(ns string, commits []TableCommit) erro
 // EvolveSchema updates the Iceberg table schema via the REST catalog.
 // It adds a new schema version and sets it as the current postgres.
 // Returns the new schema ID.
-func (c *CatalogClient) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
+func (c *CatalogClient) EvolveSchema(ctx context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
+	ctx, span := tracer.Start(ctx, "catalog.EvolveSchema "+table, trace.WithAttributes(
+		attribute.String("iceberg.namespace", ns),
+		attribute.String("iceberg.table", table),
+	))
+	defer span.End()
+
 	defer func(start time.Time) {
 		pipeline.CatalogOperationDurationSeconds.WithLabelValues("evolve_schema").Observe(time.Since(start).Seconds())
 	}(time.Now())
@@ -432,38 +507,73 @@ func (c *CatalogClient) EvolveSchema(ns, table string, currentSchemaID int, newS
 		},
 	}
 
-	resp, err := c.post(c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), body)
+	resp, err := c.post(ctx, c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return 0, fmt.Errorf("evolve schema: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return 0, c.readError(resp)
+		err := c.readError(resp)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return 0, err
 	}
 	return newSchemaID, nil
 }
 
-func (c *CatalogClient) get(path string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", c.baseURL+path, nil)
+func (c *CatalogClient) get(ctx context.Context, path string) (*http.Response, error) {
+	ctx, span := tracer.Start(ctx, "http GET "+path, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		attribute.String("http.method", "GET"),
+		attribute.String("http.url", c.baseURL+path),
+		semconv.PeerService("iceberg-catalog"),
+	))
+	defer span.End()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	return c.client.Do(req)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+	}
+	return resp, err
 }
 
-func (c *CatalogClient) post(path string, body any) (*http.Response, error) {
+func (c *CatalogClient) post(ctx context.Context, path string, body any) (*http.Response, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
-	req, err := http.NewRequest("POST", c.baseURL+path, bytes.NewReader(data))
+
+	ctx, span := tracer.Start(ctx, "http POST "+path, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		attribute.String("http.method", "POST"),
+		attribute.String("http.url", c.baseURL+path),
+		attribute.Int("http.request_content_length", len(data)),
+		semconv.PeerService("iceberg-catalog"),
+	))
+	defer span.End()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+path, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	return c.client.Do(req)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+	}
+	return resp, err
 }
 
 func (c *CatalogClient) readError(resp *http.Response) error {
@@ -479,12 +589,12 @@ type CatalogConfig struct {
 
 // GetConfig fetches catalog-wide configuration defaults.
 // Returns nil without error if the endpoint is not available (404/405).
-func (c *CatalogClient) GetConfig(warehouse string) (*CatalogConfig, error) {
+func (c *CatalogClient) GetConfig(ctx context.Context, warehouse string) (*CatalogConfig, error) {
 	path := "/v1/config"
 	if warehouse != "" {
 		path += "?warehouse=" + url.QueryEscape(warehouse)
 	}
-	resp, err := c.get(path)
+	resp, err := c.get(ctx, path)
 	if err != nil {
 		return nil, err
 	}

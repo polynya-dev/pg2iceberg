@@ -2,16 +2,13 @@ package iceberg
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/pg2iceberg/pg2iceberg/postgres"
 )
 
-// mockCatalogForVended implements Catalog with configurable LoadTable responses.
+// mockCatalogForVended implements TableLoader with configurable LoadTable responses.
 type mockCatalogForVended struct {
 	loadCount atomic.Int64
 	mu        sync.Mutex
@@ -19,21 +16,7 @@ type mockCatalogForVended struct {
 	location  string
 }
 
-func (m *mockCatalogForVended) EnsureNamespace(ns string) error { return nil }
-func (m *mockCatalogForVended) CreateTable(ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
-	return nil, fmt.Errorf("not implemented")
-}
-func (m *mockCatalogForVended) CommitSnapshot(ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
-	return nil
-}
-func (m *mockCatalogForVended) CommitTransaction(ns string, commits []TableCommit) error {
-	return nil
-}
-func (m *mockCatalogForVended) EvolveSchema(ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
-	return 0, nil
-}
-
-func (m *mockCatalogForVended) LoadTable(ns, table string) (*TableMetadata, error) {
+func (m *mockCatalogForVended) LoadTable(_ context.Context, ns, table string) (*TableMetadata, error) {
 	m.loadCount.Add(1)
 	m.mu.Lock()
 	creds := m.creds
