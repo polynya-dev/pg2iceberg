@@ -14,12 +14,9 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/utils"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/codes"
 	"golang.org/x/sync/errgroup"
 )
 
-var eventsTracer = otel.Tracer("pg2iceberg/events")
 
 // txBuffer holds events for a single in-flight PG transaction.
 type txBuffer struct {
@@ -544,9 +541,6 @@ func (s *Sink) CheckBackpressure(ctx context.Context) error {
 // atomically: S3 uploads in parallel, followed by a single multi-table
 // catalog commit.
 func (s *Sink) Flush(ctx context.Context) error {
-	ctx, span := eventsTracer.Start(ctx, "pg2iceberg.flush")
-	defer span.End()
-
 	hasPendingDirect := len(s.pendingDirectEvents) > 0
 	if len(s.committedTxns) == 0 && !hasPendingDirect {
 		return nil
@@ -628,10 +622,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 			}
 			if err := s.writeDirect(event); err != nil {
 				restoreSeqState()
-				err = fmt.Errorf("replay tx %d: %w", tx.xid, err)
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return err
+				return fmt.Errorf("replay tx %d: %w", tx.xid, err)
 			}
 		}
 	}
@@ -642,12 +633,9 @@ func (s *Sink) Flush(ctx context.Context) error {
 	actualWritten := s.seqCounter - savedSeqCounter
 	if actualWritten != expectedEvents {
 		restoreSeqState()
-		err := fmt.Errorf("seq count mismatch: expected %d events to be written, "+
+		return fmt.Errorf("seq count mismatch: expected %d events to be written, "+
 			"but seqCounter advanced by %d — possible silent event drop",
 			expectedEvents, actualWritten)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return err
 	}
 
 	// Validate global seq continuity before committing to Iceberg.
@@ -657,12 +645,9 @@ func (s *Sink) Flush(ctx context.Context) error {
 		expected := s.lastCommittedMaxSeq + 1
 		if s.flushMinSeq != expected {
 			restoreSeqState()
-			err := fmt.Errorf("seq continuity violation: expected min_seq=%d (last committed max_seq=%d), "+
+			return fmt.Errorf("seq continuity violation: expected min_seq=%d (last committed max_seq=%d), "+
 				"got min_seq=%d; this indicates WAL events were dropped — refusing to commit",
 				expected, s.lastCommittedMaxSeq, s.flushMinSeq)
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-			return err
 		}
 	}
 
@@ -670,8 +655,6 @@ func (s *Sink) Flush(ctx context.Context) error {
 	snapshotIDs, err := s.flushAllTables(ctx)
 	if err != nil {
 		restoreSeqState()
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 

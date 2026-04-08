@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -20,6 +22,20 @@ import (
 )
 
 var s3tracer = otel.Tracer("pg2iceberg/s3")
+
+// s3SpanName builds a descriptive span name from the S3 key.
+// e.g. "s3.Upload rideshare.db/orders/data/abc.parquet" → "s3.Upload orders data"
+//      "rideshare.db/orders_events/metadata/snap-123.avro" → "s3.Upload orders_events metadata"
+func s3SpanName(op, key string) string {
+	parts := strings.Split(key, "/")
+	// typical key: {namespace}.db/{table}/{data|metadata}/{file}
+	if len(parts) >= 3 {
+		table := parts[len(parts)-3]
+		kind := parts[len(parts)-2] // "data" or "metadata"
+		return op + " " + table + " " + kind
+	}
+	return op + " " + path.Base(key)
+}
 
 // ObjectStorage abstracts file upload and download operations.
 type ObjectStorage interface {
@@ -75,9 +91,10 @@ func NewIAMS3Client(ctx context.Context, region, warehouse string) (*S3Client, e
 
 // Upload writes data to an S3 key and returns the full s3:// URI.
 func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string, error) {
-	ctx, span := s3tracer.Start(ctx, "s3.Upload", trace.WithAttributes(
+	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.Upload", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
 		attribute.Int("s3.size_bytes", len(data)),
+		attribute.String("peer.service", "s3"),
 	))
 	defer span.End()
 
@@ -100,8 +117,9 @@ func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string,
 
 // Download reads an S3 object.
 func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
-	ctx, span := s3tracer.Start(ctx, "s3.Download", trace.WithAttributes(
+	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.Download", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
+		attribute.String("peer.service", "s3"),
 	))
 	defer span.End()
 
@@ -131,10 +149,11 @@ func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
 
 // DownloadRange reads a byte range from an S3 object.
 func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
-	ctx, span := s3tracer.Start(ctx, "s3.DownloadRange", trace.WithAttributes(
+	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.DownloadRange", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
 		attribute.Int64("s3.offset", offset),
 		attribute.Int64("s3.length", length),
+		attribute.String("peer.service", "s3"),
 	))
 	defer span.End()
 
@@ -166,8 +185,9 @@ func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length
 
 // StatObject returns the size of an S3 object in bytes.
 func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
-	ctx, span := s3tracer.Start(ctx, "s3.StatObject", trace.WithAttributes(
+	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.StatObject", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
+		attribute.String("peer.service", "s3"),
 	))
 	defer span.End()
 

@@ -148,6 +148,10 @@ func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Check
 	var cp Checkpoint
 	var snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks []byte
 
+	_, dbSpan := tracer.Start(ctx, "checkpoint.pg SELECT", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		attribute.String("peer.service", "postgres"),
+		attribute.String("db.system", "postgresql"),
+	))
 	err := s.pool.QueryRow(ctx, `
 		SELECT version, checksum, written_by, revision, mode, lsn, watermark,
 		       snapshot_complete, last_snapshot_id, last_sequence_number,
@@ -161,6 +165,7 @@ func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Check
 		&cp.SeqCounter, &snapshotedTables, &snapshotChunks, &matSnapshots,
 		&queryWatermarks, &cp.UpdatedAt,
 	)
+	dbSpan.End()
 
 	if err == pgx.ErrNoRows {
 		return &Checkpoint{}, nil
@@ -213,6 +218,10 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 
 	if expectedRevision == 0 {
 		// First save — insert.
+		_, dbSpan := tracer.Start(ctx, "checkpoint.pg UPSERT", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+			attribute.String("peer.service", "postgres"),
+			attribute.String("db.system", "postgresql"),
+		))
 		_, err := s.pool.Exec(ctx, `
 			INSERT INTO _pg2iceberg.checkpoints (
 				pipeline_id, version, checksum, written_by, revision, mode, lsn, watermark,
@@ -232,6 +241,7 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 			cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber, cp.SeqCounter,
 			snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
 			cp.UpdatedAt)
+		dbSpan.End()
 		if err != nil {
 			return fmt.Errorf("save checkpoint: %w", err)
 		}
@@ -239,6 +249,10 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 	}
 
 	// Subsequent saves — optimistic concurrency check.
+	_, dbSpan := tracer.Start(ctx, "checkpoint.pg UPDATE", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+		attribute.String("peer.service", "postgres"),
+		attribute.String("db.system", "postgresql"),
+	))
 	result, err := s.pool.Exec(ctx, `
 		UPDATE _pg2iceberg.checkpoints SET
 			version = $2, checksum = $3, written_by = $4, revision = $5,
@@ -252,6 +266,7 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 		cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber, cp.SeqCounter,
 		snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
 		cp.UpdatedAt, expectedRevision)
+	dbSpan.End()
 	if err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}

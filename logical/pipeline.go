@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
@@ -16,6 +18,8 @@ import (
 
 	"github.com/pg2iceberg/pg2iceberg/utils"
 )
+
+var pipelineTracer = otel.Tracer("pg2iceberg/pipeline")
 
 // Pipeline encapsulates the logical replication pipeline: WAL capture →
 // events table → materializer → materialized table.
@@ -681,6 +685,9 @@ func (p *Pipeline) handleSchemaChange(ctx context.Context, event postgres.Change
 }
 
 func (p *Pipeline) flush(ctx context.Context) error {
+	ctx, span := pipelineTracer.Start(ctx, "pg2iceberg.flush")
+	defer span.End()
+
 	if err := p.snk.Flush(ctx); err != nil {
 		return fmt.Errorf("flush: %w", err)
 	}

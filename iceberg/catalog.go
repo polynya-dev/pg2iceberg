@@ -134,8 +134,9 @@ func (tm *TableMetadata) CurrentManifestList() string {
 
 // EnsureNamespace creates a namespace if it doesn't exist.
 func (c *CatalogClient) EnsureNamespace(ctx context.Context, ns string) error {
-	ctx, span := tracer.Start(ctx, "catalog.EnsureNamespace", trace.WithAttributes(
+	ctx, span := tracer.Start(ctx, "catalog.EnsureNamespace", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
+		attribute.String("peer.service", "iceberg"),
 	))
 	defer span.End()
 
@@ -173,9 +174,10 @@ func (c *CatalogClient) EnsureNamespace(ctx context.Context, ns string) error {
 
 // LoadTable fetches table metadata from the catalog.
 func (c *CatalogClient) LoadTable(ctx context.Context, ns, table string) (*TableMetadata, error) {
-	ctx, span := tracer.Start(ctx, "catalog.LoadTable", trace.WithAttributes(
+	ctx, span := tracer.Start(ctx, "catalog.LoadTable "+table, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
+		attribute.String("peer.service", "iceberg"),
 	))
 	defer span.End()
 
@@ -218,9 +220,10 @@ func (c *CatalogClient) LoadTable(ctx context.Context, ns, table string) (*Table
 
 // CreateTable creates a new Iceberg table.
 func (c *CatalogClient) CreateTable(ctx context.Context, ns, table string, ts *postgres.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
-	ctx, span := tracer.Start(ctx, "catalog.CreateTable", trace.WithAttributes(
+	ctx, span := tracer.Start(ctx, "catalog.CreateTable "+table, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
+		attribute.String("peer.service", "iceberg"),
 	))
 	defer span.End()
 	icebergSchema := postgres.IcebergSchemaJSON(ts)
@@ -278,10 +281,11 @@ func (c *CatalogClient) CreateTable(ctx context.Context, ns, table string, ts *p
 
 // CommitSnapshot commits a new snapshot to the table.
 func (c *CatalogClient) CommitSnapshot(ctx context.Context, ns, table string, currentSnapshotID int64, snapshot SnapshotCommit) error {
-	ctx, span := tracer.Start(ctx, "catalog.CommitSnapshot", trace.WithAttributes(
+	ctx, span := tracer.Start(ctx, "catalog.CommitSnapshot "+table, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
 		attribute.Int64("iceberg.snapshot_id", snapshot.SnapshotID),
+		attribute.String("peer.service", "iceberg"),
 	))
 	defer span.End()
 
@@ -372,9 +376,10 @@ type TableCommit struct {
 // CommitTransaction atomically commits snapshots to multiple tables using
 // the Iceberg REST catalog's multi-table transaction endpoint.
 func (c *CatalogClient) CommitTransaction(ctx context.Context, ns string, commits []TableCommit) error {
-	ctx, span := tracer.Start(ctx, "catalog.CommitTransaction", trace.WithAttributes(
+	ctx, span := tracer.Start(ctx, "catalog.CommitTransaction", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.Int("iceberg.table_count", len(commits)),
+		attribute.String("peer.service", "iceberg"),
 	))
 	defer span.End()
 
@@ -467,9 +472,10 @@ func (c *CatalogClient) CommitTransaction(ctx context.Context, ns string, commit
 // It adds a new schema version and sets it as the current postgres.
 // Returns the new schema ID.
 func (c *CatalogClient) EvolveSchema(ctx context.Context, ns, table string, currentSchemaID int, newSchema *postgres.TableSchema) (int, error) {
-	ctx, span := tracer.Start(ctx, "catalog.EvolveSchema", trace.WithAttributes(
+	ctx, span := tracer.Start(ctx, "catalog.EvolveSchema "+table, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
+		attribute.String("peer.service", "iceberg"),
 	))
 	defer span.End()
 

@@ -20,13 +20,20 @@ import (
 
 var matTracer = otel.Tracer("pg2iceberg/materializer")
 
-// ChangeEventBuffer is a thread-safe buffer for change events, shared between
-// the Sink (producer) and the Materializer (consumer). Created before both and
-// injected into each, avoiding a circular dependency.
+// ChangeEventBuffer is an in-memory WAL for change events, shared between the
+// Sink (producer) and the Materializer (consumer). Events are only removed
+// after the materializer successfully commits, ensuring no data loss without
+// falling back to S3 reads.
 type ChangeEventBuffer struct {
 	events     map[string][]MatEvent
 	snapshotID map[string]int64 // latest events table snapshot ID per table
-	mu         sync.Mutex
+
+	// pending holds events read by the materializer but not yet committed.
+	// On Ack() they are discarded; on Rollback() they are prepended back.
+	pending     map[string][]MatEvent
+	pendingSnap map[string]int64
+
+	mu sync.Mutex
 }
 
 // NewChangeEventBuffer creates a new empty event buffer.
@@ -66,23 +73,56 @@ func (b *ChangeEventBuffer) Drain(pgTable string) ([]MatEvent, int64) {
 	return events, snapID
 }
 
-// DrainAll removes and returns all buffered events for all tables at once,
-// along with the latest events snapshot ID per table. This ensures events
-// from the same Sink flush are consumed atomically across tables.
-func (b *ChangeEventBuffer) DrainAll() (map[string][]MatEvent, map[string]int64) {
+// ReadAll atomically moves all buffered events to a pending area and returns
+// them. The events remain in pending until Ack (commit succeeded) or Rollback
+// (commit failed). New events pushed while pending are accumulated separately
+// and will be picked up in the next cycle.
+func (b *ChangeEventBuffer) ReadAll() (map[string][]MatEvent, map[string]int64) {
 	if b == nil {
 		return nil, nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	events := b.events
-	snapIDs := b.snapshotID
+	b.pending = b.events
+	b.pendingSnap = b.snapshotID
 	b.events = make(map[string][]MatEvent)
 	b.snapshotID = make(map[string]int64)
-	for pgTable := range events {
+	for pgTable := range b.pending {
 		pipeline.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
 	}
-	return events, snapIDs
+	return b.pending, b.pendingSnap
+}
+
+// Ack discards pending events after a successful materializer commit.
+func (b *ChangeEventBuffer) Ack() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pending = nil
+	b.pendingSnap = nil
+}
+
+// Rollback restores pending events to the front of the buffer after a
+// failed materializer cycle, so they are retried on the next cycle.
+func (b *ChangeEventBuffer) Rollback() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for table, events := range b.pending {
+		b.events[table] = append(events, b.events[table]...)
+		pipeline.MaterializerBufferSize.WithLabelValues(table).Set(float64(len(b.events[table])))
+	}
+	for table, snap := range b.pendingSnap {
+		if _, exists := b.snapshotID[table]; !exists {
+			b.snapshotID[table] = snap
+		}
+	}
+	b.pending = nil
+	b.pendingSnap = nil
 }
 
 // Materializer reads change events from events tables and applies them to
@@ -102,6 +142,10 @@ type Materializer struct {
 
 	// Per-table TableWriter for the shared write path (serialize → upload → manifest → commit).
 	tableWriters map[string]*iceberg.TableWriter
+
+	// recovered is true after the first successful buffer-based cycle.
+	// Until then, the S3 fallback path runs to catch events from before a crash.
+	recovered bool
 }
 
 // InvalidateFileIndices forces all table writers to rebuild their file indices
@@ -164,26 +208,15 @@ func (m *Materializer) LastEventsSnapshots() map[string]int64 {
 
 // MaterializeAll runs a single materialization pass for all tables.
 // Called during graceful shutdown to ensure all flushed events are materialized.
-//
-// The in-memory ChangeEventBuffer is drained and discarded so that
-// MaterializeAll runs two materialization cycles to ensure all events are
-// processed before shutdown. The first cycle processes any buffered events
-// atomically. The buffer is then drained to force the second cycle through
-// the S3 path, which reads event files directly from the Iceberg events
-// table. This is necessary because the Run() goroutine may have drained the
-// buffer but failed to materialize (e.g. context cancelled), leaving a gap.
-// The events table on S3 is the authoritative record of all flushed events,
-// so reading from it guarantees nothing is skipped.
+// The buffer WAL guarantees events are not lost on failure -- if cycle 1 fails
+// events are rolled back and retried in cycle 2.
 func (m *Materializer) MaterializeAll(ctx context.Context) {
-	// Cycle 1: process buffered events atomically.
 	if err := m.materializeCycle(ctx); err != nil {
-		log.Printf("[materializer] final cycle (buffer) error: %v", err)
-	}
-	// Discard remaining buffer to force S3 path.
-	m.buf.DrainAll()
-	// Cycle 2: catch anything via S3 fallback.
-	if err := m.materializeCycle(ctx); err != nil {
-		log.Printf("[materializer] final cycle (s3) error: %v", err)
+		log.Printf("[materializer] final cycle (1) error: %v", err)
+		// Retry — events were rolled back to buffer on failure.
+		if err := m.materializeCycle(ctx); err != nil {
+			log.Printf("[materializer] final cycle (2) error: %v", err)
+		}
 	}
 }
 
@@ -209,35 +242,68 @@ func (m *Materializer) Run(ctx context.Context) {
 	}
 }
 
-// materializeCycle runs a single materialization cycle for all tables.
-// It drains all buffered events atomically, prepares each table, then
-// commits all prepared tables atomically via CommitTransaction.
+// materializeCycle runs a single materialization cycle.
+// In normal operation it processes only tables with buffered events (WAL path).
+// On startup (before the first successful buffer cycle) it falls back to S3
+// to recover any events flushed before a crash.
 func (m *Materializer) materializeCycle(ctx context.Context) error {
 	ctx, span := matTracer.Start(ctx, "pg2iceberg.materialize")
 	defer span.End()
 
-	// Phase 1: Drain all tables atomically.
-	allEvents, allSnapIDs := m.buf.DrainAll()
+	// Phase 1: Read buffered events (they remain in pending until Ack/Rollback).
+	allEvents, allSnapIDs := m.buf.ReadAll()
+	hasBuffered := len(allEvents) > 0
 
-	// Phase 2: Prepare all tables.
+	// Phase 2: Prepare tables.
 	var prepared []*preparedMaterialization
-	for pgTable, ts := range m.tables {
-		prep, err := m.prepareTable(ctx, pgTable, ts, allEvents[pgTable], allSnapIDs[pgTable])
-		if err != nil {
-			// Abort entire cycle. Drained events are safe on S3 in the
-			// events tables; next cycle recovers via the S3 fallback path.
-			pipeline.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
-			err = fmt.Errorf("prepare %s: %w", pgTable, err)
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-			return err
+
+	if hasBuffered {
+		// Normal path: only process tables that have buffered events.
+		for pgTable, events := range allEvents {
+			ts := m.tables[pgTable]
+			if ts == nil {
+				continue
+			}
+			prep, err := m.prepareTable(ctx, pgTable, ts, events, allSnapIDs[pgTable])
+			if err != nil {
+				m.buf.Rollback()
+				pipeline.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
+				err = fmt.Errorf("prepare %s: %w", pgTable, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return err
+			}
+			if prep != nil {
+				prepared = append(prepared, prep)
+			}
 		}
-		if prep != nil {
-			prepared = append(prepared, prep)
+	} else if !m.recovered {
+		// Startup recovery: check S3 for all tables to catch events
+		// flushed before a crash that were never materialized.
+		m.buf.Ack() // nothing pending
+		for pgTable, ts := range m.tables {
+			prep, err := m.prepareTable(ctx, pgTable, ts, nil, 0)
+			if err != nil {
+				pipeline.MaterializerErrorsTotal.WithLabelValues(pgTable).Inc()
+				err = fmt.Errorf("recover %s: %w", pgTable, err)
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
+				return err
+			}
+			if prep != nil {
+				prepared = append(prepared, prep)
+			}
 		}
+	} else {
+		m.buf.Ack() // nothing pending
+		return nil
 	}
 
 	if len(prepared) == 0 {
+		if hasBuffered {
+			m.buf.Ack()
+		}
+		m.recovered = true
 		return nil
 	}
 
@@ -252,6 +318,9 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 	}
 
 	if err := m.catalog.CommitTransaction(ctx, m.cfg.Namespace, commits); err != nil {
+		if hasBuffered {
+			m.buf.Rollback()
+		}
 		for _, p := range prepared {
 			pipeline.MaterializerErrorsTotal.WithLabelValues(p.pgTable).Inc()
 		}
@@ -261,7 +330,11 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		return err
 	}
 
-	// Phase 4: Apply side effects only after successful commit.
+	// Phase 4: Success — remove events from buffer and apply side effects.
+	if hasBuffered {
+		m.buf.Ack()
+	}
+	m.recovered = true
 	for _, p := range prepared {
 		m.applyPostCommit(p)
 	}
