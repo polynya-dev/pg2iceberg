@@ -51,13 +51,17 @@ func newTestStorage() *testCompactStorage {
 	return &testCompactStorage{files: make(map[string][]byte)}
 }
 
+func (m *testCompactStorage) URIForKey(key string) string {
+	return fmt.Sprintf("s3://test-bucket/%s", key)
+}
+
 func (m *testCompactStorage) Upload(_ context.Context, key string, data []byte) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.files[key] = cp
-	return fmt.Sprintf("s3://test-bucket/%s", key), nil
+	return m.URIForKey(key), nil
 }
 
 func (m *testCompactStorage) Download(_ context.Context, key string) ([]byte, error) {

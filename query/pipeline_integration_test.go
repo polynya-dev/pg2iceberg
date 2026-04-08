@@ -359,13 +359,17 @@ func newMemStorage() *memStorage {
 	return &memStorage{files: make(map[string][]byte)}
 }
 
+func (m *memStorage) URIForKey(key string) string {
+	return fmt.Sprintf("s3://test-bucket/%s", key)
+}
+
 func (m *memStorage) Upload(_ context.Context, key string, data []byte) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	m.files[key] = cp
-	return fmt.Sprintf("s3://test-bucket/%s", key), nil
+	return m.URIForKey(key), nil
 }
 
 func (m *memStorage) Download(_ context.Context, key string) ([]byte, error) {

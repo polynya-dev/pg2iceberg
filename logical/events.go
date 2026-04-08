@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -13,9 +12,13 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
-	"github.com/pg2iceberg/pg2iceberg/utils"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 )
+
+var sinkTracer = otel.Tracer("pg2iceberg/sink")
 
 
 // txBuffer holds events for a single in-flight PG transaction.
@@ -710,61 +713,32 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		return nil, nil
 	}
 
-	// Serialize + upload all event partitions in parallel.
-	var mu sync.Mutex
-	partResults := make(map[string][]uploadResult)
-
-	var tasks []utils.Task
-	for _, t := range tablesToFlush {
-		basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, t.ts.eventsIcebergName)
-		for partKey, pw := range t.ts.partitions {
-			pw := pw
-			pgTable := t.pgTable
-			partKey := partKey
-
-			// Compute partition path for the S3 key.
-			var partPath string
-			if t.ts.eventsPartSpec != nil && !t.ts.eventsPartSpec.IsUnpartitioned() && partKey != "" {
-				partPath = partKey // partKey is already in "field=value" format
-			}
-
-			tasks = append(tasks, utils.Task{
-				Name: pgTable,
-				Fn: func(ctx context.Context, progress *utils.Progress) error {
-					uploads, err := serializeEventsPartition(pw, basePath, partPath)
-					if err != nil {
-						return err
-					}
-					results, err := s.uploadFiles(ctx, uploads)
-					if err != nil {
-						return err
-					}
-					mu.Lock()
-					partResults[pgTable] = append(partResults[pgTable], results...)
-					mu.Unlock()
-					return nil
-				},
-			})
-		}
-	}
-
-	concurrency := runtime.NumCPU()
-	if len(tasks) < concurrency {
-		concurrency = len(tasks)
-	}
-	pool := utils.NewPool(concurrency)
-	if _, err := pool.Run(ctx, tasks); err != nil {
-		return nil, err
-	}
-
-	// Assemble metadata in parallel across tables (manifest write + S3 upload).
+	// Serialize, upload data, and assemble metadata — all parallel per table.
 	prepared := make([]*preparedFlush, len(tablesToFlush))
-	ag, agctx := errgroup.WithContext(ctx)
+	g, gctx := errgroup.WithContext(ctx)
 	for i, t := range tablesToFlush {
 		i, t := i, t
-		ag.Go(func() error {
-			results := partResults[t.pgTable]
-			pf, err := s.assembleEventsCommit(agctx, t.pgTable, t.ts, results)
+		g.Go(func() error {
+			tableCtx, tableSpan := sinkTracer.Start(gctx, "pg2iceberg.flush.table "+t.ts.eventsIcebergName, trace.WithAttributes(attribute.String("table", t.ts.eventsIcebergName)))
+			defer tableSpan.End()
+
+			// Serialize data files for all partitions of this table.
+			basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, t.ts.eventsIcebergName)
+			var allUploads []pendingUpload
+			for partKey, pw := range t.ts.partitions {
+				var partPath string
+				if t.ts.eventsPartSpec != nil && !t.ts.eventsPartSpec.IsUnpartitioned() && partKey != "" {
+					partPath = partKey
+				}
+				uploads, err := serializeEventsPartition(pw, basePath, partPath)
+				if err != nil {
+					return err
+				}
+				allUploads = append(allUploads, uploads...)
+			}
+
+			// Assemble metadata and upload everything (data + manifests) in one batch.
+			pf, err := s.assembleEventsCommit(tableCtx, t.pgTable, t.ts, allUploads)
 			if err != nil {
 				return err
 			}
@@ -772,7 +746,7 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 			return nil
 		})
 	}
-	if err := ag.Wait(); err != nil {
+	if err := g.Wait(); err != nil {
 		return nil, err
 	}
 
@@ -832,26 +806,6 @@ func serializeEventsPartition(pw *partitionedWriter, basePath, partPath string) 
 	return uploads, nil
 }
 
-// uploadFiles uploads a batch of pending files to S3 in parallel.
-func (s *Sink) uploadFiles(ctx context.Context, uploads []pendingUpload) ([]uploadResult, error) {
-	results := make([]uploadResult, len(uploads))
-	g, gctx := errgroup.WithContext(ctx)
-	for i, u := range uploads {
-		i, u := i, u
-		g.Go(func() error {
-			uri, err := s.s3.Upload(gctx, u.key, u.data)
-			if err != nil {
-				return fmt.Errorf("upload %s: %w", u.key, err)
-			}
-			results[i] = uploadResult{uri: uri, pendingUpload: u}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	return results, nil
-}
 
 // extractPartDir extracts the partition directory from a data file URI.
 // E.g. "s3://bucket/.../data/_ts_day=2026-04-04/uuid.parquet" → "_ts_day=2026-04-04"
@@ -878,37 +832,36 @@ type pendingUpload struct {
 	partitionValues map[string]any
 }
 
-// uploadResult holds the outcome of a completed upload.
-type uploadResult struct {
-	uri string
-	pendingUpload
-}
 
 // assembleEventsCommit builds manifests, manifest list, and snapshot commit
 // for an events table (append-only, no deletes).
-func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tableSink, results []uploadResult) (*preparedFlush, error) {
+func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tableSink, uploads []pendingUpload) (*preparedFlush, error) {
 	now := time.Now()
 	snapshotID := now.UnixMilli()
 	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.eventsIcebergName)
 
 	eventsPartitioned := ts.eventsPartSpec != nil && !ts.eventsPartSpec.IsUnpartitioned()
 
+	// Build DataFileInfo using pre-computed URIs (no upload needed yet).
 	var dataFiles []iceberg.DataFileInfo
-	for _, r := range results {
+	var dataUploads []iceberg.PendingData
+	for _, u := range uploads {
+		uri := s.s3.URIForKey(u.key)
 		df := iceberg.DataFileInfo{
-			Path:          r.uri,
-			FileSizeBytes: int64(len(r.data)),
-			RecordCount:   r.recordCount,
+			Path:          uri,
+			FileSizeBytes: int64(len(u.data)),
+			RecordCount:   u.recordCount,
 			Content:       0,
 		}
 		if eventsPartitioned {
-			partPath := extractPartDir(r.uri)
+			partPath := extractPartDir(uri)
 			if partPath != "" {
 				partValues := ts.eventsPartSpec.ParsePartitionPath(partPath, ts.eventsSchema)
 				df.PartitionValues = ts.eventsPartSpec.PartitionAvroValue(partValues, ts.eventsSchema)
 			}
 		}
 		dataFiles = append(dataFiles, df)
+		dataUploads = append(dataUploads, iceberg.PendingData{Key: u.key, Data: u.data})
 	}
 
 	// Load current events table metadata.
@@ -940,56 +893,27 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 		}
 	}
 
-	// Write data manifest.
-	var manifestInfos []iceberg.ManifestFileInfo
-	if len(dataFiles) > 0 {
-		entries := make([]iceberg.ManifestEntry, len(dataFiles))
-		for i, df := range dataFiles {
-			entries[i] = iceberg.ManifestEntry{
-				Status:     1,
-				SnapshotID: snapshotID,
-				DataFile:   df,
-			}
-		}
-		manifestBytes, err := iceberg.WriteManifest(ts.eventsSchema, entries, seqNum, 0, ts.eventsPartSpec)
-		if err != nil {
-			return nil, fmt.Errorf("write events manifest: %w", err)
-		}
-
-		manifestKey := fmt.Sprintf("%s/metadata/%s-m0.avro", basePath, uuid.New().String())
-		manifestURI, err := s.s3.Upload(ctx, manifestKey, manifestBytes)
-		if err != nil {
-			return nil, fmt.Errorf("upload events manifest: %w", err)
-		}
-
-		var totalRows int64
-		for _, df := range dataFiles {
-			totalRows += df.RecordCount
-		}
-		manifestInfos = append(manifestInfos, iceberg.ManifestFileInfo{
-			Path:           manifestURI,
-			Length:         int64(len(manifestBytes)),
-			Content:        0,
-			SnapshotID:     snapshotID,
-			AddedFiles:     len(dataFiles),
-			AddedRows:      totalRows,
-			SequenceNumber: seqNum,
+	// Build + upload manifests + manifest list in one batch.
+	var entries []iceberg.ManifestEntry
+	for _, df := range dataFiles {
+		entries = append(entries, iceberg.ManifestEntry{
+			Status: 1, SnapshotID: snapshotID, DataFile: df,
 		})
 	}
 
-	// Write manifest list (existing + new). Cache update happens seamlessly
-	// via TableCommit.NewManifests when CommitTransaction succeeds.
-	allManifests := append(existingManifests, manifestInfos...)
-	mlBytes, err := iceberg.WriteManifestList(allManifests)
+	bundle, err := iceberg.BuildCommit(iceberg.BuildCommitConfig{
+		S3: s.s3, Schema: ts.eventsSchema, PartSpec: ts.eventsPartSpec, BasePath: basePath,
+		SnapshotID: snapshotID, SeqNum: seqNum, ExistingManifests: existingManifests,
+	}, []iceberg.ManifestGroup{{Entries: entries, Content: 0}})
 	if err != nil {
-		return nil, fmt.Errorf("write manifest list: %w", err)
+		return nil, err
+	}
+	if err := iceberg.UploadAll(ctx, s.s3, dataUploads, bundle, 0); err != nil {
+		return nil, err
 	}
 
-	mlKey := fmt.Sprintf("%s/metadata/snap-%d-0-manifest-list.avro", basePath, snapshotID)
-	mlURI, err := s.s3.Upload(ctx, mlKey, mlBytes)
-	if err != nil {
-		return nil, fmt.Errorf("upload manifest list: %w", err)
-	}
+	mlURI := bundle.ManifestListURI
+	allManifests := bundle.AllManifests
 
 	eventCount := 0
 	for _, df := range dataFiles {

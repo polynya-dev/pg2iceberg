@@ -374,87 +374,41 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 		return nil, fmt.Errorf("flush compacted data: %w", err)
 	}
 
-	// Upload compacted files.
-	type uploadResult struct {
-		uri string
-		idx int
-	}
-	uploadResults := make([]uploadResult, len(chunks))
-	uploadTasks := make([]utils.Task, len(chunks))
-
-	for i, chunk := range chunks {
-		i, chunk := i, chunk
-		key := fmt.Sprintf("%s/data/%s-compact-%d.parquet", basePath, uuid.New().String(), i)
-		uploadTasks[i] = utils.Task{
-			Name: key,
-			Fn: func(ctx context.Context, _ *utils.Progress) error {
-				uri, err := tw.s3.Upload(ctx, key, chunk.Data)
-				if err != nil {
-					return fmt.Errorf("upload %s: %w", key, err)
-				}
-				uploadResults[i] = uploadResult{uri: uri, idx: i}
-				return nil
-			},
-		}
-	}
-
-	uploadPool := utils.NewPool(concurrency)
-	if _, err := uploadPool.Run(ctx, uploadTasks); err != nil {
-		return nil, fmt.Errorf("upload compacted files: %w", err)
-	}
-
-	// Combine carried-forward entries + new compacted entries.
+	// Build entries using pre-computed URIs.
+	var dataUploads []PendingData
 	var newDataEntries []ManifestEntry
-	for i, ur := range uploadResults {
+	for i, chunk := range chunks {
+		key := fmt.Sprintf("%s/data/%s-compact-%d.parquet", basePath, uuid.New().String(), i)
 		newDataEntries = append(newDataEntries, ManifestEntry{
 			Status:     1,
 			SnapshotID: snapshotID,
 			DataFile: DataFileInfo{
-				Path:          ur.uri,
-				FileSizeBytes: int64(len(chunks[i].Data)),
-				RecordCount:   chunks[i].RowCount,
+				Path:          tw.s3.URIForKey(key),
+				FileSizeBytes: int64(len(chunk.Data)),
+				RecordCount:   chunk.RowCount,
 				Content:       0,
 			},
 		})
+		dataUploads = append(dataUploads, PendingData{Key: key, Data: chunk.Data})
 	}
 
 	allEntries := append(carriedEntries, newDataEntries...)
-	var totalNewRows int64
-	for _, e := range allEntries {
-		totalNewRows += e.DataFile.RecordCount
-	}
 
-	// Build new manifest (data only, no deletes).
+	// Build + upload everything in one parallel batch.
 	partSpec := cfg.PartSpec
-	manifestBytes, err := WriteManifest(ts, allEntries, seqNum, 0, partSpec)
+	bundle, err := BuildCommit(BuildCommitConfig{
+		S3: tw.s3, Schema: ts, PartSpec: partSpec, BasePath: basePath,
+		SnapshotID: snapshotID, SeqNum: seqNum, ExistingManifests: nil, // compaction replaces all manifests
+	}, []ManifestGroup{{Entries: allEntries, Content: 0}})
 	if err != nil {
-		return nil, fmt.Errorf("write compacted manifest: %w", err)
+		return nil, err
 	}
-	manifestKey := fmt.Sprintf("%s/metadata/%s-compact-data.avro", basePath, uuid.New().String())
-	manifestURI, err := tw.s3.Upload(ctx, manifestKey, manifestBytes)
-	if err != nil {
-		return nil, fmt.Errorf("upload compacted manifest: %w", err)
+	if err := UploadAll(ctx, tw.s3, dataUploads, bundle, concurrency); err != nil {
+		return nil, err
 	}
 
-	newManifests := []ManifestFileInfo{{
-		Path:           manifestURI,
-		Length:         int64(len(manifestBytes)),
-		Content:        0,
-		SnapshotID:     snapshotID,
-		AddedFiles:     len(allEntries),
-		AddedRows:      totalNewRows,
-		SequenceNumber: seqNum,
-	}}
-
-	mlBytes, err := WriteManifestList(newManifests)
-	if err != nil {
-		return nil, fmt.Errorf("write compacted manifest list: %w", err)
-	}
-	mlKey := fmt.Sprintf("%s/metadata/snap-%d-0-manifest-list.avro", basePath, snapshotID)
-	mlURI, err := tw.s3.Upload(ctx, mlKey, mlBytes)
-	if err != nil {
-		return nil, fmt.Errorf("upload compacted manifest list: %w", err)
-	}
+	mlURI := bundle.ManifestListURI
+	newManifests := bundle.NewManifests
 
 	deletedRows := totalRewriteRows - filteredRows
 	beforeFiles := dataFileCount + deleteFileCount

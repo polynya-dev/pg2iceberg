@@ -205,18 +205,29 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress 
 			return fmt.Errorf("snapshot chunk %d for %s: %w", chunk.Index, tbl.Name, err)
 		}
 
-		// Checkpoint this chunk. Serialized via mutex because multiple
-		// tables snapshot in parallel and share the same checkpoint.
+		// Checkpoint progress. For the last chunk, also mark the table
+		// complete in a single Load+Save (avoids a redundant round-trip).
+		isLastChunk := chunk.Index == chunks[len(chunks)-1].Index
 		s.cpMu.Lock()
 		cp, err = s.deps.Store.Load(ctx, s.deps.PipelineID)
 		if err != nil {
 			s.cpMu.Unlock()
 			return fmt.Errorf("load checkpoint after chunk %d: %w", chunk.Index, err)
 		}
-		if cp.SnapshotChunks == nil {
-			cp.SnapshotChunks = make(map[string]int)
+		if isLastChunk {
+			// Last chunk — mark table complete and clean up chunk tracker.
+			if cp.SnapshotedTables == nil {
+				cp.SnapshotedTables = make(map[string]bool)
+			}
+			cp.SnapshotedTables[tbl.Name] = true
+			delete(cp.SnapshotChunks, tbl.Name)
+		} else {
+			// Intermediate chunk — record progress for crash recovery.
+			if cp.SnapshotChunks == nil {
+				cp.SnapshotChunks = make(map[string]int)
+			}
+			cp.SnapshotChunks[tbl.Name] = chunk.Index
 		}
-		cp.SnapshotChunks[tbl.Name] = chunk.Index
 		if err := s.deps.Store.Save(ctx, s.deps.PipelineID, cp); err != nil {
 			s.cpMu.Unlock()
 			return fmt.Errorf("save checkpoint after chunk %d: %w", chunk.Index, err)
@@ -230,21 +241,24 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress 
 			tbl.Name, chunk.Index+1, len(chunks), rowCount, duration.Truncate(time.Millisecond))
 	}
 
-	// Mark table as complete in checkpoint.
+	// If all chunks were skipped (crash recovery resumed past the last chunk),
+	// ensure the table is still marked complete.
 	s.cpMu.Lock()
 	cp, err = s.deps.Store.Load(ctx, s.deps.PipelineID)
 	if err != nil {
 		s.cpMu.Unlock()
 		return fmt.Errorf("load checkpoint for table complete: %w", err)
 	}
-	if cp.SnapshotedTables == nil {
-		cp.SnapshotedTables = make(map[string]bool)
-	}
-	cp.SnapshotedTables[tbl.Name] = true
-	delete(cp.SnapshotChunks, tbl.Name)
-	if err := s.deps.Store.Save(ctx, s.deps.PipelineID, cp); err != nil {
-		s.cpMu.Unlock()
-		return fmt.Errorf("save checkpoint table complete: %w", err)
+	if cp.SnapshotedTables == nil || !cp.SnapshotedTables[tbl.Name] {
+		if cp.SnapshotedTables == nil {
+			cp.SnapshotedTables = make(map[string]bool)
+		}
+		cp.SnapshotedTables[tbl.Name] = true
+		delete(cp.SnapshotChunks, tbl.Name)
+		if err := s.deps.Store.Save(ctx, s.deps.PipelineID, cp); err != nil {
+			s.cpMu.Unlock()
+			return fmt.Errorf("save checkpoint table complete: %w", err)
+		}
 	}
 	s.cpMu.Unlock()
 

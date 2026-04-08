@@ -164,3 +164,10 @@ func (v *VendedS3Client) StatObject(ctx context.Context, key string) (int64, err
 	}
 	return c.StatObject(ctx, key)
 }
+
+func (v *VendedS3Client) URIForKey(key string) string {
+	v.mu.RLock()
+	c := v.inner
+	v.mu.RUnlock()
+	return c.URIForKey(key)
+}

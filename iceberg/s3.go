@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -26,13 +27,18 @@ var s3tracer = otel.Tracer("pg2iceberg/s3")
 // s3SpanName builds a descriptive span name from the S3 key.
 // e.g. "s3.Upload rideshare.db/orders/data/abc.parquet" → "s3.Upload orders data"
 //      "rideshare.db/orders_events/metadata/snap-123.avro" → "s3.Upload orders_events metadata"
+// Handles partitioned keys: "ns.db/table/data/_ts_day=2026-04-08/abc.parquet" → "s3.Upload table data"
 func s3SpanName(op, key string) string {
-	parts := strings.Split(key, "/")
-	// typical key: {namespace}.db/{table}/{data|metadata}/{file}
-	if len(parts) >= 3 {
-		table := parts[len(parts)-3]
-		kind := parts[len(parts)-2] // "data" or "metadata"
-		return op + " " + table + " " + kind
+	// Find the ".db/" marker to locate the table name reliably.
+	dbIdx := strings.Index(key, ".db/")
+	if dbIdx >= 0 {
+		after := key[dbIdx+4:] // everything after ".db/"
+		parts := strings.SplitN(after, "/", 3)
+		if len(parts) >= 2 {
+			table := parts[0]
+			kind := parts[1] // "data" or "metadata"
+			return op + " " + table + " " + kind
+		}
 	}
 	return op + " " + path.Base(key)
 }
@@ -46,6 +52,9 @@ type ObjectStorage interface {
 	DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
 	// StatObject returns the size of an object in bytes.
 	StatObject(ctx context.Context, key string) (int64, error)
+	// URIForKey returns the full URI for a key without uploading.
+	// Enables building manifests that reference files before they're uploaded.
+	URIForKey(key string) string
 }
 
 // S3Client wraps the S3 SDK for uploading and downloading files.
@@ -94,7 +103,7 @@ func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string,
 	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.Upload", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
 		attribute.Int("s3.size_bytes", len(data)),
-		attribute.String("service.name", "s3"),
+		semconv.PeerService("s3"),
 	))
 	defer span.End()
 
@@ -112,14 +121,18 @@ func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string,
 		return "", fmt.Errorf("upload %s: %w", key, err)
 	}
 	pipeline.S3BytesUploadedTotal.Add(float64(len(data)))
-	return fmt.Sprintf("s3://%s/%s", c.bucket, key), nil
+	return c.URIForKey(key), nil
+}
+
+func (c *S3Client) URIForKey(key string) string {
+	return fmt.Sprintf("s3://%s/%s", c.bucket, key)
 }
 
 // Download reads an S3 object.
 func (c *S3Client) Download(ctx context.Context, key string) ([]byte, error) {
 	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.Download", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
-		attribute.String("service.name", "s3"),
+		semconv.PeerService("s3"),
 	))
 	defer span.End()
 
@@ -153,7 +166,7 @@ func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length
 		attribute.String("s3.key", key),
 		attribute.Int64("s3.offset", offset),
 		attribute.Int64("s3.length", length),
-		attribute.String("service.name", "s3"),
+		semconv.PeerService("s3"),
 	))
 	defer span.End()
 
@@ -187,7 +200,7 @@ func (c *S3Client) DownloadRange(ctx context.Context, key string, offset, length
 func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
 	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.StatObject", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("s3.key", key),
-		attribute.String("service.name", "s3"),
+		semconv.PeerService("s3"),
 	))
 	defer span.End()
 
