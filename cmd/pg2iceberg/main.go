@@ -57,6 +57,7 @@ func main() {
 	// Behavior
 	snapshotOnly := flag.Bool("snapshot-only", false, "exit after initial snapshot completes (env: SNAPSHOT_ONLY)")
 	compactOnly := flag.Bool("compact", false, "run one compaction pass on all tables and exit")
+	maintainOnly := flag.Bool("maintain", false, "run one maintenance pass (snapshot expiry + orphan cleanup) and exit")
 
 	// State & metrics
 	statePostgresURL := flag.String("state-postgres-url", "", "PostgreSQL URL for state storage (env: STATE_POSTGRES_URL)")
@@ -116,7 +117,9 @@ func main() {
 	}
 
 	var runErr error
-	if *compactOnly {
+	if *maintainOnly {
+		runErr = runMaintain(ctx, cfg)
+	} else if *compactOnly {
 		runErr = runCompact(ctx, cfg)
 	} else if cfg.SnapshotOnly {
 		runErr = runSnapshotOnly(ctx, cfg)
@@ -529,6 +532,55 @@ func runCompact(ctx context.Context, cfg *config.Config) error {
 	}
 
 	log.Printf("[compact] done, %d table(s) compacted", compacted)
+	return nil
+}
+
+// runMaintain performs a single maintenance pass on all configured tables.
+func runMaintain(ctx context.Context, cfg *config.Config) error {
+	log.Println("[maintain] starting maintenance")
+
+	clients, err := iceberg.NewClients(cfg.Sink)
+	if err != nil {
+		return fmt.Errorf("create iceberg clients: %w", err)
+	}
+	catalog, ok := clients.Catalog.(*iceberg.MetadataStore)
+	if !ok {
+		return fmt.Errorf("maintenance requires MetadataStore catalog")
+	}
+
+	// Ensure storage is available.
+	if clients.S3 == nil && len(cfg.Tables) > 0 {
+		firstTable := postgres.TableToIceberg(cfg.Tables[0].Name)
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, firstTable); err != nil {
+			return fmt.Errorf("ensure storage: %w", err)
+		}
+	}
+
+	mc := iceberg.MaintenanceConfig{
+		SnapshotRetention: cfg.Sink.MaintenanceRetentionOrDefault(),
+		OrphanGracePeriod: cfg.Sink.MaintenanceGraceOrDefault(),
+	}
+
+	log.Printf("[maintain] retention=%s, grace=%s", mc.SnapshotRetention, mc.OrphanGracePeriod)
+
+	for _, tc := range cfg.Tables {
+		icebergName := postgres.TableToIceberg(tc.Name)
+
+		// Maintain materialized table.
+		if err := iceberg.MaintainTable(ctx, catalog, clients.S3, cfg.Sink.Namespace, icebergName, mc); err != nil {
+			log.Printf("[maintain] error on %s: %v", icebergName, err)
+		}
+
+		// In logical mode, also maintain events table.
+		if cfg.Source.Mode == "logical" {
+			eventsName := iceberg.EventsTableName(icebergName)
+			if err := iceberg.MaintainTable(ctx, catalog, clients.S3, cfg.Sink.Namespace, eventsName, mc); err != nil {
+				log.Printf("[maintain] error on %s: %v", eventsName, err)
+			}
+		}
+	}
+
+	log.Println("[maintain] done")
 	return nil
 }
 

@@ -298,3 +298,36 @@ var QueryDeleteFilesWrittenTotal = promauto.NewCounterVec(prometheus.CounterOpts
 	Name:      "query_delete_files_written_total",
 	Help:      "Total equality delete files written by query-mode flushes.",
 }, []string{"pipeline", "table"})
+
+// --- Maintenance ---
+
+var MaintenanceRunsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "maintenance_runs_total",
+	Help:      "Total maintenance runs by table.",
+}, []string{"table"})
+
+var MaintenanceSnapshotsExpiredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "maintenance_snapshots_expired_total",
+	Help:      "Total snapshots expired by maintenance.",
+}, []string{"table"})
+
+var MaintenanceOrphansDeletedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "maintenance_orphans_deleted_total",
+	Help:      "Total orphan files deleted by maintenance.",
+}, []string{"table"})
+
+var MaintenanceDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Namespace: namespace,
+	Name:      "maintenance_duration_seconds",
+	Help:      "Time taken for a maintenance pass per table.",
+	Buckets:   []float64{0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600},
+}, []string{"table"})
+
+var MaintenanceErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "maintenance_errors_total",
+	Help:      "Total maintenance errors.",
+}, []string{"table"})

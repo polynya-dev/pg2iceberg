@@ -277,6 +277,43 @@ func (ms *MetadataStore) SetFileIndex(ns, table string, idx *FileIndex) {
 	}
 }
 
+// --- Maintenance ---
+
+// RemoveSnapshots removes the specified snapshots from catalog metadata and
+// trims the cached snapshot list.
+func (ms *MetadataStore) RemoveSnapshots(ctx context.Context, ns, table string, snapshotIDs []int64) error {
+	if err := ms.inner.RemoveSnapshots(ctx, ns, table, snapshotIDs); err != nil {
+		return err
+	}
+
+	removedSet := make(map[int64]bool, len(snapshotIDs))
+	for _, id := range snapshotIDs {
+		removedSet[id] = true
+	}
+
+	key := tableKey{ns, table}
+	ms.mu.Lock()
+	ms.trimSnapshotsLocked(key, removedSet)
+	ms.mu.Unlock()
+	return nil
+}
+
+// trimSnapshotsLocked removes expired snapshot entries from the cached metadata.
+func (ms *MetadataStore) trimSnapshotsLocked(key tableKey, removedIDs map[int64]bool) {
+	ts, ok := ms.tables[key]
+	if !ok {
+		return
+	}
+	kept := ts.tm.Metadata.Snapshots[:0]
+	for _, snap := range ts.tm.Metadata.Snapshots {
+		if !removedIDs[snap.SnapshotID] {
+			kept = append(kept, snap)
+		}
+	}
+	ts.tm.Metadata.Snapshots = kept
+	ts.lastAccess = time.Now()
+}
+
 // --- GetConfig / SetPrefix pass-through ---
 
 func (ms *MetadataStore) GetConfig(ctx context.Context, warehouse string) (*CatalogConfig, error) {

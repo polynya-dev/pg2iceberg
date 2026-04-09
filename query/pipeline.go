@@ -330,6 +330,9 @@ func (p *Pipeline) run(ctx context.Context) {
 		}
 	}()
 
+	// Background maintenance goroutine.
+	go p.runMaintenance(ctx)
+
 	// Immediate first poll.
 	if err := p.pollAndBuffer(ctx); err != nil {
 		p.setStatus(pipeline.StatusError, fmt.Errorf("initial poll: %w", err))
@@ -630,4 +633,41 @@ func (p *Pipeline) runSnapshot(ctx context.Context) error {
 
 	log.Printf("[query:%s] initial snapshot complete, watermarks set to fence values", p.id)
 	return nil
+}
+
+func (p *Pipeline) runMaintenance(ctx context.Context) {
+	interval := p.cfg.Sink.MaintenanceIntervalOrDefault()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Printf("[query:%s] maintenance started (interval=%s, retention=%s)",
+		p.id, interval, p.cfg.Sink.MaintenanceRetentionOrDefault())
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.maintainAllTables(ctx)
+		}
+	}
+}
+
+func (p *Pipeline) maintainAllTables(ctx context.Context) {
+	catalog, ok := p.catalog.(*iceberg.MetadataStore)
+	if !ok {
+		return
+	}
+
+	mc := iceberg.MaintenanceConfig{
+		SnapshotRetention: p.cfg.Sink.MaintenanceRetentionOrDefault(),
+		OrphanGracePeriod: p.cfg.Sink.MaintenanceGraceOrDefault(),
+	}
+
+	for _, tc := range p.cfg.Tables {
+		icebergName := postgres.TableToIceberg(tc.Name)
+		if err := iceberg.MaintainTable(ctx, catalog, p.s3, p.cfg.Sink.Namespace, icebergName, mc); err != nil {
+			log.Printf("[maintain:%s] error on %s: %v", p.id, icebergName, err)
+		}
+	}
 }

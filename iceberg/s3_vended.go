@@ -171,3 +171,19 @@ func (v *VendedS3Client) URIForKey(key string) string {
 	v.mu.RUnlock()
 	return c.URIForKey(key)
 }
+
+func (v *VendedS3Client) ListObjects(ctx context.Context, prefix string) ([]ObjectInfo, error) {
+	c, err := v.client(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.ListObjects(ctx, prefix)
+}
+
+func (v *VendedS3Client) DeleteObjects(ctx context.Context, keys []string) error {
+	c, err := v.client(ctx)
+	if err != nil {
+		return err
+	}
+	return c.DeleteObjects(ctx, keys)
+}

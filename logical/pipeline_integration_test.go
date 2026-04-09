@@ -1503,6 +1503,27 @@ func (m *memStorage) StatObject(_ context.Context, key string) (int64, error) {
 	return int64(len(data)), nil
 }
 
+func (m *memStorage) ListObjects(_ context.Context, prefix string) ([]iceberg.ObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []iceberg.ObjectInfo
+	for key := range m.files {
+		if len(prefix) == 0 || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
+			result = append(result, iceberg.ObjectInfo{Key: key, LastModified: time.Now().Add(-1 * time.Hour)})
+		}
+	}
+	return result, nil
+}
+
+func (m *memStorage) DeleteObjects(_ context.Context, keys []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, k := range keys {
+		delete(m.files, k)
+	}
+	return nil
+}
+
 // memCatalog is an in-memory MetadataCache implementation for testing.
 type memCatalog struct {
 	mu         sync.Mutex
@@ -1627,6 +1648,39 @@ func (c *memCatalog) SetFileIndex(ns, table string, idx *iceberg.FileIndex) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.fileIdxs[ns+"."+table] = idx
+}
+
+func (c *memCatalog) RemoveSnapshots(_ context.Context, ns, table string, snapshotIDs []int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := ns + "." + table
+	tm := c.tables[key]
+	if tm == nil {
+		return nil
+	}
+	removed := make(map[int64]bool, len(snapshotIDs))
+	for _, id := range snapshotIDs {
+		removed[id] = true
+	}
+	kept := tm.Metadata.Snapshots[:0]
+	for _, snap := range tm.Metadata.Snapshots {
+		if !removed[snap.SnapshotID] {
+			kept = append(kept, snap)
+		}
+	}
+	tm.Metadata.Snapshots = kept
+	return nil
+}
+
+func (c *memCatalog) snapshotCount(ns, table string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := ns + "." + table
+	tm := c.tables[key]
+	if tm == nil {
+		return 0
+	}
+	return len(tm.Metadata.Snapshots)
 }
 
 // failOnceCatalog wraps memCatalog and fails the first CommitTransaction call.
@@ -2456,4 +2510,199 @@ func TestPipeline_SlotSurvivesShutdown(t *testing.T) {
 
 	t.Logf("restarted pipeline flushed LSN: %d (was %d before shutdown) — no data lost",
 		p2.Source().FlushedLSN(), flushedLSN)
+}
+
+// TestMaintenance_ExpireSnapshotsAndCleanOrphans runs the pipeline for multiple
+// materializer cycles to accumulate snapshots, then runs maintenance to expire
+// old snapshots and delete orphan files.
+func TestMaintenance_ExpireSnapshotsAndCleanOrphans(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	// Create table and seed data.
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE items (
+			id    SERIAL PRIMARY KEY,
+			name  TEXT NOT NULL,
+			price INTEGER NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	// Seed initial data for snapshot.
+	for i := 1; i <= 10; i++ {
+		_, err = conn.Exec(ctx, "INSERT INTO items (name, price) VALUES ($1, $2)",
+			fmt.Sprintf("item-%d", i), i*100)
+		if err != nil {
+			t.Fatalf("seed insert: %v", err)
+		}
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "200ms",
+		FlushRows:            3,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+		// Set maintenance interval very high so the background goroutine doesn't interfere.
+		MaintenanceInterval: "1h",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.items"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        "test_slot_maintain",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	eventBuf := logical.NewChangeEventBuffer()
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat, eventBuf)
+	store := pipeline.NewMemCheckpointStore()
+	p := logical.NewPipeline("test", cfg, snk, store)
+	p.SetEventBuf(eventBuf)
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+	t.Log("pipeline running — snapshot complete")
+
+	// Insert data in multiple batches to trigger multiple materializer cycles,
+	// each producing a new snapshot.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	const batches = 4
+	for batch := 0; batch < batches; batch++ {
+		for i := 0; i < 5; i++ {
+			_, err = conn.Exec(ctx, "INSERT INTO items (name, price) VALUES ($1, $2)",
+				fmt.Sprintf("batch%d-item%d", batch, i), (batch+1)*1000+i)
+			if err != nil {
+				t.Fatalf("insert batch %d item %d: %v", batch, i, err)
+			}
+		}
+
+		// Wait for this batch's materializer cycle to commit.
+		targetCommits := batch + 1
+		waitFor(t, 30*time.Second, func() bool {
+			return len(cat.matCommits()) >= targetCommits
+		})
+		t.Logf("materializer cycle %d committed", targetCommits)
+	}
+
+	// Count snapshots on materialized and events tables.
+	matSnaps := cat.snapshotCount("test_ns", "items")
+	evtSnaps := cat.snapshotCount("test_ns", "items_events")
+	t.Logf("before maintenance: materialized=%d snapshots, events=%d snapshots", matSnaps, evtSnaps)
+
+	if matSnaps < 3 {
+		t.Fatalf("expected at least 3 materialized snapshots, got %d", matSnaps)
+	}
+	if evtSnaps < 3 {
+		t.Fatalf("expected at least 3 events snapshots, got %d", evtSnaps)
+	}
+
+	// Count S3 files before maintenance.
+	allFiles, _ := mem.ListObjects(ctx, "test_ns.db/items/")
+	allEvtFiles, _ := mem.ListObjects(ctx, "test_ns.db/items_events/")
+	filesBefore := len(allFiles) + len(allEvtFiles)
+	t.Logf("before maintenance: %d S3 files (%d mat + %d events)", filesBefore, len(allFiles), len(allEvtFiles))
+
+	// Backdate all snapshots except the current one to simulate aging.
+	// This makes them eligible for expiry with a short retention.
+	oldTimestamp := time.Now().Add(-48 * time.Hour).UnixMilli()
+	backdateOldSnapshots := func(ns, table string) {
+		cat.mu.Lock()
+		defer cat.mu.Unlock()
+		tm := cat.tables[ns+"."+table]
+		if tm == nil {
+			return
+		}
+		for i := range tm.Metadata.Snapshots {
+			if tm.Metadata.Snapshots[i].SnapshotID != tm.Metadata.CurrentSnapshotID {
+				tm.Metadata.Snapshots[i].TimestampMs = oldTimestamp
+			}
+		}
+	}
+	backdateOldSnapshots("test_ns", "items")
+	backdateOldSnapshots("test_ns", "items_events")
+
+	// Run maintenance with 1h retention (old snapshots are 48h old → will be expired).
+	mc := iceberg.MaintenanceConfig{
+		SnapshotRetention: 1 * time.Hour,
+		OrphanGracePeriod: 0, // disable grace period for test — all orphans eligible
+	}
+
+	if err := iceberg.MaintainTable(ctx, cat, mem, "test_ns", "items", mc); err != nil {
+		t.Fatalf("maintain materialized table: %v", err)
+	}
+	if err := iceberg.MaintainTable(ctx, cat, mem, "test_ns", "items_events", mc); err != nil {
+		t.Fatalf("maintain events table: %v", err)
+	}
+
+	// Verify snapshots were expired — only the current snapshot should remain.
+	matSnapsAfter := cat.snapshotCount("test_ns", "items")
+	evtSnapsAfter := cat.snapshotCount("test_ns", "items_events")
+	t.Logf("after maintenance: materialized=%d snapshots, events=%d snapshots", matSnapsAfter, evtSnapsAfter)
+
+	if matSnapsAfter != 1 {
+		t.Errorf("expected 1 materialized snapshot after maintenance, got %d", matSnapsAfter)
+	}
+	if evtSnapsAfter != 1 {
+		t.Errorf("expected 1 events snapshot after maintenance, got %d", evtSnapsAfter)
+	}
+
+	// Verify orphan files were deleted.
+	allFilesAfter, _ := mem.ListObjects(ctx, "test_ns.db/items/")
+	allEvtFilesAfter, _ := mem.ListObjects(ctx, "test_ns.db/items_events/")
+	filesAfter := len(allFilesAfter) + len(allEvtFilesAfter)
+	t.Logf("after maintenance: %d S3 files (%d mat + %d events)", filesAfter, len(allFilesAfter), len(allEvtFilesAfter))
+
+	if filesAfter >= filesBefore {
+		t.Errorf("expected fewer files after maintenance, before=%d, after=%d", filesBefore, filesAfter)
+	}
+
+	// Verify the current snapshot's data is still intact — can still read rows.
+	matTm, _ := cat.LoadTable(ctx, "test_ns", "items")
+	if matTm == nil {
+		t.Fatal("materialized table disappeared")
+	}
+	matRows := countDataRows(t, ctx, mem, matTm)
+	if matRows == 0 {
+		t.Error("expected materialized table to still have data after maintenance")
+	}
+	t.Logf("materialized table has %d rows after maintenance — data intact", matRows)
 }

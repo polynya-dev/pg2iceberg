@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
@@ -108,6 +109,27 @@ func (m *memStorage) StatObject(_ context.Context, key string) (int64, error) {
 		return 0, fmt.Errorf("not found: %s", key)
 	}
 	return int64(len(data)), nil
+}
+
+func (m *memStorage) ListObjects(_ context.Context, prefix string) ([]iceberg.ObjectInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []iceberg.ObjectInfo
+	for key := range m.files {
+		if len(prefix) == 0 || (len(key) >= len(prefix) && key[:len(prefix)] == prefix) {
+			result = append(result, iceberg.ObjectInfo{Key: key, LastModified: time.Now().Add(-1 * time.Hour)})
+		}
+	}
+	return result, nil
+}
+
+func (m *memStorage) DeleteObjects(_ context.Context, keys []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, k := range keys {
+		delete(m.files, k)
+	}
+	return nil
 }
 
 type memCatalog struct {

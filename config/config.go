@@ -171,6 +171,11 @@ type SinkConfig struct {
 	// Compaction thresholds — compact when file counts exceed these.
 	CompactionDataFiles   int `yaml:"compaction_data_files" json:"compaction_data_files,omitempty"`
 	CompactionDeleteFiles int `yaml:"compaction_delete_files" json:"compaction_delete_files,omitempty"`
+
+	// Maintenance settings — snapshot expiry and orphan file cleanup.
+	MaintenanceRetention string `yaml:"maintenance_retention" json:"maintenance_retention,omitempty"` // e.g. "168h" (7 days)
+	MaintenanceInterval  string `yaml:"maintenance_interval" json:"maintenance_interval,omitempty"`   // e.g. "1h"
+	MaintenanceGrace     string `yaml:"maintenance_grace" json:"maintenance_grace,omitempty"`         // e.g. "30m"
 }
 
 func (s SinkConfig) EventsPartitionOrDefault() string {
@@ -236,6 +241,36 @@ func (s SinkConfig) CompactionDeleteFilesOrDefault() int {
 		return s.CompactionDeleteFiles
 	}
 	return 10
+}
+
+func (s SinkConfig) MaintenanceRetentionOrDefault() time.Duration {
+	if s.MaintenanceRetention != "" {
+		d, err := time.ParseDuration(s.MaintenanceRetention)
+		if err == nil {
+			return d
+		}
+	}
+	return 7 * 24 * time.Hour // 7 days
+}
+
+func (s SinkConfig) MaintenanceIntervalOrDefault() time.Duration {
+	if s.MaintenanceInterval != "" {
+		d, err := time.ParseDuration(s.MaintenanceInterval)
+		if err == nil {
+			return d
+		}
+	}
+	return 1 * time.Hour
+}
+
+func (s SinkConfig) MaintenanceGraceOrDefault() time.Duration {
+	if s.MaintenanceGrace != "" {
+		d, err := time.ParseDuration(s.MaintenanceGrace)
+		if err == nil {
+			return d
+		}
+	}
+	return 30 * time.Minute
 }
 
 func (s SinkConfig) FlushDuration() time.Duration {
@@ -420,6 +455,16 @@ func (cfg *Config) ApplyEnv() error {
 		cfg.MetricsAddr = v
 	}
 
+	if v := os.Getenv("MAINTENANCE_RETENTION"); v != "" {
+		cfg.Sink.MaintenanceRetention = v
+	}
+	if v := os.Getenv("MAINTENANCE_INTERVAL"); v != "" {
+		cfg.Sink.MaintenanceInterval = v
+	}
+	if v := os.Getenv("MAINTENANCE_GRACE"); v != "" {
+		cfg.Sink.MaintenanceGrace = v
+	}
+
 	return nil
 }
 
@@ -582,6 +627,21 @@ func (cfg *Config) Validate() error {
 	if cfg.Sink.MaterializerInterval != "" {
 		if _, err := time.ParseDuration(cfg.Sink.MaterializerInterval); err != nil {
 			errs = append(errs, fmt.Sprintf("sink.materializer_interval: invalid duration %q", cfg.Sink.MaterializerInterval))
+		}
+	}
+	if cfg.Sink.MaintenanceRetention != "" {
+		if _, err := time.ParseDuration(cfg.Sink.MaintenanceRetention); err != nil {
+			errs = append(errs, fmt.Sprintf("sink.maintenance_retention: invalid duration %q", cfg.Sink.MaintenanceRetention))
+		}
+	}
+	if cfg.Sink.MaintenanceInterval != "" {
+		if _, err := time.ParseDuration(cfg.Sink.MaintenanceInterval); err != nil {
+			errs = append(errs, fmt.Sprintf("sink.maintenance_interval: invalid duration %q", cfg.Sink.MaintenanceInterval))
+		}
+	}
+	if cfg.Sink.MaintenanceGrace != "" {
+		if _, err := time.ParseDuration(cfg.Sink.MaintenanceGrace); err != nil {
+			errs = append(errs, fmt.Sprintf("sink.maintenance_grace: invalid duration %q", cfg.Sink.MaintenanceGrace))
 		}
 	}
 	if cfg.Sink.FlushRows < 0 {

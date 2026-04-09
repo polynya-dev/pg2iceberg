@@ -409,6 +409,9 @@ func (p *Pipeline) run(ctx context.Context) {
 		}
 	}()
 
+	// Background maintenance goroutine.
+	go p.runMaintenance(ctx)
+
 	events := make(chan postgres.ChangeEvent, 1000)
 	errCh := make(chan error, 1)
 
@@ -720,6 +723,49 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	p.src.SetFlushedLSN(cp.LSN)
 
 	return nil
+}
+
+func (p *Pipeline) runMaintenance(ctx context.Context) {
+	interval := p.cfg.Sink.MaintenanceIntervalOrDefault()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Printf("[logical:%s] maintenance started (interval=%s, retention=%s)",
+		p.id, interval, p.cfg.Sink.MaintenanceRetentionOrDefault())
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.maintainAllTables(ctx)
+		}
+	}
+}
+
+func (p *Pipeline) maintainAllTables(ctx context.Context) {
+	catalog, ok := p.snk.Catalog().(*iceberg.MetadataStore)
+	if !ok {
+		return
+	}
+
+	mc := iceberg.MaintenanceConfig{
+		SnapshotRetention: p.cfg.Sink.MaintenanceRetentionOrDefault(),
+		OrphanGracePeriod: p.cfg.Sink.MaintenanceGraceOrDefault(),
+	}
+
+	for _, tc := range p.cfg.Tables {
+		icebergName := postgres.TableToIceberg(tc.Name)
+
+		if err := iceberg.MaintainTable(ctx, catalog, p.snk.S3(), p.cfg.Sink.Namespace, icebergName, mc); err != nil {
+			log.Printf("[maintain:%s] error on %s: %v", p.id, icebergName, err)
+		}
+
+		eventsName := iceberg.EventsTableName(icebergName)
+		if err := iceberg.MaintainTable(ctx, catalog, p.snk.S3(), p.cfg.Sink.Namespace, eventsName, mc); err != nil {
+			log.Printf("[maintain:%s] error on %s: %v", p.id, eventsName, err)
+		}
+	}
 }
 
 func (p *Pipeline) monitorWALLag(ctx context.Context) {

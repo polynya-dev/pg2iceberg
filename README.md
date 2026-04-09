@@ -160,6 +160,9 @@ You should see new rows added over time.
 | `SNAPSHOT_ONLY` | `--snapshot-only` | Exit after initial snapshot (default: `false`) |
 | `STATE_POSTGRES_URL` | `--state-postgres-url` | Separate Postgres for checkpoint storage |
 | `METRICS_ADDR` | `--metrics-addr` | Metrics server address (default: `:9090`) |
+| `MAINTENANCE_RETENTION` | | Snapshot retention duration (default: `168h` / 7 days) |
+| `MAINTENANCE_INTERVAL` | | Background maintenance interval (default: `1h`) |
+| `MAINTENANCE_GRACE` | | Orphan file grace period (default: `30m`) |
 
 See config.example.yaml for the full config YAML.
 
@@ -285,3 +288,5 @@ pg2iceberg exposes Prometheus metrics on `:9090/metrics` (configurable via `metr
 - `pg2iceberg_catalog_operation_duration_seconds` - catalog API latency by operation
 - `pg2iceberg_replication_lag_bytes` - WAL lag from Postgres
 - `pg2iceberg_rows_processed_total` - rows replicated by table and operation
+- `pg2iceberg_maintenance_snapshots_expired_total` - snapshots expired by maintenance
+- `pg2iceberg_maintenance_orphans_deleted_total` - orphan files deleted by maintenance

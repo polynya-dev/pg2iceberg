@@ -524,6 +524,51 @@ func (c *CatalogClient) EvolveSchema(ctx context.Context, ns, table string, curr
 	return newSchemaID, nil
 }
 
+// RemoveSnapshots removes the specified snapshots from table metadata using
+// the Iceberg REST catalog's table update API with "remove-snapshots" action.
+func (c *CatalogClient) RemoveSnapshots(ctx context.Context, ns, table string, snapshotIDs []int64) error {
+	if len(snapshotIDs) == 0 {
+		return nil
+	}
+
+	ctx, span := tracer.Start(ctx, "catalog.RemoveSnapshots "+table, trace.WithAttributes(
+		attribute.String("iceberg.namespace", ns),
+		attribute.String("iceberg.table", table),
+		attribute.Int("iceberg.remove_count", len(snapshotIDs)),
+	))
+	defer span.End()
+
+	defer func(start time.Time) {
+		pipeline.CatalogOperationDurationSeconds.WithLabelValues("remove_snapshots").Observe(time.Since(start).Seconds())
+	}(time.Now())
+
+	body := map[string]any{
+		"requirements": []map[string]any{},
+		"updates": []map[string]any{
+			{
+				"action":       "remove-snapshots",
+				"snapshot-ids": snapshotIDs,
+			},
+		},
+	}
+
+	resp, err := c.post(ctx, c.v1Path(fmt.Sprintf("/namespaces/%s/tables/%s", ns, table)), body)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		err := c.readError(resp)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
+	}
+	return nil
+}
+
 func (c *CatalogClient) get(ctx context.Context, path string) (*http.Response, error) {
 	ctx, span := tracer.Start(ctx, "http GET "+path, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		attribute.String("http.method", "GET"),
