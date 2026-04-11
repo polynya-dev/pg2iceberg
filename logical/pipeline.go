@@ -15,7 +15,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/snapshot"
-
+	"github.com/pg2iceberg/pg2iceberg/stream"
 	"github.com/pg2iceberg/pg2iceberg/utils"
 )
 
@@ -43,7 +43,8 @@ type Pipeline struct {
 	lastWrittenLSN uint64
 
 	materializer *Materializer
-	eventBuf     *ChangeEventBuffer
+	coord        stream.Coordinator
+	str          *stream.Stream
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -57,39 +58,49 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 		return nil, fmt.Errorf("create checkpoint store: %w", err)
 	}
 
-	eventBuf := NewChangeEventBuffer()
-	snk, clients, err := BuildSink(cfg.Sink, cfg.Tables, id, eventBuf)
+	// Create coordinator using source PG DSN.
+	coord, err := stream.NewPgCoordinator(ctx, cfg.Source.Postgres.DSN())
 	if err != nil {
+		cpStore.Close()
+		return nil, fmt.Errorf("create coordinator: %w", err)
+	}
+	if err := coord.Migrate(ctx); err != nil {
+		coord.Close()
+		cpStore.Close()
+		return nil, fmt.Errorf("migrate coordinator: %w", err)
+	}
+
+	snk, clients, err := BuildSink(cfg.Sink, cfg.Tables, id)
+	if err != nil {
+		coord.Close()
 		cpStore.Close()
 		return nil, fmt.Errorf("create sink: %w", err)
 	}
 
 	return &Pipeline{
-		id:       id,
-		cfg:      cfg,
-		snk:      snk,
-		clients:  clients,
-		store:    cpStore,
-		eventBuf: eventBuf,
-		status:   pipeline.StatusStopped,
-		done:     make(chan struct{}),
+		id:      id,
+		cfg:     cfg,
+		snk:     snk,
+		clients: clients,
+		store:   cpStore,
+		coord:   coord,
+		status:  pipeline.StatusStopped,
+		done:    make(chan struct{}),
 	}, nil
 }
 
 // NewPipeline creates a Pipeline with injected dependencies (for tests).
-func NewPipeline(id string, cfg *config.Config, snk *Sink, store pipeline.CheckpointStore) *Pipeline {
+func NewPipeline(id string, cfg *config.Config, snk *Sink, store pipeline.CheckpointStore, coord stream.Coordinator) *Pipeline {
 	return &Pipeline{
 		id:     id,
 		cfg:    cfg,
 		snk:    snk,
 		store:  store,
+		coord:  coord,
 		status: pipeline.StatusStopped,
 		done:   make(chan struct{}),
 	}
 }
-
-// SetEventBuf sets the change event buffer. Must be called before Start.
-func (p *Pipeline) SetEventBuf(buf *ChangeEventBuffer) { p.eventBuf = buf }
 
 // Config returns the pipeline configuration.
 func (p *Pipeline) Config() *config.Config { return p.cfg }
@@ -192,6 +203,9 @@ func (p *Pipeline) Stop() error {
 	if p.store != nil {
 		p.store.Close()
 	}
+	if p.coord != nil {
+		p.coord.Close()
+	}
 
 	p.setStatus(pipeline.StatusStopped, nil)
 	return nil
@@ -260,19 +274,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 			te.SnapshotID = matTm.Metadata.CurrentSnapshotID
 			te.SeqNum = matTm.Metadata.LastSequenceNumber
 		}
-		// In logical mode, also check the events table.
-		eventsName := iceberg.EventsTableName(icebergName)
-		eventsTm, err := p.snk.Catalog().LoadTable(ctx, p.cfg.Sink.Namespace, eventsName)
-		if err != nil {
-			pgConn.Close(ctx)
-			return fmt.Errorf("probe events table %s: %w", eventsName, err)
-		}
-		eventsTE := pipeline.TableExistence{PGTable: tc.Name, IcebergName: eventsName, Existed: eventsTm != nil}
-		if eventsTm != nil {
-			eventsTE.SnapshotID = eventsTm.Metadata.CurrentSnapshotID
-			eventsTE.SeqNum = eventsTm.Metadata.LastSequenceNumber
-		}
-		tableExistence = append(tableExistence, te, eventsTE)
+		tableExistence = append(tableExistence, te)
 	}
 
 	// Probe replication slot.
@@ -325,22 +327,15 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		p.snk.SetS3(p.clients.S3)
 	}
 
+	// Create Stream (needs S3 to be initialized).
+	p.str = stream.NewStream(p.coord, p.snk.S3(), p.cfg.Sink.Namespace)
+	p.snk.SetStream(p.str)
+
 	// Start WAL lag monitor.
 	go p.monitorWALLag(ctx)
 
-	// Restore sequence counter so _seq remains monotonic across restarts.
-	if cp.SeqCounter > 0 {
-		p.snk.SetSeqCounter(cp.SeqCounter)
-		log.Printf("[logical:%s] restored seq counter: %d", p.id, cp.SeqCounter)
-	}
-
 	// Start materializer.
-	materializer := NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.eventBuf)
-	if cp.MaterializerSnapshots != nil {
-		for pgTable, snapID := range cp.MaterializerSnapshots {
-			materializer.SetLastEventsSnapshot(pgTable, snapID)
-		}
-	}
+	materializer := NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.str)
 	go materializer.Run(ctx)
 	p.materializer = materializer
 	log.Printf("[logical:%s] materializer started (interval=%s)", p.id, p.cfg.Sink.MaterializerDuration())
@@ -633,7 +628,6 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	cp.SnapshotComplete = true
 	cp.SnapshotedTables = nil
 	cp.SnapshotChunks = nil
-	cp.SeqCounter = p.snk.SeqCounter()
 	// Use lastWrittenLSN if available (CDC events were flushed during snapshot),
 	// otherwise fall back to the source's flushed LSN (the slot creation point).
 	if p.lastWrittenLSN > 0 {
@@ -706,11 +700,6 @@ func (p *Pipeline) flush(ctx context.Context) error {
 
 	cp.Mode = "logical"
 	cp.LSN = p.lastWrittenLSN
-	cp.SeqCounter = p.snk.SeqCounter()
-
-	if p.materializer != nil {
-		cp.MaterializerSnapshots = p.materializer.LastEventsSnapshots()
-	}
 
 	// Save checkpoint BEFORE advancing flushedLSN. This ensures PG never
 	// recycles WAL that we haven't checkpointed. If we crash between save
@@ -759,11 +748,6 @@ func (p *Pipeline) maintainAllTables(ctx context.Context) {
 
 		if err := iceberg.MaintainTable(ctx, catalog, p.snk.S3(), p.cfg.Sink.Namespace, icebergName, mc); err != nil {
 			log.Printf("[maintain:%s] error on %s: %v", p.id, icebergName, err)
-		}
-
-		eventsName := iceberg.EventsTableName(icebergName)
-		if err := iceberg.MaintainTable(ctx, catalog, p.snk.S3(), p.cfg.Sink.Namespace, eventsName, mc); err != nil {
-			log.Printf("[maintain:%s] error on %s: %v", p.id, eventsName, err)
 		}
 	}
 }

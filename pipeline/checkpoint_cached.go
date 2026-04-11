@@ -83,12 +83,6 @@ func cloneCheckpoint(cp *Checkpoint) *Checkpoint {
 			clone.SnapshotChunks[k] = v
 		}
 	}
-	if cp.MaterializerSnapshots != nil {
-		clone.MaterializerSnapshots = make(map[string]int64, len(cp.MaterializerSnapshots))
-		for k, v := range cp.MaterializerSnapshots {
-			clone.MaterializerSnapshots[k] = v
-		}
-	}
 	if cp.QueryWatermarks != nil {
 		clone.QueryWatermarks = make(map[string]string, len(cp.QueryWatermarks))
 		for k, v := range cp.QueryWatermarks {

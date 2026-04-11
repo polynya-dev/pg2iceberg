@@ -114,7 +114,7 @@ func (s *PgCheckpointStore) createTable(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS _pg2iceberg.checkpoints (
 			pipeline_id             TEXT PRIMARY KEY,
-			version                 INTEGER NOT NULL DEFAULT 1,
+			version                 INTEGER NOT NULL DEFAULT 2,
 			checksum                TEXT NOT NULL DEFAULT '',
 			written_by              TEXT NOT NULL DEFAULT '',
 			revision                BIGINT NOT NULL DEFAULT 0,
@@ -122,12 +122,8 @@ func (s *PgCheckpointStore) createTable(ctx context.Context) error {
 			lsn                     BIGINT NOT NULL DEFAULT 0,
 			watermark               TEXT NOT NULL DEFAULT '',
 			snapshot_complete       BOOLEAN NOT NULL DEFAULT FALSE,
-			last_snapshot_id        BIGINT NOT NULL DEFAULT 0,
-			last_sequence_number    BIGINT NOT NULL DEFAULT 0,
-			seq_counter             BIGINT NOT NULL DEFAULT 0,
 			snapshoted_tables       JSONB,
 			snapshot_chunks         JSONB,
-			materializer_snapshots  JSONB,
 			query_watermarks        JSONB,
 			updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 		)
@@ -147,7 +143,7 @@ func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Check
 	defer cancel()
 
 	var cp Checkpoint
-	var snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks []byte
+	var snapshotedTables, snapshotChunks, queryWatermarks []byte
 
 	_, dbSpan := tracer.Start(ctx, "checkpoint.pg SELECT", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
 		semconv.PeerService("postgres"),
@@ -155,15 +151,13 @@ func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Check
 	))
 	err := s.pool.QueryRow(ctx, `
 		SELECT version, checksum, written_by, revision, mode, lsn, watermark,
-		       snapshot_complete, last_snapshot_id, last_sequence_number,
-		       seq_counter, snapshoted_tables, snapshot_chunks, materializer_snapshots,
+		       snapshot_complete, snapshoted_tables, snapshot_chunks,
 		       query_watermarks, updated_at
 		FROM _pg2iceberg.checkpoints
 		WHERE pipeline_id = $1
 	`, pipelineID).Scan(
 		&cp.Version, &cp.Checksum, &cp.WrittenBy, &cp.Revision, &cp.Mode, &cp.LSN, &cp.Watermark,
-		&cp.SnapshotComplete, &cp.LastSnapshotID, &cp.LastSequenceNumber,
-		&cp.SeqCounter, &snapshotedTables, &snapshotChunks, &matSnapshots,
+		&cp.SnapshotComplete, &snapshotedTables, &snapshotChunks,
 		&queryWatermarks, &cp.UpdatedAt,
 	)
 	dbSpan.End()
@@ -181,9 +175,6 @@ func (s *PgCheckpointStore) Load(ctx context.Context, pipelineID string) (*Check
 	}
 	if len(snapshotChunks) > 0 {
 		json.Unmarshal(snapshotChunks, &cp.SnapshotChunks)
-	}
-	if len(matSnapshots) > 0 {
-		json.Unmarshal(matSnapshots, &cp.MaterializerSnapshots)
 	}
 	if len(queryWatermarks) > 0 {
 		json.Unmarshal(queryWatermarks, &cp.QueryWatermarks)
@@ -212,7 +203,6 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 
 	snapshotedTables, _ := json.Marshal(cp.SnapshotedTables)
 	snapshotChunks, _ := json.Marshal(cp.SnapshotChunks)
-	matSnapshots, _ := json.Marshal(cp.MaterializerSnapshots)
 	queryWatermarks, _ := json.Marshal(cp.QueryWatermarks)
 
 	expectedRevision := cp.Revision - 1 // Seal() already incremented
@@ -226,21 +216,18 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 		_, err := s.pool.Exec(ctx, `
 			INSERT INTO _pg2iceberg.checkpoints (
 				pipeline_id, version, checksum, written_by, revision, mode, lsn, watermark,
-				snapshot_complete, last_snapshot_id, last_sequence_number, seq_counter,
-				snapshoted_tables, snapshot_chunks, materializer_snapshots,
+				snapshot_complete, snapshoted_tables, snapshot_chunks,
 				query_watermarks, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			ON CONFLICT (pipeline_id) DO UPDATE SET
 				version = $2, checksum = $3, written_by = $4, revision = $5,
 				mode = $6, lsn = $7, watermark = $8,
-				snapshot_complete = $9, last_snapshot_id = $10, last_sequence_number = $11,
-				seq_counter = $12, snapshoted_tables = $13, snapshot_chunks = $14,
-				materializer_snapshots = $15, query_watermarks = $16, updated_at = $17
+				snapshot_complete = $9, snapshoted_tables = $10, snapshot_chunks = $11,
+				query_watermarks = $12, updated_at = $13
 			WHERE _pg2iceberg.checkpoints.revision = 0 OR _pg2iceberg.checkpoints.revision IS NULL
 		`, pipelineID, cp.Version, cp.Checksum, cp.WrittenBy, cp.Revision,
 			cp.Mode, cp.LSN, cp.Watermark,
-			cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber, cp.SeqCounter,
-			snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
+			cp.SnapshotComplete, snapshotedTables, snapshotChunks, queryWatermarks,
 			cp.UpdatedAt)
 		dbSpan.End()
 		if err != nil {
@@ -258,14 +245,12 @@ func (s *PgCheckpointStore) Save(ctx context.Context, pipelineID string, cp *Che
 		UPDATE _pg2iceberg.checkpoints SET
 			version = $2, checksum = $3, written_by = $4, revision = $5,
 			mode = $6, lsn = $7, watermark = $8,
-			snapshot_complete = $9, last_snapshot_id = $10, last_sequence_number = $11,
-			seq_counter = $12, snapshoted_tables = $13, snapshot_chunks = $14,
-			materializer_snapshots = $15, query_watermarks = $16, updated_at = $17
-		WHERE pipeline_id = $1 AND revision = $18
+			snapshot_complete = $9, snapshoted_tables = $10, snapshot_chunks = $11,
+			query_watermarks = $12, updated_at = $13
+		WHERE pipeline_id = $1 AND revision = $14
 	`, pipelineID, cp.Version, cp.Checksum, cp.WrittenBy, cp.Revision,
 		cp.Mode, cp.LSN, cp.Watermark,
-		cp.SnapshotComplete, cp.LastSnapshotID, cp.LastSequenceNumber, cp.SeqCounter,
-		snapshotedTables, snapshotChunks, matSnapshots, queryWatermarks,
+		cp.SnapshotComplete, snapshotedTables, snapshotChunks, queryWatermarks,
 		cp.UpdatedAt, expectedRevision)
 	dbSpan.End()
 	if err != nil {

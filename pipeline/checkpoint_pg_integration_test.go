@@ -62,7 +62,6 @@ func TestPgCheckpointStore_SaveAndLoad(t *testing.T) {
 	cp := &Checkpoint{
 		Mode:             "logical",
 		LSN:              12345,
-		SeqCounter:       42,
 		SnapshotComplete: true,
 		SnapshotedTables: map[string]bool{
 			"public.orders": true,
@@ -71,12 +70,6 @@ func TestPgCheckpointStore_SaveAndLoad(t *testing.T) {
 		SnapshotChunks: map[string]int{
 			"public.orders": 5,
 		},
-		MaterializerSnapshots: map[string]int64{
-			"public.orders": 1000,
-			"public.users":  2000,
-		},
-		LastSnapshotID:     999,
-		LastSequenceNumber: 7,
 	}
 
 	if err := store.Save(ctx, "test-pipeline", cp); err != nil {
@@ -98,17 +91,8 @@ func TestPgCheckpointStore_SaveAndLoad(t *testing.T) {
 	if loaded.LSN != 12345 {
 		t.Errorf("LSN: got %d, want %d", loaded.LSN, 12345)
 	}
-	if loaded.SeqCounter != 42 {
-		t.Errorf("SeqCounter: got %d, want %d", loaded.SeqCounter, 42)
-	}
 	if !loaded.SnapshotComplete {
 		t.Error("SnapshotComplete: got false, want true")
-	}
-	if loaded.LastSnapshotID != 999 {
-		t.Errorf("LastSnapshotID: got %d, want %d", loaded.LastSnapshotID, 999)
-	}
-	if loaded.LastSequenceNumber != 7 {
-		t.Errorf("LastSequenceNumber: got %d, want %d", loaded.LastSequenceNumber, 7)
 	}
 	if loaded.Revision != 1 {
 		t.Errorf("Revision: got %d, want %d", loaded.Revision, 1)
@@ -123,9 +107,6 @@ func TestPgCheckpointStore_SaveAndLoad(t *testing.T) {
 	}
 	if loaded.SnapshotChunks["public.orders"] != 5 {
 		t.Errorf("SnapshotChunks: got %v", loaded.SnapshotChunks)
-	}
-	if loaded.MaterializerSnapshots["public.orders"] != 1000 || loaded.MaterializerSnapshots["public.users"] != 2000 {
-		t.Errorf("MaterializerSnapshots: got %v", loaded.MaterializerSnapshots)
 	}
 }
 
@@ -176,7 +157,7 @@ func TestPgCheckpointStore_UpdatePreservesFields(t *testing.T) {
 	defer store.Close()
 
 	// First save.
-	cp := &Checkpoint{Mode: "logical", LSN: 1000, SeqCounter: 10}
+	cp := &Checkpoint{Mode: "logical", LSN: 1000}
 	if err := store.Save(ctx, "p1", cp); err != nil {
 		t.Fatalf("save 1: %v", err)
 	}
@@ -187,8 +168,6 @@ func TestPgCheckpointStore_UpdatePreservesFields(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	loaded.LSN = 2000
-	loaded.SeqCounter = 50
-	loaded.MaterializerSnapshots = map[string]int64{"public.orders": 3000}
 	if err := store.Save(ctx, "p1", loaded); err != nil {
 		t.Fatalf("save 2: %v", err)
 	}
@@ -201,14 +180,8 @@ func TestPgCheckpointStore_UpdatePreservesFields(t *testing.T) {
 	if final.LSN != 2000 {
 		t.Errorf("LSN: got %d, want 2000", final.LSN)
 	}
-	if final.SeqCounter != 50 {
-		t.Errorf("SeqCounter: got %d, want 50", final.SeqCounter)
-	}
 	if final.Revision != 2 {
 		t.Errorf("Revision: got %d, want 2", final.Revision)
-	}
-	if final.MaterializerSnapshots["public.orders"] != 3000 {
-		t.Errorf("MaterializerSnapshots: got %v", final.MaterializerSnapshots)
 	}
 }
 
@@ -283,7 +256,7 @@ func TestPgCheckpointStore_MultiplePipelines(t *testing.T) {
 	defer store.Close()
 
 	// Save two different pipelines.
-	cp1 := &Checkpoint{Mode: "logical", LSN: 100, SeqCounter: 10}
+	cp1 := &Checkpoint{Mode: "logical", LSN: 100}
 	cp2 := &Checkpoint{Mode: "query", Watermark: "2026-01-01T00:00:00Z"}
 
 	if err := store.Save(ctx, "pipeline-a", cp1); err != nil {
@@ -303,8 +276,8 @@ func TestPgCheckpointStore_MultiplePipelines(t *testing.T) {
 		t.Fatalf("load b: %v", err)
 	}
 
-	if loadedA.Mode != "logical" || loadedA.LSN != 100 || loadedA.SeqCounter != 10 {
-		t.Errorf("pipeline-a: got Mode=%q LSN=%d SeqCounter=%d", loadedA.Mode, loadedA.LSN, loadedA.SeqCounter)
+	if loadedA.Mode != "logical" || loadedA.LSN != 100 {
+		t.Errorf("pipeline-a: got Mode=%q LSN=%d", loadedA.Mode, loadedA.LSN)
 	}
 	if loadedB.Mode != "query" || loadedB.Watermark != "2026-01-01T00:00:00Z" {
 		t.Errorf("pipeline-b: got Mode=%q Watermark=%q", loadedB.Mode, loadedB.Watermark)
