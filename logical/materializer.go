@@ -113,6 +113,9 @@ func (m *Materializer) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if ctx.Err() != nil {
+				return // don't start a cycle during shutdown
+			}
 			if err := m.materializeCycle(ctx); err != nil {
 				log.Printf("[materializer] cycle error: %v", err)
 			}
@@ -218,7 +221,15 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		return nil
 	}
 
-	// Phase 3: Atomic multi-table commit.
+	// Phase 3: Atomic multi-table commit + cursor advance.
+	// Use a background context for the critical section: once preparation
+	// is done, the commit and cursor advance must complete even if the
+	// caller's context is cancelled (e.g. SIGINT during shutdown).
+	// Without this, a cancelled ctx can cause the HTTP commit call to fail
+	// mid-flight, leaving the cursor unadvanced. MaterializeAll would then
+	// re-process the same events, producing duplicate rows.
+	commitCtx := context.Background()
+
 	commits := make([]iceberg.TableCommit, len(prepared))
 	for i, p := range prepared {
 		if p.prepared != nil {
@@ -232,7 +243,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		}
 	}
 
-	if err := m.catalog.CommitTransaction(ctx, m.cfg.Namespace, commits); err != nil {
+	if err := m.catalog.CommitTransaction(commitCtx, m.cfg.Namespace, commits); err != nil {
 		for _, p := range prepared {
 			pipeline.MaterializerErrorsTotal.WithLabelValues(p.pgTable).Inc()
 		}
@@ -244,7 +255,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 
 	// Phase 4: Success — advance cursors and apply side effects.
 	for _, w := range work {
-		if err := coord.SetCursor(ctx, w.pgTable, w.maxOffset); err != nil {
+		if err := coord.SetCursor(commitCtx, w.pgTable, w.maxOffset); err != nil {
 			log.Printf("[materializer] WARNING: failed to advance cursor for %s: %v", w.pgTable, err)
 		}
 	}

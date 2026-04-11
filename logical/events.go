@@ -374,14 +374,21 @@ func (s *Sink) CheckBackpressure(ctx context.Context) error {
 
 // Flush replays committed transactions into writers, then stages all data
 // to S3 and registers in the Stream atomically.
+//
+// On success, committedTxns is cleared and writers are finalized. If Flush
+// is called again (e.g. from a retry loop), it returns nil immediately.
+// The Stream.Append call is NOT retried — staged data is durable once
+// uploaded to S3 + registered in PG. The caller (pipeline.flush) can safely
+// retry the checkpoint save without re-staging.
 func (s *Sink) Flush(ctx context.Context) error {
 	if len(s.committedTxns) == 0 {
 		return nil
 	}
 
-	// Discard stale completed chunks from a previous failed flush.
+	// Reset writers to ensure a clean slate (no leftover rows from a
+	// previous failed flush attempt).
 	for _, ts := range s.tables {
-		ts.writer.DiscardCompleted()
+		ts.writer.Reset()
 	}
 
 	// Drain committed transactions into per-table writers.
@@ -421,18 +428,23 @@ func (s *Sink) Flush(ctx context.Context) error {
 
 	if len(batches) > 0 {
 		if err := s.stream.Append(ctx, batches); err != nil {
+			// Append failed — committedTxns are preserved for retry.
+			// The Reset at the top of the next Flush call clears the
+			// writer so events are re-drained without duplication.
 			return fmt.Errorf("stream append: %w", err)
 		}
 	}
 
-	// All staged successfully — finalize writers.
+	// Staging succeeded — clear committedTxns and finalize writers.
+	// From this point, retries (e.g. from checkpoint save failure) will
+	// see committedTxns == nil and return early.
+	s.committedTxns = nil
 	for _, ft := range flushed {
 		ft.ts.writer.Commit()
 		ft.ts.totalRows = 0
 		log.Printf("[sink] staged %s events to stream", ft.pgTable)
 	}
 
-	s.committedTxns = nil
 	return nil
 }
 

@@ -2136,8 +2136,10 @@ func TestRetry_S3UploadFailure(t *testing.T) {
 
 	mem := newFailNTimesStorage(2)
 	cat := newMemCatalog()
+	coord := stream.NewMemCoordinator()
 	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
-	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
+	snk.SetStream(stream.NewCachedStream(coord, mem, sinkCfg.Namespace))
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
@@ -2659,6 +2661,117 @@ func TestPipeline_ZeroS3ReadsAfterSnapshot(t *testing.T) {
 		}
 	} else {
 		t.Log("confirmed: zero S3 reads after snapshot (CachedStream + seeded FileIndex)")
+	}
+}
+
+// TestMaterializer_NoDuplicateRowsOnShutdown verifies that when the pipeline
+// receives SIGINT during a materialization cycle, the same events are NOT
+// committed twice. This was a regression where:
+//  1. Periodic cycle committed to Iceberg but the cursor wasn't advanced
+//     (context cancelled between commit and SetCursor)
+//  2. MaterializeAll re-processed the same events, producing duplicates
+//
+// The fix uses a non-cancellable context for commit+cursor and a mutex to
+// serialize cycles.
+func TestMaterializer_NoDuplicateRowsOnShutdown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE items (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            100,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.items"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_nodup",
+				SlotName:        "test_slot_nodup",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	coord := stream.NewMemCoordinator()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	snk.SetStream(stream.NewCachedStream(coord, mem, sinkCfg.Namespace))
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
+
+	// Ensure cursors exist (normally done in pipeline.setup).
+	if err := coord.EnsureCursor(ctx, "public.items"); err != nil {
+		t.Fatalf("ensure cursor: %v", err)
+	}
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	// Insert rows.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO items (name) VALUES ($1)", fmt.Sprintf("item-%d", i)); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	conn.Close(ctx)
+
+	// Wait for at least one materialization cycle.
+	waitFor(t, 30*time.Second, func() bool { return len(cat.matCommits()) >= 1 })
+	t.Logf("first materialization committed (%d commits)", len(cat.matCommits()))
+
+	// Shutdown — this triggers MaterializeAll which must NOT re-process.
+	cancel()
+	<-p.Done()
+
+	// Count total data rows across all Iceberg data files.
+	matTm, _ := cat.LoadTable(ctx, "test_ns", "items")
+	if matTm == nil {
+		t.Fatal("materialized table not found")
+	}
+
+	rowCount := countDataRows(t, context.Background(), mem, matTm)
+	t.Logf("total data rows: %d (expected 5)", rowCount)
+
+	if rowCount != 5 {
+		t.Errorf("DUPLICATE ROWS: expected exactly 5 rows, got %d — "+
+			"materializer processed events more than once", rowCount)
 	}
 }
 

@@ -332,6 +332,13 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	p.str = stream.NewCachedStream(p.coord, p.snk.S3(), p.cfg.Sink.Namespace)
 	p.snk.SetStream(p.str)
 
+	// Ensure materializer cursors exist for all registered tables.
+	for pgTable := range p.schemas {
+		if err := p.coord.EnsureCursor(ctx, pgTable); err != nil {
+			return fmt.Errorf("ensure cursor for %s: %w", pgTable, err)
+		}
+	}
+
 	// Start WAL lag monitor.
 	go p.monitorWALLag(ctx)
 
