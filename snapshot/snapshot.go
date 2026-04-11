@@ -293,7 +293,7 @@ func (s *Snapshotter) snapshotChunk(ctx context.Context, tx pgx.Tx, tbl Table, s
 
 		row := make(map[string]any, len(descs))
 		for i, desc := range descs {
-			row[string(desc.Name)] = PgValueToString(values[i])
+			row[string(desc.Name)] = PgValueToString(values[i], desc.DataTypeOID)
 		}
 
 		if err := sw.AddRow(row); err != nil {
@@ -322,7 +322,9 @@ func (s *Snapshotter) snapshotChunk(ctx context.Context, tx pgx.Tx, tbl Table, s
 
 // PgValueToString converts a pgx native Go value to its text representation,
 // matching the format produced by the WAL decoder (which always returns strings).
-func PgValueToString(v any) any {
+// The oid parameter is the PostgreSQL type OID from the field description,
+// used to distinguish DATE (OID 1082) from TIMESTAMP/TIMESTAMPTZ.
+func PgValueToString(v any, oid uint32) any {
 	if v == nil {
 		return nil
 	}
@@ -345,6 +347,9 @@ func PgValueToString(v any) any {
 		}
 		return "f"
 	case time.Time:
+		if oid == 1082 { // DATE
+			return x.Format("2006-01-02")
+		}
 		return x.Format("2006-01-02 15:04:05.999999-07")
 	case pgtype.Numeric:
 		if !x.Valid {

@@ -40,7 +40,7 @@ graph LR
 On logical replication mode (the recommended mode), it replicates change events to an append-only Iceberg table, which acts as a WAL. Once change events are written to this table, the replication slot LSN can be safely advanced. Since append-only write to Iceberg is fast, this minimizes the likelihood of the source database retaining too much WAL.
 
 A materializer, which runs at a separate interval, will then take these change events and merge them into its corresponding target tables, which will have the same schema as the source tables. If you don't need near real-time replication, just set the materializer interval to something high (e.g. 1 hour), which will essentially make pg2iceberg behave like a batch replication tool.
-∏
+
 ### Query mode
 
 ```mermaid

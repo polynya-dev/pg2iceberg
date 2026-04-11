@@ -95,7 +95,7 @@ extract_table_name() {
 # Extract publication name from setup SQL.
 extract_publication_name() {
     local sql="$1"
-    echo "$sql" | grep -ioE 'CREATE[[:space:]]+PUBLICATION[[:space:]]+[a-zA-Z0-9_]+' \
+    echo "$sql" | { grep -ioE 'CREATE[[:space:]]+PUBLICATION[[:space:]]+[a-zA-Z0-9_]+' || true; } \
         | head -1 | awk '{print $NF}'
 }
 
