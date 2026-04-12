@@ -183,10 +183,11 @@ func TestPipeline_SnapshotThenStream(t *testing.T) {
 	}
 
 	// Wait for the update to be flushed and materialized.
+	// Capture matCommitsBefore BEFORE waiting for flush — the materializer
+	// may commit between flush completion and our next line.
+	matCommitsBefore := len(cat.matCommits())
 	flushedBefore = ls.FlushedLSN()
 	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > flushedBefore })
-
-	matCommitsBefore := len(cat.matCommits())
 	waitFor(t, 30*time.Second, func() bool {
 		return len(cat.matCommits()) > matCommitsBefore
 	})
