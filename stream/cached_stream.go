@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
+	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
@@ -95,6 +96,12 @@ func (cs *CachedStream) Append(ctx context.Context, batches []WriteBatch) error 
 
 	if _, err := cs.coord.ClaimOffsets(ctx, appends); err != nil {
 		return fmt.Errorf("claim offsets: %w", err)
+	}
+
+	// Record staging metrics.
+	for i, b := range batches {
+		pipeline.StreamStagedFilesTotal.WithLabelValues(b.Table).Inc()
+		pipeline.StreamStagedBytesTotal.WithLabelValues(b.Table).Add(float64(files[i].byteSize))
 	}
 
 	// Cache pre-parsed events and raw data for the co-located materializer.

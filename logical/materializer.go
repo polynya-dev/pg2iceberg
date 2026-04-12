@@ -666,6 +666,7 @@ func (m *Materializer) readEventsFromLog(ctx context.Context, entries []stream.L
 				if matEvents, ok := cached.([]MatEvent); ok {
 					events = append(events, matEvents...)
 					cacheHits++
+					pipeline.StreamCacheHitsTotal.WithLabelValues(entry.Table).Inc()
 					continue
 				}
 			}
@@ -678,6 +679,7 @@ func (m *Materializer) readEventsFromLog(ctx context.Context, entries []stream.L
 		}
 		events = append(events, parsed...)
 		cacheMisses++
+		pipeline.StreamDownloadsTotal.WithLabelValues(entry.Table).Inc()
 	}
 
 	span.SetAttributes(
