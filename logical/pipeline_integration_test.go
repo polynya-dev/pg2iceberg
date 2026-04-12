@@ -2775,6 +2775,201 @@ func TestMaterializer_NoDuplicateRowsOnShutdown(t *testing.T) {
 	}
 }
 
+// TestMaterializer_HorizontalScaling verifies that materializer workers
+// can scale horizontally via heartbeat locks: 1 worker → 2 workers → 1 worker.
+//
+// Phase 1: Single materializer A processes 2 tables (orders, payments)
+// Phase 2: Scale up — materializers A+B run concurrently, tables distributed
+// Phase 3: Scale down — only materializer A runs, processes both tables again
+//
+// Verifies: all rows materialized exactly once, no duplicates, no data loss.
+func TestMaterializer_HorizontalScaling(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE orders (
+			id SERIAL PRIMARY KEY,
+			name TEXT NOT NULL
+		);
+		CREATE TABLE payments (
+			id SERIAL PRIMARY KEY,
+			amount INTEGER NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            100,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "1h", // disable auto-materializer — we control it manually
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.orders"},
+			{Name: "public.payments"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub_hscale",
+				SlotName:        "test_slot_hscale",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	coord := stream.NewMemCoordinator()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	cs := stream.NewCachedStream(coord, mem, sinkCfg.Namespace)
+	snk.SetStream(cs)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), coord)
+
+	// Ensure cursors for both tables.
+	coord.EnsureCursor(ctx, "public.orders")
+	coord.EnsureCursor(ctx, "public.payments")
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() { cancel(); <-p.Done() }()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	insertBatch := func(start, count int) {
+		for i := start; i < start+count; i++ {
+			conn.Exec(ctx, "INSERT INTO orders (name) VALUES ($1)", fmt.Sprintf("order-%d", i))
+			conn.Exec(ctx, "INSERT INTO payments (amount) VALUES ($1)", (i+1)*100)
+		}
+	}
+
+	// Helper: create a distributed materializer with the given workerID.
+	newDistMat := func(workerID string) *logical.Materializer {
+		m := logical.NewMaterializer(sinkCfg, cat, mem, snk.Tables(), cs)
+		m.WorkerID = workerID
+		return m
+	}
+
+	// --- Phase 1: Single materializer A processes both tables ---
+	insertBatch(0, 5)
+	time.Sleep(2 * time.Second) // wait for flush
+
+	matA := newDistMat("worker-a")
+	matA.MaterializeAll(ctx)
+
+	commitsAfterPhase1 := len(cat.matCommits())
+	t.Logf("phase 1 (1 worker): %d commits", commitsAfterPhase1)
+
+	if commitsAfterPhase1 == 0 {
+		t.Fatal("expected commits from single worker in phase 1")
+	}
+
+	// Verify phase 1 cursors advanced for both tables.
+	curOrders, _ := coord.GetCursor(ctx, "public.orders")
+	curPayments, _ := coord.GetCursor(ctx, "public.payments")
+	t.Logf("phase 1 cursors: orders=%d, payments=%d", curOrders, curPayments)
+	if curOrders <= 0 || curPayments <= 0 {
+		t.Fatalf("expected both cursors > 0 after phase 1, got orders=%d payments=%d", curOrders, curPayments)
+	}
+
+	// --- Phase 2: Scale up — A and B run concurrently ---
+	insertBatch(5, 5)
+	time.Sleep(2 * time.Second)
+
+	matB := newDistMat("worker-b")
+	commitsBeforePhase2 := len(cat.matCommits())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); matA.MaterializeAll(ctx) }()
+	go func() { defer wg.Done(); matB.MaterializeAll(ctx) }()
+	wg.Wait()
+
+	phase2Commits := len(cat.matCommits()) - commitsBeforePhase2
+	t.Logf("phase 2 (2 workers): %d new commits", phase2Commits)
+
+	if phase2Commits == 0 {
+		t.Fatal("expected commits from distributed workers in phase 2")
+	}
+
+	// Verify phase 2 cursors advanced.
+	curOrders2, _ := coord.GetCursor(ctx, "public.orders")
+	curPayments2, _ := coord.GetCursor(ctx, "public.payments")
+	t.Logf("phase 2 cursors: orders=%d, payments=%d", curOrders2, curPayments2)
+	if curOrders2 <= curOrders || curPayments2 <= curPayments {
+		t.Fatalf("expected cursors to advance in phase 2: orders %d->%d, payments %d->%d",
+			curOrders, curOrders2, curPayments, curPayments2)
+	}
+
+	// --- Phase 3: Scale down — only A runs, processes both tables ---
+	insertBatch(10, 5)
+	time.Sleep(2 * time.Second)
+
+	commitsBeforePhase3 := len(cat.matCommits())
+	matA.MaterializeAll(ctx)
+
+	phase3Commits := len(cat.matCommits()) - commitsBeforePhase3
+	t.Logf("phase 3 (1 worker again): %d new commits", phase3Commits)
+
+	if phase3Commits == 0 {
+		t.Fatal("expected commits from single worker in phase 3 after scale-down")
+	}
+
+	// Verify final cursors advanced.
+	curOrders3, _ := coord.GetCursor(ctx, "public.orders")
+	curPayments3, _ := coord.GetCursor(ctx, "public.payments")
+	t.Logf("phase 3 cursors: orders=%d, payments=%d", curOrders3, curPayments3)
+	if curOrders3 <= curOrders2 || curPayments3 <= curPayments2 {
+		t.Fatalf("expected cursors to advance in phase 3: orders %d->%d, payments %d->%d",
+			curOrders2, curOrders3, curPayments2, curPayments3)
+	}
+
+	// --- Verify data correctness ---
+	// Each table: 5 rows × 3 phases = 15 rows total, no duplicates.
+	ordersTm, _ := cat.LoadTable(context.Background(), "test_ns", "orders")
+	paymentsTm, _ := cat.LoadTable(context.Background(), "test_ns", "payments")
+
+	ordersRows := countDataRows(t, context.Background(), mem, ordersTm)
+	paymentsRows := countDataRows(t, context.Background(), mem, paymentsTm)
+
+	t.Logf("final: orders=%d rows, payments=%d rows (expected 15 each)", ordersRows, paymentsRows)
+
+	if ordersRows != 15 {
+		t.Errorf("orders: expected 15 rows, got %d — possible duplicate or data loss", ordersRows)
+	}
+	if paymentsRows != 15 {
+		t.Errorf("payments: expected 15 rows, got %d — possible duplicate or data loss", paymentsRows)
+	}
+}
+
 // TestPipeline_SlotSurvivesShutdown verifies that the replication slot is NOT
 // dropped when the pipeline shuts down. The slot must persist so the pipeline
 // can resume from its last confirmed LSN without data loss.

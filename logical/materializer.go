@@ -37,6 +37,12 @@ type Materializer struct {
 	// Per-table TableWriter for the shared write path (serialize → upload → manifest → commit).
 	tableWriters map[string]*iceberg.TableWriter
 
+	// WorkerID enables distributed mode: when set, the materializer acquires
+	// heartbeat locks per table before processing. Tables locked by other
+	// workers are skipped. When empty (combined mode), all tables are
+	// processed unconditionally.
+	WorkerID string
+
 	// cycleMu serializes materializeCycle calls. Prevents the periodic Run()
 	// goroutine and the shutdown MaterializeAll() from processing the same
 	// events concurrently (which would cause duplicate rows).
@@ -136,43 +142,85 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 
 	coord := m.stream.Coordinator()
 
+	lockTTL := 30 * time.Second
+	distributed := m.WorkerID != ""
+
 	// Phase 1: Read new log entries per table and parse events.
+	// In distributed mode, acquire a heartbeat lock before processing each
+	// table. Tables locked by other workers are skipped.
 	type tableWork struct {
 		pgTable   string
 		ts        *tableSink
 		events    []MatEvent
 		maxOffset int64
+		locked    bool // true if we hold the lock (distributed mode)
 	}
 	var work []tableWork
 
 	for pgTable, ts := range m.tables {
+		// In distributed mode, try to claim the table.
+		if distributed {
+			acquired, err := coord.TryLock(ctx, pgTable, m.WorkerID, lockTTL)
+			if err != nil {
+				log.Printf("[materializer] lock error for %s: %v", pgTable, err)
+				continue
+			}
+			if !acquired {
+				continue // another worker owns this table
+			}
+		}
+
 		cursor, err := coord.GetCursor(ctx, pgTable)
 		if err != nil {
+			if distributed {
+				coord.ReleaseLock(ctx, pgTable, m.WorkerID)
+			}
 			return fmt.Errorf("get cursor for %s: %w", pgTable, err)
 		}
 
 		entries, err := m.stream.Read(ctx, pgTable, cursor)
 		if err != nil {
+			if distributed {
+				coord.ReleaseLock(ctx, pgTable, m.WorkerID)
+			}
 			return fmt.Errorf("read log for %s: %w", pgTable, err)
 		}
 		if len(entries) == 0 {
+			if distributed {
+				coord.ReleaseLock(ctx, pgTable, m.WorkerID)
+			}
 			continue
 		}
 
 		events, err := m.readEventsFromLog(ctx, entries, ts.srcSchema)
 		if err != nil {
+			if distributed {
+				coord.ReleaseLock(ctx, pgTable, m.WorkerID)
+			}
 			return fmt.Errorf("read events for %s: %w", pgTable, err)
 		}
 		if len(events) == 0 {
+			if distributed {
+				coord.ReleaseLock(ctx, pgTable, m.WorkerID)
+			}
 			continue
 		}
 
 		maxOffset := entries[len(entries)-1].EndOffset
-		work = append(work, tableWork{pgTable, ts, events, maxOffset})
+		work = append(work, tableWork{pgTable, ts, events, maxOffset, distributed})
 	}
 
 	if len(work) == 0 {
 		return nil
+	}
+
+	// Release all held locks on error exit.
+	releaseLocks := func() {
+		for _, w := range work {
+			if w.locked {
+				coord.ReleaseLock(context.Background(), w.pgTable, m.WorkerID)
+			}
+		}
 	}
 
 	// Phase 2: Prepare tables in parallel.
@@ -204,6 +252,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		})
 	}
 	if err := g.Wait(); err != nil {
+		releaseLocks()
 		pipeline.MaterializerErrorsTotal.WithLabelValues(prepErrTable).Inc()
 		err = fmt.Errorf("prepare %s: %w", prepErrTable, prepErr)
 		span.RecordError(err)
@@ -218,6 +267,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		}
 	}
 	if len(prepared) == 0 {
+		releaseLocks()
 		return nil
 	}
 
@@ -243,7 +293,22 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		}
 	}
 
+	// In distributed mode, verify we still hold all locks before committing.
+	if distributed {
+		for _, w := range work {
+			if !w.locked {
+				continue
+			}
+			ok, err := coord.RenewLock(commitCtx, w.pgTable, m.WorkerID, lockTTL)
+			if err != nil || !ok {
+				releaseLocks()
+				return fmt.Errorf("lock lost for %s before commit — aborting", w.pgTable)
+			}
+		}
+	}
+
 	if err := m.catalog.CommitTransaction(commitCtx, m.cfg.Namespace, commits); err != nil {
+		releaseLocks()
 		for _, p := range prepared {
 			pipeline.MaterializerErrorsTotal.WithLabelValues(p.pgTable).Inc()
 		}
@@ -253,12 +318,13 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		return err
 	}
 
-	// Phase 4: Success — advance cursors and apply side effects.
+	// Phase 4: Success — advance cursors, release locks, apply side effects.
 	for _, w := range work {
 		if err := coord.SetCursor(commitCtx, w.pgTable, w.maxOffset); err != nil {
 			log.Printf("[materializer] WARNING: failed to advance cursor for %s: %v", w.pgTable, err)
 		}
 	}
+	releaseLocks()
 	for _, p := range prepared {
 		m.applyPostCommit(p)
 	}
