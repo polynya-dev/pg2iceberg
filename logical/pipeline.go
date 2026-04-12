@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
@@ -690,7 +692,10 @@ func (p *Pipeline) handleSchemaChange(ctx context.Context, event postgres.Change
 }
 
 func (p *Pipeline) flush(ctx context.Context) error {
-	ctx, span := pipelineTracer.Start(ctx, "pg2iceberg.flush")
+	flushedRows := p.snk.TotalBuffered()
+
+	ctx, span := pipelineTracer.Start(ctx, "pg2iceberg.flush",
+		trace.WithAttributes(attribute.Int("flush.rows", flushedRows)))
 	defer span.End()
 
 	if err := p.snk.Flush(ctx); err != nil {
