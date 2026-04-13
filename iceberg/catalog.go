@@ -165,11 +165,16 @@ func (c *CatalogClient) EnsureNamespace(ctx context.Context, ns string) error {
 	}
 	defer resp.Body.Close()
 
-	// 200 = created, 409 = already exists — both fine
-	if resp.StatusCode != 200 && resp.StatusCode != 409 {
-		return c.readError(resp)
+	// 200 = created, 409 = already exists — both fine.
+	// 500 with "duplicate key" = JdbcCatalog race on concurrent create — also fine.
+	if resp.StatusCode == 200 || resp.StatusCode == 409 {
+		return nil
 	}
-	return nil
+	catalogErr := c.readError(resp)
+	if resp.StatusCode == 500 && strings.Contains(catalogErr.Error(), "duplicate key") {
+		return nil
+	}
+	return catalogErr
 }
 
 // LoadTable fetches table metadata from the catalog.
@@ -258,6 +263,13 @@ func (c *CatalogClient) CreateTable(ctx context.Context, ns, table string, ts *p
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	// 409 = already exists (race with another process). Fall back to LoadTable.
+	if resp.StatusCode == 409 {
+		resp.Body.Close()
+		log.Printf("[catalog] table %s.%s already exists (concurrent create), loading", ns, table)
+		return c.LoadTable(ctx, ns, table)
+	}
 
 	if resp.StatusCode != 200 {
 		err := c.readError(resp)

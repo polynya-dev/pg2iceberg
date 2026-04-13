@@ -130,6 +130,32 @@ var S3ErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help:      "Total S3 operation errors.",
 }, []string{"operation"})
 
+// --- Stream (staged WAL) ---
+
+var StreamStagedFilesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "stream_staged_files_total",
+	Help:      "Total staged Parquet files uploaded to S3 (write path).",
+}, []string{"table"})
+
+var StreamStagedBytesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "stream_staged_bytes_total",
+	Help:      "Total bytes uploaded to S3 for staged files.",
+}, []string{"table"})
+
+var StreamDownloadsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "stream_downloads_total",
+	Help:      "Total staged file downloads from S3 (materializer cache misses).",
+}, []string{"table"})
+
+var StreamCacheHitsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: namespace,
+	Name:      "stream_cache_hits_total",
+	Help:      "Total staged file reads served from in-memory cache (combined mode).",
+}, []string{"table"})
+
 // --- Catalog ---
 
 var CatalogOperationDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{

@@ -26,20 +26,72 @@ graph LR
   subgraph Postgres
       TableA["Table A"]
       TableB["Table B"]
+      Coord["_pg2iceberg schema<br />(coordination)"]
+  end
+
+  subgraph S3
+      StagedA["Staged WAL<br />(Parquet)"]
+      StagedB["Staged WAL<br />(Parquet)"]
   end
 
   subgraph Iceberg
-      WALA["Change Events"] -->|Materializer| TargetA[Table A]
-      WALB["Change Events"] -->|Materializer| TargetB[Table B]
+      TargetA[Table A]
+      TargetB[Table B]
   end
 
-  TableA -->|Logical Replication| WALA
-  TableB -->|Logical Replication| WALB
+  TableA -->|Logical Replication| StagedA
+  TableB -->|Logical Replication| StagedB
+  StagedA -->|Materializer| TargetA
+  StagedB -->|Materializer| TargetB
+  StagedA -.->|offset index| Coord
+  StagedB -.->|offset index| Coord
 ```
 
-On logical replication mode (the recommended mode), it replicates change events to an append-only Iceberg table, which acts as a WAL. Once change events are written to this table, the replication slot LSN can be safely advanced. Since append-only write to Iceberg is fast, this minimizes the likelihood of the source database retaining too much WAL.
+On logical replication mode (the recommended mode), it captures WAL change events and stages them as Parquet files in S3. A lightweight coordination layer in the source Postgres database (`_pg2iceberg` schema) tracks offsets and materializer progress. Since the write path only involves S3 uploads + a small PG transaction (no Iceberg catalog on the hot path), the replication slot LSN can be advanced quickly, minimizing WAL retention on the source database.
 
-A materializer, which runs at a separate interval, will then take these change events and merge them into its corresponding target tables, which will have the same schema as the source tables. If you don't need near real-time replication, just set the materializer interval to something high (e.g. 1 hour), which will essentially make pg2iceberg behave like a batch replication tool.
+A materializer, which runs at a separate interval, reads the staged Parquet files and merges them into the corresponding Iceberg tables using merge-on-read (equality deletes for updates/deletes, data files for inserts/updates). In combined mode (single process), the materializer reads staged events directly from memory to avoid S3 download and Parquet parsing overhead.
+
+Staged files use a fixed Parquet schema regardless of source table changes: metadata columns (`_op`, `_lsn`, `_ts`, `_unchanged_cols`) plus a JSON `_data` column containing user data. Schema evolution (ALTER TABLE) only affects the Iceberg materialized table, not the staging layer.
+
+#### Deployment modes
+
+**Combined mode** (default): A single process runs the WAL writer and materializer together. Staged events are served from an in-memory cache, avoiding S3 round-trips. Best for simplicity.
+
+```
++------------------------------+
+|  pg2iceberg                  |
+|  +----------+  +------------+|
+|  |WAL Writer|->|Materializer||
+|  +----------+  +------------+|
+|  (in-memory cache + S3)      |
++------------------------------+
+```
+
+**Horizontal scaling**: One process runs the WAL writer (single replication slot), and N materializer workers each claim tables via heartbeat locks. Workers are added or removed dynamically — tables rebalance automatically.
+
+```
++------------------+   +--------------+   +--------------+
+|  pg2iceberg      |   | materializer |   | materializer |
+|  +----------+    |   |  worker A    |   |  worker B    |
+|  |WAL Writer|    |   | (tables 1,3) |   | (tables 2,4) |
+|  +----------+    |   +--------------+   +--------------+
+|  (S3 only)       |         ^                   ^
++------------------+         +-- heartbeat locks -+
+```
+
+#### Coordination
+
+All coordination state lives in the source Postgres database under the `_pg2iceberg` schema:
+
+| Table | Purpose |
+|-------|---------|
+| `log_seq` | Per-table offset counter (atomic increment) |
+| `log_index` | Sparse index of staged Parquet files with offset ranges |
+| `mat_cursor` | Materializer progress (last committed offset per table) |
+| `lock` | Heartbeat-based locks for distributed materializer |
+| `checkpoints` | Replication checkpoint (LSN, snapshot state) |
+
+Coordinator write amplification is negligible: ~3 PG writes per flush regardless of batch size. At the default `flush_rows=1000`, overhead is <0.3% of source write throughput per table.
 
 ### Query mode
 
@@ -70,14 +122,21 @@ pg2iceberg/
 ├── cmd/pg2iceberg/  # entry point, mode dispatch
 ├── config/          # YAML config parsing & validation
 ├── iceberg/         # shared Iceberg primitives (catalog, S3, Parquet, manifest, TableWriter)
-├── logical/         # logical replication mode (WAL capture, events table, materializer)
+├── logical/         # logical replication mode (WAL capture, staging, materializer)
 ├── pipeline/        # shared infrastructure (Pipeline interface, checkpoint, metrics)
 ├── postgres/        # shared PG types (TableSchema, ChangeEvent, Op)
 ├── query/           # query polling mode (watermark poller, PK buffer, pipeline)
+├── stream/          # leaderless log (Coordinator, Stream, CachedStream)
+├── snapshot/        # initial table snapshot (CTID-based chunked COPY)
 └── utils/           # retry helper, task pool
 ```
 
-Both modes share `iceberg.TableWriter` for the final write path (partition bucketing, Parquet serialization, S3 upload, manifest assembly, catalog commit). Logical mode adds a two-tier architecture (events table + materializer) on top, query mode calls the TableWriter directly.
+The `stream` package implements the [leaderless log protocol](https://github.com/lakestream-io/leaderless-log-protocol):
+- **Coordinator** interface — distributed coordination primitives (offset claiming, cursors, heartbeat locks) backed by PostgreSQL
+- **BaseStream** — S3 upload + PG coordination (for multi-process mode)
+- **CachedStream** — same, plus in-memory event cache (for combined mode — zero-copy from WAL writer to materializer)
+
+Both modes share `iceberg.TableWriter` for the final write path (partition bucketing, Parquet serialization, S3 upload, manifest assembly, catalog commit).
 
 ## Type mapping
 
@@ -90,8 +149,8 @@ pg2iceberg maps PostgreSQL column types to Iceberg types automatically during sc
 | `bigint`, `bigserial` | `long` | |
 | `real` | `float` | |
 | `double precision` | `double` | |
-| `numeric(p,s)` where p ≤ 38 | `decimal(p,s)` | Precision preserved exactly |
-| `numeric(p,s)` where p > 38 | — | **Pipeline refuses to start** (see below) |
+| `numeric(p,s)` where p <= 38 | `decimal(p,s)` | Precision preserved exactly |
+| `numeric(p,s)` where p > 38 | -- | **Pipeline refuses to start** (see below) |
 | `numeric` (unconstrained) | `decimal(38,18)` | Warning logged; values that overflow will error |
 | `boolean` | `boolean` | |
 | `text`, `varchar`, `char`, `name` | `string` | |
@@ -210,6 +269,12 @@ To run specific test:
 ./tests/run.sh 00001_basic_insert
 ```
 
+To run tests in parallel:
+
+```sh
+PARALLEL=4 ./tests/run.sh
+```
+
 ### Writing tests
 
 Test cases live in `tests/cases/` with three files per test:
@@ -242,31 +307,44 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 pg2iceberg
 
 When unset, tracing is a no-op with zero overhead.
 
-**Trace hierarchy:**
+**Trace hierarchy (write path):**
 
 ```
-pg2iceberg.flush                           # events table flush cycle
-  pg2iceberg.flush.table {table}           # per events table (parallel across tables)
-    catalog.LoadTable {table} (cached)     # metadata cache hit (0ms)
-    pg2iceberg.upload                      # data + manifests + manifest list (all parallel)
-      s3.Upload {table} data
-      s3.Upload {table} metadata
-      s3.Upload {table} metadata
-  catalog.CommitTransaction                # atomic catalog commit
-    http POST /v1/transactions/commit      # actual HTTP round-trip (peer.service=iceberg-catalog)
+pg2iceberg.flush {flush.rows=1000}
+  stream.Append {batch_count=1, cached=true}
+    s3.Upload staged/orders/xxx.parquet
+    coordinator.ClaimOffsets {batch_size=1}         # PG: atomic offset claim
+  checkpoint.Save
+    checkpoint.pg UPDATE                            # PG: checkpoint persistence
+```
 
-pg2iceberg.materialize                     # materialization cycle
-  pg2iceberg.materialize.table {table}     # per materialized table (parallel across tables)
-    catalog.LoadTable {table} (cached)
-    pg2iceberg.serialize                   # parquet encoding
-    pg2iceberg.upload                      # data + manifests + manifest list (all parallel)
-      s3.Upload {table} data
-      s3.Upload {table} metadata
-  catalog.CommitTransaction
+The write hot path involves one S3 upload + one small PG transaction (ClaimOffsets). No Iceberg catalog operations.
 
-pg2iceberg.compact                         # only when thresholds exceeded
-  pg2iceberg.upload
-  catalog.CommitTransaction
+**Trace hierarchy (read path):**
+
+```
+pg2iceberg.materialize
+  coordinator.GetCursor {table=public.orders}       # PG: read cursor
+  pg2iceberg.materialize.readEvents {entry_count=1, cache_hits=1, cache_misses=0}
+  pg2iceberg.materialize.table {table=public.orders}
+    s3.Upload orders data                           # data files
+    s3.Upload orders metadata                       # manifests
+  catalog.CommitTransaction                         # Iceberg REST catalog
+    http POST /v1/transactions/commit
+  coordinator.SetCursor {table, offset=1000}        # PG: advance cursor
+```
+
+In combined mode, `cache_hits > 0` confirms the materializer reads staged events from memory (zero S3 download, zero Parquet/JSON parsing). On recovery (cold start), `cache_misses > 0` indicates the S3 fallback path.
+
+**Trace hierarchy (distributed mode):**
+
+```
+pg2iceberg.materialize
+  coordinator.TryLock {table=public.orders, worker_id=worker-a}   # acquired
+  coordinator.TryLock {table=public.payments, worker_id=worker-a}  # blocked (held by worker-b)
+  coordinator.GetCursor {table=public.orders}
+  ...
+  coordinator.SetCursor {table=public.orders, offset=5000}
 ```
 
 **External services** identified via `peer.service` attribute:
@@ -275,7 +353,15 @@ pg2iceberg.compact                         # only when thresholds exceeded
 |---------|-------|
 | `iceberg-catalog` | `http GET/POST /v1/...` (REST catalog API calls) |
 | `s3` | `s3.Upload`, `s3.Download`, `s3.DownloadRange`, `s3.StatObject` |
-| `postgres` | `checkpoint.pg SELECT/UPDATE/UPSERT` |
+| `postgres` | `coordinator.*`, `checkpoint.pg SELECT/UPDATE/UPSERT` |
+
+**Measuring coordinator write amplification** from span metrics:
+
+```
+amplification = rate(coordinator_ClaimOffsets_count) / rate(flush_rows_sum)
+```
+
+At default settings (`flush_rows=1000`), expect <0.3% per table.
 
 **SigNoz setup:** The `example/single/` directory includes a complete docker-compose with SigNoz, an OTel collector, and ClickHouse as the trace backend. Run `docker compose up` and open `http://localhost:3301` to view traces.
 
@@ -283,7 +369,7 @@ pg2iceberg.compact                         # only when thresholds exceeded
 
 pg2iceberg exposes Prometheus metrics on `:9090/metrics` (configurable via `metrics_addr` in config). Key metrics include:
 
-- `pg2iceberg_flush_duration_seconds` - events table flush latency
+- `pg2iceberg_flush_duration_seconds` - staged WAL flush latency
 - `pg2iceberg_materializer_duration_seconds` - materialization cycle latency
 - `pg2iceberg_catalog_operation_duration_seconds` - catalog API latency by operation
 - `pg2iceberg_replication_lag_bytes` - WAL lag from Postgres

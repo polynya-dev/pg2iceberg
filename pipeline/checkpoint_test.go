@@ -78,14 +78,14 @@ func TestCheckpoint_VerifyFutureVersion(t *testing.T) {
 func TestCheckpoint_ChecksumDeterministic(t *testing.T) {
 	// computeChecksum should be deterministic for the same fields (including map ordering).
 	cp := &Checkpoint{
-		Version:          1,
+		Version:          2,
 		Revision:         5,
 		Mode:             "logical",
 		LSN:              12345,
 		SnapshotComplete: true,
-		MaterializerSnapshots: map[string]int64{
-			"public.b": 2,
-			"public.a": 1,
+		QueryWatermarks: map[string]string{
+			"public.b": "2024-01-02T00:00:00Z",
+			"public.a": "2024-01-01T00:00:00Z",
 		},
 	}
 	first := cp.computeChecksum()

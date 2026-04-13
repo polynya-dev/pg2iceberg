@@ -75,3 +75,4 @@ sink:
 state:
   # postgres_url: postgresql://user:pass@host:5432/db?sslmode=disable
   # path: ./pg2iceberg-state.json
+  # coordinator_schema: _pg2iceberg  # PG schema for coordination tables (default: _pg2iceberg)

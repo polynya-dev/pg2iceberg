@@ -20,6 +20,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/pg2iceberg/pg2iceberg/query"
+	"github.com/pg2iceberg/pg2iceberg/stream"
 	"github.com/pg2iceberg/pg2iceberg/snapshot"
 	"github.com/pg2iceberg/pg2iceberg/tracing"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -58,6 +59,9 @@ func main() {
 	snapshotOnly := flag.Bool("snapshot-only", false, "exit after initial snapshot completes (env: SNAPSHOT_ONLY)")
 	compactOnly := flag.Bool("compact", false, "run one compaction pass on all tables and exit")
 	maintainOnly := flag.Bool("maintain", false, "run one maintenance pass (snapshot expiry + orphan cleanup) and exit")
+	materializerOnly := flag.Bool("materializer-only", false, "run materializer worker only (no WAL capture; requires --materializer-worker-id)")
+	streamOnly := flag.Bool("stream-only", false, "run WAL writer only (no materializer)")
+	materializerWorkerID := flag.String("materializer-worker-id", "", "worker ID for distributed materializer (env: MATERIALIZER_WORKER_ID)")
 
 	// State & metrics
 	statePostgresURL := flag.String("state-postgres-url", "", "PostgreSQL URL for state storage (env: STATE_POSTGRES_URL)")
@@ -86,24 +90,25 @@ func main() {
 
 	// Build config: YAML (optional) → env vars → CLI flags → defaults → validate
 	cfg, err := buildConfig(*configPath, cliOverrides{
-		postgresURL:       *postgresURL,
-		tables:            *tables,
-		mode:              *mode,
-		slotName:          *slotName,
-		pubName:           *pubName,
-		icebergCatalogURL: *icebergCatalogURL,
-		catalogAuth:       *catalogAuth,
-		catalogToken:      *catalogToken,
-		credentialMode:    *credentialMode,
-		warehouse:         *warehouse,
-		namespace:         *namespace,
-		s3Endpoint:        *s3Endpoint,
-		s3AccessKey:       *s3AccessKey,
-		s3SecretKey:       *s3SecretKey,
-		s3Region:          *s3Region,
-		snapshotOnly:      *snapshotOnly,
-		statePostgresURL:  *statePostgresURL,
-		metricsAddr:       *metricsAddr,
+		postgresURL:          *postgresURL,
+		tables:               *tables,
+		mode:                 *mode,
+		slotName:             *slotName,
+		pubName:              *pubName,
+		icebergCatalogURL:    *icebergCatalogURL,
+		catalogAuth:          *catalogAuth,
+		catalogToken:         *catalogToken,
+		credentialMode:       *credentialMode,
+		warehouse:            *warehouse,
+		namespace:            *namespace,
+		s3Endpoint:           *s3Endpoint,
+		s3AccessKey:          *s3AccessKey,
+		s3SecretKey:          *s3SecretKey,
+		s3Region:             *s3Region,
+		snapshotOnly:         *snapshotOnly,
+		statePostgresURL:     *statePostgresURL,
+		metricsAddr:          *metricsAddr,
+		materializerWorkerID: *materializerWorkerID,
 	})
 	if err != nil {
 		log.Fatalf("fatal: %v", err)
@@ -123,6 +128,13 @@ func main() {
 		runErr = runCompact(ctx, cfg)
 	} else if cfg.SnapshotOnly {
 		runErr = runSnapshotOnly(ctx, cfg)
+	} else if *materializerOnly {
+		if cfg.Sink.MaterializerWorkerID == "" {
+			log.Fatalf("fatal: --materializer-only requires --materializer-worker-id")
+		}
+		runErr = runMaterializerOnly(ctx, cfg)
+	} else if *streamOnly {
+		runErr = runStreamOnly(ctx, cfg)
 	} else {
 		runErr = runPipeline(ctx, cfg)
 	}
@@ -133,24 +145,25 @@ func main() {
 }
 
 type cliOverrides struct {
-	postgresURL       string
-	tables            string
-	mode              string
-	slotName          string
-	pubName           string
-	icebergCatalogURL string
-	catalogAuth       string
-	catalogToken      string
-	credentialMode    string
-	warehouse         string
-	namespace         string
-	s3Endpoint        string
-	s3AccessKey       string
-	s3SecretKey       string
-	s3Region          string
-	snapshotOnly      bool
-	statePostgresURL  string
-	metricsAddr       string
+	postgresURL          string
+	tables               string
+	mode                 string
+	slotName             string
+	pubName              string
+	icebergCatalogURL    string
+	catalogAuth          string
+	catalogToken         string
+	credentialMode       string
+	warehouse            string
+	namespace            string
+	s3Endpoint           string
+	s3AccessKey          string
+	s3SecretKey          string
+	s3Region             string
+	snapshotOnly         bool
+	statePostgresURL     string
+	metricsAddr          string
+	materializerWorkerID string
 }
 
 func buildConfig(configPath string, cli cliOverrides) (*config.Config, error) {
@@ -229,6 +242,9 @@ func buildConfig(configPath string, cli cliOverrides) (*config.Config, error) {
 	if cli.metricsAddr != "" {
 		cfg.MetricsAddr = cli.metricsAddr
 	}
+	if cli.materializerWorkerID != "" {
+		cfg.Sink.MaterializerWorkerID = cli.materializerWorkerID
+	}
 
 	// 4. Apply defaults and validate.
 	cfg.ApplyDefaults()
@@ -275,6 +291,135 @@ func runPipeline(ctx context.Context, cfg *config.Config) error {
 	if status, err := r.Status(); status == pipeline.StatusError && err != nil {
 		return err
 	}
+	return nil
+}
+
+// runStreamOnly runs the WAL writer (logical replication) without a materializer.
+// Use this when materializer workers run as separate processes.
+func runStreamOnly(ctx context.Context, cfg *config.Config) error {
+	log.Println("[stream-only] starting WAL writer only (no materializer)")
+
+	// Disable the materializer.
+	cfg.Sink.MaterializerInterval = "0"
+
+	lp, err := logical.BuildPipeline(ctx, "default", cfg)
+	if err != nil {
+		return fmt.Errorf("build logical pipeline: %w", err)
+	}
+	if err := lp.Start(ctx); err != nil {
+		return err
+	}
+
+	metricsAddr := cfg.MetricsAddr
+	if metricsAddr == "" {
+		metricsAddr = ":9090"
+	}
+	startMetricsServer(ctx, metricsAddr, lp)
+
+	<-lp.Done()
+	if status, err := lp.Status(); status == pipeline.StatusError && err != nil {
+		return err
+	}
+	return nil
+}
+
+// runMaterializerOnly runs a standalone materializer worker. It reads staged
+// events from the Stream (S3 + PG coordinator) and writes to Iceberg.
+// No WAL capture — the WAL writer runs as a separate process.
+func runMaterializerOnly(ctx context.Context, cfg *config.Config) error {
+	workerID := cfg.Sink.MaterializerWorkerID
+	log.Printf("[materializer-only] starting worker %s", workerID)
+
+	// Connect to source PG to discover schemas.
+	pgConn, err := pgx.Connect(ctx, cfg.Source.Postgres.DSN())
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+	schemas := make(map[string]*postgres.TableSchema)
+	for _, tc := range cfg.Tables {
+		ts, err := postgres.DiscoverSchema(ctx, pgConn, tc.Name)
+		if err != nil {
+			pgConn.Close(ctx)
+			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
+		}
+		schemas[tc.Name] = ts
+		log.Printf("[materializer-only] discovered schema for %s: %d columns, pk=%v", tc.Name, len(ts.Columns), ts.PK)
+	}
+	pgConn.Close(ctx)
+
+	// Create Iceberg clients.
+	clients, err := iceberg.NewClients(cfg.Sink)
+	if err != nil {
+		return fmt.Errorf("create iceberg clients: %w", err)
+	}
+
+	// Create coordinator.
+	coord, err := stream.NewPgCoordinatorWithSchema(ctx, cfg.Source.Postgres.DSN(), cfg.State.CoordinatorSchema)
+	if err != nil {
+		return fmt.Errorf("create coordinator: %w", err)
+	}
+	defer coord.Close()
+
+	if err := coord.Migrate(ctx); err != nil {
+		return fmt.Errorf("migrate coordinator: %w", err)
+	}
+
+	// Register tables in a temporary sink to get tableSink state.
+	snk := logical.NewSink(cfg.Sink, cfg.Tables, workerID, clients.S3, clients.Catalog)
+
+	// Ensure S3 is initialized (vended credentials).
+	if clients.S3 == nil && len(cfg.Tables) > 0 {
+		firstTable := postgres.TableToIceberg(cfg.Tables[0].Name)
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, firstTable); err != nil {
+			return fmt.Errorf("ensure storage: %w", err)
+		}
+		snk.SetS3(clients.S3)
+	}
+
+	str := stream.NewStream(coord, snk.S3(), cfg.Sink.Namespace)
+	snk.SetStream(str)
+
+	for _, ts := range schemas {
+		if err := snk.RegisterTable(ctx, ts); err != nil {
+			return fmt.Errorf("register table %s: %w", ts.Table, err)
+		}
+	}
+
+	// Ensure cursors for the consumer group (scoped by publication name).
+	group := cfg.Source.Logical.PublicationName
+	for pgTable := range schemas {
+		if err := coord.EnsureCursor(ctx, group, pgTable); err != nil {
+			return fmt.Errorf("ensure cursor for %s: %w", pgTable, err)
+		}
+	}
+
+	// Create and run materializer.
+	mat := logical.NewMaterializer(cfg.Sink, snk.Catalog(), snk.S3(), snk.Tables(), str)
+	mat.WorkerID = workerID
+	mat.ConsumerGroup = cfg.Source.Logical.PublicationName
+
+	metricsAddr := cfg.MetricsAddr
+	if metricsAddr == "" {
+		metricsAddr = ":9090"
+	}
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
+		})
+		srv := &http.Server{Addr: metricsAddr, Handler: mux}
+		go func() { <-ctx.Done(); srv.Shutdown(context.Background()) }()
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Printf("[materializer-only] metrics server error: %v", err)
+		}
+	}()
+
+	log.Printf("[materializer-only] worker %s running (interval=%s)", workerID, cfg.Sink.MaterializerDuration())
+	mat.Run(ctx)
+
+	log.Printf("[materializer-only] worker %s stopped", workerID)
 	return nil
 }
 

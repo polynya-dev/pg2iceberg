@@ -21,7 +21,6 @@ import (
 var tracer = otel.Tracer("pg2iceberg/checkpoint")
 
 // CheckpointVersion is the current schema version.
-// Increment when the checkpoint format changes in a backward-incompatible way.
 const CheckpointVersion = 1
 
 // CommitSHA is the git commit hash of the pg2iceberg binary.
@@ -65,25 +64,10 @@ type Checkpoint struct {
 	// snapshot. On crash recovery, only tables not in this map are re-snapshotted.
 	SnapshotedTables map[string]bool `json:"snapshoted_tables,omitempty"`
 
-	// LastSnapshotID is the Iceberg snapshot ID of the last successful commit.
-	LastSnapshotID int64 `json:"last_snapshot_id,omitempty"`
-
-	// LastSequenceNumber is the Iceberg sequence number of the last commit.
-	LastSequenceNumber int64 `json:"last_sequence_number,omitempty"`
-
 	// SnapshotChunks tracks the last completed CTID chunk index per table
 	// during the initial snapshot. On crash recovery, chunks with index <= this
 	// value are skipped. Keyed by PG table name (e.g. "public.orders").
 	SnapshotChunks map[string]int `json:"snapshot_chunks,omitempty"`
-
-	// MaterializerSnapshots tracks the last processed events table snapshot
-	// per table. Keyed by PG table name (e.g. "public.orders").
-	MaterializerSnapshots map[string]int64 `json:"materializer_snapshots,omitempty"`
-
-	// SeqCounter is the next sequence number to assign to an event in the
-	// events table. Persisted so that _seq is globally monotonic across
-	// pipeline restarts, enabling gap detection for audit.
-	SeqCounter int64 `json:"seq_counter,omitempty"`
 
 	// QueryWatermarks stores per-table watermarks for query mode.
 	// Keyed by PG table name (e.g. "public.orders"), values are RFC3339Nano timestamps.
@@ -108,9 +92,6 @@ func (cp *Checkpoint) computeChecksum() string {
 	parts = append(parts, fmt.Sprintf("watermark=%s", cp.Watermark))
 	parts = append(parts, fmt.Sprintf("lsn=%d", cp.LSN))
 	parts = append(parts, fmt.Sprintf("snapshot_complete=%t", cp.SnapshotComplete))
-	parts = append(parts, fmt.Sprintf("last_snapshot_id=%d", cp.LastSnapshotID))
-	parts = append(parts, fmt.Sprintf("last_sequence_number=%d", cp.LastSequenceNumber))
-	parts = append(parts, fmt.Sprintf("seq_counter=%d", cp.SeqCounter))
 	parts = append(parts, fmt.Sprintf("updated_at=%s", cp.UpdatedAt.UTC().Format(time.RFC3339Nano)))
 
 	// Deterministic serialization of maps.
@@ -119,9 +100,6 @@ func (cp *Checkpoint) computeChecksum() string {
 	}
 	if len(cp.SnapshotChunks) > 0 {
 		parts = append(parts, fmt.Sprintf("snapshot_chunks=%s", sortedMapStr(cp.SnapshotChunks)))
-	}
-	if len(cp.MaterializerSnapshots) > 0 {
-		parts = append(parts, fmt.Sprintf("materializer_snapshots=%s", sortedMapStr(cp.MaterializerSnapshots)))
 	}
 	if len(cp.QueryWatermarks) > 0 {
 		parts = append(parts, fmt.Sprintf("query_watermarks=%s", sortedMapStr(cp.QueryWatermarks)))
@@ -199,12 +177,6 @@ func (cp *Checkpoint) clone() *Checkpoint {
 		c.SnapshotChunks = make(map[string]int, len(cp.SnapshotChunks))
 		for k, v := range cp.SnapshotChunks {
 			c.SnapshotChunks[k] = v
-		}
-	}
-	if cp.MaterializerSnapshots != nil {
-		c.MaterializerSnapshots = make(map[string]int64, len(cp.MaterializerSnapshots))
-		for k, v := range cp.MaterializerSnapshots {
-			c.MaterializerSnapshots[k] = v
 		}
 	}
 	if cp.QueryWatermarks != nil {

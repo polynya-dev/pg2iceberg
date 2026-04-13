@@ -184,6 +184,14 @@ func (ms *MetadataStore) CommitSnapshot(ctx context.Context, ns, table string, c
 // cache — callers never need a separate "apply" step.
 func (ms *MetadataStore) CommitTransaction(ctx context.Context, ns string, commits []TableCommit) error {
 	if err := ms.inner.CommitTransaction(ctx, ns, commits); err != nil {
+		// On conflict (409), invalidate cache for affected tables so the
+		// next cycle loads fresh metadata from the catalog. Without this,
+		// the stale CurrentSnapshotID causes repeated 409 failures.
+		ms.mu.Lock()
+		for _, tc := range commits {
+			delete(ms.tables, tableKey{ns, tc.Table})
+		}
+		ms.mu.Unlock()
 		return err
 	}
 
