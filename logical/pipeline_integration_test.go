@@ -3190,14 +3190,51 @@ func (c *conflictCheckingCatalog) CommitSnapshot(ctx context.Context, ns, table 
 }
 
 func (c *conflictCheckingCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Validate all preconditions atomically before applying any changes,
+	// matching the real Iceberg REST catalog's all-or-nothing semantics.
 	for _, tc := range commits {
-		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
-			return err
+		key := ns + "." + tc.Table
+		tm := c.tables[key]
+		if tm == nil {
+			return fmt.Errorf("table not found: %s", key)
 		}
+		if tm.Metadata.CurrentSnapshotID != tc.CurrentSnapshotID {
+			c.conflicts.Add(1)
+			return fmt.Errorf("catalog error 409: Requirement failed: branch main was created concurrently (expected snapshot %d, actual %d)",
+				tc.CurrentSnapshotID, tm.Metadata.CurrentSnapshotID)
+		}
+	}
+
+	// All assertions passed — apply all changes.
+	for _, tc := range commits {
+		key := ns + "." + tc.Table
+		tm := c.tables[key]
+		tm.Metadata.CurrentSnapshotID = tc.Snapshot.SnapshotID
+		tm.Metadata.LastSequenceNumber = tc.Snapshot.SequenceNumber
+		snap := struct {
+			SnapshotID     int64             `json:"snapshot-id"`
+			TimestampMs    int64             `json:"timestamp-ms"`
+			ManifestList   string            `json:"manifest-list"`
+			Summary        map[string]string `json:"summary"`
+			SchemaID       int               `json:"schema-id"`
+			SequenceNumber int64             `json:"sequence-number"`
+		}{
+			SnapshotID:     tc.Snapshot.SnapshotID,
+			TimestampMs:    tc.Snapshot.TimestampMs,
+			ManifestList:   tc.Snapshot.ManifestListPath,
+			Summary:        tc.Snapshot.Summary,
+			SchemaID:       tc.Snapshot.SchemaID,
+			SequenceNumber: tc.Snapshot.SequenceNumber,
+		}
+		tm.Metadata.Snapshots = append(tm.Metadata.Snapshots, snap)
+
 		if tc.NewManifests != nil {
-			c.SetManifests(ns, tc.Table, tc.NewManifests)
+			c.manifests[ns+"."+tc.Table] = tc.NewManifests
 		}
-		fi := c.FileIndex(ns, tc.Table)
+		fi := c.fileIdxs[ns+"."+tc.Table]
 		if fi != nil {
 			for _, pk := range tc.DeletedPKs {
 				if filePath, ok := fi.PkToFile[pk]; ok {
