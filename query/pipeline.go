@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,7 +37,8 @@ type Pipeline struct {
 	err           error
 	startedAt     time.Time
 	lastFlushAt   time.Time
-	rowsProcessed int64
+	rowsProcessed  int64
+	perTableRows   map[string]*atomic.Int64
 
 	snapshotNeeded bool // true if initial snapshot is required (no checkpoint)
 
@@ -152,6 +154,58 @@ func (p *Pipeline) Metrics() pipeline.Metrics {
 	return m
 }
 
+// Tables returns per-table metadata and statistics.
+func (p *Pipeline) Tables() []pipeline.TableInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.schemas == nil {
+		return nil
+	}
+
+	tables := make([]pipeline.TableInfo, 0, len(p.cfg.Tables))
+	for _, tc := range p.cfg.Tables {
+		ts, ok := p.schemas[tc.Name]
+		if !ok {
+			continue
+		}
+
+		info := pipeline.TableInfo{
+			SourceTable:   tc.Name,
+			Namespace:     p.cfg.Sink.Namespace,
+			IcebergTable:  postgres.TableToIceberg(tc.Name),
+			PrimaryKey:    ts.PK,
+			PartitionSpec: tc.Iceberg.Partition,
+		}
+
+		// Columns with PG and Iceberg types.
+		info.Columns = make([]pipeline.ColumnInfo, len(ts.Columns))
+		for i, col := range ts.Columns {
+			iceType, _ := col.IcebergType()
+			info.Columns[i] = pipeline.ColumnInfo{
+				Name:        col.Name,
+				PGType:      string(col.PGType),
+				IcebergType: iceType,
+				Nullable:    col.IsNullable,
+			}
+		}
+
+		// Buffered stats from buffer.
+		if buf, ok := p.buffers[tc.Name]; ok {
+			info.Stats.BufferedRows = buf.Len()
+			info.Stats.BufferedBytes = buf.EstimatedBytes()
+		}
+
+		// Cumulative rows from atomic counter.
+		if ctr := p.perTableRows[tc.Name]; ctr != nil {
+			info.Stats.RowsProcessed = ctr.Load()
+		}
+
+		tables = append(tables, info)
+	}
+	return tables
+}
+
 func (p *Pipeline) setStatus(s pipeline.Status, err error) {
 	p.mu.Lock()
 	p.status = s
@@ -174,6 +228,12 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		return fmt.Errorf("poller connect: %w", err)
 	}
 	p.schemas = p.poller.Schemas()
+
+	// Initialize per-table row counters for /tables endpoint.
+	p.perTableRows = make(map[string]*atomic.Int64, len(p.cfg.Tables))
+	for _, tc := range p.cfg.Tables {
+		p.perTableRows[tc.Name] = &atomic.Int64{}
+	}
 
 	// Restore watermarks from checkpoint or mark snapshot as needed.
 	if cp.Mode == "query" {
@@ -400,6 +460,9 @@ func (p *Pipeline) pollAndBuffer(ctx context.Context) error {
 			buf.Upsert(row)
 		}
 		p.rowsProcessed += int64(len(r.Rows))
+		if ctr := p.perTableRows[r.Table]; ctr != nil {
+			ctr.Add(int64(len(r.Rows)))
+		}
 		pipeline.RowsProcessedTotal.WithLabelValues(p.id, r.Table, "INSERT").Add(float64(len(r.Rows)))
 		pipeline.QueryPollRowsTotal.WithLabelValues(p.id, r.Table).Add(float64(len(r.Rows)))
 		pipeline.QueryBufferRows.WithLabelValues(p.id, r.Table).Set(float64(buf.Len()))

@@ -3747,3 +3747,188 @@ func TestCleanup(t *testing.T) {
 
 	t.Log("cleanup complete: slot, publication, and schema all removed")
 }
+
+// TestPipeline_TablesEndpoint verifies that Pipeline.Tables() returns correct
+// per-table metadata (source/iceberg names, columns with PG and Iceberg types,
+// primary keys, partition specs) and that per-table stats are populated after
+// rows flow through the pipeline.
+func TestPipeline_TablesEndpoint(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	// Create a table with varied column types to verify PG→Iceberg type mapping.
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE orders (
+			id         SERIAL PRIMARY KEY,
+			customer   TEXT NOT NULL,
+			amount     NUMERIC(10,2),
+			placed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			shipped    BOOLEAN NOT NULL DEFAULT false
+		);
+	`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	const seedRows = 10
+	for i := 1; i <= seedRows; i++ {
+		_, err = conn.Exec(ctx, "INSERT INTO orders (customer, amount, placed_at, shipped) VALUES ($1, $2, now(), $3)",
+			fmt.Sprintf("cust-%d", i), i*100, i%2 == 0)
+		if err != nil {
+			t.Fatalf("seed insert %d: %v", i, err)
+		}
+	}
+	conn.Close(ctx)
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            5,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{
+				Name: "public.orders",
+				Iceberg: config.IcebergTableConfig{
+					Partition: []string{"day(placed_at)"},
+				},
+			},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        "test_slot_tables",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newTrackingCatalog()
+	coord := stream.NewMemCoordinator()
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	store := pipeline.NewMemCheckpointStore()
+	p := logical.NewPipeline("test", cfg, snk, store, coord)
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	// === Assertion 1: Table metadata is correctly populated ===
+	tables := p.Tables()
+	if len(tables) != 1 {
+		t.Fatalf("expected 1 table, got %d", len(tables))
+	}
+
+	tbl := tables[0]
+
+	if tbl.SourceTable != "public.orders" {
+		t.Errorf("source_table: got %q, want %q", tbl.SourceTable, "public.orders")
+	}
+	if tbl.Namespace != "test_ns" {
+		t.Errorf("namespace: got %q, want %q", tbl.Namespace, "test_ns")
+	}
+	if tbl.IcebergTable != "orders" {
+		t.Errorf("iceberg_table: got %q, want %q", tbl.IcebergTable, "orders")
+	}
+
+	// Primary key.
+	if len(tbl.PrimaryKey) != 1 || tbl.PrimaryKey[0] != "id" {
+		t.Errorf("primary_key: got %v, want [id]", tbl.PrimaryKey)
+	}
+
+	// Partition spec.
+	if len(tbl.PartitionSpec) != 1 || tbl.PartitionSpec[0] != "day(placed_at)" {
+		t.Errorf("partition_spec: got %v, want [day(placed_at)]", tbl.PartitionSpec)
+	}
+
+	// === Assertion 2: Columns with PG and Iceberg types ===
+	expectedCols := map[string]struct {
+		pgType      string
+		icebergType string
+		nullable    bool
+	}{
+		"id":        {pgType: string(postgres.Int4), icebergType: "int", nullable: false},
+		"customer":  {pgType: string(postgres.Text), icebergType: "string", nullable: false},
+		"amount":    {pgType: string(postgres.Numeric), icebergType: "decimal(10,2)", nullable: true},
+		"placed_at": {pgType: string(postgres.TimestampTZ), icebergType: "timestamptz", nullable: false},
+		"shipped":   {pgType: string(postgres.Bool), icebergType: "boolean", nullable: false},
+	}
+
+	if len(tbl.Columns) != len(expectedCols) {
+		t.Fatalf("expected %d columns, got %d: %+v", len(expectedCols), len(tbl.Columns), tbl.Columns)
+	}
+
+	for _, col := range tbl.Columns {
+		exp, ok := expectedCols[col.Name]
+		if !ok {
+			t.Errorf("unexpected column %q", col.Name)
+			continue
+		}
+		if col.PGType != exp.pgType {
+			t.Errorf("column %s pg_type: got %q, want %q", col.Name, col.PGType, exp.pgType)
+		}
+		if col.IcebergType != exp.icebergType {
+			t.Errorf("column %s iceberg_type: got %q, want %q", col.Name, col.IcebergType, exp.icebergType)
+		}
+		if col.Nullable != exp.nullable {
+			t.Errorf("column %s nullable: got %v, want %v", col.Name, col.Nullable, exp.nullable)
+		}
+	}
+
+	// === Assertion 3: Per-table stats are populated after rows flow through ===
+	// Insert rows during streaming to increment the per-table counter.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	const streamInserts = 5
+	for i := 1; i <= streamInserts; i++ {
+		_, err = conn.Exec(ctx, "INSERT INTO orders (customer, amount, placed_at, shipped) VALUES ($1, $2, now(), $3)",
+			fmt.Sprintf("stream-cust-%d", i), i*200, true)
+		if err != nil {
+			t.Fatalf("stream insert %d: %v", i, err)
+		}
+	}
+
+	// Wait for the streaming rows to be processed.
+	waitFor(t, 30*time.Second, func() bool {
+		tables = p.Tables()
+		return len(tables) == 1 && tables[0].Stats.RowsProcessed >= int64(streamInserts)
+	})
+
+	tbl = tables[0]
+	t.Logf("stats after streaming: rows_processed=%d, buffered_rows=%d, buffered_bytes=%d",
+		tbl.Stats.RowsProcessed, tbl.Stats.BufferedRows, tbl.Stats.BufferedBytes)
+
+	if tbl.Stats.RowsProcessed < int64(streamInserts) {
+		t.Errorf("rows_processed: got %d, want >= %d", tbl.Stats.RowsProcessed, streamInserts)
+	}
+}
