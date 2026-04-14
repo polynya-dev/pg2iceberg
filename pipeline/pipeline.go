@@ -41,6 +41,38 @@ type Metrics struct {
 	Uptime         string `json:"uptime"`
 }
 
+// TableLister is an optional interface that Pipeline implementations can
+// satisfy to expose per-table metadata via the /tables endpoint.
+type TableLister interface {
+	Tables() []TableInfo
+}
+
+// TableInfo describes a single replicated table.
+type TableInfo struct {
+	SourceTable   string       `json:"source_table"`
+	Namespace     string       `json:"namespace"`
+	IcebergTable  string       `json:"iceberg_table"`
+	Columns       []ColumnInfo `json:"columns"`
+	PrimaryKey    []string     `json:"primary_key"`
+	PartitionSpec []string     `json:"partition_spec"`
+	Stats         TableStats   `json:"stats"`
+}
+
+// ColumnInfo describes a single column with both PG and Iceberg types.
+type ColumnInfo struct {
+	Name        string `json:"name"`
+	PGType      string `json:"pg_type"`
+	IcebergType string `json:"iceberg_type"`
+	Nullable    bool   `json:"nullable"`
+}
+
+// TableStats holds per-table runtime statistics.
+type TableStats struct {
+	RowsProcessed int64 `json:"rows_processed"`
+	BufferedRows  int   `json:"buffered_rows"`
+	BufferedBytes int64 `json:"buffered_bytes"`
+}
+
 // NewCheckpointStore creates a CheckpointStore from config. It uses a file store
 // if a path is configured, otherwise falls back to Postgres.
 func NewCheckpointStore(ctx context.Context, cfg *config.Config) (CheckpointStore, error) {

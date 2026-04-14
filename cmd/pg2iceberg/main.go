@@ -771,6 +771,15 @@ func startMetricsServer(ctx context.Context, addr string, r pipeline.Pipeline) {
 		}
 		json.NewEncoder(w).Encode(r.Metrics())
 	})
+	mux.HandleFunc("/tables", func(w http.ResponseWriter, r2 *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if tl, ok := r.(pipeline.TableLister); ok {
+			json.NewEncoder(w).Encode(tl.Tables())
+		} else {
+			w.WriteHeader(http.StatusNotImplemented)
+			json.NewEncoder(w).Encode(map[string]string{"error": "table listing not available"})
+		}
+	})
 
 	srv := &http.Server{Addr: addr, Handler: mux}
 

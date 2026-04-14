@@ -376,3 +376,56 @@ pg2iceberg exposes Prometheus metrics on `:9090/metrics` (configurable via `metr
 - `pg2iceberg_rows_processed_total` - rows replicated by table and operation
 - `pg2iceberg_maintenance_snapshots_expired_total` - snapshots expired by maintenance
 - `pg2iceberg_maintenance_orphans_deleted_total` - orphan files deleted by maintenance
+
+### HTTP Endpoints
+
+The metrics server (`:9090` by default) exposes the following endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /metrics` | Prometheus metrics |
+| `GET /healthz` | Pipeline health check (503 if status is `error`) |
+| `GET /ready` | Readiness probe (503 if pipeline is not `running`) |
+| `GET /tables` | Per-table metadata, schema, and statistics |
+
+#### `GET /tables`
+
+Returns metadata and runtime statistics for every replicated table. Includes source and Iceberg schema information, partition specs, and per-table counters.
+
+```bash
+curl http://localhost:9090/tables | jq .
+```
+
+```json
+[
+  {
+    "source_table": "public.orders",
+    "namespace": "analytics",
+    "iceberg_table": "orders",
+    "columns": [
+      {"name": "id", "pg_type": "int4", "iceberg_type": "int", "nullable": false},
+      {"name": "amount", "pg_type": "numeric", "iceberg_type": "decimal(10,2)", "nullable": true},
+      {"name": "created_at", "pg_type": "timestamptz", "iceberg_type": "timestamptz", "nullable": false}
+    ],
+    "primary_key": ["id"],
+    "partition_spec": ["day(created_at)"],
+    "stats": {
+      "rows_processed": 152340,
+      "buffered_rows": 47,
+      "buffered_bytes": 6016
+    }
+  }
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `source_table` | Fully qualified PostgreSQL table name |
+| `namespace` | Iceberg namespace |
+| `iceberg_table` | Iceberg table name |
+| `columns` | Column list with PostgreSQL type, Iceberg type, and nullability |
+| `primary_key` | Primary key column names |
+| `partition_spec` | Partition expressions from config (e.g. `day(ts)`, `bucket[16](id)`) |
+| `stats.rows_processed` | Cumulative rows replicated for this table |
+| `stats.buffered_rows` | Rows currently buffered awaiting flush |
+| `stats.buffered_bytes` | Estimated bytes currently buffered |

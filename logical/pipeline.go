@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -43,6 +44,7 @@ type Pipeline struct {
 	rowsProcessed  int64
 	bytesProcessed int64
 	lastWrittenLSN uint64
+	perTableRows   map[string]*atomic.Int64
 
 	materializer *Materializer
 	coord        stream.Coordinator
@@ -154,6 +156,63 @@ func (p *Pipeline) Metrics() pipeline.Metrics {
 	return m
 }
 
+// Tables returns per-table metadata and statistics.
+func (p *Pipeline) Tables() []pipeline.TableInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.schemas == nil {
+		return nil
+	}
+
+	tables := make([]pipeline.TableInfo, 0, len(p.cfg.Tables))
+	sinkTables := make(map[string]*tableSink)
+	if p.snk != nil {
+		sinkTables = p.snk.Tables()
+	}
+
+	for _, tc := range p.cfg.Tables {
+		ts, ok := p.schemas[tc.Name]
+		if !ok {
+			continue
+		}
+
+		info := pipeline.TableInfo{
+			SourceTable:   tc.Name,
+			Namespace:     p.cfg.Sink.Namespace,
+			IcebergTable:  postgres.TableToIceberg(tc.Name),
+			PrimaryKey:    ts.PK,
+			PartitionSpec: tc.Iceberg.Partition,
+		}
+
+		// Columns with PG and Iceberg types.
+		info.Columns = make([]pipeline.ColumnInfo, len(ts.Columns))
+		for i, col := range ts.Columns {
+			iceType, _ := col.IcebergType()
+			info.Columns[i] = pipeline.ColumnInfo{
+				Name:        col.Name,
+				PGType:      string(col.PGType),
+				IcebergType: iceType,
+				Nullable:    col.IsNullable,
+			}
+		}
+
+		// Buffered stats from sink.
+		if tSink, ok := sinkTables[tc.Name]; ok {
+			info.Stats.BufferedRows = tSink.totalRows
+			info.Stats.BufferedBytes = tSink.writer.EstimatedBytes()
+		}
+
+		// Cumulative rows from atomic counter.
+		if ctr := p.perTableRows[tc.Name]; ctr != nil {
+			info.Stats.RowsProcessed = ctr.Load()
+		}
+
+		tables = append(tables, info)
+	}
+	return tables
+}
+
 // Start initializes and runs the pipeline.
 func (p *Pipeline) Start(ctx context.Context) error {
 	p.mu.Lock()
@@ -262,6 +321,13 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		p.schemas[tc.Name] = ts
 		log.Printf("[logical:%s] discovered schema for %s: %d columns, pk=%v", p.id, tc.Name, len(ts.Columns), ts.PK)
 	}
+
+	// Initialize per-table row counters for /tables endpoint.
+	p.perTableRows = make(map[string]*atomic.Int64, len(p.cfg.Tables))
+	for _, tc := range p.cfg.Tables {
+		p.perTableRows[tc.Name] = &atomic.Int64{}
+	}
+
 	// Probe Iceberg table existence before registration.
 	var tableExistence []pipeline.TableExistence
 	for _, tc := range p.cfg.Tables {
@@ -500,6 +566,9 @@ func (p *Pipeline) run(ctx context.Context) {
 				p.lastWrittenLSN = event.LSN
 			}
 			p.rowsProcessed++
+			if ctr := p.perTableRows[event.Table]; ctr != nil {
+				ctr.Add(1)
+			}
 			pipeline.RowsProcessedTotal.WithLabelValues(p.id, event.Table, event.Operation.String()).Inc()
 
 			if p.snk.TotalBuffered() >= flushRows {
