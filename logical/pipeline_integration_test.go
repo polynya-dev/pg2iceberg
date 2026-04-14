@@ -3544,3 +3544,169 @@ func TestMaintenance_ExpireSnapshotsAndCleanOrphans(t *testing.T) {
 	}
 	t.Logf("materialized table has %d rows after maintenance — data intact", matRows)
 }
+
+// TestCleanup starts a real pg2iceberg pipeline, lets it run for a couple of
+// flush cycles (creating the slot, publication, and _pg2iceberg schema
+// organically), stops it, then verifies that logical.Cleanup removes all
+// Postgres resources.
+func TestCleanup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, pgCleanup := startPostgres(t, ctx)
+	defer pgCleanup()
+
+	// Create table and seed data.
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	_, err = conn.Exec(ctx, `CREATE TABLE orders (id SERIAL PRIMARY KEY, total INTEGER NOT NULL)`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	conn.Close(ctx)
+
+	slotName := "test_cleanup_slot"
+	pubName := "test_cleanup_pub"
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            5,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.orders"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: pubName,
+				SlotName:        slotName,
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newMemCatalog()
+	coord := stream.NewMemCoordinator()
+
+	// Use PG-backed checkpoint store so pg2iceberg creates the _pg2iceberg schema.
+	cpStore, err := pipeline.NewPgCheckpointStore(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("create pg checkpoint store: %v", err)
+	}
+
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, cpStore, coord)
+	snk.SetStream(stream.NewStream(coord, mem, sinkCfg.Namespace))
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+
+	waitForStatus(t, p, pipeline.StatusRunning, 60*time.Second)
+
+	// Insert rows while pipeline is running.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	for i := 6; i <= 15; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	// Wait for at least one flush.
+	waitFor(t, 30*time.Second, func() bool {
+		return p.Source().FlushedLSN() > 0
+	})
+	t.Logf("flushed LSN: %d", p.Source().FlushedLSN())
+	conn.Close(ctx)
+
+	// Graceful shutdown.
+	if err := p.Stop(); err != nil {
+		t.Fatalf("stop pipeline: %v", err)
+	}
+
+	// Verify pg2iceberg created everything.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect for verification: %v", err)
+	}
+
+	var exists bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)", slotName).Scan(&exists); err != nil {
+		t.Fatalf("check slot: %v", err)
+	}
+	if !exists {
+		t.Fatal("pipeline should have created the replication slot")
+	}
+
+	if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)", pubName).Scan(&exists); err != nil {
+		t.Fatalf("check publication: %v", err)
+	}
+	if !exists {
+		t.Fatal("pipeline should have created the publication")
+	}
+
+	if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = '_pg2iceberg')").Scan(&exists); err != nil {
+		t.Fatalf("check schema: %v", err)
+	}
+	if !exists {
+		t.Fatal("pipeline should have created _pg2iceberg schema")
+	}
+
+	t.Log("verified: slot, publication, and _pg2iceberg schema all exist after pipeline run")
+
+	// Run cleanup.
+	if err := logical.Cleanup(ctx, conn, slotName, pubName, "_pg2iceberg"); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	conn.Close(ctx)
+
+	// Verify everything is gone.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect after cleanup: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)", slotName).Scan(&exists); err != nil {
+		t.Fatalf("check slot after cleanup: %v", err)
+	}
+	if exists {
+		t.Error("slot should not exist after cleanup")
+	}
+
+	if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)", pubName).Scan(&exists); err != nil {
+		t.Fatalf("check publication after cleanup: %v", err)
+	}
+	if exists {
+		t.Error("publication should not exist after cleanup")
+	}
+
+	if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = '_pg2iceberg')").Scan(&exists); err != nil {
+		t.Fatalf("check schema after cleanup: %v", err)
+	}
+	if exists {
+		t.Error("_pg2iceberg schema should not exist after cleanup")
+	}
+
+	t.Log("cleanup complete: slot, publication, and schema all removed")
+}

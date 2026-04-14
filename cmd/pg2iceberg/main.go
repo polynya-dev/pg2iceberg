@@ -59,6 +59,7 @@ func main() {
 	snapshotOnly := flag.Bool("snapshot-only", false, "exit after initial snapshot completes (env: SNAPSHOT_ONLY)")
 	compactOnly := flag.Bool("compact", false, "run one compaction pass on all tables and exit")
 	maintainOnly := flag.Bool("maintain", false, "run one maintenance pass (snapshot expiry + orphan cleanup) and exit")
+	cleanupOnly := flag.Bool("cleanup", false, "drop replication slot, publication, and _pg2iceberg schema, then exit")
 	materializerOnly := flag.Bool("materializer-only", false, "run materializer worker only (no WAL capture; requires --materializer-worker-id)")
 	streamOnly := flag.Bool("stream-only", false, "run WAL writer only (no materializer)")
 	materializerWorkerID := flag.String("materializer-worker-id", "", "worker ID for distributed materializer (env: MATERIALIZER_WORKER_ID)")
@@ -122,7 +123,9 @@ func main() {
 	}
 
 	var runErr error
-	if *maintainOnly {
+	if *cleanupOnly {
+		runErr = runCleanup(ctx, cfg)
+	} else if *maintainOnly {
 		runErr = runMaintain(ctx, cfg)
 	} else if *compactOnly {
 		runErr = runCompact(ctx, cfg)
@@ -731,6 +734,22 @@ func runMaintain(ctx context.Context, cfg *config.Config) error {
 
 	log.Println("[maintain] done")
 	return nil
+}
+
+func runCleanup(ctx context.Context, cfg *config.Config) error {
+	dsn := cfg.Source.Postgres.DSN()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	schema := "_pg2iceberg"
+	if cfg.State.CoordinatorSchema != "" {
+		schema = cfg.State.CoordinatorSchema
+	}
+
+	return logical.Cleanup(ctx, conn, cfg.Source.Logical.SlotName, cfg.Source.Logical.PublicationName, schema)
 }
 
 func startMetricsServer(ctx context.Context, addr string, r pipeline.Pipeline) {
