@@ -90,7 +90,7 @@ func main() {
 	}()
 
 	// Build config: YAML (optional) → env vars → CLI flags → defaults → validate
-	cfg, err := buildConfig(*configPath, cliOverrides{
+	cfg, err := buildConfig(*configPath, *cleanupOnly, cliOverrides{
 		postgresURL:          *postgresURL,
 		tables:               *tables,
 		mode:                 *mode,
@@ -169,7 +169,7 @@ type cliOverrides struct {
 	materializerWorkerID string
 }
 
-func buildConfig(configPath string, cli cliOverrides) (*config.Config, error) {
+func buildConfig(configPath string, cleanupOnly bool, cli cliOverrides) (*config.Config, error) {
 	var cfg config.Config
 
 	// 1. Load YAML base config if provided.
@@ -251,8 +251,10 @@ func buildConfig(configPath string, cli cliOverrides) (*config.Config, error) {
 
 	// 4. Apply defaults and validate.
 	cfg.ApplyDefaults()
-	if err := cfg.Validate(); err != nil {
-		return nil, err
+	if !cleanupOnly {
+		if err := cfg.Validate(); err != nil {
+			return nil, err
+		}
 	}
 
 	return &cfg, nil
