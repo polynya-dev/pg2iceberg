@@ -104,10 +104,11 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 }
 
 // EnsureStorage ensures the S3 storage client is initialized.
-// In static mode this is a no-op (already created in NewClients).
-// In vended mode, it calls LoadTable to obtain temporary credentials
-// from the catalog and creates a VendedS3Client.
-func (ic *IcebergClients) EnsureStorage(ctx context.Context, ns, table string) error {
+// In static/iam mode this is a no-op (already created in NewClients).
+// In vended mode, it loads each table to obtain per-table temporary
+// credentials and creates a VendedS3Router that routes S3 operations
+// to the correct per-table client by key prefix.
+func (ic *IcebergClients) EnsureStorage(ctx context.Context, ns string, tables []string) error {
 	if ic.S3 != nil {
 		return nil
 	}
@@ -115,27 +116,28 @@ func (ic *IcebergClients) EnsureStorage(ctx context.Context, ns, table string) e
 		return fmt.Errorf("S3 client not configured and credential mode is %q", ic.credentialMode)
 	}
 
-	// Use the cached catalog for the initial load (populates cache),
-	// but pass the raw catalogClient to VendedS3Client for credential
-	// refresh — those calls must bypass the cache to get fresh creds.
-	tm, err := ic.Catalog.LoadTable(ctx, ns, table)
-	if err != nil {
-		return fmt.Errorf("load table for vended credentials: %w", err)
+	router := NewVendedS3Router()
+	for _, table := range tables {
+		tm, err := ic.Catalog.LoadTable(ctx, ns, table)
+		if err != nil {
+			return fmt.Errorf("load table %s for vended credentials: %w", table, err)
+		}
+		if tm == nil {
+			return fmt.Errorf("table %s.%s does not exist, cannot obtain vended credentials", ns, table)
+		}
+		creds := tm.VendedCredentials()
+		if creds == nil {
+			return fmt.Errorf("catalog did not return vended credentials for %s.%s", ns, table)
+		}
+		client, err := NewVendedS3Client(ic.catalogClient, ns, table, creds, tm.Metadata.Location)
+		if err != nil {
+			return fmt.Errorf("create vended s3 client for %s: %w", table, err)
+		}
+		basePath := TableBasePath(tm.Metadata.Location, ns, table)
+		router.Add(basePath, client)
+		log.Printf("[vended-s3] registered table %s.%s (prefix=%s)", ns, table, basePath)
 	}
-	if tm == nil {
-		return fmt.Errorf("table %s.%s does not exist, cannot obtain vended credentials", ns, table)
-	}
-
-	creds := tm.VendedCredentials()
-	if creds == nil {
-		return fmt.Errorf("catalog did not return vended credentials for %s.%s", ns, table)
-	}
-
-	vendedClient, err := NewVendedS3Client(ic.catalogClient, ns, table, creds, tm.Metadata.Location)
-	if err != nil {
-		return fmt.Errorf("create vended s3 client: %w", err)
-	}
-	ic.S3 = vendedClient
+	ic.S3 = router
 	return nil
 }
 

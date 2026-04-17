@@ -60,10 +60,13 @@ func BuildPipeline(ctx context.Context, id string, cfg *config.Config) (*Pipelin
 		return nil, fmt.Errorf("create iceberg clients: %w", err)
 	}
 
-	// In vended credential mode, initialize storage from the catalog.
+	// In vended credential mode, initialize per-table S3 clients from the catalog.
 	if clients.S3 == nil && len(cfg.Tables) > 0 {
-		firstTable := postgres.TableToIceberg(cfg.Tables[0].Name)
-		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, firstTable); err != nil {
+		var tableNames []string
+		for _, tc := range cfg.Tables {
+			tableNames = append(tableNames, postgres.TableToIceberg(tc.Name))
+		}
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, tableNames); err != nil {
 			cpStore.Close()
 			return nil, fmt.Errorf("ensure storage: %w", err)
 		}

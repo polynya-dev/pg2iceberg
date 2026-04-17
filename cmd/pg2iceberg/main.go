@@ -370,10 +370,13 @@ func runMaterializerOnly(ctx context.Context, cfg *config.Config) error {
 	// Register tables in a temporary sink to get tableSink state.
 	snk := logical.NewSink(cfg.Sink, cfg.Tables, workerID, clients.S3, clients.Catalog)
 
-	// Ensure S3 is initialized (vended credentials).
+	// Ensure S3 is initialized (vended credentials — per-table routing).
 	if clients.S3 == nil && len(cfg.Tables) > 0 {
-		firstTable := postgres.TableToIceberg(cfg.Tables[0].Name)
-		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, firstTable); err != nil {
+		var tableNames []string
+		for _, tc := range cfg.Tables {
+			tableNames = append(tableNames, postgres.TableToIceberg(tc.Name))
+		}
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, tableNames); err != nil {
 			return fmt.Errorf("ensure storage: %w", err)
 		}
 		snk.SetS3(clients.S3)
@@ -487,8 +490,10 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("ensure namespace: %w", err)
 	}
 
+	var icebergTableNames []string
 	for pgTable, ts := range schemas {
 		icebergName := postgres.TableToIceberg(pgTable)
+		icebergTableNames = append(icebergTableNames, icebergName)
 
 		var partExprs []string
 		for _, tc := range cfg.Tables {
@@ -516,12 +521,12 @@ func runSnapshotOnly(ctx context.Context, cfg *config.Config) error {
 			}
 			log.Printf("[snapshot] created table %s.%s", cfg.Sink.Namespace, icebergName)
 		}
+	}
 
-		// In vended mode, initialize storage after first LoadTable/CreateTable.
-		if clients.S3 == nil {
-			if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, icebergName); err != nil {
-				return fmt.Errorf("ensure storage: %w", err)
-			}
+	// In vended mode, initialize per-table S3 clients after all tables exist.
+	if clients.S3 == nil && len(icebergTableNames) > 0 {
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, icebergTableNames); err != nil {
+			return fmt.Errorf("ensure storage: %w", err)
 		}
 	}
 
@@ -616,10 +621,13 @@ func runCompact(ctx context.Context, cfg *config.Config) error {
 	}
 	catalog := clients.Catalog
 
-	// Ensure storage is available.
+	// Ensure storage is available (per-table routing for vended creds).
 	if clients.S3 == nil && len(cfg.Tables) > 0 {
-		firstTable := postgres.TableToIceberg(cfg.Tables[0].Name)
-		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, firstTable); err != nil {
+		var tableNames []string
+		for _, tc := range cfg.Tables {
+			tableNames = append(tableNames, postgres.TableToIceberg(tc.Name))
+		}
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, tableNames); err != nil {
 			return fmt.Errorf("ensure storage: %w", err)
 		}
 	}
@@ -700,10 +708,13 @@ func runMaintain(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("maintenance requires MetadataStore catalog")
 	}
 
-	// Ensure storage is available.
+	// Ensure storage is available (per-table routing for vended creds).
 	if clients.S3 == nil && len(cfg.Tables) > 0 {
-		firstTable := postgres.TableToIceberg(cfg.Tables[0].Name)
-		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, firstTable); err != nil {
+		var tableNames []string
+		for _, tc := range cfg.Tables {
+			tableNames = append(tableNames, postgres.TableToIceberg(tc.Name))
+		}
+		if err := clients.EnsureStorage(ctx, cfg.Sink.Namespace, tableNames); err != nil {
 			return fmt.Errorf("ensure storage: %w", err)
 		}
 	}

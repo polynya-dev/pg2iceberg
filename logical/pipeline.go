@@ -386,10 +386,13 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		}
 	}
 
-	// In vended credential mode, initialize S3 after tables are created in the catalog.
+	// In vended credential mode, initialize per-table S3 clients after tables are created.
 	if p.clients != nil && p.clients.S3 == nil && len(p.cfg.Tables) > 0 {
-		firstTable := postgres.TableToIceberg(p.cfg.Tables[0].Name)
-		if err := p.clients.EnsureStorage(ctx, p.cfg.Sink.Namespace, firstTable); err != nil {
+		var tableNames []string
+		for _, tc := range p.cfg.Tables {
+			tableNames = append(tableNames, postgres.TableToIceberg(tc.Name))
+		}
+		if err := p.clients.EnsureStorage(ctx, p.cfg.Sink.Namespace, tableNames); err != nil {
 			return fmt.Errorf("ensure storage: %w", err)
 		}
 		p.snk.SetS3(p.clients.S3)
