@@ -72,7 +72,7 @@ func (cs *CachedStream) Append(ctx context.Context, batches []WriteBatch) error 
 			if err != nil {
 				return fmt.Errorf("generate uuid: %w", err)
 			}
-			key := fmt.Sprintf("staged/%s/%s.parquet", b.Table, id.String())
+			key := stagingKey(b.BasePath, b.Table, id.String())
 			if _, err := cs.s3.Upload(gctx, key, b.Data); err != nil {
 				return fmt.Errorf("upload staged file for %s: %w", b.Table, err)
 			}

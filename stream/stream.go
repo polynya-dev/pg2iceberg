@@ -15,6 +15,17 @@ import (
 
 var streamTracer = otel.Tracer("pg2iceberg/stream")
 
+// stagingKey returns the S3 key for a staged WAL file.
+// When basePath is set (vended credential mode), files are placed under the
+// table's catalog location so they stay within the scoped STS session policy.
+// Otherwise falls back to the legacy global "staged/{table}/" prefix.
+func stagingKey(basePath, table, id string) string {
+	if basePath != "" {
+		return fmt.Sprintf("%s/staged/%s.parquet", basePath, id)
+	}
+	return fmt.Sprintf("staged/%s/%s.parquet", table, id)
+}
+
 // Stream is an append-only distributed log for staging WAL change events.
 // Writers call Append to stage files. Readers call Read + Download to consume.
 // No Iceberg catalog operations are on the write path.
@@ -57,6 +68,7 @@ func (s *BaseStream) Coordinator() Coordinator { return s.coord }
 // WriteBatch is a Parquet file chunk to stage in S3.
 type WriteBatch struct {
 	Table       string // PG table name (e.g. "public.orders")
+	BasePath    string // S3 key prefix for the table (e.g. "project/uuid1/uuid2")
 	Data        []byte // serialized Parquet bytes
 	RecordCount int    // number of change events
 
@@ -98,7 +110,7 @@ func (s *BaseStream) Append(ctx context.Context, batches []WriteBatch) error {
 			if err != nil {
 				return fmt.Errorf("generate uuid: %w", err)
 			}
-			key := fmt.Sprintf("staged/%s/%s.parquet", b.Table, id.String())
+			key := stagingKey(b.BasePath, b.Table, id.String())
 			if _, err := s.s3.Upload(gctx, key, b.Data); err != nil {
 				return fmt.Errorf("upload staged file for %s: %w", b.Table, err)
 			}

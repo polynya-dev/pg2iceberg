@@ -57,10 +57,11 @@ type tableSink struct {
 	// Source schema (user columns only).
 	srcSchema *postgres.TableSchema
 
-	icebergName string                 // materialized table name in Iceberg (e.g. "orders")
-	partSpec    *iceberg.PartitionSpec // materialized table partition spec
-	matSchemaID int                    // materialized table schema ID
-	targetSize  int64
+	icebergName   string                 // materialized table name in Iceberg (e.g. "orders")
+	partSpec      *iceberg.PartitionSpec // materialized table partition spec
+	matSchemaID   int                    // materialized table schema ID
+	targetSize    int64
+	tableBasePath string // S3 key prefix derived from catalog table location
 
 	// Single rolling writer for staged Parquet files.
 	// Uses the fixed stagedSchema (user data is JSON in _data).
@@ -176,12 +177,13 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *postgres.TableSchema) erro
 
 	targetSize := s.cfg.TargetFileSizeOrDefault()
 	tSink := &tableSink{
-		srcSchema:   ts,
-		icebergName: icebergTable,
-		partSpec:    partSpec,
-		matSchemaID: matSchemaID,
-		targetSize:  targetSize,
-		writer:      iceberg.NewRollingDataWriter(stagedSchema, targetSize),
+		srcSchema:     ts,
+		icebergName:   icebergTable,
+		partSpec:      partSpec,
+		matSchemaID:   matSchemaID,
+		targetSize:    targetSize,
+		tableBasePath: iceberg.TableBasePath(matTm.Metadata.Location, s.cfg.Namespace, icebergTable),
+		writer:        iceberg.NewRollingDataWriter(stagedSchema, targetSize),
 	}
 
 	s.tables[ts.Table] = tSink
@@ -440,6 +442,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 
 			batches = append(batches, stream.WriteBatch{
 				Table:       pgTable,
+				BasePath:    ts.tableBasePath,
 				Data:        chunk.Data,
 				RecordCount: count,
 				Events:      chunkEvents,
