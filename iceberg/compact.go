@@ -73,7 +73,6 @@ func ReadParquetRowsFromReaderAt(r io.ReaderAt, size int64, schema *postgres.Tab
 func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionConfig) (*PreparedCommit, error) {
 	cfg := tw.cfg
 	ns := cfg.Namespace
-	basePath := fmt.Sprintf("%s.db/%s", ns, cfg.IcebergName)
 
 	// Load table state from catalog cache (cache hit in steady state).
 	matTm, err := tw.catalog.LoadTable(ctx, ns, cfg.IcebergName)
@@ -83,6 +82,7 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	if matTm == nil || matTm.Metadata.CurrentSnapshotID <= 0 {
 		return nil, nil
 	}
+	basePath := TableBasePath(matTm.Metadata.Location, ns, cfg.IcebergName)
 	currentSnapID := matTm.Metadata.CurrentSnapshotID
 	lastSeqNum := matTm.Metadata.LastSequenceNumber
 

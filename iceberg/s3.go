@@ -111,6 +111,23 @@ func NewIAMS3Client(ctx context.Context, region, warehouse string) (*S3Client, e
 	return &S3Client{client: client, bucket: bucket}, nil
 }
 
+// TableBasePath extracts the S3 key prefix from an Iceberg table location.
+// For "s3://bucket/project/uuid1/uuid2/" it returns "project/uuid1/uuid2".
+// Falls back to the legacy "{ns}.db/{table}" pattern if location is empty or not an S3 URI.
+func TableBasePath(location, ns, table string) string {
+	if location != "" {
+		u, err := url.Parse(location)
+		if err == nil && u.Host != "" {
+			p := strings.TrimPrefix(u.Path, "/")
+			p = strings.TrimSuffix(p, "/")
+			if p != "" {
+				return p
+			}
+		}
+	}
+	return fmt.Sprintf("%s.db/%s", ns, table)
+}
+
 // Upload writes data to an S3 key and returns the full s3:// URI.
 func (c *S3Client) Upload(ctx context.Context, key string, data []byte) (string, error) {
 	ctx, span := s3tracer.Start(ctx, s3SpanName("s3.Upload", key), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(

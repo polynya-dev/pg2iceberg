@@ -133,7 +133,7 @@ func cleanOrphanFiles(ctx context.Context, s3 ObjectStorage, ns, table string, t
 
 	// 1. ListObjects in background.
 	var objects []ObjectInfo
-	prefix := fmt.Sprintf("%s.db/%s/", ns, table)
+	prefix := TableBasePath(tm.Metadata.Location, ns, table) + "/"
 	g.Go(func() error {
 		var err error
 		objects, err = s3.ListObjects(gctx, prefix)

@@ -13,12 +13,13 @@ import (
 // SnapshotWriterConfig holds configuration for direct snapshot writes
 // to a materialized Iceberg table.
 type SnapshotWriterConfig struct {
-	Namespace   string
-	IcebergName string
-	SrcSchema   *postgres.TableSchema
-	PartSpec    *PartitionSpec
-	SchemaID    int
-	TargetSize  int64
+	Namespace     string
+	IcebergName   string
+	TableLocation string // s3:// URI from catalog; used to derive S3 key prefix
+	SrcSchema     *postgres.TableSchema
+	PartSpec      *PartitionSpec
+	SchemaID      int
+	TargetSize    int64
 }
 
 // SnapshotWriter accumulates rows into per-partition RollingWriters and
@@ -98,7 +99,7 @@ func (sw *SnapshotWriter) RowCount() int {
 func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 	cfg := sw.cfg
 	partitioned := cfg.PartSpec != nil && !cfg.PartSpec.IsUnpartitioned()
-	basePath := fmt.Sprintf("%s.db/%s", cfg.Namespace, cfg.IcebergName)
+	basePath := TableBasePath(cfg.TableLocation, cfg.Namespace, cfg.IcebergName)
 
 	// Flush all partition writers to get file chunks.
 	type pendingFile struct {

@@ -182,13 +182,18 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress 
 	}
 
 	// Create the snapshot writer.
+	var tableLocation string
+	if matTm != nil {
+		tableLocation = matTm.Metadata.Location
+	}
 	sw := iceberg.NewSnapshotWriter(iceberg.SnapshotWriterConfig{
-		Namespace:   s.deps.SinkCfg.Namespace,
-		IcebergName: icebergName,
-		SrcSchema:   tbl.Schema,
-		PartSpec:    partSpec,
-		SchemaID:    schemaID,
-		TargetSize:  s.deps.LogicalCfg.SnapshotTargetFileSizeOrDefault(),
+		Namespace:     s.deps.SinkCfg.Namespace,
+		IcebergName:   icebergName,
+		TableLocation: tableLocation,
+		SrcSchema:     tbl.Schema,
+		PartSpec:      partSpec,
+		SchemaID:      schemaID,
+		TargetSize:    s.deps.LogicalCfg.SnapshotTargetFileSizeOrDefault(),
 	}, s.deps.Catalog, s.deps.S3)
 
 	log.Printf("[snapshot] %s: %d chunks (pages=%d, chunk_size=%d), resuming after chunk %d",

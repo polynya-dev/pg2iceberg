@@ -143,8 +143,10 @@ func (c LogicalConfig) SnapshotTargetFileSizeOrDefault() int64 {
 
 type SinkConfig struct {
 	CatalogURI   string `yaml:"catalog_uri" json:"catalog_uri"`
-	CatalogAuth  string `yaml:"catalog_auth" json:"catalog_auth,omitempty"`   // "" (none), "sigv4", or "bearer"
-	CatalogToken string `yaml:"catalog_token" json:"catalog_token,omitempty"` // Bearer token (required when catalog_auth=bearer)
+	CatalogAuth         string `yaml:"catalog_auth" json:"catalog_auth,omitempty"`                   // "" (none), "sigv4", "bearer", or "oauth2"
+	CatalogToken        string `yaml:"catalog_token" json:"catalog_token,omitempty"`               // Bearer token (required when catalog_auth=bearer)
+	CatalogClientID     string `yaml:"catalog_client_id" json:"catalog_client_id,omitempty"`       // OAuth2 client ID (required when catalog_auth=oauth2)
+	CatalogClientSecret string `yaml:"catalog_client_secret" json:"catalog_client_secret,omitempty"` // OAuth2 client secret (required when catalog_auth=oauth2)
 
 	CredentialMode string `yaml:"credential_mode" json:"credential_mode,omitempty"` // "static" (default) or "vended"
 
@@ -423,6 +425,12 @@ func (cfg *Config) ApplyEnv() error {
 	}
 	if v := os.Getenv("CATALOG_TOKEN"); v != "" {
 		cfg.Sink.CatalogToken = v
+	}
+	if v := os.Getenv("CATALOG_CLIENT_ID"); v != "" {
+		cfg.Sink.CatalogClientID = v
+	}
+	if v := os.Getenv("CATALOG_CLIENT_SECRET"); v != "" {
+		cfg.Sink.CatalogClientSecret = v
 	}
 	if v := os.Getenv("CREDENTIAL_MODE"); v != "" {
 		cfg.Sink.CredentialMode = v

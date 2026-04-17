@@ -37,6 +37,9 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 		httpClient = &http.Client{Transport: transport}
 	case "bearer":
 		httpClient = &http.Client{Transport: NewBearerTransport(cfg.CatalogToken)}
+	case "oauth2":
+		tokenURL := strings.TrimSuffix(cfg.CatalogURI, "/") + "/v1/oauth/tokens"
+		httpClient = &http.Client{Transport: NewOAuth2Transport(tokenURL, cfg.CatalogClientID, cfg.CatalogClientSecret)}
 	case "", "none":
 		// No auth.
 	default:
@@ -68,8 +71,13 @@ func NewClients(cfg config.SinkConfig) (*IcebergClients, error) {
 			ic.DiscoveredWarehouse = wh
 			log.Printf("[iceberg] discovered warehouse from catalog: %s", wh)
 		}
-		// Apply prefix override (required by some catalogs like Cloudflare R2).
-		if prefix, ok := cc.Overrides["prefix"]; ok && prefix != "" {
+		// Apply prefix from overrides or defaults (different catalogs use different fields).
+		// Cloudflare R2 uses overrides["prefix"], Lakekeeper uses defaults["prefix"].
+		prefix := cc.Overrides["prefix"]
+		if prefix == "" {
+			prefix = cc.Defaults["prefix"]
+		}
+		if prefix != "" {
 			catalogClient.SetPrefix(prefix)
 			log.Printf("[iceberg] using catalog prefix: %s", prefix)
 		}

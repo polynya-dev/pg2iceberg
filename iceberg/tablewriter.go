@@ -165,8 +165,6 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	targetSize := cfg.TargetSize
 	pkFieldIDs := ts.PKFieldIDs()
 	partitioned := partSpec != nil && !partSpec.IsUnpartitioned()
-	basePath := fmt.Sprintf("%s.db/%s", cfg.Namespace, cfg.IcebergName)
-
 	// Load table metadata from the catalog cache (cache hit in steady state,
 	// cold-start miss falls through to the real catalog).
 	var prevMatSnapID int64
@@ -179,6 +177,12 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 		prevMatSnapID = matTm.Metadata.CurrentSnapshotID
 		seqNum = matTm.Metadata.LastSequenceNumber + 1
 	}
+
+	var tableLocation string
+	if matTm != nil {
+		tableLocation = matTm.Metadata.Location
+	}
+	basePath := TableBasePath(tableLocation, cfg.Namespace, cfg.IcebergName)
 
 	now := time.Now()
 	snapshotID := now.UnixMilli()
