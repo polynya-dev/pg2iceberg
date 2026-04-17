@@ -4108,3 +4108,185 @@ func TestPipeline_AddTableToRunningPipeline(t *testing.T) {
 
 	t.Logf("success: new table snapshotted, existing table preserved with CDC catch-up")
 }
+
+// TestPipeline_RemoveTableFromRunningPipeline verifies that removing a table
+// from the config and restarting the pipeline works: the pipeline continues
+// streaming for the remaining tables, and the removed table's Iceberg data
+// stays intact in the catalog.
+func TestPipeline_RemoveTableFromRunningPipeline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE orders (id SERIAL PRIMARY KEY, total INTEGER NOT NULL);
+		CREATE TABLE products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, price INTEGER NOT NULL);
+	`)
+	if err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	for i := 1; i <= 20; i++ {
+		conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100)
+		conn.Exec(ctx, "INSERT INTO products (name, price) VALUES ($1, $2)", fmt.Sprintf("p-%d", i), i*10)
+	}
+	conn.Close(ctx)
+
+	slotName := "test_slot_rmtable"
+	pubName := "test_pub_rmtable"
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval:        "500ms",
+		FlushRows:            5,
+		FlushBytes:           1 << 30,
+		Namespace:            "test_ns",
+		Warehouse:            "s3://test-bucket/",
+		MaterializerInterval: "500ms",
+	}
+
+	// Phase 1: Start pipeline with both tables.
+	cfg1 := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.orders"},
+			{Name: "public.products"},
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical:  config.LogicalConfig{PublicationName: pubName, SlotName: slotName},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newMemCatalog()
+	coord1 := stream.NewMemCoordinator()
+	cpStore := pipeline.NewMemCheckpointStore()
+
+	snk1 := logical.NewSink(sinkCfg, cfg1.Tables, "test", mem, cat)
+	p1 := logical.NewPipeline("test", cfg1, snk1, cpStore, coord1)
+	snk1.SetStream(stream.NewCachedStream(coord1, mem, sinkCfg.Namespace))
+
+	if err := p1.Start(ctx); err != nil {
+		t.Fatalf("start pipeline (phase 1): %v", err)
+	}
+
+	waitForStatus(t, p1, pipeline.StatusRunning, 60*time.Second)
+	t.Log("phase 1: pipeline running — both tables snapshotted")
+
+	// Verify both tables exist.
+	ordersTm, _ := cat.LoadTable(ctx, "test_ns", "orders")
+	productsTm, _ := cat.LoadTable(ctx, "test_ns", "products")
+	if ordersTm == nil || ordersTm.Metadata.CurrentSnapshotID == 0 {
+		t.Fatal("expected orders to have snapshot data")
+	}
+	if productsTm == nil || productsTm.Metadata.CurrentSnapshotID == 0 {
+		t.Fatal("expected products to have snapshot data")
+	}
+	ordersRows := countDataRows(t, ctx, mem, ordersTm)
+	productsRows := countDataRows(t, ctx, mem, productsTm)
+	t.Logf("phase 1: orders=%d rows, products=%d rows", ordersRows, productsRows)
+
+	// Insert CDC rows for both tables.
+	conn, err = pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	for i := 21; i <= 25; i++ {
+		conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100)
+		conn.Exec(ctx, "INSERT INTO products (name, price) VALUES ($1, $2)", fmt.Sprintf("p-%d", i), i*10)
+	}
+
+	waitFor(t, 30*time.Second, func() bool {
+		return p1.Source().FlushedLSN() > 0
+	})
+
+	if err := p1.Stop(); err != nil {
+		t.Fatalf("stop pipeline: %v", err)
+	}
+	t.Log("phase 1: pipeline stopped")
+
+	// Record products snapshot count before restart — it should not change.
+	productsTm, _ = cat.LoadTable(ctx, "test_ns", "products")
+	productsSnapshotsBefore := len(productsTm.Metadata.Snapshots)
+	productsRowsBefore := countDataRows(t, ctx, mem, productsTm)
+	t.Logf("phase 1 final: products has %d rows, %d snapshots", productsRowsBefore, productsSnapshotsBefore)
+
+	// Insert more orders while down (to verify CDC catch-up).
+	for i := 26; i <= 30; i++ {
+		conn.Exec(ctx, "INSERT INTO orders (total) VALUES ($1)", i*100)
+	}
+	conn.Close(ctx)
+
+	// Phase 2: Restart with only "orders" (products removed from config).
+	cfg2 := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.orders"},
+			// public.products removed
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical:  config.LogicalConfig{PublicationName: pubName, SlotName: slotName},
+		},
+		Sink: sinkCfg,
+	}
+
+	coord2 := stream.NewMemCoordinator()
+	snk2 := logical.NewSink(sinkCfg, cfg2.Tables, "test", mem, cat)
+	p2 := logical.NewPipeline("test", cfg2, snk2, cpStore, coord2)
+	snk2.SetStream(stream.NewCachedStream(coord2, mem, sinkCfg.Namespace))
+
+	if err := p2.Start(ctx); err != nil {
+		t.Fatalf("start pipeline (phase 2): %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p2.Done()
+	}()
+
+	waitForStatus(t, p2, pipeline.StatusRunning, 60*time.Second)
+	t.Log("phase 2: pipeline running — only orders")
+
+	// Wait for CDC catch-up.
+	waitFor(t, 30*time.Second, func() bool {
+		return p2.Source().FlushedLSN() > p1.Source().FlushedLSN()
+	})
+
+	// Verify orders is still working with CDC catch-up.
+	ordersTm, _ = cat.LoadTable(ctx, "test_ns", "orders")
+	ordersRows = countDataRows(t, ctx, mem, ordersTm)
+	t.Logf("phase 2: orders has %d rows", ordersRows)
+	if ordersRows < 25 {
+		t.Fatalf("expected at least 25 orders rows, got %d", ordersRows)
+	}
+
+	// Verify products Iceberg data is untouched — same snapshots, same rows.
+	productsTm, _ = cat.LoadTable(ctx, "test_ns", "products")
+	if productsTm == nil {
+		t.Fatal("products table should still exist in catalog after removal from config")
+	}
+	productsSnapshotsAfter := len(productsTm.Metadata.Snapshots)
+	productsRowsAfter := countDataRows(t, ctx, mem, productsTm)
+	t.Logf("phase 2: products has %d rows, %d snapshots (unchanged)", productsRowsAfter, productsSnapshotsAfter)
+
+	if productsRowsAfter != productsRowsBefore {
+		t.Fatalf("products rows changed: was %d, now %d — data should be untouched", productsRowsBefore, productsRowsAfter)
+	}
+	if productsSnapshotsAfter != productsSnapshotsBefore {
+		t.Fatalf("products snapshots changed: was %d, now %d — should be untouched", productsSnapshotsBefore, productsSnapshotsAfter)
+	}
+
+	t.Logf("success: removed table data preserved, pipeline continues with remaining tables")
+}
