@@ -219,7 +219,6 @@ func collectSnapshotRefs(ctx context.Context, s3 ObjectStorage, manifestListURI 
 	// Download all manifests within this snapshot concurrently.
 	g, gctx := errgroup.WithContext(ctx)
 	for _, mfi := range manifests {
-		mfi := mfi
 		g.Go(func() error {
 			mKey, err := KeyFromURI(mfi.Path)
 			if err != nil {
