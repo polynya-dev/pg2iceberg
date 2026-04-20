@@ -189,7 +189,11 @@ func (ms *MetadataStore) CommitTransaction(ctx context.Context, ns string, commi
 		// the stale CurrentSnapshotID causes repeated 409 failures.
 		ms.mu.Lock()
 		for _, tc := range commits {
-			delete(ms.tables, tableKey{ns, tc.Table})
+			tcNs := tc.Namespace
+			if tcNs == "" {
+				tcNs = ns
+			}
+			delete(ms.tables, tableKey{tcNs, tc.Table})
 		}
 		ms.mu.Unlock()
 		return err
@@ -197,7 +201,11 @@ func (ms *MetadataStore) CommitTransaction(ctx context.Context, ns string, commi
 
 	ms.mu.Lock()
 	for _, tc := range commits {
-		key := tableKey{ns, tc.Table}
+		tcNs := tc.Namespace
+		if tcNs == "" {
+			tcNs = ns
+		}
+		key := tableKey{tcNs, tc.Table}
 		ms.applySnapshotLocked(key, tc.Snapshot)
 		ms.applyPostCommitLocked(key, tc)
 	}

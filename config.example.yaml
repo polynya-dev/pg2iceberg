@@ -69,6 +69,12 @@ sink:
   # Compaction settings (used by materializer for target file size)
   # compaction_target_size: 268435456  # 256MB - target merged file size
 
+  # Control-plane metadata tables (commits + checkpoints) written to a
+  # separate Iceberg namespace for customer-facing observability. Rows are
+  # piggybacked on the data commit so they're atomically consistent.
+  # meta_enabled: true          # default: true
+  # meta_namespace: _pg2iceberg # default: _pg2iceberg
+
 # State checkpoint storage.
 # By default, checkpoints are stored in the source postgres under the _pg2iceberg schema.
 # To use a separate postgres, set postgres_url. To use a local file (dev only), set path.

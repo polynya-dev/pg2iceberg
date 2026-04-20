@@ -59,6 +59,10 @@ type Materializer struct {
 	// goroutine and the shutdown MaterializeAll() from processing the same
 	// events concurrently (which would cause duplicate rows).
 	cycleMu sync.Mutex
+
+	// Meta records control-plane commit/checkpoint rows piggybacked on the
+	// materialize transaction. Nil when meta is disabled.
+	Meta *iceberg.MetaRecorder
 }
 
 // InvalidateFileIndices is a no-op. The SnapshotWriter now seeds the FileIndex
@@ -210,6 +214,8 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 
 	ctx, span := matTracer.Start(ctx, "pg2iceberg.materialize")
 	defer span.End()
+
+	cycleStart := time.Now()
 
 	coord := m.stream.Coordinator()
 
@@ -389,6 +395,47 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		}
 	}
 
+	// Piggyback control-plane meta rows on the same CommitTransaction so
+	// each materialize commit atomically produces one stats row per table.
+	if m.Meta != nil {
+		durationMs := time.Since(cycleStart).Milliseconds()
+		for _, p := range prepared {
+			var rows int64
+			var maxLSN int64
+			for _, e := range p.events {
+				rows++
+				if e.lsn > maxLSN {
+					maxLSN = e.lsn
+				}
+			}
+			var bytes int64
+			if p.prepared != nil {
+				for _, fe := range p.prepared.NewDataFiles {
+					bytes += fe.DataFile.FileSizeBytes
+				}
+			}
+			m.Meta.RecordFlush(iceberg.FlushStats{
+				Ts:             cycleStart,
+				TableName:      p.pgTable,
+				Mode:           iceberg.CommitModeMaterialize,
+				SnapshotID:     p.commit.SnapshotID,
+				SequenceNumber: p.commit.SequenceNumber,
+				LSN:            maxLSN,
+				Rows:           rows,
+				Bytes:          bytes,
+				DurationMs:     durationMs,
+				DataFiles:      p.dataCount,
+				DeleteFiles:    p.deleteCount,
+			})
+		}
+		metaCommits, err := m.Meta.BuildCommits(commitCtx)
+		if err != nil {
+			log.Printf("[materializer] build meta commits: %v (continuing without meta)", err)
+		} else {
+			commits = append(commits, metaCommits...)
+		}
+	}
+
 	if err := m.catalog.CommitTransaction(commitCtx, m.cfg.Namespace, commits); err != nil {
 
 		for _, p := range prepared {
@@ -423,6 +470,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 	for _, p := range prepared {
 		tw := m.tableWriters[p.pgTable]
 		ts := m.tables[p.pgTable]
+		compactStart := time.Now()
 		compacted, err := tw.Compact(ctx, ts.srcSchema.PK, cc)
 		if err != nil {
 			log.Printf("[materializer] compaction error for %s: %v", p.pgTable, err)
@@ -431,7 +479,24 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, []iceberg.TableCommit{compacted.ToTableCommit()})
+		compactCommits := []iceberg.TableCommit{compacted.ToTableCommit()}
+		if m.Meta != nil && compacted.Compaction != nil {
+			m.Meta.RecordCompaction(iceberg.CompactionStats{
+				Ts:                compactStart,
+				TableName:         p.pgTable,
+				SnapshotID:        compacted.Commit.SnapshotID,
+				SequenceNumber:    compacted.Commit.SequenceNumber,
+				DurationMs:        time.Since(compactStart).Milliseconds(),
+				CompactionMetrics: *compacted.Compaction,
+			})
+			metaCommits, merr := m.Meta.BuildCommits(ctx)
+			if merr != nil {
+				log.Printf("[materializer] build meta compaction commits: %v", merr)
+			} else {
+				compactCommits = append(compactCommits, metaCommits...)
+			}
+		}
+		err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, compactCommits)
 		if err != nil {
 			log.Printf("[materializer] compaction commit error for %s: %v", p.pgTable, err)
 			continue

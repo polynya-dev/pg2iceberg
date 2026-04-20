@@ -377,6 +377,7 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	// Build entries using pre-computed URIs.
 	var dataUploads []PendingData
 	var newDataEntries []ManifestEntry
+	var bytesAfter int64
 	for i, chunk := range chunks {
 		key := fmt.Sprintf("%s/data/%s-compact-%d.parquet", basePath, uuid.New().String(), i)
 		newDataEntries = append(newDataEntries, ManifestEntry{
@@ -390,6 +391,15 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 			},
 		})
 		dataUploads = append(dataUploads, PendingData{Key: key, Data: chunk.Data})
+		bytesAfter += int64(len(chunk.Data))
+	}
+
+	var bytesBefore int64
+	for _, df := range filesToRewrite {
+		bytesBefore += df.FileSizeBytes
+	}
+	for _, df := range deleteFiles {
+		bytesBefore += df.FileSizeBytes
 	}
 
 	allEntries := append(carriedEntries, newDataEntries...)
@@ -436,5 +446,14 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 		DeleteCount:    len(deleteFiles),
 		DeleteRowCount: deletedRows,
 		BucketCount:    len(chunks),
+		Compaction: &CompactionMetrics{
+			InputDataFiles:   len(filesToRewrite),
+			InputDeleteFiles: len(deleteFiles),
+			OutputDataFiles:  len(allEntries),
+			RowsRewritten:    totalRewriteRows,
+			RowsRemoved:      deletedRows,
+			BytesBefore:      bytesBefore,
+			BytesAfter:       bytesAfter,
+		},
 	}, nil
 }

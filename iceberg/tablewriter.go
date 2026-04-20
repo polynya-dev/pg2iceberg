@@ -57,6 +57,22 @@ type PreparedCommit struct {
 	DeleteCount    int
 	DeleteRowCount int64
 	BucketCount    int
+
+	// Compaction returns this filled in; Prepare leaves it nil.
+	Compaction *CompactionMetrics
+}
+
+// CompactionMetrics captures input/output counts and byte sizes for a
+// single compaction commit, used to populate the control-plane
+// `compactions` meta table.
+type CompactionMetrics struct {
+	InputDataFiles   int
+	InputDeleteFiles int
+	OutputDataFiles  int
+	RowsRewritten    int64
+	RowsRemoved      int64
+	BytesBefore      int64
+	BytesAfter       int64
 }
 
 // FileIndexEntry pairs a data file with the PK keys it contains.

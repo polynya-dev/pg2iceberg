@@ -50,6 +50,8 @@ type Pipeline struct {
 	coord        stream.Coordinator
 	str          stream.Stream
 
+	meta *iceberg.MetaRecorder
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	mu     sync.RWMutex
@@ -403,6 +405,19 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	p.str = stream.NewCachedStream(p.coord, p.snk.S3(), p.cfg.Sink.Namespace)
 	p.snk.SetStream(p.str)
 
+	// Initialize control-plane metadata tables (commits, checkpoints).
+	if p.cfg.Sink.MetaEnabledOrDefault() {
+		metaNs := p.cfg.Sink.MetaNamespaceOrDefault()
+		if err := iceberg.EnsureMetaTables(ctx, p.snk.Catalog(), p.cfg.Sink.Warehouse, metaNs); err != nil {
+			return fmt.Errorf("ensure meta tables: %w", err)
+		}
+		rec, err := iceberg.NewMetaRecorder(ctx, metaNs, p.cfg.Sink.MaterializerWorkerID, p.snk.Catalog(), p.snk.S3())
+		if err != nil {
+			return fmt.Errorf("create meta recorder: %w", err)
+		}
+		p.meta = rec
+	}
+
 	// Ensure materializer cursors exist for all registered tables (default group).
 	// Distributed materializer workers with a consumer group will also call
 	// EnsureCursor for their group on first cycle.
@@ -417,6 +432,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 
 	// Start materializer.
 	materializer := NewMaterializer(p.cfg.Sink, p.snk.Catalog(), p.snk.S3(), p.snk.Tables(), p.str)
+	materializer.Meta = p.meta
 	if p.cfg.Sink.MaterializerWorkerID != "" {
 		materializer.WorkerID = p.cfg.Sink.MaterializerWorkerID
 		materializer.ConsumerGroup = p.cfg.Source.Logical.PublicationName
@@ -753,6 +769,11 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 
 	p.src.SetFlushedLSN(cp.LSN)
 
+	p.meta.RecordCheckpoint(iceberg.CheckpointStats{
+		WorkerID: p.cfg.Sink.MaterializerWorkerID,
+		LSN:      int64(cp.LSN),
+	})
+
 	// Invalidate materializer file indices so they pick up snapshot-written files.
 	if p.materializer != nil {
 		p.materializer.InvalidateFileIndices()
@@ -823,6 +844,12 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	}
 
 	p.src.SetFlushedLSN(cp.LSN)
+
+	p.meta.RecordCheckpoint(iceberg.CheckpointStats{
+		WorkerID:    p.cfg.Sink.MaterializerWorkerID,
+		LSN:         int64(cp.LSN),
+		LastFlushAt: p.lastFlushAt,
+	})
 
 	return nil
 }
