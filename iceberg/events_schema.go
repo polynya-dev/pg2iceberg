@@ -12,9 +12,12 @@ func EventsTableName(icebergTable string) string {
 	return icebergTable + "_events"
 }
 
-// StagedEventSchema returns the fixed Parquet schema used for staged WAL files.
-// This schema never changes regardless of source table schema evolution —
-// user columns are JSON-encoded into the _data column.
+// StagedEventSchema returns the Parquet schema for staged WAL files.
+// User columns are JSON-encoded into the _data column.
+//
+// Evolution rule: columns are append-only and nullable so the materializer
+// can read files written by older versions (parquet returns null for
+// absent columns).
 //
 // Columns:
 //
@@ -23,6 +26,7 @@ func EventsTableName(icebergTable string) string {
 //	_ts              TIMESTAMPTZ PG commit time
 //	_unchanged_cols  TEXT        comma-separated (nullable)
 //	_data            TEXT        JSON-encoded user columns
+//	_xid             INT8        PG transaction ID (nullable; null in older files)
 func StagedEventSchema() *postgres.TableSchema {
 	return &postgres.TableSchema{
 		Table: "__staged_events__",
@@ -32,6 +36,7 @@ func StagedEventSchema() *postgres.TableSchema {
 			{Name: "_ts", PGType: postgres.TimestampTZ, IsNullable: false, FieldID: 3},
 			{Name: "_unchanged_cols", PGType: postgres.Text, IsNullable: true, FieldID: 4},
 			{Name: "_data", PGType: postgres.Text, IsNullable: false, FieldID: 5},
+			{Name: "_xid", PGType: postgres.Int8, IsNullable: true, FieldID: 6},
 		},
 	}
 }

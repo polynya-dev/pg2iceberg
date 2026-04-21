@@ -328,6 +328,8 @@ func (s *Sink) writeDirect(event postgres.ChangeEvent) error {
 		return nil
 	}
 	me.lsn = int64(event.LSN)
+	me.sourceTs = event.SourceTimestamp
+	me.xid = int64(event.TransactionID)
 
 	// JSON-encode user columns for the _data field.
 	dataJSON, err := json.Marshal(me.row)
@@ -337,10 +339,13 @@ func (s *Sink) writeDirect(event postgres.ChangeEvent) error {
 
 	// Build the fixed-schema Parquet row.
 	row := map[string]any{
-		"_op":  me.op,
-		"_lsn": me.lsn,
-		"_ts":  event.SourceTimestamp,
+		"_op":   me.op,
+		"_lsn":  me.lsn,
+		"_ts":   event.SourceTimestamp,
 		"_data": string(dataJSON),
+	}
+	if me.xid != 0 {
+		row["_xid"] = me.xid
 	}
 	if len(me.unchangedCols) > 0 {
 		row["_unchanged_cols"] = iceberg.UnchangedColsString(me.unchangedCols)

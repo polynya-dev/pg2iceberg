@@ -377,6 +377,7 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	// Build entries using pre-computed URIs.
 	var dataUploads []PendingData
 	var newDataEntries []ManifestEntry
+	var bytesAfter int64
 	for i, chunk := range chunks {
 		key := fmt.Sprintf("%s/data/%s-compact-%d.parquet", basePath, uuid.New().String(), i)
 		newDataEntries = append(newDataEntries, ManifestEntry{
@@ -390,6 +391,15 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 			},
 		})
 		dataUploads = append(dataUploads, PendingData{Key: key, Data: chunk.Data})
+		bytesAfter += int64(len(chunk.Data))
+	}
+
+	var bytesBefore int64
+	for _, df := range filesToRewrite {
+		bytesBefore += df.FileSizeBytes
+	}
+	for _, df := range deleteFiles {
+		bytesBefore += df.FileSizeBytes
 	}
 
 	allEntries := append(carriedEntries, newDataEntries...)
@@ -416,15 +426,36 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 	log.Printf("[compact] %s: %d files -> %d files (%d rewritten, %d carried, %d deletes applied, %d rows removed)",
 		cfg.IcebergName, beforeFiles, afterFiles, len(filesToRewrite), len(carriedEntries), len(deleteFiles), deletedRows)
 
+	var outputRows int64
+	for _, e := range newDataEntries {
+		outputRows += e.DataFile.RecordCount
+	}
+	var inputDataBytes, inputDeleteBytes int64
+	var inputDataRows int64
+	for _, df := range filesToRewrite {
+		inputDataBytes += df.FileSizeBytes
+		inputDataRows += df.RecordCount
+	}
+	for _, df := range deleteFiles {
+		inputDeleteBytes += df.FileSizeBytes
+	}
+	delta := SummaryDelta{
+		AddedDataFiles:         int64(len(newDataEntries)),
+		AddedRecords:           outputRows,
+		AddedFilesSize:         bytesAfter,
+		RemovedDataFiles:       int64(len(filesToRewrite)),
+		RemovedRecords:         inputDataRows,
+		RemovedFilesSize:       inputDataBytes + inputDeleteBytes,
+		RemovedDeleteFiles:     int64(len(deleteFiles)),
+		RemovedEqualityDeletes: int64(len(deletePKSeq)),
+	}
 	commit := SnapshotCommit{
 		SnapshotID:       snapshotID,
 		SequenceNumber:   seqNum,
 		TimestampMs:      now.UnixMilli(),
 		ManifestListPath: mlURI,
 		SchemaID:         cfg.SchemaID,
-		Summary: map[string]string{
-			"operation": "replace",
-		},
+		Summary:          BuildSummary("replace", PrevSnapshotSummary(matTm, currentSnapID), delta),
 	}
 
 	return &PreparedCommit{
@@ -436,5 +467,14 @@ func (tw *TableWriter) Compact(ctx context.Context, pk []string, cc CompactionCo
 		DeleteCount:    len(deleteFiles),
 		DeleteRowCount: deletedRows,
 		BucketCount:    len(chunks),
+		Compaction: &CompactionMetrics{
+			InputDataFiles:   len(filesToRewrite),
+			InputDeleteFiles: len(deleteFiles),
+			OutputDataFiles:  len(allEntries),
+			RowsRewritten:    totalRewriteRows,
+			RowsRemoved:      deletedRows,
+			BytesBefore:      bytesBefore,
+			BytesAfter:       bytesAfter,
+		},
 	}, nil
 }

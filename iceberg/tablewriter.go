@@ -57,6 +57,22 @@ type PreparedCommit struct {
 	DeleteCount    int
 	DeleteRowCount int64
 	BucketCount    int
+
+	// Compaction returns this filled in; Prepare leaves it nil.
+	Compaction *CompactionMetrics
+}
+
+// CompactionMetrics captures input/output counts and byte sizes for a
+// single compaction commit, used to populate the control-plane
+// `compactions` meta table.
+type CompactionMetrics struct {
+	InputDataFiles   int
+	InputDeleteFiles int
+	OutputDataFiles  int
+	RowsRewritten    int64
+	RowsRemoved      int64
+	BytesBefore      int64
+	BytesAfter       int64
 }
 
 // FileIndexEntry pairs a data file with the PK keys it contains.
@@ -458,15 +474,29 @@ func (tw *TableWriter) Prepare(ctx context.Context, rows []RowState, pk []string
 	mlURI := bundle.ManifestListURI
 	allManifests := bundle.AllManifests
 
+	var addedDataRows, addedDataBytes int64
+	for _, e := range dataEntries {
+		addedDataRows += e.DataFile.RecordCount
+		addedDataBytes += e.DataFile.FileSizeBytes
+	}
+	var addedDeleteBytes int64
+	for _, e := range deleteEntries {
+		addedDeleteBytes += e.DataFile.FileSizeBytes
+	}
+	delta := SummaryDelta{
+		AddedDataFiles:         int64(len(dataEntries)),
+		AddedRecords:           addedDataRows,
+		AddedFilesSize:         addedDataBytes + addedDeleteBytes,
+		AddedDeleteFiles:       int64(len(deleteEntries)),
+		AddedEqualityDeletes:   totalDeleteRows,
+	}
 	commit := SnapshotCommit{
 		SnapshotID:       snapshotID,
 		SequenceNumber:   seqNum,
 		TimestampMs:      now.UnixMilli(),
 		ManifestListPath: mlURI,
 		SchemaID:         cfg.SchemaID,
-		Summary: map[string]string{
-			"operation": "overwrite",
-		},
+		Summary:          BuildSummary("overwrite", PrevSnapshotSummary(matTm, prevMatSnapID), delta),
 	}
 
 	return &PreparedCommit{

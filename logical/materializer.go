@@ -59,6 +59,10 @@ type Materializer struct {
 	// goroutine and the shutdown MaterializeAll() from processing the same
 	// events concurrently (which would cause duplicate rows).
 	cycleMu sync.Mutex
+
+	// Meta records control-plane commit/checkpoint rows piggybacked on the
+	// materialize transaction. Nil when meta is disabled.
+	Meta *iceberg.MetaRecorder
 }
 
 // InvalidateFileIndices is a no-op. The SnapshotWriter now seeds the FileIndex
@@ -210,6 +214,8 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 
 	ctx, span := matTracer.Start(ctx, "pg2iceberg.materialize")
 	defer span.End()
+
+	cycleStart := time.Now()
 
 	coord := m.stream.Coordinator()
 
@@ -389,6 +395,58 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		}
 	}
 
+	// Piggyback control-plane meta rows on the same CommitTransaction so
+	// each materialize commit atomically produces one stats row per table.
+	if m.Meta != nil {
+		durationMs := time.Since(cycleStart).Milliseconds()
+		for _, p := range prepared {
+			var rows int64
+			var maxLSN int64
+			var maxSourceTs time.Time
+			xids := make(map[int64]struct{})
+			for _, e := range p.events {
+				rows++
+				if e.lsn > maxLSN {
+					maxLSN = e.lsn
+				}
+				if e.sourceTs.After(maxSourceTs) {
+					maxSourceTs = e.sourceTs
+				}
+				if e.xid != 0 {
+					xids[e.xid] = struct{}{}
+				}
+			}
+			var bytes int64
+			if p.prepared != nil {
+				for _, fe := range p.prepared.NewDataFiles {
+					bytes += fe.DataFile.FileSizeBytes
+				}
+			}
+			m.Meta.RecordFlush(iceberg.FlushStats{
+				Ts:             cycleStart,
+				TableName:      p.pgTable,
+				Mode:           iceberg.CommitModeMaterialize,
+				SnapshotID:     p.commit.SnapshotID,
+				SequenceNumber: p.commit.SequenceNumber,
+				SchemaID:       p.commit.SchemaID,
+				TxCount:        len(xids),
+				MaxSourceTs:    maxSourceTs,
+				LSN:            maxLSN,
+				Rows:           rows,
+				Bytes:          bytes,
+				DurationMs:     durationMs,
+				DataFiles:      p.dataCount,
+				DeleteFiles:    p.deleteCount,
+			})
+		}
+		metaCommits, err := m.Meta.BuildCommits(commitCtx)
+		if err != nil {
+			log.Printf("[materializer] build meta commits: %v (continuing without meta)", err)
+		} else {
+			commits = append(commits, metaCommits...)
+		}
+	}
+
 	if err := m.catalog.CommitTransaction(commitCtx, m.cfg.Namespace, commits); err != nil {
 
 		for _, p := range prepared {
@@ -423,6 +481,7 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 	for _, p := range prepared {
 		tw := m.tableWriters[p.pgTable]
 		ts := m.tables[p.pgTable]
+		compactStart := time.Now()
 		compacted, err := tw.Compact(ctx, ts.srcSchema.PK, cc)
 		if err != nil {
 			log.Printf("[materializer] compaction error for %s: %v", p.pgTable, err)
@@ -431,7 +490,24 @@ func (m *Materializer) materializeCycle(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, []iceberg.TableCommit{compacted.ToTableCommit()})
+		compactCommits := []iceberg.TableCommit{compacted.ToTableCommit()}
+		if m.Meta != nil && compacted.Compaction != nil {
+			m.Meta.RecordCompaction(iceberg.CompactionStats{
+				Ts:                compactStart,
+				TableName:         p.pgTable,
+				SnapshotID:        compacted.Commit.SnapshotID,
+				SequenceNumber:    compacted.Commit.SequenceNumber,
+				DurationMs:        time.Since(compactStart).Milliseconds(),
+				CompactionMetrics: *compacted.Compaction,
+			})
+			metaCommits, merr := m.Meta.BuildCommits(ctx)
+			if merr != nil {
+				log.Printf("[materializer] build meta compaction commits: %v", merr)
+			} else {
+				compactCommits = append(compactCommits, metaCommits...)
+			}
+		}
+		err = m.catalog.CommitTransaction(ctx, m.cfg.Namespace, compactCommits)
 		if err != nil {
 			log.Printf("[materializer] compaction commit error for %s: %v", p.pgTable, err)
 			continue
@@ -446,6 +522,8 @@ type MatEvent struct {
 	op            string // "I", "U", "D"
 	lsn           int64
 	seq           int64
+	xid           int64     // PG transaction ID; 0 if unknown (snapshot or pre-v2 staged files)
+	sourceTs      time.Time // PG commit timestamp of the source event
 	unchangedCols []string
 	row           map[string]any // user columns only
 }
@@ -795,6 +873,20 @@ func (m *Materializer) readEventsFromParquet(ctx context.Context, s3Path string)
 		ev := MatEvent{
 			op:  fmt.Sprintf("%v", row["_op"]),
 			lsn: lsn,
+		}
+
+		// _ts is written as TimestampTZ and round-trips as int64 micros
+		// via parquet. Use ToTime to normalize either representation.
+		if tsVal, ok := row["_ts"]; ok && tsVal != nil {
+			ev.sourceTs = iceberg.ToTime(tsVal, postgres.TimestampTZ)
+		}
+
+		// _xid is nullable and absent in files written before the schema
+		// was extended — parquet returns nil in that case.
+		if xidVal, ok := row["_xid"]; ok && xidVal != nil {
+			if xid, err := iceberg.ToInt64(xidVal); err == nil {
+				ev.xid = xid
+			}
 		}
 
 		if uc, ok := row["_unchanged_cols"]; ok && uc != nil {

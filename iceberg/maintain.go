@@ -28,14 +28,25 @@ type MaintenanceConfig struct {
 	OrphanGracePeriod time.Duration // don't delete files newer than this
 }
 
+// MaintenanceResult captures per-phase counts and timing for one MaintainTable run.
+type MaintenanceResult struct {
+	SnapshotsExpired int
+	ExpireDuration   time.Duration
+	OrphansDeleted   int
+	OrphanBytesFreed int64
+	CleanupDuration  time.Duration
+}
+
 // MaintainTable runs snapshot expiry and orphan file deletion for a single table.
-func MaintainTable(ctx context.Context, catalog MaintenanceCatalog, s3 ObjectStorage, ns, table string, cfg MaintenanceConfig) error {
+// Returns per-phase stats so callers can record them to the meta tables.
+func MaintainTable(ctx context.Context, catalog MaintenanceCatalog, s3 ObjectStorage, ns, table string, cfg MaintenanceConfig) (MaintenanceResult, error) {
 	ctx, span := maintainTracer.Start(ctx, "maintain.Table "+table, trace.WithAttributes(
 		attribute.String("iceberg.namespace", ns),
 		attribute.String("iceberg.table", table),
 	))
 	defer span.End()
 
+	var result MaintenanceResult
 	start := time.Now()
 	defer func() {
 		pipeline.MaintenanceDurationSeconds.WithLabelValues(table).Observe(time.Since(start).Seconds())
@@ -46,17 +57,20 @@ func MaintainTable(ctx context.Context, catalog MaintenanceCatalog, s3 ObjectSto
 	tm, err := catalog.LoadTable(ctx, ns, table)
 	if err != nil {
 		pipeline.MaintenanceErrorsTotal.WithLabelValues(table).Inc()
-		return fmt.Errorf("load table %s: %w", table, err)
+		return result, fmt.Errorf("load table %s: %w", table, err)
 	}
 	if tm == nil {
-		return nil // table doesn't exist
+		return result, nil // table doesn't exist
 	}
 
 	// 2. Expire old snapshots.
+	expireStart := time.Now()
 	expired, err := expireSnapshots(ctx, catalog, ns, table, tm, cfg.SnapshotRetention)
+	result.ExpireDuration = time.Since(expireStart)
+	result.SnapshotsExpired = expired
 	if err != nil {
 		pipeline.MaintenanceErrorsTotal.WithLabelValues(table).Inc()
-		return fmt.Errorf("expire snapshots for %s: %w", table, err)
+		return result, fmt.Errorf("expire snapshots for %s: %w", table, err)
 	}
 	if expired > 0 {
 		pipeline.MaintenanceSnapshotsExpiredTotal.WithLabelValues(table).Add(float64(expired))
@@ -68,22 +82,26 @@ func MaintainTable(ctx context.Context, catalog MaintenanceCatalog, s3 ObjectSto
 		tm, err = catalog.LoadTable(ctx, ns, table)
 		if err != nil {
 			pipeline.MaintenanceErrorsTotal.WithLabelValues(table).Inc()
-			return fmt.Errorf("reload table %s after expiry: %w", table, err)
+			return result, fmt.Errorf("reload table %s after expiry: %w", table, err)
 		}
 	}
 
 	// 3. Clean orphan files.
-	deleted, err := cleanOrphanFiles(ctx, s3, ns, table, tm, cfg.OrphanGracePeriod)
+	cleanStart := time.Now()
+	deleted, bytesFreed, err := cleanOrphanFiles(ctx, s3, ns, table, tm, cfg.OrphanGracePeriod)
+	result.CleanupDuration = time.Since(cleanStart)
+	result.OrphansDeleted = deleted
+	result.OrphanBytesFreed = bytesFreed
 	if err != nil {
 		pipeline.MaintenanceErrorsTotal.WithLabelValues(table).Inc()
-		return fmt.Errorf("clean orphans for %s: %w", table, err)
+		return result, fmt.Errorf("clean orphans for %s: %w", table, err)
 	}
 	if deleted > 0 {
 		pipeline.MaintenanceOrphansDeletedTotal.WithLabelValues(table).Add(float64(deleted))
-		log.Printf("[maintain] %s: deleted %d orphan files", table, deleted)
+		log.Printf("[maintain] %s: deleted %d orphan files (%d bytes)", table, deleted, bytesFreed)
 	}
 
-	return nil
+	return result, nil
 }
 
 // expireSnapshots removes snapshots older than retention, never removing the current snapshot.
@@ -123,9 +141,9 @@ func expireSnapshots(ctx context.Context, catalog MaintenanceCatalog, ns, table 
 //   - Each snapshot's manifest tree is walked concurrently
 //   - Within each snapshot, manifest downloads are concurrent
 //   - Delete batches are concurrent (handled by S3Client.DeleteObjects)
-func cleanOrphanFiles(ctx context.Context, s3 ObjectStorage, ns, table string, tm *TableMetadata, gracePeriod time.Duration) (int, error) {
+func cleanOrphanFiles(ctx context.Context, s3 ObjectStorage, ns, table string, tm *TableMetadata, gracePeriod time.Duration) (int, int64, error) {
 	if tm == nil || tm.Metadata.CurrentSnapshotID <= 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	// Run ListObjects and manifest walks concurrently.
@@ -170,12 +188,13 @@ func cleanOrphanFiles(ctx context.Context, s3 ObjectStorage, ns, table string, t
 	}
 
 	if err := g.Wait(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	// 3. Diff: orphans = listed - referenced - grace-period-protected.
 	graceCutoff := time.Now().Add(-gracePeriod)
 	var orphanKeys []string
+	var orphanBytes int64
 	for _, obj := range objects {
 		if referenced[obj.Key] {
 			continue
@@ -184,17 +203,18 @@ func cleanOrphanFiles(ctx context.Context, s3 ObjectStorage, ns, table string, t
 			continue
 		}
 		orphanKeys = append(orphanKeys, obj.Key)
+		orphanBytes += obj.Size
 	}
 
 	if len(orphanKeys) == 0 {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	// 4. Delete orphans (batches parallelized inside S3Client.DeleteObjects).
 	if err := s3.DeleteObjects(ctx, orphanKeys); err != nil {
-		return 0, fmt.Errorf("delete orphan files: %w", err)
+		return 0, 0, fmt.Errorf("delete orphan files: %w", err)
 	}
-	return len(orphanKeys), nil
+	return len(orphanKeys), orphanBytes, nil
 }
 
 // collectSnapshotRefs downloads a snapshot's manifest list and all its manifests,

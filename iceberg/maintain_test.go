@@ -84,7 +84,7 @@ func TestMaintainTable_PreservesMetadataFile(t *testing.T) {
 	}
 
 	// Run maintenance with zero grace period — all unreferenced old files are eligible.
-	err = MaintainTable(ctx, catalog, s3, ns, "orders", MaintenanceConfig{
+	_, err = MaintainTable(ctx, catalog, s3, ns, "orders", MaintenanceConfig{
 		SnapshotRetention: 24 * time.Hour,
 		OrphanGracePeriod: 0,
 	})

@@ -1887,14 +1887,18 @@ func (c *memCatalog) CommitSnapshot(_ context.Context, ns, table string, current
 
 func (c *memCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
 	for _, tc := range commits {
-		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
+		tcNs := tc.Namespace
+		if tcNs == "" {
+			tcNs = ns
+		}
+		if err := c.CommitSnapshot(ctx, tcNs, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
 		}
 		if tc.NewManifests != nil {
-			c.SetManifests(ns, tc.Table, tc.NewManifests)
+			c.SetManifests(tcNs, tc.Table, tc.NewManifests)
 		}
 		// Apply incremental file index updates (mirrors MetadataStore behavior).
-		fi := c.FileIndex(ns, tc.Table)
+		fi := c.FileIndex(tcNs, tc.Table)
 		if fi != nil {
 			for _, pk := range tc.DeletedPKs {
 				if filePath, ok := fi.PkToFile[pk]; ok {
@@ -3193,10 +3197,18 @@ func (c *conflictCheckingCatalog) CommitTransaction(ctx context.Context, ns stri
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	keyFor := func(tc iceberg.TableCommit) string {
+		tcNs := tc.Namespace
+		if tcNs == "" {
+			tcNs = ns
+		}
+		return tcNs + "." + tc.Table
+	}
+
 	// Validate all preconditions atomically before applying any changes,
 	// matching the real Iceberg REST catalog's all-or-nothing semantics.
 	for _, tc := range commits {
-		key := ns + "." + tc.Table
+		key := keyFor(tc)
 		tm := c.tables[key]
 		if tm == nil {
 			return fmt.Errorf("table not found: %s", key)
@@ -3210,7 +3222,7 @@ func (c *conflictCheckingCatalog) CommitTransaction(ctx context.Context, ns stri
 
 	// All assertions passed — apply all changes.
 	for _, tc := range commits {
-		key := ns + "." + tc.Table
+		key := keyFor(tc)
 		tm := c.tables[key]
 		tm.Metadata.CurrentSnapshotID = tc.Snapshot.SnapshotID
 		tm.Metadata.LastSequenceNumber = tc.Snapshot.SequenceNumber
@@ -3232,9 +3244,9 @@ func (c *conflictCheckingCatalog) CommitTransaction(ctx context.Context, ns stri
 		tm.Metadata.Snapshots = append(tm.Metadata.Snapshots, snap)
 
 		if tc.NewManifests != nil {
-			c.manifests[ns+"."+tc.Table] = tc.NewManifests
+			c.manifests[keyFor(tc)] = tc.NewManifests
 		}
-		fi := c.fileIdxs[ns+"."+tc.Table]
+		fi := c.fileIdxs[keyFor(tc)]
 		if fi != nil {
 			for _, pk := range tc.DeletedPKs {
 				if filePath, ok := fi.PkToFile[pk]; ok {
@@ -3549,7 +3561,7 @@ func TestMaintenance_ExpireSnapshotsAndCleanOrphans(t *testing.T) {
 		OrphanGracePeriod: 0, // disable grace period for test — all orphans eligible
 	}
 
-	if err := iceberg.MaintainTable(ctx, cat, mem, "test_ns", "items", mc); err != nil {
+	if _, err := iceberg.MaintainTable(ctx, cat, mem, "test_ns", "items", mc); err != nil {
 		t.Fatalf("maintain materialized table: %v", err)
 	}
 

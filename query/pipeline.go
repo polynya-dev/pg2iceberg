@@ -42,6 +42,8 @@ type Pipeline struct {
 
 	snapshotNeeded bool // true if initial snapshot is required (no checkpoint)
 
+	meta *iceberg.MetaRecorder
+
 	cancel context.CancelFunc
 	done   chan struct{}
 	mu     sync.RWMutex
@@ -326,6 +328,19 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		p.buffers[pgTable] = NewBuffer(ts.PK)
 	}
 
+	// Initialize control-plane metadata tables (commits, checkpoints).
+	if p.cfg.Sink.MetaEnabledOrDefault() {
+		metaNs := p.cfg.Sink.MetaNamespaceOrDefault()
+		if err := iceberg.EnsureMetaTables(ctx, p.catalog, p.cfg.Sink.Warehouse, metaNs); err != nil {
+			return fmt.Errorf("ensure meta tables: %w", err)
+		}
+		rec, err := iceberg.NewMetaRecorder(ctx, metaNs, p.id, p.catalog, p.s3)
+		if err != nil {
+			return fmt.Errorf("create meta recorder: %w", err)
+		}
+		p.meta = rec
+	}
+
 	return nil
 }
 
@@ -509,6 +524,37 @@ func (p *Pipeline) flush(ctx context.Context) error {
 		return nil
 	}
 
+	// Piggyback control-plane meta rows (one per table) + pending checkpoint rows.
+	if p.meta != nil {
+		durationMs := time.Since(start).Milliseconds()
+		watermarks := p.poller.Watermarks()
+		for _, tp := range preps {
+			var bytes int64
+			for _, fe := range tp.prepared.NewDataFiles {
+				bytes += fe.DataFile.FileSizeBytes
+			}
+			p.meta.RecordFlush(iceberg.FlushStats{
+				Ts:             start,
+				TableName:      tp.pgTable,
+				Mode:           iceberg.CommitModeQuery,
+				SnapshotID:     tp.prepared.Commit.SnapshotID,
+				SequenceNumber: tp.prepared.Commit.SequenceNumber,
+				SchemaID:       tp.prepared.Commit.SchemaID,
+				MaxSourceTs:    watermarks[tp.pgTable],
+				Bytes:          bytes,
+				DurationMs:     durationMs,
+				DataFiles:      tp.prepared.DataCount,
+				DeleteFiles:    tp.prepared.DeleteCount,
+			})
+		}
+		metaCommits, err := p.meta.BuildCommits(ctx)
+		if err != nil {
+			log.Printf("[query:%s] build meta commits: %v (continuing without meta)", p.id, err)
+		} else {
+			commits = append(commits, metaCommits...)
+		}
+	}
+
 	// Atomic multi-table commit.
 	if err := p.catalog.CommitTransaction(ctx, p.cfg.Sink.Namespace, commits); err != nil {
 		pipeline.QueryFlushErrorsTotal.WithLabelValues(p.id).Inc()
@@ -534,6 +580,7 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	for _, tp := range preps {
 		tw := p.writers[tp.pgTable]
 		ts := p.schemas[tp.pgTable]
+		compactStart := time.Now()
 		compacted, err := tw.Compact(ctx, ts.PK, cc)
 		if err != nil {
 			log.Printf("[query:%s] compaction error for %s: %v", p.id, tp.pgTable, err)
@@ -542,7 +589,24 @@ func (p *Pipeline) flush(ctx context.Context) error {
 		if compacted == nil {
 			continue
 		}
-		err = p.catalog.CommitTransaction(ctx, p.cfg.Sink.Namespace, []iceberg.TableCommit{compacted.ToTableCommit()})
+		compactCommits := []iceberg.TableCommit{compacted.ToTableCommit()}
+		if p.meta != nil && compacted.Compaction != nil {
+			p.meta.RecordCompaction(iceberg.CompactionStats{
+				Ts:                compactStart,
+				TableName:         tp.pgTable,
+				SnapshotID:        compacted.Commit.SnapshotID,
+				SequenceNumber:    compacted.Commit.SequenceNumber,
+				DurationMs:        time.Since(compactStart).Milliseconds(),
+				CompactionMetrics: *compacted.Compaction,
+			})
+			metaCommits, merr := p.meta.BuildCommits(ctx)
+			if merr != nil {
+				log.Printf("[query:%s] build meta compaction commits: %v", p.id, merr)
+			} else {
+				compactCommits = append(compactCommits, metaCommits...)
+			}
+		}
+		err = p.catalog.CommitTransaction(ctx, p.cfg.Sink.Namespace, compactCommits)
 		if err != nil {
 			log.Printf("[query:%s] compaction commit error for %s: %v", p.id, tp.pgTable, err)
 			continue
@@ -566,6 +630,10 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	if err := p.store.Save(ctx, p.id, cp); err != nil {
 		return fmt.Errorf("save checkpoint: %w", err)
 	}
+
+	p.meta.RecordCheckpoint(iceberg.CheckpointStats{
+		LastFlushAt: p.lastFlushAt,
+	})
 
 	return nil
 }
@@ -732,8 +800,33 @@ func (p *Pipeline) maintainAllTables(ctx context.Context) {
 
 	for _, tc := range p.cfg.Tables {
 		icebergName := postgres.TableToIceberg(tc.Name)
-		if err := iceberg.MaintainTable(ctx, catalog, p.s3, p.cfg.Sink.Namespace, icebergName, mc); err != nil {
+		result, err := iceberg.MaintainTable(ctx, catalog, p.s3, p.cfg.Sink.Namespace, icebergName, mc)
+		if err != nil {
 			log.Printf("[maintain:%s] error on %s: %v", p.id, icebergName, err)
+		}
+		if p.meta != nil {
+			if result.SnapshotsExpired > 0 {
+				p.meta.RecordMaintenance(iceberg.MaintenanceStats{
+					TableName:     tc.Name,
+					Operation:     iceberg.MaintenanceOpExpireSnapshots,
+					ItemsAffected: result.SnapshotsExpired,
+					DurationMs:    result.ExpireDuration.Milliseconds(),
+				})
+			}
+			if result.OrphansDeleted > 0 {
+				p.meta.RecordMaintenance(iceberg.MaintenanceStats{
+					TableName:     tc.Name,
+					Operation:     iceberg.MaintenanceOpCleanOrphans,
+					ItemsAffected: result.OrphansDeleted,
+					BytesFreed:    result.OrphanBytesFreed,
+					DurationMs:    result.CleanupDuration.Milliseconds(),
+				})
+			}
+		}
+	}
+	if p.meta != nil {
+		if err := p.meta.Flush(ctx); err != nil {
+			log.Printf("[maintain:%s] meta flush error: %v", p.id, err)
 		}
 	}
 }

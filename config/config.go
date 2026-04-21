@@ -179,6 +179,11 @@ type SinkConfig struct {
 	MaintenanceRetention string `yaml:"maintenance_retention" json:"maintenance_retention,omitempty"` // e.g. "168h" (7 days)
 	MaintenanceInterval  string `yaml:"maintenance_interval" json:"maintenance_interval,omitempty"`   // e.g. "1h"
 	MaintenanceGrace     string `yaml:"maintenance_grace" json:"maintenance_grace,omitempty"`         // e.g. "30m"
+
+	// Control-plane metadata tables (flushes, materializations, checkpoints)
+	// written to a separate Iceberg namespace for customer-facing observability.
+	MetaEnabled   *bool  `yaml:"meta_enabled" json:"meta_enabled,omitempty"`     // nil = enabled (default true)
+	MetaNamespace string `yaml:"meta_namespace" json:"meta_namespace,omitempty"` // default "_pg2iceberg"
 }
 
 func (s SinkConfig) EventsPartitionOrDefault() string {
@@ -264,6 +269,24 @@ func (s SinkConfig) MaintenanceIntervalOrDefault() time.Duration {
 		}
 	}
 	return 1 * time.Hour
+}
+
+// MetaEnabledOrDefault returns whether control-plane metadata tables are enabled.
+// Defaults to true when unset.
+func (s SinkConfig) MetaEnabledOrDefault() bool {
+	if s.MetaEnabled == nil {
+		return true
+	}
+	return *s.MetaEnabled
+}
+
+// MetaNamespaceOrDefault returns the namespace for control-plane metadata tables.
+// Defaults to "_pg2iceberg".
+func (s SinkConfig) MetaNamespaceOrDefault() string {
+	if s.MetaNamespace != "" {
+		return s.MetaNamespace
+	}
+	return "_pg2iceberg"
 }
 
 func (s SinkConfig) MaintenanceGraceOrDefault() time.Duration {
@@ -479,6 +502,13 @@ func (cfg *Config) ApplyEnv() error {
 	}
 	if v := os.Getenv("MAINTENANCE_GRACE"); v != "" {
 		cfg.Sink.MaintenanceGrace = v
+	}
+	if v := os.Getenv("META_ENABLED"); v != "" {
+		b := v == "1" || v == "true"
+		cfg.Sink.MetaEnabled = &b
+	}
+	if v := os.Getenv("META_NAMESPACE"); v != "" {
+		cfg.Sink.MetaNamespace = v
 	}
 
 	return nil

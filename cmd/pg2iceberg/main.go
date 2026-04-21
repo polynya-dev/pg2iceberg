@@ -732,14 +732,14 @@ func runMaintain(ctx context.Context, cfg *config.Config) error {
 		icebergName := postgres.TableToIceberg(tc.Name)
 
 		// Maintain materialized table.
-		if err := iceberg.MaintainTable(ctx, catalog, clients.S3, cfg.Sink.Namespace, icebergName, mc); err != nil {
+		if _, err := iceberg.MaintainTable(ctx, catalog, clients.S3, cfg.Sink.Namespace, icebergName, mc); err != nil {
 			log.Printf("[maintain] error on %s: %v", icebergName, err)
 		}
 
 		// In logical mode, also maintain events table.
 		if cfg.Source.Mode == "logical" {
 			eventsName := iceberg.EventsTableName(icebergName)
-			if err := iceberg.MaintainTable(ctx, catalog, clients.S3, cfg.Sink.Namespace, eventsName, mc); err != nil {
+			if _, err := iceberg.MaintainTable(ctx, catalog, clients.S3, cfg.Sink.Namespace, eventsName, mc); err != nil {
 				log.Printf("[maintain] error on %s: %v", eventsName, err)
 			}
 		}

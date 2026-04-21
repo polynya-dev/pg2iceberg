@@ -383,6 +383,12 @@ type TableCommit struct {
 	CurrentSnapshotID int64
 	Snapshot          SnapshotCommit
 
+	// Namespace overrides the outer namespace passed to CommitTransaction.
+	// When empty, the outer namespace is used. Set this to commit tables
+	// from a different namespace (e.g. control-plane meta tables) in the
+	// same atomic transaction as customer tables.
+	Namespace string
+
 	// Post-commit cache updates. These are applied by MetadataCache
 	// after the catalog write succeeds — callers never need to call
 	// SetManifests/SetFileIndex manually.
@@ -410,7 +416,11 @@ func (c *CatalogClient) CommitTransaction(ctx context.Context, ns string, commit
 	// Single table — use the normal commit path.
 	if len(commits) == 1 {
 		tc := commits[0]
-		return c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot)
+		tcNs := tc.Namespace
+		if tcNs == "" {
+			tcNs = ns
+		}
+		return c.CommitSnapshot(ctx, tcNs, tc.Table, tc.CurrentSnapshotID, tc.Snapshot)
 	}
 
 	var tableChanges []map[string]any
@@ -454,9 +464,13 @@ func (c *CatalogClient) CommitTransaction(ctx context.Context, ns string, commit
 			},
 		}
 
+		tcNs := tc.Namespace
+		if tcNs == "" {
+			tcNs = ns
+		}
 		tableChanges = append(tableChanges, map[string]any{
 			"identifier": map[string]any{
-				"namespace": []string{ns},
+				"namespace": []string{tcNs},
 				"name":      tc.Table,
 			},
 			"requirements": requirements,

@@ -231,16 +231,22 @@ func (sw *SnapshotWriter) Commit(ctx context.Context) (int64, error) {
 	mlURI := bundle.ManifestListURI
 	allManifests := bundle.AllManifests
 
-	// Commit to catalog.
+	var addedBytes int64
+	for _, e := range entries {
+		addedBytes += e.DataFile.FileSizeBytes
+	}
+	delta := SummaryDelta{
+		AddedDataFiles: int64(len(entries)),
+		AddedRecords:   totalRows,
+		AddedFilesSize: addedBytes,
+	}
 	commit := SnapshotCommit{
 		SnapshotID:       snapshotID,
 		SequenceNumber:   seqNum,
 		TimestampMs:      now.UnixMilli(),
 		ManifestListPath: mlURI,
 		SchemaID:         cfg.SchemaID,
-		Summary: map[string]string{
-			"operation": "append",
-		},
+		Summary:          BuildSummary("append", PrevSnapshotSummary(tm, prevSnapID), delta),
 	}
 
 	tc := TableCommit{
