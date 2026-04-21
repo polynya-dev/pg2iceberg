@@ -489,11 +489,15 @@ func (c *memCatalog) CommitSnapshot(_ context.Context, ns, table string, current
 
 func (c *memCatalog) CommitTransaction(ctx context.Context, ns string, commits []iceberg.TableCommit) error {
 	for _, tc := range commits {
-		if err := c.CommitSnapshot(ctx, ns, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
+		tcNs := tc.Namespace
+		if tcNs == "" {
+			tcNs = ns
+		}
+		if err := c.CommitSnapshot(ctx, tcNs, tc.Table, tc.CurrentSnapshotID, tc.Snapshot); err != nil {
 			return err
 		}
 		if tc.NewManifests != nil {
-			c.SetManifests(ns, tc.Table, tc.NewManifests)
+			c.SetManifests(tcNs, tc.Table, tc.NewManifests)
 		}
 	}
 	return nil
