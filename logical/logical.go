@@ -39,7 +39,9 @@ type LogicalSource struct {
 	// startLSN is the position to start streaming from.
 	startLSN pglogrepl.LSN
 	// receivedLSN is the latest WAL position received from PG.
-	receivedLSN pglogrepl.LSN
+	// Accessed atomically: written by the capture goroutine (handleCopyData),
+	// read by the pipeline goroutine (idle-advance path) and by standbyStatus.
+	receivedLSN atomic.Uint64
 	// flushedLSN is the latest WAL position that has been durably written
 	// to Iceberg. Only this value is confirmed back to PG via standby
 	// status updates, so PG will not recycle WAL that hasn't been persisted.
@@ -96,7 +98,7 @@ func (l *LogicalSource) SetStandbyInterval(d time.Duration) {
 // SetStartLSN restores position from a checkpoint.
 func (l *LogicalSource) SetStartLSN(lsn uint64) {
 	l.startLSN = pglogrepl.LSN(lsn)
-	l.receivedLSN = pglogrepl.LSN(lsn)
+	l.receivedLSN.Store(lsn)
 	l.flushedLSN.Store(lsn)
 }
 
@@ -118,7 +120,7 @@ func (l *LogicalSource) SetSnapshotDeps(deps *snapshot.Deps) {
 
 // ReceivedLSN returns the latest WAL position received from PG.
 func (l *LogicalSource) ReceivedLSN() uint64 {
-	return uint64(l.receivedLSN)
+	return l.receivedLSN.Load()
 }
 
 // FlushedLSN returns the latest WAL position durably written to Iceberg.
@@ -258,6 +260,13 @@ func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyDa
 		if err != nil {
 			return fmt.Errorf("parse keepalive: %w", err)
 		}
+		// Advance receivedLSN from the server's sent-ptr so idle-advance can
+		// ack non-tracked-table WAL back to PG. Without this, publications
+		// that filter out most activity see receivedLSN stuck at the last
+		// tracked-table LSN, pinning confirmed_flush_lsn and leaking WAL.
+		if end := uint64(pkm.ServerWALEnd); end > l.receivedLSN.Load() {
+			l.receivedLSN.Store(end)
+		}
 		if pkm.ReplyRequested {
 			if err := utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
 				return l.sendStandby(ctx)
@@ -277,8 +286,9 @@ func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyDa
 		}
 
 		// Track the latest WAL position received.
-		if xld.WALStart+pglogrepl.LSN(len(xld.WALData)) > l.receivedLSN {
-			l.receivedLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
+		end := uint64(xld.WALStart) + uint64(len(xld.WALData))
+		if end > l.receivedLSN.Load() {
+			l.receivedLSN.Store(end)
 		}
 	}
 	return nil
@@ -577,7 +587,7 @@ func (l *LogicalSource) ensureSlot(ctx context.Context) (string, error) {
 			return "", fmt.Errorf("parse consistent point LSN %q: %w", result.ConsistentPoint, err)
 		}
 		l.startLSN = lsn
-		l.receivedLSN = lsn
+		l.receivedLSN.Store(uint64(lsn))
 		l.flushedLSN.Store(uint64(lsn))
 	}
 
@@ -661,8 +671,9 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string)
 // but WALFlushPosition (which controls WAL recycling) uses flushedLSN.
 func (l *LogicalSource) standbyStatus() pglogrepl.StandbyStatusUpdate {
 	flushed := pglogrepl.LSN(l.flushedLSN.Load())
+	received := pglogrepl.LSN(l.receivedLSN.Load())
 	return pglogrepl.StandbyStatusUpdate{
-		WALWritePosition: l.receivedLSN,
+		WALWritePosition: received,
 		WALFlushPosition: flushed,
 		WALApplyPosition: flushed,
 		ClientTime:       time.Now(),

@@ -832,6 +832,162 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 	}
 }
 
+// TestPipeline_IdleAdvance_OnSparseTrackedWrites verifies that when tracked
+// tables are idle but the source keeps producing WAL (e.g. writes to tables
+// outside the publication), flushedLSN still advances so PG can recycle WAL.
+//
+// Without the idle-advance path, flushedLSN only moves when a flush lands
+// tracked-table rows in Iceberg — so a publication with sparse writes pins
+// confirmed_flush_lsn on the server and WAL accumulates indefinitely.
+// This test writes only to a non-tracked table and asserts both pg2iceberg's
+// flushedLSN and PG's confirmed_flush_lsn advance past the post-snapshot mark.
+func TestPipeline_IdleAdvance_OnSparseTrackedWrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	// Shorten wal_sender_timeout so primary keepalives arrive ~every 1s
+	// instead of the default ~30s. Keepalives are what carry the advancing
+	// server WAL position for non-published-table activity.
+	if _, err := conn.Exec(ctx, `ALTER SYSTEM SET wal_sender_timeout = '2s'`); err != nil {
+		t.Fatalf("alter wal_sender_timeout: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_reload_conf()`); err != nil {
+		t.Fatalf("reload conf: %v", err)
+	}
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE tracked_events (
+			id SERIAL PRIMARY KEY,
+			value INTEGER NOT NULL
+		);
+		CREATE TABLE noise (
+			id SERIAL PRIMARY KEY,
+			value INTEGER NOT NULL
+		);
+	`); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+
+	sinkCfg := config.SinkConfig{
+		FlushInterval: "300ms", // tick often so idle-advance fires quickly
+		FlushRows:     10000,   // high — noise writes won't buffer to sink anyway
+		FlushBytes:    1 << 30,
+		Namespace:     "test_ns",
+		Warehouse:     "s3://test-bucket/",
+	}
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{
+			{Name: "public.tracked_events"}, // publication includes only this
+		},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        "test_slot",
+			},
+		},
+		Sink: sinkCfg,
+	}
+
+	mem := newMemStorage()
+	cat := newMemCatalog()
+	snk := logical.NewSink(sinkCfg, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start pipeline: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	ls := p.Source()
+	if ls == nil {
+		t.Fatal("pipeline source is nil")
+	}
+
+	// Let standby updates settle so the slot reflects the initial state.
+	if err := ls.SendStandbyNow(ctx); err != nil {
+		t.Fatalf("send standby: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	initialFlushed := ls.FlushedLSN()
+
+	var confirmedInitial string
+	if err := conn.QueryRow(ctx, `
+		SELECT confirmed_flush_lsn::text
+		FROM pg_replication_slots WHERE slot_name = 'test_slot'
+	`).Scan(&confirmedInitial); err != nil {
+		t.Fatalf("read initial confirmed_flush_lsn: %v", err)
+	}
+	t.Logf("initial: flushedLSN=%d receivedLSN=%d confirmed_flush_lsn=%s",
+		initialFlushed, ls.ReceivedLSN(), confirmedInitial)
+
+	// Write only to the NON-tracked table. pgoutput filters these out, so
+	// the pipeline sees no XLogData — only periodic primary keepalives
+	// carrying the advancing ServerWALEnd.
+	for i := 0; i < 50; i++ {
+		if _, err := conn.Exec(ctx, "INSERT INTO noise (value) VALUES ($1)", i); err != nil {
+			t.Fatalf("insert noise: %v", err)
+		}
+	}
+
+	// Wait for flushedLSN to catch up via idle-advance. Needs: a keepalive
+	// to arrive (bumps receivedLSN), then a flush ticker in a quiescent
+	// state (no buffered sink, no pending channel events) to fire.
+	waitFor(t, 30*time.Second, func() bool { return ls.FlushedLSN() > initialFlushed })
+	t.Logf("after idle-advance: flushedLSN=%d receivedLSN=%d",
+		ls.FlushedLSN(), ls.ReceivedLSN())
+
+	if ls.FlushedLSN() <= initialFlushed {
+		t.Fatalf("flushedLSN did not advance: got %d, want > %d",
+			ls.FlushedLSN(), initialFlushed)
+	}
+
+	// Confirm PG's confirmed_flush_lsn advanced — otherwise WAL still pins.
+	if err := ls.SendStandbyNow(ctx); err != nil {
+		t.Fatalf("send standby: %v", err)
+	}
+	var confirmedAfter string
+	waitFor(t, 5*time.Second, func() bool {
+		err := conn.QueryRow(ctx, `
+			SELECT confirmed_flush_lsn::text
+			FROM pg_replication_slots WHERE slot_name = 'test_slot'
+		`).Scan(&confirmedAfter)
+		return err == nil && confirmedAfter != confirmedInitial
+	})
+	t.Logf("PG confirmed_flush_lsn: before=%s after=%s", confirmedInitial, confirmedAfter)
+	if confirmedAfter == confirmedInitial {
+		t.Errorf("PG confirmed_flush_lsn did not advance under sparse writes: still %s", confirmedInitial)
+	}
+
+	// Sanity: no data files should have been written for tracked_events
+	// (we never wrote to it post-snapshot).
+	mem.mu.Lock()
+	fileCount := len(mem.files)
+	mem.mu.Unlock()
+	t.Logf("storage file count: %d", fileCount)
+}
+
 // TestPipeline_FlushRetry_NoDuplicateData verifies that when a flush fails at
 // the catalog commit stage and is retried, the retry does not produce duplicate
 // data in Iceberg.

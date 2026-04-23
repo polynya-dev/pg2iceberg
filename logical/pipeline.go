@@ -630,6 +630,13 @@ func (p *Pipeline) run(ctx context.Context) {
 					p.setStatus(pipeline.StatusError, fmt.Errorf("flush failed after retries: %w", err))
 					return
 				}
+			} else if len(events) == 0 && p.snk.TotalBuffered() == 0 {
+				// Quiescent: no events pending in channel, nothing buffered in sink.
+				// Advance flushedLSN up to receivedLSN so PG can recycle WAL even
+				// when tracked tables are idle but the server keeps producing WAL.
+				if err := p.idleAdvance(ctx); err != nil {
+					log.Printf("[logical:%s] idle advance: %v", p.id, err)
+				}
 			}
 
 		case err := <-errCh:
@@ -851,6 +858,44 @@ func (p *Pipeline) flush(ctx context.Context) error {
 		LastFlushAt: p.lastFlushAt,
 	})
 
+	return nil
+}
+
+// idleAdvance bumps flushedLSN up to receivedLSN when the pipeline is
+// quiescent — no events buffered in the sink, no events queued in the
+// channel, and snapshot is complete. Callers must verify quiescence before
+// invoking; the checks inside this function serve as a second line of
+// defence (status/checkpoint) rather than the primary race guard.
+//
+// This is the fix for WAL buildup when tracked tables are sparsely written:
+// without it, flushedLSN only advances when a flush lands tracked-table
+// rows in Iceberg, so an idle publication pins confirmed_flush_lsn and PG
+// cannot recycle WAL.
+func (p *Pipeline) idleAdvance(ctx context.Context) error {
+	status, _ := p.Status()
+	if status != pipeline.StatusRunning {
+		return nil
+	}
+	received := p.src.ReceivedLSN()
+	if received <= p.src.FlushedLSN() {
+		return nil
+	}
+	cp, err := p.store.Load(ctx, p.id)
+	if err != nil {
+		return fmt.Errorf("load checkpoint: %w", err)
+	}
+	if !cp.SnapshotComplete {
+		return nil
+	}
+	if cp.LSN >= received {
+		return nil
+	}
+	cp.Mode = "logical"
+	cp.LSN = received
+	if err := p.store.Save(ctx, p.id, cp); err != nil {
+		return fmt.Errorf("save checkpoint: %w", err)
+	}
+	p.src.SetFlushedLSN(received)
 	return nil
 }
 
