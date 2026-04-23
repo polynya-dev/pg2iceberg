@@ -347,6 +347,10 @@ func runMaterializerOnly(ctx context.Context, cfg *config.Config) error {
 			pgConn.Close(ctx)
 			return fmt.Errorf("discover schema for %s: %w", tc.Name, err)
 		}
+		if err := ts.Validate(); err != nil {
+			pgConn.Close(ctx)
+			return err
+		}
 		schemas[tc.Name] = ts
 		log.Printf("[materializer-only] discovered schema for %s: %d columns, pk=%v", tc.Name, len(ts.Columns), ts.PK)
 	}
