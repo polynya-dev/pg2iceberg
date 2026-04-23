@@ -19,6 +19,11 @@ const (
 	OpBegin
 	OpCommit
 	OpSchemaChange
+	// OpMarker is emitted when a row is inserted into
+	// _pg2iceberg.switchover_markers. It carries a UUID in MarkerUUID and an
+	// LSN, and signals that the pipeline should snapshot-align at the next
+	// COMMIT. Never forwarded to the sink.
+	OpMarker
 )
 
 func (o Op) String() string {
@@ -39,6 +44,8 @@ func (o Op) String() string {
 		return "COMMIT"
 	case OpSchemaChange:
 		return "SCHEMA_CHANGE"
+	case OpMarker:
+		return "MARKER"
 	default:
 		return "UNKNOWN"
 	}
@@ -95,5 +102,8 @@ type ChangeEvent struct {
 	TransactionID uint32
 	// SchemaChange is populated only for OpSchemaChange events.
 	SchemaChange *SchemaChange
+	// MarkerUUID is populated only for OpMarker events — the UUID value
+	// inserted into _pg2iceberg.switchover_markers by an operator.
+	MarkerUUID string
 }
 

@@ -68,6 +68,18 @@ type MaintenanceStats struct {
 	DurationMs    int64
 }
 
+// MarkerRecord is one row in the meta `markers` table — the verifier's
+// join between an operator-emitted marker UUID and the per-table Iceberg
+// snapshot that aligns with it.
+type MarkerRecord struct {
+	Ts         time.Time
+	WorkerID   string
+	MarkerUUID string
+	TableName  string
+	SnapshotID int64
+	MarkerLSN  int64
+}
+
 // MetaRecorder coordinates writes to the control-plane meta tables. It buffers
 // rows and produces TableCommit values that callers append to their existing
 // CommitTransaction invocation, so meta rows land atomically with the commit
@@ -90,6 +102,7 @@ type MetaRecorder struct {
 	checkpointsW *MetaWriter
 	compactionsW *MetaWriter
 	maintenanceW *MetaWriter
+	markersW     *MetaWriter
 }
 
 // NewMetaRecorder constructs a recorder bound to the meta namespace. The
@@ -116,6 +129,11 @@ func NewMetaRecorder(ctx context.Context, namespace, workerID string, catalog Me
 	if err != nil {
 		return nil, err
 	}
+	markersSchema := MetaMarkersSchema()
+	markersPart, err := MetaPartitionSpec(markersSchema)
+	if err != nil {
+		return nil, err
+	}
 	return &MetaRecorder{
 		workerID:     workerID,
 		catalog:      catalog,
@@ -124,6 +142,7 @@ func NewMetaRecorder(ctx context.Context, namespace, workerID string, catalog Me
 		checkpointsW: NewMetaWriter(namespace, MetaCheckpointsTable, checkpointsSchema, checkpointsPart, catalog, s3),
 		compactionsW: NewMetaWriter(namespace, MetaCompactionsTable, compactionsSchema, compactionsPart, catalog, s3),
 		maintenanceW: NewMetaWriter(namespace, MetaMaintenanceTable, maintenanceSchema, maintenancePart, catalog, s3),
+		markersW:     NewMetaWriter(namespace, MetaMarkersTable, markersSchema, markersPart, catalog, s3),
 	}, nil
 }
 
@@ -224,6 +243,36 @@ func (r *MetaRecorder) RecordCompaction(s CompactionStats) {
 	}
 }
 
+// RecordMarker buffers a markers-table row. Safe to call with a nil receiver.
+// The row lands in Iceberg on the next BuildCommits / Flush — callers that
+// need atomicity with the data commit should append the returned TableCommit
+// to the same CommitTransaction as the data commit.
+func (r *MetaRecorder) RecordMarker(m MarkerRecord) {
+	if r == nil {
+		return
+	}
+	if m.Ts.IsZero() {
+		m.Ts = time.Now()
+	}
+	if m.WorkerID == "" {
+		m.WorkerID = r.workerID
+	}
+	row := map[string]any{
+		"ts":                    m.Ts,
+		"worker_id":             nullableString(m.WorkerID),
+		"marker_uuid":           m.MarkerUUID,
+		"table_name":            m.TableName,
+		"snapshot_id":           m.SnapshotID,
+		"marker_lsn":            nullableInt64(m.MarkerLSN),
+		"pg2iceberg_commit_sha": nullableString(pipeline.CommitSHA),
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.markersW.Append(row); err != nil {
+		log.Printf("[meta] append markers row: %v", err)
+	}
+}
+
 // RecordMaintenance buffers a maintenance-table row. Safe to call with a nil
 // receiver.
 func (r *MetaRecorder) RecordMaintenance(s MaintenanceStats) {
@@ -311,6 +360,15 @@ func (r *MetaRecorder) BuildCommits(ctx context.Context) ([]TableCommit, error) 
 	}
 	if r.maintenanceW.HasRows() {
 		tc, err := r.maintenanceW.BuildTableCommit(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if tc != nil {
+			out = append(out, *tc)
+		}
+	}
+	if r.markersW.HasRows() {
+		tc, err := r.markersW.BuildTableCommit(ctx)
 		if err != nil {
 			return nil, err
 		}

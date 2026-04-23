@@ -8,6 +8,7 @@ const (
 	MetaCheckpointsTable = "checkpoints"
 	MetaCompactionsTable = "compactions"
 	MetaMaintenanceTable = "maintenance"
+	MetaMarkersTable     = "markers"
 )
 
 // Maintenance operation kinds.
@@ -120,6 +121,40 @@ func MetaCheckpointsSchema() *postgres.TableSchema {
 			{Name: "lsn", PGType: postgres.Int8, IsNullable: true, FieldID: 3},
 			{Name: "last_flush_at", PGType: postgres.TimestampTZ, IsNullable: true, FieldID: 4},
 			{Name: "pg2iceberg_commit_sha", PGType: postgres.Text, IsNullable: true, FieldID: 5},
+		},
+	}
+}
+
+// MetaMarkersSchema returns the schema for the control-plane `markers` table.
+// One row per (marker_uuid, table_name) — the mapping a verifier uses to
+// locate the Iceberg snapshot that corresponds to a given operator-emitted
+// marker on each side of a blue/green pair. Append-only; no deletes.
+//
+// Rows are written by the logical pipeline when it observes the COMMIT of a
+// transaction that contained an INSERT into _pg2iceberg.switchover_markers
+// on the source PG. Each tracked table contributes one row per marker.
+//
+// Follows the same additive evolution rules as the other meta schemas.
+func MetaMarkersSchema() *postgres.TableSchema {
+	return &postgres.TableSchema{
+		Table: MetaMarkersTable,
+		Columns: []postgres.Column{
+			{Name: "ts", PGType: postgres.TimestampTZ, IsNullable: false, FieldID: 1},
+			{Name: "worker_id", PGType: postgres.Text, IsNullable: true, FieldID: 2},
+			// Operator-chosen UUID of the marker. Identical across blue and
+			// green for a replicated marker row — the join key for verifiers.
+			{Name: "marker_uuid", PGType: postgres.Text, IsNullable: false, FieldID: 3},
+			// PG-qualified tracked-table name (e.g. "public.orders").
+			{Name: "table_name", PGType: postgres.Text, IsNullable: false, FieldID: 4},
+			// Iceberg snapshot id of `table_name` at the marker's alignment
+			// point. This is the snapshot the verifier reads from.
+			{Name: "snapshot_id", PGType: postgres.Int8, IsNullable: false, FieldID: 5},
+			// LSN of the marker row insertion in the source PG's WAL.
+			// Namespace-scoped — blue and green will have different values
+			// for the same logical marker. Useful for diagnostics, not for
+			// alignment (the UUID is the join key).
+			{Name: "marker_lsn", PGType: postgres.Int8, IsNullable: true, FieldID: 6},
+			{Name: "pg2iceberg_commit_sha", PGType: postgres.Text, IsNullable: true, FieldID: 7},
 		},
 	}
 }

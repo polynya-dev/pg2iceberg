@@ -251,6 +251,7 @@ func EnsureMetaTables(ctx context.Context, catalog MetadataCache, warehouse, nam
 		{MetaCheckpointsTable, MetaCheckpointsSchema()},
 		{MetaCompactionsTable, MetaCompactionsSchema()},
 		{MetaMaintenanceTable, MetaMaintenanceSchema()},
+		{MetaMarkersTable, MetaMarkersSchema()},
 	} {
 		tm, err := catalog.LoadTable(ctx, namespace, entry.name)
 		if err != nil {

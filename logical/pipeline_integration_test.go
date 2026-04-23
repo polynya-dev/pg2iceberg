@@ -832,6 +832,198 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 	}
 }
 
+// TestPipeline_SwitchoverMarker_DetectedAtCommit verifies the marker
+// detection path end-to-end: inserting a row into _pg2iceberg.switchover_markers
+// produces an OpMarker event that the pipeline acts on only after the
+// containing transaction's COMMIT is processed. This is the first slice of
+// the blue/green snapshot-alignment design (see
+// docs/plans/marker-snapshot-alignment.md) — it only asserts detection and
+// transaction-boundary semantics; the Iceberg marker-index write lands in
+// a follow-up slice.
+func TestPipeline_SwitchoverMarker_DetectedAtCommit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE users (
+			id    SERIAL PRIMARY KEY,
+			email TEXT NOT NULL
+		);
+	`); err != nil {
+		t.Fatalf("create users: %v", err)
+	}
+	conn.Close(ctx)
+
+	cfg := &config.Config{
+		Tables: []config.TableConfig{{Name: "public.users"}},
+		Source: config.SourceConfig{
+			Mode:     "logical",
+			Postgres: pgCfg,
+			Logical: config.LogicalConfig{
+				PublicationName: "test_pub",
+				SlotName:        "test_slot",
+			},
+		},
+		Sink: config.SinkConfig{
+			FlushInterval: "300ms",
+			FlushRows:     100,
+			FlushBytes:    1 << 30,
+			Namespace:     "test_ns",
+			Warehouse:     "s3://test-bucket/",
+		},
+	}
+
+	mem := newMemStorage()
+	cat := newMemCatalog()
+	snk := logical.NewSink(cfg.Sink, cfg.Tables, "test", mem, cat)
+	p := logical.NewPipeline("test", cfg, snk, pipeline.NewMemCheckpointStore(), stream.NewMemCoordinator())
+
+	if err := p.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		cancel()
+		<-p.Done()
+	}()
+
+	waitForStatus(t, p, pipeline.StatusRunning, 30*time.Second)
+
+	// The marker table must have been auto-created by the pipeline's setup.
+	c2, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer c2.Close(ctx)
+
+	var exists bool
+	if err := c2.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_tables
+			WHERE schemaname = '_pg2iceberg' AND tablename = 'switchover_markers'
+		)
+	`).Scan(&exists); err != nil {
+		t.Fatalf("check marker table: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected _pg2iceberg.switchover_markers table to be auto-created")
+	}
+
+	// The marker table must be in the publication so pgoutput streams it.
+	var inPub bool
+	if err := c2.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_publication_tables
+			WHERE pubname = 'test_pub'
+			  AND schemaname = '_pg2iceberg'
+			  AND tablename = 'switchover_markers'
+		)
+	`).Scan(&inPub); err != nil {
+		t.Fatalf("check publication membership: %v", err)
+	}
+	if !inPub {
+		t.Fatal("expected switchover_markers to be in publication test_pub")
+	}
+
+	// Insert a user row mid-transaction with a marker to verify the
+	// transaction-boundary invariant: the marker must not be "committed"
+	// (from pg2iceberg's perspective) until PG's COMMIT is processed.
+	markerUUID := "marker-abc-123"
+	tx, err := c2.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO users (email) VALUES ($1)", "alice@example.com"); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO _pg2iceberg.switchover_markers (uuid) VALUES ($1)", markerUUID); err != nil {
+		t.Fatalf("insert marker: %v", err)
+	}
+	// Insert another user row AFTER the marker in the same transaction —
+	// the flush should still encompass this row (flush fires at COMMIT,
+	// not at the marker INSERT).
+	if _, err := tx.Exec(ctx, "INSERT INTO users (email) VALUES ($1)", "bob@example.com"); err != nil {
+		t.Fatalf("insert user 2: %v", err)
+	}
+	// While the transaction is still open, the pipeline should not have
+	// committed the marker yet (it hasn't seen COMMIT).
+	if got := p.LastCommittedMarker(); got == markerUUID {
+		t.Errorf("marker was recorded as committed before PG COMMIT was sent: got %q", got)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// After COMMIT, the pipeline should observe and commit the marker.
+	waitFor(t, 15*time.Second, func() bool {
+		return p.LastCommittedMarker() == markerUUID
+	})
+
+	if got := p.LastCommittedMarker(); got != markerUUID {
+		t.Fatalf("expected LastCommittedMarker=%q, got %q", markerUUID, got)
+	}
+
+	// The pipeline must have written a row to _pg2iceberg.markers for each
+	// tracked table, pointing at the Iceberg snapshot that aligns with this
+	// marker. For the single tracked table (public.users) we expect one row.
+	// Meta tables live in the meta namespace ("_pg2iceberg" by default), not
+	// the data namespace.
+	metaNs := cfg.Sink.MetaNamespaceOrDefault()
+	markersTm, err := snk.Catalog().LoadTable(ctx, metaNs, iceberg.MetaMarkersTable)
+	if err != nil {
+		t.Fatalf("load markers table: %v", err)
+	}
+	if markersTm == nil {
+		t.Fatal("expected _pg2iceberg.markers Iceberg table to exist")
+	}
+	markerRows := readAllDataFileRows(t, ctx, mem, markersTm)
+
+	var rowsForMarker []map[string]any
+	for _, r := range markerRows {
+		if fmt.Sprint(r["marker_uuid"]) == markerUUID {
+			rowsForMarker = append(rowsForMarker, r)
+		}
+	}
+	if len(rowsForMarker) != 1 {
+		t.Fatalf("expected 1 marker row for %q, got %d (all rows: %+v)", markerUUID, len(rowsForMarker), markerRows)
+	}
+	row := rowsForMarker[0]
+	if got := fmt.Sprint(row["table_name"]); got != "public.users" {
+		t.Errorf("marker row table_name: want %q, got %q", "public.users", got)
+	}
+	// snapshot_id must be a non-zero int pointing at the post-marker snapshot
+	// of public.users (in the DATA namespace, not the meta namespace).
+	usersTm, err := snk.Catalog().LoadTable(ctx, cfg.Sink.Namespace, "users")
+	if err != nil {
+		t.Fatalf("load users table: %v", err)
+	}
+	if snapID, ok := row["snapshot_id"].(int64); !ok || snapID == 0 {
+		t.Errorf("marker row snapshot_id: want non-zero int64, got %T=%v", row["snapshot_id"], row["snapshot_id"])
+	} else if snapID != usersTm.Metadata.CurrentSnapshotID {
+		t.Errorf("marker row snapshot_id=%d but public.users current snapshot=%d", snapID, usersTm.Metadata.CurrentSnapshotID)
+	}
+
+	// An insert that does NOT include a marker must not spuriously advance
+	// LastCommittedMarker.
+	if _, err := c2.Exec(ctx, "INSERT INTO users (email) VALUES ($1)", "carol@example.com"); err != nil {
+		t.Fatalf("post-marker insert: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+	if got := p.LastCommittedMarker(); got != markerUUID {
+		t.Errorf("LastCommittedMarker drifted past original after non-marker insert: got %q, want %q", got, markerUUID)
+	}
+}
+
 // TestPipeline_IdleAdvance_OnSparseTrackedWrites verifies that when tracked
 // tables are idle but the source keeps producing WAL (e.g. writes to tables
 // outside the publication), flushedLSN still advances so PG can recycle WAL.

@@ -155,6 +155,13 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- postgres.Chan
 		l.tables[tc.Name] = ts
 	}
 
+	// Ensure the source-side marker table exists so operators can insert
+	// snapshot-alignment markers. The table is included in the publication
+	// below so marker rows flow through logical decoding like any user row.
+	if err := l.ensureSwitchoverMarkersTable(ctx); err != nil {
+		return fmt.Errorf("ensure switchover_markers: %w", err)
+	}
+
 	// Ensure publication exists, creating or updating it if needed.
 	if err := l.ensurePublication(ctx); err != nil {
 		return fmt.Errorf("ensure publication: %w", err)
@@ -334,6 +341,31 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 			return nil
 		}
 		table := fqTable(rel.Namespace, rel.RelationName)
+		// Marker table: emit a synthetic OpMarker event instead of a
+		// user-table INSERT. The marker row itself is never written to the
+		// sink — the pipeline uses it as a flush fence at the transaction
+		// COMMIT that contains it.
+		if table == MarkerTableQualified {
+			uuidVal, _ := msg.After["uuid"].(string)
+			if uuidVal == "" {
+				log.Printf("[logical] marker row missing uuid at LSN %d, ignoring", walEnd)
+				return nil
+			}
+			select {
+			case events <- postgres.ChangeEvent{
+				Table:               table,
+				Operation:           postgres.OpMarker,
+				MarkerUUID:          uuidVal,
+				LSN:                 walEnd,
+				SourceTimestamp:     l.currentTxCommitTime,
+				ProcessingTimestamp: time.Now(),
+				TransactionID:       l.currentTxXID,
+			}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		}
 		if !l.isTracked(table) {
 			return nil
 		}
@@ -448,6 +480,40 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 // It uses l.replConn (which must already be open) so that the exported
 // snapshot remains valid for the initial COPY.
 // Returns the snapshot name (non-empty only when a new slot was created).
+// MarkerSchemaName and MarkerTableName identify the source-side marker table
+// that operators insert into to trigger a snapshot-alignment flush. The table
+// lives on both the publisher (blue) and subscriber (green) sides — on green
+// the row arrives via logical replication from blue.
+const (
+	MarkerSchemaName = "_pg2iceberg"
+	MarkerTableName  = "switchover_markers"
+)
+
+// MarkerTableQualified is the schema-qualified name used in publications and
+// decoder filtering.
+var MarkerTableQualified = MarkerSchemaName + "." + MarkerTableName
+
+// ensureSwitchoverMarkersTable creates the _pg2iceberg schema and the
+// switchover_markers table if they don't already exist. Idempotent. The
+// table is the source-side rendezvous point for blue/green verification —
+// an operator inserts a UUID, pg2iceberg observes it in the WAL stream on
+// both sides, and produces aligned Iceberg snapshots.
+func (l *LogicalSource) ensureSwitchoverMarkersTable(ctx context.Context) error {
+	if _, err := l.queryConn.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS `+pgx.Identifier{MarkerSchemaName}.Sanitize()); err != nil {
+		return fmt.Errorf("create schema: %w", err)
+	}
+	_, err := l.queryConn.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s.%s (
+			uuid       TEXT PRIMARY KEY,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`, pgx.Identifier{MarkerSchemaName}.Sanitize(), pgx.Identifier{MarkerTableName}.Sanitize()))
+	if err != nil {
+		return fmt.Errorf("create marker table: %w", err)
+	}
+	return nil
+}
+
 // ensurePublication creates the publication if it doesn't exist, and ensures
 // it covers all configured tables. If tables are added to the config, they are
 // added to the publication; tables removed from config are left in the publication
@@ -486,11 +552,13 @@ func (l *LogicalSource) ensurePublication(ctx context.Context) error {
 		return fmt.Errorf("check publication: %w", err)
 	}
 
-	// Collect configured table names.
-	tableNames := make([]string, 0, len(l.tableCfgs))
+	// Collect configured table names, plus the marker table so operators
+	// can drive snapshot alignment through logical replication.
+	tableNames := make([]string, 0, len(l.tableCfgs)+1)
 	for _, tc := range l.tableCfgs {
 		tableNames = append(tableNames, tc.Name)
 	}
+	tableNames = append(tableNames, MarkerTableQualified)
 
 	if !pubExists {
 		// CREATE PUBLICATION requires table names inlined (not parameterized).

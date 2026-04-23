@@ -51,6 +51,20 @@ type Pipeline struct {
 	// can detect if the DSN was repointed at a different cluster.
 	systemIdentifier uint64
 
+	// pendingMarker holds the UUID observed when an OpMarker event was
+	// decoded within the current transaction. It is cleared when the
+	// containing transaction's OpCommit is processed and the snapshot
+	// alignment flush has been recorded. Only the pipeline goroutine reads
+	// and writes these fields.
+	pendingMarker    string
+	pendingMarkerLSN uint64
+
+	// lastCommittedMarker is the UUID of the most recent marker that has
+	// been fully processed (post-COMMIT, after handleMarkerCommit ran).
+	// Exposed via LastCommittedMarker() so integration tests can assert
+	// the marker path was exercised.
+	lastCommittedMarker atomic.Value // string
+
 	materializer *Materializer
 	coord        stream.Coordinator
 	str          stream.Stream
@@ -622,6 +636,24 @@ func (p *Pipeline) run(ctx context.Context) {
 				continue
 			}
 
+			if event.Operation == postgres.OpMarker {
+				// Remember the marker and defer the flush until COMMIT so
+				// the marker transaction is snapshotted atomically (per
+				// design note: the flush must not cut between rows of the
+				// same PG transaction).
+				if p.pendingMarker != "" && p.pendingMarker != event.MarkerUUID {
+					// Two markers in one transaction — honor the last one.
+					log.Printf("[logical:%s] marker %s superseded by %s within same transaction", p.id, p.pendingMarker, event.MarkerUUID)
+				}
+				p.pendingMarker = event.MarkerUUID
+				p.pendingMarkerLSN = event.LSN
+				if event.LSN > p.lastWrittenLSN {
+					p.lastWrittenLSN = event.LSN
+				}
+				log.Printf("[logical:%s] observed switchover marker %s at LSN %d (commit pending)", p.id, event.MarkerUUID, event.LSN)
+				continue
+			}
+
 			if event.Operation == postgres.OpBegin || event.Operation == postgres.OpCommit {
 				if err := p.snk.Write(event); err != nil {
 					p.setStatus(pipeline.StatusError, fmt.Errorf("write error: %w", err))
@@ -629,6 +661,13 @@ func (p *Pipeline) run(ctx context.Context) {
 				}
 				if event.LSN > p.lastWrittenLSN {
 					p.lastWrittenLSN = event.LSN
+				}
+				if event.Operation == postgres.OpCommit && p.pendingMarker != "" {
+					if err := p.handleMarkerCommit(ctx); err != nil {
+						log.Printf("[logical:%s] marker commit error: %v", p.id, err)
+						p.setStatus(pipeline.StatusError, err)
+						return
+					}
 				}
 				continue
 			}
@@ -693,7 +732,8 @@ func (p *Pipeline) run(ctx context.Context) {
 						}
 					} else if event.Operation != postgres.OpSnapshotTableComplete &&
 						event.Operation != postgres.OpSnapshotComplete &&
-						event.Operation != postgres.OpSchemaChange {
+						event.Operation != postgres.OpSchemaChange &&
+						event.Operation != postgres.OpMarker {
 						if writeErr := p.snk.Write(event); writeErr != nil {
 							drainErr = writeErr
 							goto drained
@@ -826,6 +866,94 @@ func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
 	pipeline.SnapshotInProgress.WithLabelValues(p.id).Set(0)
 	log.Printf("[logical:%s] initial snapshot complete, checkpoint saved", p.id)
 	return nil
+}
+
+// handleMarkerCommit runs when the pipeline observes the COMMIT of a
+// transaction that contained an OpMarker. It drives an alignment flush so the
+// verifier can find matching Iceberg snapshots on blue and green:
+//
+//  1. Flush the sink's staged events to the stream and persist the checkpoint,
+//     so any user-table rows from the marker transaction are durable.
+//  2. Run a materializer cycle synchronously so those rows land in Iceberg.
+//  3. For each tracked table, read the current Iceberg snapshot id and buffer
+//     a row in the _pg2iceberg.markers meta table.
+//  4. Flush the meta recorder so the marker rows land in Iceberg before we
+//     ack anything further — that way the verifier can read them immediately.
+//
+// For tracked tables that have no Iceberg snapshot yet (e.g. a marker was
+// inserted before any data), the table is skipped with a log line — there's
+// no snapshot to align to. Option 1a (forcing an empty Iceberg commit to
+// produce a fresh snapshot per marker per table) is deferred; Option 1b
+// (record the table's current snapshot id) is what we do today, which is
+// functionally equivalent for the verifier — multiple markers may point to
+// the same snapshot id for an idle table, and that is fine.
+func (p *Pipeline) handleMarkerCommit(ctx context.Context) error {
+	marker := p.pendingMarker
+	lsn := p.pendingMarkerLSN
+	p.pendingMarker = ""
+	p.pendingMarkerLSN = 0
+
+	// Flush the sink so the marker transaction's events are staged in the
+	// stream and the checkpoint advances past the marker LSN.
+	if p.snk.ShouldFlush() {
+		if err := p.flush(ctx); err != nil {
+			return fmt.Errorf("marker %s: flush: %w", marker, err)
+		}
+	}
+
+	// Drive a synchronous materializer cycle so the newly staged events are
+	// committed to Iceberg before we read each table's snapshot id.
+	if p.materializer != nil {
+		p.materializer.MaterializeAll(ctx)
+	}
+
+	// Record one markers-table row per tracked table.
+	recorded := 0
+	skipped := 0
+	for _, tc := range p.cfg.Tables {
+		icebergName := postgres.TableToIceberg(tc.Name)
+		tm, err := p.snk.Catalog().LoadTable(ctx, p.cfg.Sink.Namespace, icebergName)
+		if err != nil {
+			log.Printf("[logical:%s] marker %s: load %s: %v (skipping)", p.id, marker, icebergName, err)
+			skipped++
+			continue
+		}
+		if tm == nil || tm.Metadata.CurrentSnapshotID == 0 {
+			log.Printf("[logical:%s] marker %s: %s has no snapshot yet (skipping)", p.id, marker, tc.Name)
+			skipped++
+			continue
+		}
+		p.meta.RecordMarker(iceberg.MarkerRecord{
+			WorkerID:   p.cfg.Sink.MaterializerWorkerID,
+			MarkerUUID: marker,
+			TableName:  tc.Name,
+			SnapshotID: tm.Metadata.CurrentSnapshotID,
+			MarkerLSN:  int64(lsn),
+		})
+		recorded++
+	}
+
+	// Flush meta so the markers-table rows land in Iceberg immediately.
+	// Otherwise they would wait for the next materializer cycle.
+	if err := p.meta.Flush(ctx); err != nil {
+		return fmt.Errorf("marker %s: flush meta: %w", marker, err)
+	}
+
+	p.lastCommittedMarker.Store(marker)
+	log.Printf("[logical:%s] marker %s committed at LSN %d: recorded=%d skipped=%d", p.id, marker, lsn, recorded, skipped)
+	return nil
+}
+
+// LastCommittedMarker returns the UUID of the most recent marker whose
+// transaction COMMIT has been processed. Empty string if no marker has been
+// observed yet. Intended for observability and integration tests.
+func (p *Pipeline) LastCommittedMarker() string {
+	v := p.lastCommittedMarker.Load()
+	if v == nil {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
 }
 
 func (p *Pipeline) handleSchemaChange(ctx context.Context, event postgres.ChangeEvent) error {
