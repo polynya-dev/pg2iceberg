@@ -1,0 +1,30 @@
+tables:
+  - name: public.accounts
+  - name: public.transfers
+
+source:
+  mode: logical
+  postgres:
+    host: green-postgres
+    port: 5432
+    database: app
+    user: postgres
+    password: postgres
+  logical:
+    publication_name: pg2iceberg_green_pub
+    slot_name: pg2iceberg_green_slot
+
+sink:
+  catalog_uri: http://iceberg-rest:8181
+  warehouse: s3://warehouse/
+  namespace: app_green
+  meta_namespace: _pg2iceberg_green
+  s3_endpoint: http://minio:9000
+  s3_access_key: admin
+  s3_secret_key: password
+  s3_region: us-east-1
+  flush_interval: 2s
+  flush_rows: 200
+  materializer_interval: 2s
+
+state: {}
