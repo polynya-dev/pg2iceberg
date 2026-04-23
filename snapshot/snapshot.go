@@ -364,12 +364,23 @@ func PgValueToString(v any, oid uint32) any {
 		if x.Exp >= 0 {
 			return intStr + strings.Repeat("0", int(x.Exp))
 		}
+		// Strip the sign before padding/splitting so zero-padding doesn't
+		// land between the sign and the digits. For -0.01 the raw digits are
+		// "-1" with Exp=-2; naive padding produces "0.-1" — we want "-0.01".
+		negative := strings.HasPrefix(intStr, "-")
+		if negative {
+			intStr = intStr[1:]
+		}
 		scale := int(-x.Exp)
 		if len(intStr) <= scale {
 			intStr = strings.Repeat("0", scale-len(intStr)+1) + intStr
 		}
 		pos := len(intStr) - scale
-		return intStr[:pos] + "." + intStr[pos:]
+		result := intStr[:pos] + "." + intStr[pos:]
+		if negative {
+			result = "-" + result
+		}
+		return result
 	case []byte:
 		return string(x)
 	default:
