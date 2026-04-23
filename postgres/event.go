@@ -19,9 +19,9 @@ const (
 	OpBegin
 	OpCommit
 	OpSchemaChange
-	// OpMarker is emitted when a row is inserted into
-	// _pg2iceberg.switchover_markers. It carries a UUID in MarkerUUID and an
-	// LSN, and signals that the pipeline should snapshot-align at the next
+	// OpMarker is emitted when a row is inserted into _pg2iceberg.markers.
+	// It carries a UUID in MarkerUUID and an LSN, and signals that the
+	// pipeline should flush-and-record an alignment point at the next
 	// COMMIT. Never forwarded to the sink.
 	OpMarker
 )
@@ -103,7 +103,7 @@ type ChangeEvent struct {
 	// SchemaChange is populated only for OpSchemaChange events.
 	SchemaChange *SchemaChange
 	// MarkerUUID is populated only for OpMarker events — the UUID value
-	// inserted into _pg2iceberg.switchover_markers by an operator.
+	// inserted into _pg2iceberg.markers by an operator.
 	MarkerUUID string
 }
 

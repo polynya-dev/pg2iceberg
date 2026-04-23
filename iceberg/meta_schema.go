@@ -131,7 +131,8 @@ func MetaCheckpointsSchema() *postgres.TableSchema {
 // marker on each side of a blue/green pair. Append-only; no deletes.
 //
 // Rows are written by the logical pipeline when it observes the COMMIT of a
-// transaction that contained an INSERT into _pg2iceberg.switchover_markers
+// transaction that contained an INSERT into _pg2iceberg.markers (on the
+// source PG side)
 // on the source PG. Each tracked table contributes one row per marker.
 //
 // Follows the same additive evolution rules as the other meta schemas.

@@ -156,10 +156,10 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- postgres.Chan
 	}
 
 	// Ensure the source-side marker table exists so operators can insert
-	// snapshot-alignment markers. The table is included in the publication
-	// below so marker rows flow through logical decoding like any user row.
-	if err := l.ensureSwitchoverMarkersTable(ctx); err != nil {
-		return fmt.Errorf("ensure switchover_markers: %w", err)
+	// alignment markers. The table is included in the publication below so
+	// marker rows flow through logical decoding like any user row.
+	if err := l.ensureMarkerTable(ctx); err != nil {
+		return fmt.Errorf("ensure marker table: %w", err)
 	}
 
 	// Ensure publication exists, creating or updating it if needed.
@@ -481,24 +481,29 @@ func (l *LogicalSource) processWAL(ctx context.Context, xld pglogrepl.XLogData, 
 // snapshot remains valid for the initial COPY.
 // Returns the snapshot name (non-empty only when a new slot was created).
 // MarkerSchemaName and MarkerTableName identify the source-side marker table
-// that operators insert into to trigger a snapshot-alignment flush. The table
-// lives on both the publisher (blue) and subscriber (green) sides — on green
-// the row arrives via logical replication from blue.
+// that operators insert into to drive a pipeline-wide alignment flush. Named
+// generically — blue/green cutover is the first user but the same fence can
+// be reused for watermarks, audit points, and other "finished up to here"
+// signals. On both publisher (blue) and subscriber (green) sides it's the
+// same schema+name; on green the row arrives via logical replication from
+// the publisher side.
+//
+// The Iceberg index table this pairs with also lives at _pg2iceberg.markers
+// — symmetric naming across systems: INSERT into PG markers, look up the
+// result in Iceberg markers. Code paths never confuse the two because one
+// goes through a PG connection and the other through the Iceberg catalog.
 const (
 	MarkerSchemaName = "_pg2iceberg"
-	MarkerTableName  = "switchover_markers"
+	MarkerTableName  = "markers"
 )
 
 // MarkerTableQualified is the schema-qualified name used in publications and
 // decoder filtering.
 var MarkerTableQualified = MarkerSchemaName + "." + MarkerTableName
 
-// ensureSwitchoverMarkersTable creates the _pg2iceberg schema and the
-// switchover_markers table if they don't already exist. Idempotent. The
-// table is the source-side rendezvous point for blue/green verification —
-// an operator inserts a UUID, pg2iceberg observes it in the WAL stream on
-// both sides, and produces aligned Iceberg snapshots.
-func (l *LogicalSource) ensureSwitchoverMarkersTable(ctx context.Context) error {
+// ensureMarkerTable creates the _pg2iceberg schema and the markers table
+// if they don't already exist. Idempotent.
+func (l *LogicalSource) ensureMarkerTable(ctx context.Context) error {
 	if _, err := l.queryConn.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS `+pgx.Identifier{MarkerSchemaName}.Sanitize()); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}

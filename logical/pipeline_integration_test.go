@@ -833,7 +833,7 @@ func TestPipeline_FlushedLSN_DoesNotIncludeUnflushedEvents(t *testing.T) {
 }
 
 // TestPipeline_SwitchoverMarker_DetectedAtCommit verifies the marker
-// detection path end-to-end: inserting a row into _pg2iceberg.switchover_markers
+// detection path end-to-end: inserting a row into _pg2iceberg.markers
 // produces an OpMarker event that the pipeline acts on only after the
 // containing transaction's COMMIT is processed. This is the first slice of
 // the blue/green snapshot-alignment design (see
@@ -910,13 +910,13 @@ func TestPipeline_SwitchoverMarker_DetectedAtCommit(t *testing.T) {
 	if err := c2.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM pg_tables
-			WHERE schemaname = '_pg2iceberg' AND tablename = 'switchover_markers'
+			WHERE schemaname = '_pg2iceberg' AND tablename = 'markers'
 		)
 	`).Scan(&exists); err != nil {
 		t.Fatalf("check marker table: %v", err)
 	}
 	if !exists {
-		t.Fatal("expected _pg2iceberg.switchover_markers table to be auto-created")
+		t.Fatal("expected _pg2iceberg.markers table to be auto-created")
 	}
 
 	// The marker table must be in the publication so pgoutput streams it.
@@ -926,13 +926,13 @@ func TestPipeline_SwitchoverMarker_DetectedAtCommit(t *testing.T) {
 			SELECT 1 FROM pg_publication_tables
 			WHERE pubname = 'test_pub'
 			  AND schemaname = '_pg2iceberg'
-			  AND tablename = 'switchover_markers'
+			  AND tablename = 'markers'
 		)
 	`).Scan(&inPub); err != nil {
 		t.Fatalf("check publication membership: %v", err)
 	}
 	if !inPub {
-		t.Fatal("expected switchover_markers to be in publication test_pub")
+		t.Fatal("expected markers to be in publication test_pub")
 	}
 
 	// Insert a user row mid-transaction with a marker to verify the
@@ -946,7 +946,7 @@ func TestPipeline_SwitchoverMarker_DetectedAtCommit(t *testing.T) {
 	if _, err := tx.Exec(ctx, "INSERT INTO users (email) VALUES ($1)", "alice@example.com"); err != nil {
 		t.Fatalf("insert user: %v", err)
 	}
-	if _, err := tx.Exec(ctx, "INSERT INTO _pg2iceberg.switchover_markers (uuid) VALUES ($1)", markerUUID); err != nil {
+	if _, err := tx.Exec(ctx, "INSERT INTO _pg2iceberg.markers (uuid) VALUES ($1)", markerUUID); err != nil {
 		t.Fatalf("insert marker: %v", err)
 	}
 	// Insert another user row AFTER the marker in the same transaction —
