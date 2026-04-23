@@ -160,9 +160,16 @@ func icebergDecimal(precision, scale int) (string, bool) {
 }
 
 // Validate checks the schema for columns that cannot be safely represented
-// in Iceberg. It returns an error if any numeric column has precision > 38
-// (Iceberg's maximum). This should be called at pipeline startup to fail fast.
+// in Iceberg, and that the table has a primary key. It should be called at
+// pipeline startup to fail fast.
 func (ts *TableSchema) Validate() error {
+	if len(ts.PK) == 0 {
+		return fmt.Errorf(
+			"table %s has no primary key; pg2iceberg requires a primary key on every "+
+				"replicated table so downstream tooling (CDC, compaction, diffing) can "+
+				"uniquely identify rows — add a PRIMARY KEY in PostgreSQL or exclude this table",
+			ts.Table)
+	}
 	for _, col := range ts.Columns {
 		if col.PGType == Numeric && col.Precision > MaxDecimalPrecision {
 			return fmt.Errorf(
@@ -311,11 +318,18 @@ func IcebergSchemaJSONWithID(ts *TableSchema, schemaID int) map[string]any {
 			"type":     iceType,
 		}
 	}
-	return map[string]any{
+	schema := map[string]any{
 		"type":      "struct",
 		"schema-id": schemaID,
 		"fields":    fields,
 	}
+	// Iceberg requires identifier fields to be `required`. PG primary-key
+	// columns are always NOT NULL, so this holds implicitly; we emit the ids
+	// only when a PK was discovered.
+	if pkIDs := ts.PKFieldIDs(); len(pkIDs) > 0 {
+		schema["identifier-field-ids"] = pkIDs
+	}
+	return schema
 }
 
 // TableToIceberg converts a fully qualified PG table name like "public.orders"

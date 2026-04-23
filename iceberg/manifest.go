@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/pg2iceberg/pg2iceberg/postgres"
 	"github.com/linkedin/goavro/v2"
@@ -344,7 +345,15 @@ func IcebergSchemaJSONString(ts *postgres.TableSchema) string {
 		fields += fmt.Sprintf(`{"id":%d,"name":"%s","required":%t,"type":%s}`,
 			col.FieldID, col.Name, !col.IsNullable, typeJSON)
 	}
-	return fmt.Sprintf(`{"type":"struct","schema-id":0,"fields":[%s]}`, fields)
+	identifier := ""
+	if pkIDs := ts.PKFieldIDs(); len(pkIDs) > 0 {
+		parts := make([]string, len(pkIDs))
+		for i, id := range pkIDs {
+			parts[i] = fmt.Sprintf("%d", id)
+		}
+		identifier = fmt.Sprintf(`,"identifier-field-ids":[%s]`, strings.Join(parts, ","))
+	}
+	return fmt.Sprintf(`{"type":"struct","schema-id":0,"fields":[%s]%s}`, fields, identifier)
 }
 
 func contentStr(content int) string {
