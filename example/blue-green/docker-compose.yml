@@ -117,7 +117,7 @@ services:
 
   iceberg-rest:
     # Reuse the same REST catalog image as the single example.
-    build: ../../single/iceberg-rest
+    build: ../../../single/iceberg-rest
     environment:
       AWS_ACCESS_KEY_ID: admin
       AWS_SECRET_ACCESS_KEY: password
@@ -147,7 +147,7 @@ services:
 
   pg2iceberg-blue:
     build:
-      context: ../../pg2iceberg
+      context: ../..
       dockerfile: Dockerfile
     depends_on:
       bootstrap-replication: { condition: service_completed_successfully }
@@ -161,7 +161,7 @@ services:
 
   pg2iceberg-green:
     build:
-      context: ../../pg2iceberg
+      context: ../..
       dockerfile: Dockerfile
     depends_on:
       bootstrap-replication: { condition: service_completed_successfully }
