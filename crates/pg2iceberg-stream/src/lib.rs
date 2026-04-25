@@ -12,9 +12,11 @@ use thiserror::Error;
 
 pub mod blob;
 pub mod codec;
+pub mod prod;
 pub mod rolling;
 
 pub use blob::BlobStore;
+pub use prod::ObjectStoreBlobStore;
 
 #[derive(Clone, Debug, Error)]
 pub enum StreamError {

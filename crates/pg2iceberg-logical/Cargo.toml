@@ -20,6 +20,7 @@ pg2iceberg-iceberg.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+object_store = { version = "0.11", default-features = false }
 pg2iceberg-sim.workspace = true
 pg2iceberg-validate.workspace = true
 pollster = "0.4"
