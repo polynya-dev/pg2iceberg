@@ -7,9 +7,12 @@ pub mod checkpoint;
 pub mod event;
 pub mod io;
 pub mod lsn;
+pub mod metrics;
 pub mod schema;
 pub mod typemap;
 pub mod value;
+
+pub use metrics::{InMemoryMetrics, Labels, Metrics, NoopMetrics};
 
 pub use checkpoint::{Checkpoint, Mode, SnapshotState};
 pub use event::{ChangeEvent, ColumnName, Op, Row};

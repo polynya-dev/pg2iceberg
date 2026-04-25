@@ -11,6 +11,9 @@
 //!   diffs. This is the headline "is my mirror correct?" command.
 
 pub mod verify;
+pub mod watcher;
+
+pub use watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
 
 use pg2iceberg_core::{Lsn, Mode, TableIdent};
 use thiserror::Error;

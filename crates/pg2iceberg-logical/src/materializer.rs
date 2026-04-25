@@ -25,7 +25,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use pg2iceberg_coord::{Coordinator, LogEntry};
-use pg2iceberg_core::{ColumnName, Row, TableIdent, TableSchema};
+use pg2iceberg_core::metrics::{names, Labels};
+use pg2iceberg_core::{ColumnName, Metrics, NoopMetrics, Row, TableIdent, TableSchema};
 use pg2iceberg_iceberg::{
     fold_events, pk_key, promote_re_inserts, read_data_file, rebuild_from_catalog,
     resolve_unchanged_cols, Catalog, DataFile, FileIndex, IcebergError, MaterializedRow,
@@ -102,6 +103,7 @@ pub struct Materializer<C: Catalog> {
     tables: BTreeMap<TableIdent, TableEntry>,
     group: String,
     cycle_limit: usize,
+    metrics: Arc<dyn Metrics>,
 }
 
 impl<C: Catalog> Materializer<C> {
@@ -113,6 +115,26 @@ impl<C: Catalog> Materializer<C> {
         group: impl Into<String>,
         cycle_limit: usize,
     ) -> Self {
+        Self::with_metrics(
+            coord,
+            blob_store,
+            catalog,
+            namer,
+            group,
+            cycle_limit,
+            Arc::new(NoopMetrics),
+        )
+    }
+
+    pub fn with_metrics(
+        coord: Arc<dyn Coordinator>,
+        blob_store: Arc<dyn BlobStore>,
+        catalog: Arc<C>,
+        namer: Arc<dyn MaterializerNamer>,
+        group: impl Into<String>,
+        cycle_limit: usize,
+        metrics: Arc<dyn Metrics>,
+    ) -> Self {
         assert!(cycle_limit > 0);
         Self {
             coord,
@@ -122,6 +144,7 @@ impl<C: Catalog> Materializer<C> {
             tables: BTreeMap::new(),
             group: group.into(),
             cycle_limit,
+            metrics,
         }
     }
 
@@ -176,6 +199,11 @@ impl<C: Catalog> Materializer<C> {
     }
 
     pub async fn cycle_table(&mut self, ident: &TableIdent) -> Result<usize> {
+        let mut labels = Labels::new();
+        labels.insert("table".into(), ident.name.clone());
+        self.metrics
+            .counter(names::MATERIALIZER_CYCLE_TOTAL, &labels, 1);
+
         let entry = self
             .tables
             .get(ident)
@@ -310,7 +338,10 @@ impl<C: Catalog> Materializer<C> {
             entry_mut.file_index.add_file(path, new_data_pks);
         }
 
-        Ok(folded.len())
+        let folded_len = folded.len();
+        self.metrics
+            .counter(names::MATERIALIZER_ROWS_TOTAL, &labels, folded_len as u64);
+        Ok(folded_len)
     }
 
     async fn fetch_prior_rows(
