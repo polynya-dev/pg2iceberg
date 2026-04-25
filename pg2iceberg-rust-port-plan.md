@@ -443,24 +443,35 @@ CTID-page chunked, parallel; marker-row fence to PG WAL stream so logical-mode h
 - Graceful shutdown: drain buffer → flush → coord write → final standby → exit.
 - Crash test: real `SIGKILL` mid-flush, restart, `verify` shows no loss.
 
-#### Phase 13 status — iceberg-rust prod catalog wired
+#### Phase 13 status — iceberg-rust prod catalog wired (forked)
 
 `pg2iceberg-iceberg/src/prod/catalog.rs::IcebergRustCatalog<C>` wraps any
 `iceberg::Catalog` (Memory, REST, Glue, SQL, S3Tables, HMS) behind our
 `Catalog` trait. Append-only commits use `Transaction::fast_append`;
-namespace + table CRUD + snapshot reads work end-to-end. 18 prod tests
-pass against `iceberg::memory::MemoryCatalog`. See
-`crates/pg2iceberg-iceberg/src/prod/gap_audit.rs` for full method status.
+schema evolution uses `Transaction::update_schema()`; namespace + table
+CRUD + snapshot reads work end-to-end. ~25 prod tests pass against
+`iceberg::memory::MemoryCatalog`. See
+`crates/pg2iceberg-iceberg/src/prod/gap_audit.rs` for the full
+method-by-method status.
 
-Two upstream-blocked items remain:
+The workspace pins `iceberg` to `polynya-dev/iceberg-rust` (branch
+`polynya-patches`, based on upstream `v0.9.0`) via `[patch.crates-io]`.
+The fork carries two minimal patches we'll cut PRs for upstream:
+
+1. `TransactionAction` trait + `BoxedTransactionAction` flipped from
+   `pub(crate)` to `pub`. Lets downstream crates author custom actions.
+2. New `UpdateSchemaAction` (and `Transaction::update_schema()`
+   convenience). Takes a target `Schema`, emits `AddSchema` +
+   `SetCurrentSchema(-1)` with three guarding requirements
+   (`UuidMatch`, `CurrentSchemaIdMatch`, `LastAssignedFieldIdMatch`).
+
+One upstream-blocked item remains:
 
 - **Equality-delete commits.** `FastAppendAction` rejects non-Data
-  content; `TableCommit::builder` is `pub(crate)` in 0.9. We surface a
-  clear `IcebergError::Other` with "blocked on upstream" so callers
-  needing upserts/deletes use the sim catalog. Track upstream for
-  delete-aware actions (`RowDelta`/`MergeAppend`).
-- **Schema evolution.** `evolve_schema` returns "not yet wired" — the
-  materializer doesn't drive DDL through the prod catalog yet.
+  content; we surface a clear `IcebergError::Other` so callers needing
+  upserts/deletes use the sim catalog. Closing this is the next patch
+  on the same fork — author a `RowDeltaAction` accepting both data
+  and equality-delete files.
 
 Carry-forward into binary wiring: `IcebergRustCatalog::new(Arc<C>)`
 accepts any concrete catalog, so swapping Memory → REST → Glue is a

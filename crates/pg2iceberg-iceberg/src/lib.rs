@@ -90,6 +90,55 @@ pub enum SchemaChange {
     DropColumn { name: String },
 }
 
+/// Apply [`SchemaChange`] variants in-place to a [`TableSchema`]. Shared
+/// between the sim and prod catalogs so they handle field-id allocation
+/// and soft-drop semantics identically.
+///
+/// - `AddColumn` appends a new non-PK column. Field id = current highest +
+///   1 (Iceberg's metadata builder forbids id reuse, so monotonic allocation
+///   is the only safe choice).
+/// - `DropColumn` is a soft drop — the column stays in the schema but
+///   becomes nullable. Preserves read compatibility for older data files
+///   that still carry the column.
+///
+/// Errors on duplicate adds and drops of unknown columns so the caller
+/// doesn't silently no-op.
+pub fn apply_schema_changes(
+    schema: &mut pg2iceberg_core::TableSchema,
+    changes: &[SchemaChange],
+) -> Result<()> {
+    for change in changes {
+        match change {
+            SchemaChange::AddColumn { name, ty, nullable } => {
+                if schema.columns.iter().any(|c| c.name == *name) {
+                    return Err(IcebergError::Conflict(format!(
+                        "AddColumn: column {name} already exists"
+                    )));
+                }
+                let next_id = schema.columns.iter().map(|c| c.field_id).max().unwrap_or(0) + 1;
+                schema.columns.push(pg2iceberg_core::ColumnSchema {
+                    name: name.clone(),
+                    field_id: next_id,
+                    ty: *ty,
+                    nullable: *nullable,
+                    is_primary_key: false,
+                });
+            }
+            SchemaChange::DropColumn { name } => {
+                let col = schema
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name == *name)
+                    .ok_or_else(|| {
+                        IcebergError::NotFound(format!("DropColumn: column {name} not in schema"))
+                    })?;
+                col.nullable = true;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 pub trait Catalog: Send + Sync {
     async fn ensure_namespace(&self, ns: &Namespace) -> Result<()>;

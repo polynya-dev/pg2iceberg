@@ -37,7 +37,8 @@ use iceberg::{
 use pg2iceberg_core::{typemap::IcebergType, ColumnSchema, Namespace, TableIdent, TableSchema};
 
 use crate::{
-    Catalog, DataFile, IcebergError, PreparedCommit, Result, SchemaChange, Snapshot, TableMetadata,
+    apply_schema_changes, Catalog, DataFile, IcebergError, PreparedCommit, Result, SchemaChange,
+    Snapshot, TableMetadata,
 };
 
 /// Wraps an `iceberg::Catalog` (e.g. `MemoryCatalog`, `RestCatalog`,
@@ -168,15 +169,36 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
 
     async fn evolve_schema(
         &self,
-        _ident: &TableIdent,
-        _changes: Vec<SchemaChange>,
+        ident: &TableIdent,
+        changes: Vec<SchemaChange>,
     ) -> Result<TableMetadata> {
-        // The materializer's `apply_schema_change` path doesn't drive this
-        // through the prod catalog yet. Wire UpdateSchema action when we
-        // start mirroring DDL through Iceberg.
-        Err(IcebergError::Other(
-            "schema evolution against iceberg-rust prod catalog is not yet wired".into(),
-        ))
+        if changes.is_empty() {
+            // Match the sim semantics: a no-op evolve still returns current
+            // metadata rather than erroring.
+            let it = to_iceberg_table_ident(ident)?;
+            let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
+            return metadata_from_table(ident, &table);
+        }
+
+        let it = to_iceberg_table_ident(ident)?;
+        let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
+
+        // Translate iceberg schema → our shape, apply changes, translate back.
+        // Keeping the round-trip in our type domain centralizes field-id
+        // allocation rules (next id = current highest + 1) and the soft-drop
+        // semantics for `DropColumn`.
+        let mut our_schema = from_iceberg_schema(ident, table.metadata().current_schema())?;
+        apply_schema_changes(&mut our_schema, &changes)?;
+        let new_iceberg_schema = to_iceberg_schema(&our_schema)?;
+
+        let tx = Transaction::new(&table);
+        let action = tx.update_schema().set_schema(new_iceberg_schema);
+        let tx = action.apply(tx).map_err(map_iceberg_err)?;
+        let updated = tx
+            .commit(self.inner.as_ref())
+            .await
+            .map_err(map_iceberg_err)?;
+        metadata_from_table(ident, &updated)
     }
 
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>> {
@@ -580,11 +602,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evolve_schema_returns_not_yet_wired() {
+    async fn evolve_schema_add_column_appends_to_schema_with_fresh_field_id() {
         let c = fresh().await;
         c.ensure_namespace(&ident().namespace).await.unwrap();
         c.create_table(&schema()).await.unwrap();
-        let err = c
+        let meta = c
             .evolve_schema(
                 &ident(),
                 vec![SchemaChange::AddColumn {
@@ -594,8 +616,135 @@ mod tests {
                 }],
             )
             .await
+            .unwrap();
+        assert_eq!(meta.schema.columns.len(), 4);
+        let new_col = meta
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.name == "new_col")
+            .expect("new_col must be in schema after evolve");
+        // Original schema had ids 1,2,3 — the new column should get 4.
+        assert_eq!(new_col.field_id, 4);
+        assert!(new_col.nullable);
+        assert!(!new_col.is_primary_key);
+
+        // Re-loading via load_table sees the same evolved schema.
+        let reloaded = c.load_table(&ident()).await.unwrap().unwrap();
+        assert_eq!(reloaded.schema, meta.schema);
+    }
+
+    #[tokio::test]
+    async fn evolve_schema_drop_column_is_soft_drop_makes_column_nullable() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        // `qty` (column 2) is non-nullable in the test schema.
+        let pre = c.load_table(&ident()).await.unwrap().unwrap();
+        assert!(!pre.schema.columns[1].nullable);
+
+        let meta = c
+            .evolve_schema(
+                &ident(),
+                vec![SchemaChange::DropColumn { name: "qty".into() }],
+            )
+            .await
+            .unwrap();
+        // Column count unchanged — soft-drop preserves it.
+        assert_eq!(meta.schema.columns.len(), 3);
+        let qty = meta
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.name == "qty")
+            .unwrap();
+        assert!(qty.nullable, "soft-drop should mark column nullable");
+        // field_id is preserved across the evolve.
+        assert_eq!(qty.field_id, 2);
+    }
+
+    #[tokio::test]
+    async fn evolve_schema_empty_changes_is_a_noop() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        let original = c.create_table(&schema()).await.unwrap();
+        let after = c.evolve_schema(&ident(), vec![]).await.unwrap();
+        assert_eq!(original.schema, after.schema);
+    }
+
+    #[tokio::test]
+    async fn evolve_schema_add_existing_column_errors() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let err = c
+            .evolve_schema(
+                &ident(),
+                vec![SchemaChange::AddColumn {
+                    name: "qty".into(),
+                    ty: IcebergType::Long,
+                    nullable: true,
+                }],
+            )
+            .await
             .unwrap_err();
-        assert!(matches!(err, IcebergError::Other(_)));
+        assert!(matches!(err, IcebergError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn evolve_schema_drop_unknown_column_errors() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let err = c
+            .evolve_schema(
+                &ident(),
+                vec![SchemaChange::DropColumn {
+                    name: "ghost".into(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IcebergError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn evolve_schema_then_commit_snapshot_uses_new_schema_id() {
+        // After an evolve, subsequent commits should target the new schema
+        // version. We can't observe the schema id directly through our
+        // metadata surface (we only carry sequence_number for current_snapshot_id),
+        // but we can confirm the round-trip stays self-consistent: evolve,
+        // commit a data file, reload, and assert the evolved column is
+        // still present.
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        c.evolve_schema(
+            &ident(),
+            vec![SchemaChange::AddColumn {
+                name: "added".into(),
+                ty: IcebergType::Int,
+                nullable: true,
+            }],
+        )
+        .await
+        .unwrap();
+        c.commit_snapshot(PreparedCommit {
+            ident: ident(),
+            data_files: vec![DataFile {
+                path: "memory:///warehouse/public/orders/data-0.parquet".into(),
+                record_count: 1,
+                byte_size: 256,
+                equality_field_ids: vec![],
+            }],
+            equality_deletes: vec![],
+        })
+        .await
+        .unwrap();
+
+        let reloaded = c.load_table(&ident()).await.unwrap().unwrap();
+        assert!(reloaded.schema.columns.iter().any(|c| c.name == "added"));
+        assert!(reloaded.current_snapshot_id.is_some());
     }
 
     #[tokio::test]

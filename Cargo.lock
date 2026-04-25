@@ -1239,8 +1239,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b795ef2e2197596efad630c5e8cc4b4ebdfc488c02dadc709bef0416e1ffd49"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches#b48523df18fbbca7cd9d0349562228207965a645"
 dependencies = [
  "anyhow",
  "apache-avro",

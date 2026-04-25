@@ -8,7 +8,9 @@
 use async_trait::async_trait;
 use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
 use pg2iceberg_iceberg::PreparedCommit;
-use pg2iceberg_iceberg::{Catalog, IcebergError, Result, SchemaChange, Snapshot, TableMetadata};
+use pg2iceberg_iceberg::{
+    apply_schema_changes, Catalog, IcebergError, Result, SchemaChange, Snapshot, TableMetadata,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -109,13 +111,23 @@ impl Catalog for MemoryCatalog {
 
     async fn evolve_schema(
         &self,
-        _ident: &TableIdent,
-        _changes: Vec<SchemaChange>,
+        ident: &TableIdent,
+        changes: Vec<SchemaChange>,
     ) -> Result<TableMetadata> {
-        // Phase 7.5+; the materializer doesn't call this in Phase 8.
-        Err(IcebergError::Other(
-            "schema evolution not yet implemented".into(),
-        ))
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
+        if changes.is_empty() {
+            return Ok(table.metadata.clone());
+        }
+        // Use the same helper the prod catalog uses, so both backends apply
+        // identical field-id allocation and soft-drop semantics. The sim
+        // does not produce snapshots for schema-only commits — it just
+        // updates the schema in metadata.
+        apply_schema_changes(&mut table.metadata.schema, &changes)?;
+        Ok(table.metadata.clone())
     }
 
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>> {
@@ -210,5 +222,87 @@ mod tests {
         }))
         .unwrap();
         assert!(block_on(c.snapshots(&ident())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn evolve_schema_add_column_appends_with_fresh_field_id() {
+        let c = MemoryCatalog::new();
+        block_on(c.ensure_namespace(&ident().namespace)).unwrap();
+        block_on(c.create_table(&schema())).unwrap();
+        let meta = block_on(c.evolve_schema(
+            &ident(),
+            vec![pg2iceberg_iceberg::SchemaChange::AddColumn {
+                name: "qty".into(),
+                ty: IcebergType::Long,
+                nullable: true,
+            }],
+        ))
+        .unwrap();
+        assert_eq!(meta.schema.columns.len(), 2);
+        let qty = meta
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.name == "qty")
+            .unwrap();
+        assert_eq!(qty.field_id, 2);
+        assert!(qty.nullable);
+        assert!(!qty.is_primary_key);
+    }
+
+    #[test]
+    fn evolve_schema_drop_column_is_soft_drop() {
+        let c = MemoryCatalog::new();
+        block_on(c.ensure_namespace(&ident().namespace)).unwrap();
+        // Create a table where column 2 is non-nullable so we can observe
+        // the soft-drop flipping it.
+        let s = TableSchema {
+            ident: ident(),
+            columns: vec![
+                ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+                ColumnSchema {
+                    name: "qty".into(),
+                    field_id: 2,
+                    ty: IcebergType::Long,
+                    nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+        };
+        block_on(c.create_table(&s)).unwrap();
+        let meta = block_on(c.evolve_schema(
+            &ident(),
+            vec![pg2iceberg_iceberg::SchemaChange::DropColumn { name: "qty".into() }],
+        ))
+        .unwrap();
+        assert_eq!(meta.schema.columns.len(), 2);
+        let qty = meta
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.name == "qty")
+            .unwrap();
+        assert!(qty.nullable);
+    }
+
+    #[test]
+    fn evolve_schema_on_missing_table_errors() {
+        let c = MemoryCatalog::new();
+        let err = block_on(c.evolve_schema(
+            &ident(),
+            vec![pg2iceberg_iceberg::SchemaChange::AddColumn {
+                name: "x".into(),
+                ty: IcebergType::Int,
+                nullable: true,
+            }],
+        ))
+        .unwrap_err();
+        assert!(matches!(err, IcebergError::NotFound(_)));
     }
 }

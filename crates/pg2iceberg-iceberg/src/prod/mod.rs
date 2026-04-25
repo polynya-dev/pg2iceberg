@@ -1,21 +1,24 @@
 //! Production-impl glue for the [`crate::Catalog`] trait, wrapping the
-//! upstream Apache `iceberg-rust` 0.9 crate.
+//! upstream Apache `iceberg-rust` crate (pinned to our
+//! `polynya-dev/iceberg-rust` fork — see [`gap_audit`] for what's
+//! patched and why).
 //!
 //! Allowlisted to use real IO via `crates/pg2iceberg-iceberg/src/prod/`
 //! per the banned-calls CI script.
 //!
-//! ## Status (post-Phase 13)
+//! ## Status
 //!
-//! Append-only commits, namespace + table CRUD, and snapshot reads are
-//! all wired through [`IcebergRustCatalog`]. See [`gap_audit`] for the
-//! full method-by-method status. The two remaining gaps:
+//! Append-only commits, namespace + table CRUD, snapshot reads, and
+//! schema evolution are all wired through [`IcebergRustCatalog`]. See
+//! [`gap_audit`] for the full method-by-method status.
 //!
-//! - **Equality-delete commits** — upstream-blocked on iceberg-rust 0.9.
-//!   Surfaced as a clear `IcebergError::Other` so callers know the path
-//!   is unsupported rather than silently broken.
-//! - **Schema evolution** — `evolve_schema` returns "not yet wired".
-//!   Needs an `UpdateSchema` action wiring; tracked alongside CDC-side
-//!   DDL handling.
+//! One remaining gap:
+//!
+//! - **Equality-delete commits** — upstream's `FastAppendAction` rejects
+//!   non-Data files and there's no public delete-aware action. Surfaced
+//!   as a clear `IcebergError::Other` so callers know the path is
+//!   unsupported rather than silently broken. Closing this is the next
+//!   patch on the fork.
 //!
 //! Smoke tests (`smoke.rs`) exercise the upstream surface directly to
 //! catch breakage on `iceberg-rust` upgrades. Per-method translation
