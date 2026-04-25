@@ -1,1 +1,0 @@
-SELECT id, label, substr(payload, 1, 1), length(payload) FROM iceberg.`default.e2e_toast_col_then_update` ORDER BY id, label

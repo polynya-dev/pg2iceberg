@@ -1,0 +1,18 @@
+[package]
+name = "pg2iceberg-sim"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+pg2iceberg-core.workspace = true
+pg2iceberg-pg.workspace = true
+pg2iceberg-coord.workspace = true
+pg2iceberg-stream.workspace = true
+pg2iceberg-iceberg.workspace = true

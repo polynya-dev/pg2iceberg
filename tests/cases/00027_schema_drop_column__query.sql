@@ -1,1 +1,0 @@
-SELECT id, name, amount FROM iceberg.`default.e2e_schema_drop_col` ORDER BY id

@@ -1,1 +1,0 @@
-SELECT id, name, value FROM iceberg.`default.e2e_schema_varchar` ORDER BY id

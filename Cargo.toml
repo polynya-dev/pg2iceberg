@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pg2iceberg-core",
+    "crates/pg2iceberg-pg",
+    "crates/pg2iceberg-coord",
+    "crates/pg2iceberg-stream",
+    "crates/pg2iceberg-iceberg",
+    "crates/pg2iceberg-logical",
+    "crates/pg2iceberg-query",
+    "crates/pg2iceberg-snapshot",
+    "crates/pg2iceberg-validate",
+    "crates/pg2iceberg-sim",
+    "crates/pg2iceberg-tests",
+    "crates/pg2iceberg",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+proptest = "1"
+
+pg2iceberg-core = { path = "crates/pg2iceberg-core" }
+pg2iceberg-pg = { path = "crates/pg2iceberg-pg" }
+pg2iceberg-coord = { path = "crates/pg2iceberg-coord" }
+pg2iceberg-stream = { path = "crates/pg2iceberg-stream" }
+pg2iceberg-iceberg = { path = "crates/pg2iceberg-iceberg" }
+pg2iceberg-logical = { path = "crates/pg2iceberg-logical" }
+pg2iceberg-query = { path = "crates/pg2iceberg-query" }
+pg2iceberg-snapshot = { path = "crates/pg2iceberg-snapshot" }
+pg2iceberg-validate = { path = "crates/pg2iceberg-validate" }
+pg2iceberg-sim = { path = "crates/pg2iceberg-sim" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

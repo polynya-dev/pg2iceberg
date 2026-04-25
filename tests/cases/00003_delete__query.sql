@@ -1,1 +1,0 @@
-SELECT id, name FROM iceberg.`default.e2e_delete` ORDER BY id

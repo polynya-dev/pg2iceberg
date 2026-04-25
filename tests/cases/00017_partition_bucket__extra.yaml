@@ -1,3 +1,0 @@
-    iceberg:
-      partition:
-        - bucket[4](id)

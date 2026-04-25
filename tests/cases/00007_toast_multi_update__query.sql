@@ -1,1 +1,0 @@
-SELECT id, label, length(payload) FROM iceberg.`default.e2e_toast_multi_update` ORDER BY id, label

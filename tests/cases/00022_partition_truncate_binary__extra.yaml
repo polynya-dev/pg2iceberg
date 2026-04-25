@@ -1,3 +1,0 @@
-    iceberg:
-      partition:
-        - truncate[3](data)

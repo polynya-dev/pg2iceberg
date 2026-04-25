@@ -1,1 +1,0 @@
-SELECT id, label, length(bio), length(payload) FROM iceberg.`default.e2e_toast_nullable` ORDER BY id, label

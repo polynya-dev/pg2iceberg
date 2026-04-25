@@ -1,0 +1,17 @@
+[package]
+name = "pg2iceberg-tests"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pg2iceberg-core.workspace = true
+pg2iceberg-sim.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

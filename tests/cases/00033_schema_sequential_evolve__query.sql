@@ -1,1 +1,0 @@
-SELECT id, name, score, level FROM iceberg.`default.e2e_schema_seq` ORDER BY id
