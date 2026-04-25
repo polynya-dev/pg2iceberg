@@ -743,6 +743,8 @@ dependencies = [
  "pg2iceberg-pg",
  "pg2iceberg-stream",
  "pollster",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

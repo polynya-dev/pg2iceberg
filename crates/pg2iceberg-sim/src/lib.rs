@@ -6,3 +6,4 @@
 
 pub mod clock;
 pub mod coord;
+pub mod postgres;

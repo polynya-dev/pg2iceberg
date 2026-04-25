@@ -33,9 +33,11 @@ pub type Result<T> = std::result::Result<T, PgError>;
 pub enum DecodedMessage {
     Begin {
         final_lsn: Lsn,
+        xid: u32,
     },
     Commit {
         commit_lsn: Lsn,
+        xid: u32,
     },
     /// Schema for a relation. Sent before any change events for that relation.
     Relation {
