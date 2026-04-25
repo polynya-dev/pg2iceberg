@@ -16,3 +16,6 @@ pg2iceberg-pg.workspace = true
 pg2iceberg-coord.workspace = true
 pg2iceberg-stream.workspace = true
 pg2iceberg-iceberg.workspace = true
+
+[dev-dependencies]
+pollster = "0.4"

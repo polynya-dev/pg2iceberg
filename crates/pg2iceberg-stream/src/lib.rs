@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod codec;
+pub mod rolling;
 
 #[derive(Clone, Debug, Error)]
 pub enum StreamError {

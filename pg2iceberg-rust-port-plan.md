@@ -81,11 +81,12 @@ Owned by the coordinator package; every distributed-state question routes here i
 
 ## 3. Guiding principles
 
-1. **IO seams from day one.** All IO, time, task spawning, and randomness go through traits owned by this codebase. Production impls wrap real runtimes; sim impls are in-process fakes driven by a seeded scheduler. Banned-call CI enforces this — see §7.
-2. **The coordinator is the source of truth for durability.** `flushedLSN` advances only after the coord write commits in PG. Encode this in types: the function that calls `SetFlushedLSN` accepts a "coord-commit receipt" parameter, and that receipt can only be constructed by `Coordinator::claim_offsets`.
-3. **Idempotent replay everywhere.** Recovery is "resume from last cursor / `restart_lsn`." `log_index` uses `(table_name, end_offset)` as PK; materializer fold is keyed by user PK; equality deletes are commutative under replay. Make this structurally true, not just observed.
-4. **The sim is your model of Postgres.** It will be wrong. Differential testing against real PG is how you find out, and the bugs in your sim are wins.
-5. **Verify is a product feature.** `pg2iceberg verify` diffs PG ground truth against Iceberg state. The Go code has only startup validation; the Rust port should ship a CLI verify subcommand from the start. Users will run it.
+1. **Mirror, not CDC.** pg2iceberg is a managed-mirror product, not a streaming framework. PG and Iceberg are guaranteed to match 100%. Therefore: no `--start-lsn`, no `--skip-snapshot`, no `--reset-checkpoint` flag. If a user thinks they need one, the answer is "delete the Iceberg table and re-snapshot," not "rewind the slot." This shapes the CLI surface, the recovery design, and what `verify` means — the diff is only meaningful because there's no legitimate way the operator could have skipped data.
+2. **IO seams from day one.** All IO, time, task spawning, and randomness go through traits owned by this codebase. Production impls wrap real runtimes; sim impls are in-process fakes driven by a seeded scheduler. Banned-call CI enforces this — see §7.
+3. **The coordinator is the source of truth for durability.** `flushedLSN` advances only after the coord write commits in PG. Encode this in types: the function that calls `SetFlushedLSN` accepts a "coord-commit receipt" parameter, and that receipt can only be constructed by `Coordinator::claim_offsets`. The receipt's `flushable_lsn` is supplied by the *pipeline* (it knows what LSN it just staged), not by user input — keep the user-facing surface free of any "advance LSN" knob (see principle 1).
+4. **Idempotent replay everywhere.** Recovery is "resume from last cursor / `restart_lsn`." `log_index` uses `(table_name, end_offset)` as PK; materializer fold is keyed by user PK; equality deletes are commutative under replay. Make this structurally true, not just observed.
+5. **The sim is your model of Postgres.** It will be wrong. Differential testing against real PG is how you find out, and the bugs in your sim are wins.
+6. **Verify is a product feature.** `pg2iceberg verify` diffs PG ground truth against Iceberg state. The Go code has only startup validation; the Rust port should ship a CLI verify subcommand from the start. Users will run it.
 
 ---
 

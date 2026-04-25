@@ -173,6 +173,7 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
 /// Encode events into a single Parquet file (one row group). Returns the
 /// serialized bytes plus the highest LSN seen, which the caller hands to the
 /// coordinator as `OffsetClaim::max_lsn`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedChunk {
     pub bytes: Bytes,
     pub record_count: u64,

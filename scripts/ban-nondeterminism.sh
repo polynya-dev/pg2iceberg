@@ -19,6 +19,7 @@ PATTERNS=(
   'chrono::Local::now'
   'tokio::spawn'
   'tokio::task::spawn_blocking'
+  '#\[tokio::test'
   'std::thread::spawn'
   'rand::thread_rng'
   'rand::random'
