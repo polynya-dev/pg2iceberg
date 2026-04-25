@@ -5,6 +5,7 @@
 //! without testcontainers). Phase 4 adds `SimPostgres` (WAL + slot semantics).
 
 pub mod blob;
+pub mod catalog;
 pub mod clock;
 pub mod coord;
 pub mod postgres;

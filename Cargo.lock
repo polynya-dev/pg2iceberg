@@ -701,6 +701,7 @@ dependencies = [
  "parquet",
  "pg2iceberg-core",
  "pg2iceberg-stream",
+ "pollster",
  "serde",
  "serde_json",
  "thiserror",
