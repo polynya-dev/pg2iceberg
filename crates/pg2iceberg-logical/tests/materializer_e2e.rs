@@ -9,7 +9,7 @@ use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
-    ColumnName, ColumnSchema, Lsn, Namespace, PgValue, Row, TableIdent, TableSchema, Timestamp,
+    ColumnName, ColumnSchema, Namespace, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
 use pg2iceberg_iceberg::{read_materialized_state, Catalog};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
