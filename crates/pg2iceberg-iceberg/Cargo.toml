@@ -22,5 +22,15 @@ serde.workspace = true
 serde_json = "1"
 thiserror.workspace = true
 
+# iceberg-rust prod-impl wrap. Heavy transitive deps (reqwest, opendal,
+# arrow) but most of those are already in our graph from parquet.
+iceberg = { version = "0.9", optional = true }
+
+[features]
+default = []
+# Enables the prod-impl module that wraps iceberg-rust. Off by default so
+# sim-only consumers don't pull the heavier dep graph (reqwest, opendal).
+prod = ["dep:iceberg"]
+
 [dev-dependencies]
 pollster = "0.4"

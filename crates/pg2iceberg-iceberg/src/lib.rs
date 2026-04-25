@@ -6,6 +6,8 @@
 pub mod file_index;
 pub mod fold;
 pub mod materialize;
+#[cfg(feature = "prod")]
+pub mod prod;
 pub mod reader;
 pub mod verify;
 pub mod writer;
