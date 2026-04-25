@@ -223,11 +223,7 @@ mod tests {
     /// the parts the verify tests need.
     fn boot_with_seeds(
         seeds: &[(i32, i32)],
-    ) -> (
-        SimPostgres,
-        Arc<MemoryCatalog>,
-        Arc<MemoryBlobStore>,
-    ) {
+    ) -> (SimPostgres, Arc<MemoryCatalog>, Arc<MemoryBlobStore>) {
         let db = SimPostgres::new();
         db.create_table(schema()).unwrap();
         if !seeds.is_empty() {
