@@ -31,6 +31,11 @@ impl fmt::Display for TableIdent {
 #[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ColumnSchema {
     pub name: String,
+    /// Iceberg field id. Stable across renames; required by Iceberg readers
+    /// for column resolution. The first column in a fresh table starts at 1
+    /// and increments; new columns added via schema evolution take the next
+    /// unused id.
+    pub field_id: i32,
     pub ty: IcebergType,
     pub nullable: bool,
     pub is_primary_key: bool,

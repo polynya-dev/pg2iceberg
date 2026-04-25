@@ -53,12 +53,14 @@ fn schema() -> TableSchema {
         columns: vec![
             ColumnSchema {
                 name: "id".into(),
+                field_id: 1,
                 ty: IcebergType::Int,
                 nullable: false,
                 is_primary_key: true,
             },
             ColumnSchema {
                 name: "qty".into(),
+                field_id: 2,
                 ty: IcebergType::Int,
                 nullable: false,
                 is_primary_key: false,

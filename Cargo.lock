@@ -693,9 +693,16 @@ dependencies = [
 name = "pg2iceberg-iceberg"
 version = "0.0.0"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
  "async-trait",
+ "bytes",
+ "parquet",
  "pg2iceberg-core",
+ "pg2iceberg-stream",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
