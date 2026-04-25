@@ -34,3 +34,7 @@ prod = ["dep:iceberg"]
 
 [dev-dependencies]
 pollster = "0.4"
+# Iceberg's Transaction::commit uses tokio::time::sleep in its retry backoff.
+# Smoke tests under `--features prod` therefore need a tokio runtime; the
+# non-prod tests still run on pollster.
+tokio = { version = "1", features = ["rt", "macros", "time"] }

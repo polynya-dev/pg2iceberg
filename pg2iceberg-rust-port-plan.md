@@ -443,6 +443,29 @@ CTID-page chunked, parallel; marker-row fence to PG WAL stream so logical-mode h
 - Graceful shutdown: drain buffer → flush → coord write → final standby → exit.
 - Crash test: real `SIGKILL` mid-flush, restart, `verify` shows no loss.
 
+#### Phase 13 status — iceberg-rust prod catalog wired
+
+`pg2iceberg-iceberg/src/prod/catalog.rs::IcebergRustCatalog<C>` wraps any
+`iceberg::Catalog` (Memory, REST, Glue, SQL, S3Tables, HMS) behind our
+`Catalog` trait. Append-only commits use `Transaction::fast_append`;
+namespace + table CRUD + snapshot reads work end-to-end. 18 prod tests
+pass against `iceberg::memory::MemoryCatalog`. See
+`crates/pg2iceberg-iceberg/src/prod/gap_audit.rs` for full method status.
+
+Two upstream-blocked items remain:
+
+- **Equality-delete commits.** `FastAppendAction` rejects non-Data
+  content; `TableCommit::builder` is `pub(crate)` in 0.9. We surface a
+  clear `IcebergError::Other` with "blocked on upstream" so callers
+  needing upserts/deletes use the sim catalog. Track upstream for
+  delete-aware actions (`RowDelta`/`MergeAppend`).
+- **Schema evolution.** `evolve_schema` returns "not yet wired" — the
+  materializer doesn't drive DDL through the prod catalog yet.
+
+Carry-forward into binary wiring: `IcebergRustCatalog::new(Arc<C>)`
+accepts any concrete catalog, so swapping Memory → REST → Glue is a
+config-only change at the binary layer.
+
 ### Phase 14 — Compaction + maintenance (week 12+)
 
 Ports `iceberg/compact.go`, `iceberg/maintain.go`. Note the existing partition bug (deferred, [project_compaction_partition_bug.md]) — do not re-introduce.
@@ -472,7 +495,12 @@ DST and the production-runtime metric checker both assert these. Wording matters
 
 ## 10. Open questions to resolve before deep coding
 
-1. **`iceberg-rust` gap audit.** Does it support: equality deletes (write path), schema evolution (add/drop column), per-table partition spec evolution, REST catalog auth flavors (none/sigv4/bearer/oauth2 with refresh), vended-credentials response handling? File a tracking doc with one row per Go feature → Rust feature → status (supported / workaround / upstream issue). Block Phase 7 on this, not earlier.
+1. **`iceberg-rust` gap audit.** ✅ done — see
+   `crates/pg2iceberg-iceberg/src/prod/gap_audit.rs`. Result: append-only
+   commits + namespace/table CRUD + snapshot reads work end-to-end via
+   `IcebergRustCatalog<C>`. Equality-delete commits are upstream-blocked
+   in 0.9 (no public action accepts non-Data content; `TableCommit::builder`
+   is `pub(crate)`); schema evolution wiring is deferred until DDL handling.
 2. **Replication protocol crate.** `pgwire-replication` vs hand-rolled `pgoutput` decoder over `tokio-postgres`'s replication mode. Spike both with a 50-row publication to compare. Decision criterion: does the crate handle truncate, relation, message, type, origin? If gaps, hand-roll.
 3. **`madsim` interception coverage.** Run a hello-world test that uses `tokio-postgres` and `reqwest` under `madsim`. If either escapes, decide: (a) use a custom seeded executor for those paths, (b) require all PG/HTTP go through trait boundaries (which we already do — sim bypasses the wire protocol entirely), (c) fork.
 4. **TOAST handling on UPDATE.** Go preserves `unchanged_cols` and resolves at materialize time via FileIndex. Match exactly. Failure mode if FileIndex miss (e.g., compaction removed the prior file): re-read source row? Refuse the update? Document the chosen mode and DST-test it.
