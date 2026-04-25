@@ -1,4 +1,4 @@
-//! What `iceberg-rust` 0.9 supports vs. what `pg2iceberg-iceberg`'s
+//! What `iceberg-rust` (our fork) supports vs. what `pg2iceberg-iceberg`'s
 //! `Catalog` trait needs. Updated as we close gaps.
 //!
 //! ## Methods we need to translate
@@ -8,7 +8,7 @@
 //! load_table                → iceberg::Catalog::load_table                     ✅ wired
 //! create_table              → iceberg::Catalog::create_table                   ✅ wired
 //! commit_snapshot (append)  → iceberg::transaction::Transaction::fast_append   ✅ wired
-//! commit_snapshot (deletes) → no public action accepts non-Data files          🔴 upstream-blocked
+//! commit_snapshot (deletes) → fork-patched FastAppendAction routes by type     ✅ wired (via fork)
 //! evolve_schema             → iceberg::transaction::Transaction::update_schema ✅ wired (via fork)
 //! snapshots                 → table.metadata().snapshots() + manifest walk     ✅ wired
 //! ```
@@ -20,19 +20,26 @@
 //!
 //! The workspace `Cargo.toml` pins `iceberg` to
 //! `polynya-dev/iceberg-rust` (branch `polynya-patches`), based on
-//! upstream `v0.9.0`. The fork carries two non-invasive patches:
+//! upstream `v0.9.0`. The fork carries three non-invasive patches:
 //!
-//! - `TransactionAction` trait (and `BoxedTransactionAction`) flipped
-//!   from `pub(crate)` to `pub`. Lets us author custom transaction
-//!   actions in downstream crates.
-//! - New `UpdateSchemaAction`. Takes a target `Schema` and emits
-//!   `TableUpdate::AddSchema` + `TableUpdate::SetCurrentSchema(-1)` plus
-//!   `UuidMatch` / `CurrentSchemaIdMatch` / `LastAssignedFieldIdMatch`
-//!   requirements. Wrapped by a `Transaction::update_schema()`
-//!   convenience method matching upstream conventions.
+//! 1. **`TransactionAction` visibility.** The trait (and
+//!    `BoxedTransactionAction`) flipped from `pub(crate)` to `pub`. Lets
+//!    downstream crates author custom transaction actions.
+//! 2. **`UpdateSchemaAction`.** Takes a target `Schema`, emits
+//!    `TableUpdate::AddSchema` + `TableUpdate::SetCurrentSchema(-1)` plus
+//!    `UuidMatch` / `CurrentSchemaIdMatch` / `LastAssignedFieldIdMatch`
+//!    requirements. Wrapped by a `Transaction::update_schema()`
+//!    convenience method matching upstream conventions.
+//! 3. **`FastAppendAction` accepts mixed content types.** Files passed to
+//!    `add_data_files` are routed by `content_type()` into
+//!    `added_data_files` (Data) or `added_delete_files`
+//!    (EqualityDeletes / PositionDeletes). `SnapshotProducer` writes them
+//!    to separate manifests (`build_v{2,3}_data` vs
+//!    `build_v{2,3}_deletes`) per Iceberg-spec rules. The old
+//!    "Only data content type is allowed for fast append" check is gone.
 //!
-//! Both changes are intended to be upstreamed — once they land we drop
-//! the fork and pin to a fresh crates.io release.
+//! All three are intended to be upstreamed as separate PRs; once they
+//! land we drop the fork and pin to a fresh crates.io release.
 //!
 //! ## Schema evolution wiring
 //!
@@ -53,36 +60,26 @@
 //! `pg2iceberg-sim::catalog::tests` exercise the same change set against
 //! both.
 //!
-//! ## Equality-delete write path is upstream-blocked
+//! ## Equality-delete commit wiring
 //!
-//! - `iceberg::transaction::FastAppendAction::validate_added_data_files`
-//!   in 0.9 explicitly rejects any `DataFile` whose `content_type()` is
-//!   not `DataContentType::Data` with the error
-//!   `"Only data content type is allowed for fast append"`. There is no
-//!   other public commit action in 0.9 — `RowDelta` / `MergeAppend` /
-//!   delete-aware actions don't exist upstream.
-//! - The lower-level escape hatch
-//!   `iceberg::TableCommit::builder()` is **`pub(crate)`** in 0.9, so we
-//!   cannot construct a `TableCommit` with a hand-built
-//!   `TableUpdate::AddSnapshot` from outside the crate.
-//! - There IS an `iceberg::writer::base_writer::EqualityDeleteFileWriter`
-//!   that *writes* a delete file (returning a `DataFile` with
-//!   `content = EqualityDeletes`) — but no way to commit it via the
-//!   public Catalog/Transaction surface.
+//! `IcebergRustCatalog::commit_snapshot` builds a single
+//! `Vec<iceberg::spec::DataFile>` from `prepared.data_files` (Data) and
+//! `prepared.equality_deletes` (EqualityDeletes), and hands the lot to
+//! `FastAppendAction::add_data_files`. The fork's action splits by
+//! `content_type()` and `SnapshotProducer` writes two manifests — one
+//! data, one deletes — both attached to the same snapshot.
 //!
-//! Consequences for `IcebergRustCatalog::commit_snapshot`:
+//! Pre-flight check: equality-delete files with empty
+//! `equality_field_ids` are rejected before submission, since they would
+//! match either no rows or every row depending on reader and silently
+//! corrupt the table either way.
 //!
-//! - When `prepared.equality_deletes` is empty, we use `FastAppendAction`
-//!   and the commit succeeds.
-//! - When `prepared.equality_deletes` is non-empty, we return
-//!   `IcebergError::Other("equality-delete commits are not yet supported
-//!   by the iceberg-rust prod backend...")`. Callers that need
-//!   upserts/deletes today must run against the sim catalog.
-//!
-//! Closing this is a **follow-on patch on the same fork** — author a
-//! `RowDeltaAction` (or relax `FastAppendAction` to accept all content
-//! types, splitting manifests by content). Doable, deferred until we
-//! tackle equality deletes specifically.
+//! Position deletes: not used yet. Our `TableWriter` only emits equality
+//! deletes today. RisingWave's `DeltaWriter` shows the optimization path
+//! (in-batch self-cancellation via position deletes), but it's a separate
+//! optimization — read-side correctness already works with equality
+//! deletes only. Revisit if profiling shows in-batch insert/delete churn
+//! is hot.
 //!
 //! ## Snapshot ID semantics
 //!
@@ -119,12 +116,12 @@
 //!
 //! ## Remaining items for the prod path
 //!
-//! 1. Equality-delete commit path — author a delete-aware action on the
-//!    fork (`RowDeltaAction`).
-//! 2. Drive an end-to-end materializer flush through
+//! 1. Drive an end-to-end materializer flush through
 //!    `IcebergRustCatalog<MemoryCatalog>` in an integration test (proves
 //!    real BlobStore + catalog interop, not just per-method translation).
-//! 3. Wire `IcebergRustCatalog` into the binary, replacing the sim
+//! 2. Wire `IcebergRustCatalog` into the binary, replacing the sim
 //!    catalog as the default at runtime.
+//! 3. (Optional optimization) Adopt RisingWave-style position deletes
+//!    for in-batch self-cancellation. Equality deletes alone are correct.
 
 #![allow(clippy::doc_markdown)]

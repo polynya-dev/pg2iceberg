@@ -4,22 +4,21 @@
 //!
 //! Translation rules:
 //!
-//! - **Append-only commits.** `commit_snapshot` uses
-//!   [`iceberg::transaction::Transaction::fast_append`]. This handles the
-//!   bulk of pg2iceberg's I/O: every initial-snapshot batch and every
-//!   no-update-only WAL flush is append-only.
-//! - **Equality-delete commits.** Returns
-//!   [`crate::IcebergError::Other`] with a clear "blocked on upstream"
-//!   message. iceberg-rust 0.9's only public commit action is
-//!   `FastAppendAction`, which rejects `DataContentType::EqualityDeletes`,
-//!   and `TableCommit::builder` is `pub(crate)` so we cannot bypass it.
-//!   See `gap_audit` for the upstream tracking.
-//! - **Schema evolution.** Returns `Other("not yet supported")`. The
-//!   transaction surface for `UpdateSchema` exists in `iceberg-rust` but
-//!   the materializer doesn't drive it yet — wiring is a follow-on task.
-//! - **`load_table` not-found.** Maps `ErrorKind::TableNotFound` →
-//!   `Ok(None)` (the materializer treats not-found distinctly from
-//!   transient errors).
+//! - **Mixed data + equality-delete commits.** `commit_snapshot` builds a
+//!   single `Vec<DataFile>` from `prepared.data_files` (content = Data)
+//!   and `prepared.equality_deletes` (content = EqualityDeletes), then
+//!   submits via [`iceberg::transaction::Transaction::fast_append`]. The
+//!   forked `FastAppendAction` routes by `content_type()` into separate
+//!   data and delete manifests at commit time.
+//! - **Schema evolution.** Translates our `Vec<SchemaChange>` to a target
+//!   `iceberg::Schema` (via [`crate::apply_schema_changes`]) and submits
+//!   via the forked `Transaction::update_schema()`.
+//! - **`load_table` not-found.** Maps `ErrorKind::TableNotFound` and
+//!   `NamespaceNotFound` → `Ok(None)` (the materializer treats not-found
+//!   distinctly from transient errors).
+//!
+//! See [`super::gap_audit`] for the full method-by-method status and the
+//! list of fork patches we depend on.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -111,19 +110,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     }
 
     async fn commit_snapshot(&self, prepared: PreparedCommit) -> Result<TableMetadata> {
-        if !prepared.equality_deletes.is_empty() {
-            // FastAppendAction validates `content_type == Data`. Our only other
-            // public path would be `TableCommit::builder`, which is `pub(crate)`
-            // in 0.9. Tracked in `gap_audit`.
-            return Err(IcebergError::Other(
-                "equality-delete commits are not yet supported by the iceberg-rust prod \
-                 backend (FastAppendAction rejects non-Data content; TableCommit::builder \
-                 is pub(crate) in 0.9). Use the sim catalog or wait for upstream to ship a \
-                 delete-aware action."
-                    .to_string(),
-            ));
-        }
-        if prepared.data_files.is_empty() {
+        if prepared.data_files.is_empty() && prepared.equality_deletes.is_empty() {
             // No work — match the sim-catalog noop semantics so the materializer
             // can flush "no data, no deletes" without a snapshot bump.
             let it = to_iceberg_table_ident(&prepared.ident)?;
@@ -135,9 +122,10 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
         let spec_id = table.metadata().default_partition_spec_id();
 
-        let mut data_files: Vec<IcebergDataFile> = Vec::with_capacity(prepared.data_files.len());
+        let mut all_files: Vec<IcebergDataFile> =
+            Vec::with_capacity(prepared.data_files.len() + prepared.equality_deletes.len());
         for df in &prepared.data_files {
-            data_files.push(
+            all_files.push(
                 DataFileBuilder::default()
                     .content(DataContentType::Data)
                     .file_path(df.path.clone())
@@ -150,6 +138,28 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     .map_err(|e| IcebergError::Other(format!("data file build: {e}")))?,
             );
         }
+        for df in &prepared.equality_deletes {
+            if df.equality_field_ids.is_empty() {
+                return Err(IcebergError::Other(format!(
+                    "equality-delete file {} has empty equality_field_ids; refusing to \
+                     commit a delete that wouldn't match any rows",
+                    df.path
+                )));
+            }
+            all_files.push(
+                DataFileBuilder::default()
+                    .content(DataContentType::EqualityDeletes)
+                    .file_path(df.path.clone())
+                    .file_format(DataFileFormat::Parquet)
+                    .file_size_in_bytes(df.byte_size)
+                    .record_count(df.record_count)
+                    .equality_ids(Some(df.equality_field_ids.clone()))
+                    .partition(Struct::empty())
+                    .partition_spec_id(spec_id)
+                    .build()
+                    .map_err(|e| IcebergError::Other(format!("delete file build: {e}")))?,
+            );
+        }
 
         let tx = Transaction::new(&table);
         let action = tx
@@ -158,7 +168,9 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             // counter-based namer; skip iceberg-rust's path-dedup which would
             // otherwise scan the full manifest list on each commit.
             .with_check_duplicate(false)
-            .add_data_files(data_files);
+            // FastAppendAction (forked) routes by `content_type()` into
+            // separate data and delete manifests at commit time.
+            .add_data_files(all_files);
         let tx = action.apply(tx).map_err(map_iceberg_err)?;
         let updated = tx
             .commit(self.inner.as_ref())
@@ -569,7 +581,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equality_delete_commit_returns_clear_unsupported_error() {
+    async fn commit_snapshot_with_only_equality_deletes_produces_a_snapshot() {
+        // After the fork patch, equality-delete commits flow through the same
+        // FastAppendAction path as data commits. A delete-only commit should
+        // still produce a snapshot whose delete_files list is non-empty.
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let meta = c
+            .commit_snapshot(PreparedCommit {
+                ident: ident(),
+                data_files: vec![],
+                equality_deletes: vec![DataFile {
+                    path: "memory:///warehouse/public/orders/eq-deletes-0.parquet".into(),
+                    record_count: 1,
+                    byte_size: 64,
+                    equality_field_ids: vec![1],
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(meta.current_snapshot_id.is_some());
+
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert!(snaps[0].data_files.is_empty());
+        assert_eq!(snaps[0].delete_files.len(), 1);
+        assert_eq!(snaps[0].delete_files[0].equality_field_ids, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn commit_snapshot_with_data_plus_equality_deletes_lands_in_one_snapshot() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let meta = c
+            .commit_snapshot(PreparedCommit {
+                ident: ident(),
+                data_files: vec![DataFile {
+                    path: "memory:///warehouse/public/orders/data-0.parquet".into(),
+                    record_count: 5,
+                    byte_size: 1024,
+                    equality_field_ids: vec![],
+                }],
+                equality_deletes: vec![DataFile {
+                    path: "memory:///warehouse/public/orders/eq-deletes-0.parquet".into(),
+                    record_count: 2,
+                    byte_size: 128,
+                    equality_field_ids: vec![1],
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(meta.current_snapshot_id.is_some());
+
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        // Both files belong to the same snapshot — not two.
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].data_files.len(), 1);
+        assert_eq!(snaps[0].delete_files.len(), 1);
+        assert_eq!(snaps[0].data_files[0].record_count, 5);
+        assert_eq!(snaps[0].delete_files[0].record_count, 2);
+    }
+
+    #[tokio::test]
+    async fn commit_snapshot_rejects_delete_file_with_empty_equality_field_ids() {
+        // An equality-delete file with no field-id list would match no rows
+        // (or every row, depending on reader). Refuse rather than silently
+        // commit a meaningless delete.
         let c = fresh().await;
         c.ensure_namespace(&ident().namespace).await.unwrap();
         c.create_table(&schema()).await.unwrap();
@@ -578,20 +657,16 @@ mod tests {
                 ident: ident(),
                 data_files: vec![],
                 equality_deletes: vec![DataFile {
-                    path: "memory:///warehouse/public/orders/eq-deletes-0.parquet".to_string(),
+                    path: "memory:///warehouse/public/orders/eq-deletes-bad.parquet".into(),
                     record_count: 1,
                     byte_size: 64,
-                    equality_field_ids: vec![1],
+                    equality_field_ids: vec![],
                 }],
             })
             .await
             .unwrap_err();
         assert!(matches!(err, IcebergError::Other(_)));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("equality-delete"),
-            "expected message about equality-delete blocker, got: {msg}"
-        );
+        assert!(err.to_string().contains("empty equality_field_ids"));
     }
 
     #[tokio::test]

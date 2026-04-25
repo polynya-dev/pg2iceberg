@@ -1239,7 +1239,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches#b48523df18fbbca7cd9d0349562228207965a645"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches#554809c7d64ac46e988c635ba521d419ce12d9c1"
 dependencies = [
  "anyhow",
  "apache-avro",

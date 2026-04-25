@@ -8,17 +8,11 @@
 //!
 //! ## Status
 //!
-//! Append-only commits, namespace + table CRUD, snapshot reads, and
-//! schema evolution are all wired through [`IcebergRustCatalog`]. See
-//! [`gap_audit`] for the full method-by-method status.
-//!
-//! One remaining gap:
-//!
-//! - **Equality-delete commits** — upstream's `FastAppendAction` rejects
-//!   non-Data files and there's no public delete-aware action. Surfaced
-//!   as a clear `IcebergError::Other` so callers know the path is
-//!   unsupported rather than silently broken. Closing this is the next
-//!   patch on the fork.
+//! All trait methods on [`IcebergRustCatalog`] are wired end-to-end:
+//! namespace + table CRUD, append-only commits, **equality-delete
+//! commits**, schema evolution, and snapshot reads. See [`gap_audit`]
+//! for the method-by-method status and the list of fork patches we
+//! depend on.
 //!
 //! Smoke tests (`smoke.rs`) exercise the upstream surface directly to
 //! catch breakage on `iceberg-rust` upgrades. Per-method translation

@@ -447,16 +447,16 @@ CTID-page chunked, parallel; marker-row fence to PG WAL stream so logical-mode h
 
 `pg2iceberg-iceberg/src/prod/catalog.rs::IcebergRustCatalog<C>` wraps any
 `iceberg::Catalog` (Memory, REST, Glue, SQL, S3Tables, HMS) behind our
-`Catalog` trait. Append-only commits use `Transaction::fast_append`;
-schema evolution uses `Transaction::update_schema()`; namespace + table
-CRUD + snapshot reads work end-to-end. ~25 prod tests pass against
+`Catalog` trait. **All trait methods are wired end-to-end:** namespace +
+table CRUD, append-only commits, equality-delete commits, schema
+evolution, and snapshot reads. 25 prod tests pass against
 `iceberg::memory::MemoryCatalog`. See
 `crates/pg2iceberg-iceberg/src/prod/gap_audit.rs` for the full
 method-by-method status.
 
 The workspace pins `iceberg` to `polynya-dev/iceberg-rust` (branch
 `polynya-patches`, based on upstream `v0.9.0`) via `[patch.crates-io]`.
-The fork carries two minimal patches we'll cut PRs for upstream:
+The fork carries three minimal patches we'll cut PRs for upstream:
 
 1. `TransactionAction` trait + `BoxedTransactionAction` flipped from
    `pub(crate)` to `pub`. Lets downstream crates author custom actions.
@@ -464,18 +464,21 @@ The fork carries two minimal patches we'll cut PRs for upstream:
    convenience). Takes a target `Schema`, emits `AddSchema` +
    `SetCurrentSchema(-1)` with three guarding requirements
    (`UuidMatch`, `CurrentSchemaIdMatch`, `LastAssignedFieldIdMatch`).
-
-One upstream-blocked item remains:
-
-- **Equality-delete commits.** `FastAppendAction` rejects non-Data
-  content; we surface a clear `IcebergError::Other` so callers needing
-  upserts/deletes use the sim catalog. Closing this is the next patch
-  on the same fork — author a `RowDeltaAction` accepting both data
-  and equality-delete files.
+3. `FastAppendAction.add_data_files()` routes by `content_type()` into
+   data vs delete buckets; `SnapshotProducer` writes them to separate
+   manifests (`build_v{2,3}_data` vs `build_v{2,3}_deletes`). The old
+   "Only data content type is allowed" check is gone. Same approach
+   RisingWave's fork uses.
 
 Carry-forward into binary wiring: `IcebergRustCatalog::new(Arc<C>)`
 accepts any concrete catalog, so swapping Memory → REST → Glue is a
 config-only change at the binary layer.
+
+Optional future optimization: RisingWave's `DeltaWriter` uses position
+deletes for in-batch self-cancellation (insert+delete same PK in one
+batch → cheaper position delete on the just-written row, instead of an
+equality delete on prior data). Equality-delete-only is correct; this
+is purely a read-perf knob. Revisit if profiling shows in-batch churn.
 
 ### Phase 14 — Compaction + maintenance (week 12+)
 

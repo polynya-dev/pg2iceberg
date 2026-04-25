@@ -215,12 +215,14 @@ async fn fast_append_round_trip_creates_snapshot_with_data_file() {
     assert_eq!(manifest.entries()[0].data_file().file_size_in_bytes(), 2048);
 }
 
-/// Fast append rejects `EqualityDeletes` — explicit upstream check we
-/// rely on to know the equality-delete path needs a different surface.
-/// If this test ever stops failing, iceberg-rust has shipped delete-aware
-/// actions and we should revisit the `commit_snapshot` impl.
+/// Fast append on the patched fork accepts mixed Data + EqualityDeletes
+/// and routes them into separate manifests. Behavioral guard: if upstream
+/// ever reverts to the data-only check, this test fails and we know the
+/// fork patch has drifted.
 #[tokio::test]
-async fn fast_append_rejects_equality_delete_files() {
+async fn fast_append_accepts_mixed_data_and_equality_delete_files() {
+    use iceberg::spec::ManifestContentType;
+
     let catalog = make_memory_catalog().await;
     let ns = NamespaceIdent::from_strs(["public"]).unwrap();
     catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
@@ -233,6 +235,17 @@ async fn fast_append_rejects_equality_delete_files() {
                 .build(),
         )
         .await
+        .unwrap();
+
+    let data_file: DataFile = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(format!("{}/data/0001.parquet", table.metadata().location()))
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(2048)
+        .record_count(7)
+        .partition(Struct::empty())
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .build()
         .unwrap();
 
     let delete_file: DataFile = DataFileBuilder::default()
@@ -254,12 +267,25 @@ async fn fast_append_rejects_equality_delete_files() {
     let action = tx
         .fast_append()
         .with_check_duplicate(false)
-        .add_data_files(vec![delete_file]);
+        .add_data_files(vec![data_file, delete_file]);
     let tx = action.apply(tx).unwrap();
-    let err = tx.commit(&catalog).await.unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Only data content type is allowed"),
-        "expected upstream rejection, got: {msg}"
+    let table = tx.commit(&catalog).await.unwrap();
+
+    let snap = table.metadata().current_snapshot().unwrap();
+    let manifest_list = snap
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .unwrap();
+    // Two manifests: one Data, one Deletes.
+    assert_eq!(manifest_list.entries().len(), 2);
+    let mut kinds: Vec<ManifestContentType> =
+        manifest_list.entries().iter().map(|e| e.content).collect();
+    kinds.sort_by_key(|c| match c {
+        ManifestContentType::Data => 0,
+        ManifestContentType::Deletes => 1,
+    });
+    assert_eq!(
+        kinds,
+        vec![ManifestContentType::Data, ManifestContentType::Deletes]
     );
 }
