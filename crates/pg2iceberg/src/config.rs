@@ -41,19 +41,32 @@ pub struct TableConfig {
     pub name: String,
     #[serde(default)]
     pub skip_snapshot: bool,
-    /// Required in query mode, optional in logical (we still need it
-    /// to know the PK for equality-delete files; if absent, we infer
-    /// from `pg_attribute.indisprimary` at startup — but that path
-    /// isn't wired yet, so today this is required).
+    /// Operator-supplied PK columns. When non-empty, overrides whatever
+    /// schema discovery found in the source `pg_index`.
     #[serde(default)]
     pub primary_key: Vec<String>,
     #[serde(default)]
     pub watermark_column: String,
-    /// Column declarations. The Go reference doesn't carry these in
-    /// YAML (it discovers them from `pg_attribute`); we keep them
-    /// here as a stopgap until the schema-discovery query lands.
+    /// Optional column declarations. When provided, these override
+    /// schema discovery; useful for tables where the source columns
+    /// don't match what you want to materialize, or for testing.
     #[serde(default, rename = "columns")]
     pub columns: Vec<ColumnConfig>,
+    /// Iceberg-specific per-table settings. Currently just partition.
+    #[serde(default)]
+    pub iceberg: IcebergTableConfig,
+}
+
+/// Iceberg per-table options. Mirrors Go's `IcebergTableConfig` —
+/// just `partition` for now; sort orders and other knobs are
+/// follow-ons.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct IcebergTableConfig {
+    /// Partition expressions, one per partition field. Examples:
+    /// `["day(created_at)"]`, `["region", "bucket[16](id)"]`. See
+    /// [`pg2iceberg_core::parse_partition_expr`] for the grammar.
+    #[serde(default)]
+    pub partition: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -394,12 +407,15 @@ impl TableConfig {
                 is_primary_key: pk_set.contains(c.name.as_str()),
             });
         }
+        let partition_spec = pg2iceberg_core::parse_partition_spec(&self.iceberg.partition)
+            .map_err(|e| anyhow::anyhow!("partition spec for {}: {e}", self.name))?;
         Ok(TableSchema {
             ident: TableIdent {
                 namespace: Namespace(vec![ns]),
                 name,
             },
             columns,
+            partition_spec,
         })
     }
 }

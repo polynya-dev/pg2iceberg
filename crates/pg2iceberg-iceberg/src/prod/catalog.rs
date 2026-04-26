@@ -97,10 +97,23 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     async fn create_table(&self, schema: &TableSchema) -> Result<TableMetadata> {
         let ns = to_iceberg_namespace(&schema.ident.namespace)?;
         let ice_schema = to_iceberg_schema(schema)?;
-        let creation = TableCreation::builder()
-            .name(schema.ident.name.clone())
-            .schema(ice_schema)
-            .build();
+        // TypedBuilder switches type-state when `partition_spec()` is
+        // called, so we have to choose at compile time which arm to
+        // build. The `clone()` on `ice_schema` is the cost of avoiding
+        // a more elaborate dynamic-build dance.
+        let creation = if schema.partition_spec.is_empty() {
+            TableCreation::builder()
+                .name(schema.ident.name.clone())
+                .schema(ice_schema)
+                .build()
+        } else {
+            let unbound = to_iceberg_unbound_partition_spec(schema)?;
+            TableCreation::builder()
+                .name(schema.ident.name.clone())
+                .schema(ice_schema)
+                .partition_spec(unbound)
+                .build()
+        };
         let table = self
             .inner
             .create_table(&ns, creation)
@@ -121,6 +134,27 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let it = to_iceberg_table_ident(&prepared.ident)?;
         let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
         let spec_id = table.metadata().default_partition_spec_id();
+
+        // Per-partition routing on the writer side isn't wired yet —
+        // see `prepare_partitioned` follow-on. For now, refuse to
+        // commit data files into a partitioned table with empty
+        // partition values; iceberg-rust's `validate_partition_value`
+        // would reject this with a less informative error.
+        if !table
+            .metadata()
+            .default_partition_spec()
+            .fields()
+            .is_empty()
+        {
+            return Err(IcebergError::Other(format!(
+                "table {} is partitioned but the writer-side per-partition routing \
+                 is not yet wired in the Rust port — every Insert/Update/Delete would \
+                 land at `Struct::empty()` and fail iceberg validation. \
+                 Drop the `iceberg.partition` block in YAML to mirror unpartitioned \
+                 today, or wire the writer (Phase: per-partition routing follow-on).",
+                prepared.ident
+            )));
+        }
 
         let mut all_files: Vec<IcebergDataFile> =
             Vec::with_capacity(prepared.data_files.len() + prepared.equality_deletes.len());
@@ -199,7 +233,9 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         // Keeping the round-trip in our type domain centralizes field-id
         // allocation rules (next id = current highest + 1) and the soft-drop
         // semantics for `DropColumn`.
-        let mut our_schema = from_iceberg_schema(ident, table.metadata().current_schema())?;
+        let part_spec = table.metadata().default_partition_spec();
+        let mut our_schema =
+            from_iceberg_schema(ident, table.metadata().current_schema(), part_spec.as_ref())?;
         apply_schema_changes(&mut our_schema, &changes)?;
         let new_iceberg_schema = to_iceberg_schema(&our_schema)?;
 
@@ -384,7 +420,11 @@ fn to_iceberg_schema(schema: &TableSchema) -> Result<IcebergSchema> {
         .map_err(|e| IcebergError::Other(format!("schema build: {e}")))
 }
 
-fn from_iceberg_schema(ident: &TableIdent, schema: &IcebergSchema) -> Result<TableSchema> {
+fn from_iceberg_schema(
+    ident: &TableIdent,
+    schema: &IcebergSchema,
+    partition_spec: &iceberg::spec::PartitionSpec,
+) -> Result<TableSchema> {
     let pk_set: std::collections::BTreeSet<i32> = schema.identifier_field_ids().collect();
     let mut columns: Vec<ColumnSchema> = Vec::new();
     for f in schema.as_struct().fields().iter() {
@@ -396,16 +436,100 @@ fn from_iceberg_schema(ident: &TableIdent, schema: &IcebergSchema) -> Result<Tab
             is_primary_key: pk_set.contains(&f.id),
         });
     }
+
+    // Build a `field_id -> column_name` index so we can resolve
+    // PartitionField source IDs back to column names.
+    let id_to_name: std::collections::HashMap<i32, String> = columns
+        .iter()
+        .map(|c| (c.field_id, c.name.clone()))
+        .collect();
+    let partition_fields = partition_spec
+        .fields()
+        .iter()
+        .map(|f| {
+            let source_column = id_to_name.get(&f.source_id).cloned().ok_or_else(|| {
+                IcebergError::Other(format!(
+                    "partition field {} references unknown source_id {}",
+                    f.name, f.source_id
+                ))
+            })?;
+            let transform = from_iceberg_transform(&f.transform)?;
+            Ok(pg2iceberg_core::PartitionField {
+                source_column,
+                name: f.name.clone(),
+                transform,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(TableSchema {
         ident: ident.clone(),
         columns,
+        partition_spec: partition_fields,
     })
 }
 
+fn from_iceberg_transform(t: &iceberg::spec::Transform) -> Result<pg2iceberg_core::Transform> {
+    use iceberg::spec::Transform as IT;
+    use pg2iceberg_core::Transform as OT;
+    Ok(match t {
+        IT::Identity => OT::Identity,
+        IT::Year => OT::Year,
+        IT::Month => OT::Month,
+        IT::Day => OT::Day,
+        IT::Hour => OT::Hour,
+        IT::Bucket(n) => OT::Bucket(*n),
+        IT::Truncate(n) => OT::Truncate(*n),
+        other => {
+            return Err(IcebergError::Other(format!(
+                "iceberg partition transform {other:?} is not supported by pg2iceberg"
+            )))
+        }
+    })
+}
+
+fn to_iceberg_transform(t: pg2iceberg_core::Transform) -> iceberg::spec::Transform {
+    use iceberg::spec::Transform as IT;
+    use pg2iceberg_core::Transform as OT;
+    match t {
+        OT::Identity => IT::Identity,
+        OT::Year => IT::Year,
+        OT::Month => IT::Month,
+        OT::Day => IT::Day,
+        OT::Hour => IT::Hour,
+        OT::Bucket(n) => IT::Bucket(n),
+        OT::Truncate(n) => IT::Truncate(n),
+    }
+}
+
+/// Build an `iceberg::spec::UnboundPartitionSpec` from our schema's
+/// `partition_spec`. We use the *unbound* variant because at
+/// `create_table` time the iceberg schema doesn't yet have stable
+/// field ids for the partition fields; `TableMetadataBuilder` binds
+/// them when the table metadata is constructed.
+fn to_iceberg_unbound_partition_spec(
+    schema: &TableSchema,
+) -> Result<iceberg::spec::UnboundPartitionSpec> {
+    let mut builder = iceberg::spec::UnboundPartitionSpec::builder();
+    for f in &schema.partition_spec {
+        let source_id = schema.field_id_for(&f.source_column).ok_or_else(|| {
+            IcebergError::Other(format!(
+                "partition source column {} not in schema",
+                f.source_column
+            ))
+        })?;
+        builder = builder
+            .add_partition_field(source_id, f.name.clone(), to_iceberg_transform(f.transform))
+            .map_err(|e| IcebergError::Other(format!("add partition field {}: {e}", f.name)))?;
+    }
+    Ok(builder.build())
+}
+
 fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Result<TableMetadata> {
+    let part_spec = table.metadata().default_partition_spec();
     Ok(TableMetadata {
         ident: ident.clone(),
-        schema: from_iceberg_schema(ident, table.metadata().current_schema())?,
+        schema: from_iceberg_schema(ident, table.metadata().current_schema(), part_spec.as_ref())?,
         // We surface `sequence_number` rather than the random 63-bit
         // `snapshot_id`, matching `Snapshot.id` in `snapshots()` so callers
         // get consistent monotonic IDs across both surfaces.
@@ -486,7 +610,105 @@ mod tests {
                     is_primary_key: false,
                 },
             ],
+            partition_spec: Vec::new(),
         }
+    }
+
+    /// `orders` schema with a `created_at` timestamp column, ready to
+    /// be partitioned by day.
+    fn schema_with_timestamp() -> TableSchema {
+        TableSchema {
+            ident: ident(),
+            columns: vec![
+                ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                },
+                ColumnSchema {
+                    name: "created_at".into(),
+                    field_id: 2,
+                    ty: IcebergType::TimestampTz,
+                    nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+            partition_spec: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_table_with_identity_partition_spec_round_trips() {
+        use pg2iceberg_core::Transform;
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        let mut s = schema();
+        s.partition_spec = vec![pg2iceberg_core::PartitionField {
+            source_column: "qty".into(),
+            name: "qty".into(),
+            transform: Transform::Identity,
+        }];
+        let meta = c.create_table(&s).await.unwrap();
+        assert_eq!(meta.schema.partition_spec.len(), 1);
+        assert_eq!(meta.schema.partition_spec[0].source_column, "qty");
+        assert_eq!(meta.schema.partition_spec[0].transform, Transform::Identity);
+
+        // Reload via load_table — confirms the partition spec round-trips
+        // through the Iceberg metadata read path.
+        let reloaded = c.load_table(&ident()).await.unwrap().unwrap();
+        assert_eq!(reloaded.schema.partition_spec, meta.schema.partition_spec);
+    }
+
+    #[tokio::test]
+    async fn create_table_with_day_transform_round_trips() {
+        use pg2iceberg_core::Transform;
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        let mut s = schema_with_timestamp();
+        s.partition_spec = vec![pg2iceberg_core::PartitionField {
+            source_column: "created_at".into(),
+            name: "created_at_day".into(),
+            transform: Transform::Day,
+        }];
+        let meta = c.create_table(&s).await.unwrap();
+        assert_eq!(meta.schema.partition_spec.len(), 1);
+        assert_eq!(meta.schema.partition_spec[0].source_column, "created_at");
+        assert_eq!(meta.schema.partition_spec[0].transform, Transform::Day);
+        assert_eq!(meta.schema.partition_spec[0].name, "created_at_day");
+    }
+
+    #[tokio::test]
+    async fn commit_to_partitioned_table_returns_clear_not_yet_wired_error() {
+        use pg2iceberg_core::Transform;
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        let mut s = schema();
+        s.partition_spec = vec![pg2iceberg_core::PartitionField {
+            source_column: "qty".into(),
+            name: "qty".into(),
+            transform: Transform::Identity,
+        }];
+        c.create_table(&s).await.unwrap();
+        let err = c
+            .commit_snapshot(PreparedCommit {
+                ident: ident(),
+                data_files: vec![DataFile {
+                    path: "memory:///warehouse/public/orders/data-0.parquet".into(),
+                    record_count: 1,
+                    byte_size: 256,
+                    equality_field_ids: vec![],
+                }],
+                equality_deletes: vec![],
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partitioned"),
+            "expected partitioning error, got: {msg}"
+        );
     }
 
     #[tokio::test]

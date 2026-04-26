@@ -1,3 +1,4 @@
+use crate::partition::PartitionField;
 use crate::typemap::IcebergType;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -45,10 +46,32 @@ pub struct ColumnSchema {
 pub struct TableSchema {
     pub ident: TableIdent,
     pub columns: Vec<ColumnSchema>,
+    /// Iceberg partition spec. Empty = unpartitioned.
+    /// Source columns must reference names that exist in `columns`.
+    #[serde(default)]
+    pub partition_spec: Vec<PartitionField>,
 }
 
 impl TableSchema {
     pub fn primary_key_columns(&self) -> impl Iterator<Item = &ColumnSchema> {
         self.columns.iter().filter(|c| c.is_primary_key)
+    }
+
+    pub fn is_partitioned(&self) -> bool {
+        !self.partition_spec.is_empty()
+    }
+
+    /// Look up a column's `field_id` by name. Used to resolve
+    /// `partition_spec[].source_column` to a Iceberg `source_id`.
+    pub fn field_id_for(&self, column_name: &str) -> Option<i32> {
+        self.columns
+            .iter()
+            .find(|c| c.name == column_name)
+            .map(|c| c.field_id)
+    }
+
+    /// Look up a column by name.
+    pub fn column(&self, name: &str) -> Option<&ColumnSchema> {
+        self.columns.iter().find(|c| c.name == name)
     }
 }

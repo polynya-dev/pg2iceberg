@@ -258,6 +258,11 @@ where
                     }
                 }
             }
+            // Partition spec is always YAML-driven — discovery
+            // doesn't infer it from the source PG (which has no
+            // notion of "Iceberg partitioning").
+            s.partition_spec = pg2iceberg_core::parse_partition_spec(&t.iceberg.partition)
+                .map_err(|e| anyhow::anyhow!("partition spec for {}: {e}", t.name))?;
             s
         };
         if !schema.columns.iter().any(|c| c.is_primary_key) {

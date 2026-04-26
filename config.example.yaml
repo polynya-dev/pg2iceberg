@@ -17,6 +17,19 @@ tables:
     # columns:                       # optional — overrides discovery
     #   - { name: id, pg_type: int4 }
     #   - { name: qty, pg_type: int8, nullable: true }
+    # iceberg:
+    #   partition:                   # Iceberg partition spec
+    #     - day(created_at)          # day/month/year/hour
+    #     - bucket[16](id)           # murmur3-bucket
+    #     - region                   # identity
+    #     - truncate[4](name)        # truncate
+    #
+    # NOTE: today's Rust port creates partitioned tables with the
+    # right spec on the iceberg side, but the writer-side
+    # per-partition file routing is not yet wired — commits to
+    # partitioned tables fail with a clear "not yet wired" error.
+    # Use unpartitioned tables for now; partition routing lands as
+    # a follow-on alongside the Phase 7 vended-creds router.
 
 source:
   mode: logical                # "logical" or "query"

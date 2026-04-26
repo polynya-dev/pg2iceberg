@@ -202,6 +202,7 @@ mod tests {
                     is_primary_key: false,
                 },
             ],
+            partition_spec: Vec::new(),
         }
     }
 

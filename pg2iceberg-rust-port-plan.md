@@ -631,6 +631,33 @@ See `config.example.yaml` for the full surface.
   - `"vended"` errors with "not yet wired" — that's the Phase 7
     vended-credentials S3 router.
 
+**Iceberg partition spec — partial:**
+
+- **Parsing + create-table:** done. YAML
+  `tables[].iceberg.partition: ["day(col)", "bucket[16](id)", ...]`
+  parses through `pg2iceberg_core::parse_partition_spec` (all six
+  transforms: identity, year, month, day, hour, bucket[N], truncate[W]).
+  `IcebergRustCatalog::create_table` translates to
+  `iceberg::spec::UnboundPartitionSpec` and creates the table
+  partitioned. `load_table` round-trips the spec back through
+  `from_iceberg_schema`.
+- **Per-partition file routing — NOT YET WIRED.** `commit_snapshot`
+  refuses commits to partitioned tables with a clear "writer-side
+  per-partition routing is not yet wired" error rather than letting
+  iceberg's `validate_partition_value` reject `Struct::empty()` with
+  a less informative error. Use unpartitioned tables today.
+- **Transform application — partial.** `apply_transform` in
+  `pg2iceberg_core::partition` handles identity / year / month / day /
+  hour over `PgValue`. Bucket and truncate parse correctly and
+  partition-spec values land on the iceberg side, but `apply_transform`
+  for them returns "not yet wired"; wire alongside the writer.
+- **Writer follow-on (Phase 7.x):** group folded rows by
+  `partition_tuple = (apply_transform(value, transform), ...)`,
+  encode one parquet file per partition group, attach
+  `partition: Struct::from_iter(...)` to each `DataFile` at
+  `commit_snapshot` time. iceberg-rust 0.9 has
+  `RecordBatchPartitionSplitter` we can lean on for the arrow side.
+
 **Remaining items for the binary (now P0.5 / P1):**
 
 1. **Glue / SQL / S3Tables / HMS catalog backends** — variants of

@@ -64,6 +64,10 @@ pub(crate) async fn discover_schema(
             name: table.to_string(),
         },
         columns,
+        // PG-side discovery doesn't carry partition info — that's
+        // declared in YAML (`tables[].iceberg.partition`) and merged
+        // by the binary before handing the schema to the catalog.
+        partition_spec: Vec::new(),
     })
 }
 

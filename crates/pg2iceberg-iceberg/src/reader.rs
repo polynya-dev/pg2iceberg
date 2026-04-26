@@ -122,6 +122,7 @@ mod tests {
                     is_primary_key: false,
                 },
             ],
+            partition_spec: Vec::new(),
         }
     }
 
@@ -179,6 +180,7 @@ mod tests {
                     is_primary_key: false,
                 },
             ],
+            partition_spec: Vec::new(),
         };
         let w = TableWriter::new(schema.clone());
         let mut r = BTreeMap::new();

@@ -38,6 +38,7 @@ fn orders_schema() -> TableSchema {
                 is_primary_key: false,
             },
         ],
+        partition_spec: Vec::new(),
     }
 }
 
@@ -51,6 +52,7 @@ fn other_schema() -> TableSchema {
             nullable: false,
             is_primary_key: true,
         }],
+        partition_spec: Vec::new(),
     }
 }
 

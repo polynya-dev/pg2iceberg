@@ -164,6 +164,7 @@ mod tests {
                 nullable: false,
                 is_primary_key: true,
             }],
+            partition_spec: Vec::new(),
         }
     }
 
@@ -274,6 +275,7 @@ mod tests {
                     is_primary_key: false,
                 },
             ],
+            partition_spec: Vec::new(),
         };
         block_on(c.create_table(&s)).unwrap();
         let meta = block_on(c.evolve_schema(
