@@ -562,6 +562,57 @@ Ports `iceberg/compact.go`, `iceberg/maintain.go`. Note the existing partition b
 
 ---
 
+## Binary status — `pg2iceberg` CLI wired
+
+`crates/pg2iceberg` now produces a real binary that assembles all four
+prod surfaces. CLI surface (clap-based):
+
+- `pg2iceberg connect-pg --config <toml>` — opens a replication-mode
+  connection via `PgClientImpl`, reports slot existence + restart_lsn.
+- `pg2iceberg connect-iceberg --config <toml>` — opens an Iceberg
+  catalog (memory only today; REST/Glue/SQL/HMS are follow-ons),
+  pre-creates configured namespaces.
+- `pg2iceberg migrate-coord --config <toml>` — runs
+  `PostgresCoordinator::migrate()` (idempotent).
+- `pg2iceberg run --config <toml>` — assembles `Pipeline` (with
+  `PostgresCoordinator`, `ObjectStoreBlobStore<InMemory>`, UUID-based
+  blob namer) plus a `Materializer<IcebergRustCatalog<MemoryCatalog>>`,
+  starts replication from the slot's confirmed_flush_lsn, drives the
+  `Ticker` with default 10s flush/standby/materialize cadence, and
+  exits cleanly on SIGINT/SIGTERM.
+
+`src/realio.rs` provides the wall-clock `Clock`, `Uuid::new_v4()`-backed
+`IdGen`, and `tokio::spawn`-backed `Spawner`. The ban-script's allowlist
+extends to `crates/pg2iceberg/src/` so non-determinism is contained
+to the binary's prod glue.
+
+`src/config.rs` defines the TOML schema: `[pg]`, `[coord]`,
+`[iceberg]`, `[blob]`, `[[table]]` with per-column type declarations.
+4 unit tests cover type-name parsing, schema construction with PK
+detection + auto field-id assignment, and TOML round-trip.
+
+**Remaining items for the binary:**
+
+1. **TLS** — both `PgClientImpl::connect` and the coord's
+   `connect()` use `NoTls`. Wire `tokio-postgres-rustls` for managed
+   PG.
+2. **Iceberg catalog backends** — config currently only supports
+   `type = "memory"`. Add REST/Glue/SQL/HMS variants when we wire
+   real Iceberg deployments.
+3. **Object store backends** — config only supports `type = "memory"`.
+   Add S3/GCS/Azure variants with their auth-config sections.
+4. **Verify + validate subcommands** — `pg2iceberg-validate` and the
+   verifier in `pg2iceberg-iceberg::verify` aren't exposed in the CLI
+   yet.
+5. **Invariant watcher task** — `pg2iceberg-validate::watcher`
+   exists but the binary's `Handler::Watcher` arm is a no-op. Wire
+   it as a follow-on.
+6. **Testcontainers integration** — once the ban-script allowance
+   for tests is in, wire an end-to-end test that boots PG + runs
+   `connect-pg` / `migrate-coord` / a short `run`.
+
+---
+
 ## 9. Invariants (the contract to prove)
 
 DST and the production-runtime metric checker both assert these. Wording matters; phrase as predicates, not prose.

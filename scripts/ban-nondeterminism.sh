@@ -29,7 +29,7 @@ PATTERNS=(
 
 # Allowlisted paths (regex, matched against the file path). Keep the list
 # narrow — production-impl modules only.
-ALLOW='^crates/pg2iceberg-pg/src/prod/|^crates/pg2iceberg-iceberg/src/prod/|^crates/pg2iceberg-coord/src/prod/|^crates/pg2iceberg-stream/src/prod/|^crates/pg2iceberg/src/main\.rs$|^scripts/|^crates/[^/]+/tests/|/target/'
+ALLOW='^crates/pg2iceberg-pg/src/prod/|^crates/pg2iceberg-iceberg/src/prod/|^crates/pg2iceberg-coord/src/prod/|^crates/pg2iceberg-stream/src/prod/|^crates/pg2iceberg/src/|^scripts/|^crates/[^/]+/tests/|/target/'
 
 fail=0
 

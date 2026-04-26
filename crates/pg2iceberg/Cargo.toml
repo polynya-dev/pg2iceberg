@@ -14,8 +14,37 @@ name = "pg2iceberg"
 path = "src/main.rs"
 
 [dependencies]
+# Workspace crates with prod features turned on. The binary is the only
+# place where `prod` is mandatory — every library crate keeps `prod` as
+# an opt-in feature so test/sim builds stay light.
 pg2iceberg-core.workspace = true
+pg2iceberg-pg = { path = "../pg2iceberg-pg", features = ["prod"] }
+pg2iceberg-coord = { path = "../pg2iceberg-coord", features = ["prod"] }
+pg2iceberg-iceberg = { path = "../pg2iceberg-iceberg", features = ["prod"] }
+pg2iceberg-stream.workspace = true
 pg2iceberg-logical.workspace = true
 pg2iceberg-query.workspace = true
 pg2iceberg-snapshot.workspace = true
 pg2iceberg-validate.workspace = true
+
+# Real iceberg + object_store types — same fork pin as the rest of the
+# workspace, applied via [patch.crates-io] in the workspace Cargo.toml.
+iceberg = { version = "0.9", features = [] }
+object_store = { version = "0.11", default-features = false }
+
+# Async runtime + signals + CLI + config.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+    "sync",
+] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
