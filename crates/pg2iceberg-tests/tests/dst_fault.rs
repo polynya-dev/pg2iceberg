@@ -45,7 +45,7 @@ use pg2iceberg_sim::fault::{
     ops, FaultPlan, FaultyBlobStore, FaultyCatalog, FaultyCoordinator,
 };
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
-use pg2iceberg_snapshot::Snapshotter;
+use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome, Snapshotter};
 use pollster::block_on;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -502,31 +502,152 @@ fn mid_snapshot_blob_put_fault_recovers_via_resumable_snapshotter() {
 }
 
 #[test]
-#[ignore = "GAP: binary uses run_snapshot (free fn) which doesn't persist mid-snapshot progress; flagged for Phase 11.5"]
-fn mid_snapshot_blob_put_fault_with_run_snapshot_loses_progress() {
-    // Documents the known gap in `pg2iceberg/src/run.rs`: it calls
-    // `pg2iceberg_snapshot::run_snapshot` (single-pass) instead of
-    // `Snapshotter::run_chunks` (resumable). With `run_snapshot`, a
-    // mid-chunk fault means the next attempt restarts from chunk 0,
-    // re-staging chunks 0..K already-staged before the fault.
+fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
+    // The headline test for "wiring logic shouldn't be in the binary":
+    // exercises `pg2iceberg_snapshot::run_snapshot_phase` (the helper
+    // the binary now calls) end-to-end with sim wiring + a scripted
+    // mid-chunk fault. Proves the binary's snapshot path resumes
+    // correctly on restart instead of restarting from chunk 0.
     //
-    // It's *correctness-safe* (re-stage produces the same rows; fold
-    // dedups), but it's wasteful on huge tables. Fix: switch the
-    // binary to `Snapshotter` with checkpoint-backed progress.
+    // Setup: 10 seeded rows, chunk_size=2 → 5 chunks.
+    // Fault: blob.put #4 fails (i.e. mid-3rd-chunk during snapshot
+    // staging — chunk 0 puts blob 0, chunk 1 puts blob 1, ..., the
+    // PUT for chunk 2 happens at index 4 because materializer cycles
+    // ran in between... wait, materializer doesn't run during
+    // snapshot. So blob.put indices match chunk indices: chunk K
+    // PUTs at index K.
     //
-    // This test is `#[ignore]` because reproducing the wasted work
-    // requires inspecting checkpoint state we don't have plumbing for
-    // yet; left as a placeholder so the gap stays visible.
+    // Failing PUT at index 2 means chunks 0 and 1 succeeded (4 rows
+    // staged), chunk 2 failed. Checkpoint persists progress through
+    // chunk 1. On restart, the helper resumes at chunk 2.
     let seeds: Vec<(i32, i32)> = (1..=10).map(|i| (i, i * 10)).collect();
     let mut h = FaultHarness::boot_with_seeds(&seeds);
     h.set_fault(ops::BLOB_PUT, [2]);
-    let _ = block_on(pg2iceberg_snapshot::run_snapshot(
+
+    // Run the same library function the binary calls. This is the
+    // production wiring under test.
+    let skip: std::collections::BTreeSet<TableIdent> = std::collections::BTreeSet::new();
+    let err = block_on(run_snapshot_phase(
         &h.db,
+        h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
+        &skip,
         &mut h.pipeline,
-    ));
-    // ... future: assert that re-running re-stages the previously-
-    // successful chunks (proving non-resumability).
+        2,
+    ))
+    .expect_err("mid-chunk fault should bubble up");
+    assert!(format!("{err:?}").contains("blob.put"), "got: {err:?}");
+    assert_eq!(h.injected(), 1);
+
+    // Checkpoint must reflect partial progress: snapshot_state ==
+    // InProgress AND snapshot_progress is non-empty (the last
+    // successfully-staged chunk's last PK key is recorded).
+    let cp = block_on(h.coord_inner.load_checkpoint()).unwrap().unwrap();
+    assert_eq!(
+        cp.snapshot_state,
+        pg2iceberg_core::SnapshotState::InProgress,
+        "expected InProgress, got {:?}",
+        cp.snapshot_state
+    );
+    assert!(
+        !cp.snapshot_progress.is_empty(),
+        "expected progress recorded for resume; got empty map"
+    );
+
+    // Crash + clear faults; resume.
+    h.crash_and_restart();
+    h.clear_faults();
+    let outcome = block_on(run_snapshot_phase(
+        &h.db,
+        h.coord.clone() as Arc<dyn Coordinator>,
+        &[schema()],
+        &skip,
+        &mut h.pipeline,
+        2,
+    ))
+    .expect("resume should succeed");
+    let snap_lsn = match outcome {
+        SnapshotPhaseOutcome::Completed { snapshot_lsn } => snapshot_lsn,
+        SnapshotPhaseOutcome::Skipped => panic!("resume should not skip"),
+    };
+    h.stream.send_standby(snap_lsn);
+    let _ = h.try_materialize();
+
+    // Final state: PG ↔ Iceberg parity, checkpoint marked Complete.
+    let mut iceberg = block_on(read_materialized_state(
+        h.catalog_inner.as_ref(),
+        h.blob_inner.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    ))
+    .unwrap();
+    sort_by_pk(&mut iceberg);
+    let mut pg = h.db.read_table(&ident()).unwrap();
+    sort_by_pk(&mut pg);
+    assert_eq!(iceberg, pg, "all 10 rows visible in Iceberg after resume");
+
+    let cp_done = block_on(h.coord_inner.load_checkpoint()).unwrap().unwrap();
+    assert_eq!(
+        cp_done.snapshot_state,
+        pg2iceberg_core::SnapshotState::Complete,
+        "checkpoint must be Complete after resume"
+    );
+    assert!(
+        cp_done.snapshot_progress.is_empty(),
+        "progress map should be cleared on Complete"
+    );
+}
+
+#[test]
+fn binary_snapshot_phase_skips_when_checkpoint_already_complete() {
+    // Second-run idempotence: with checkpoint == Complete, the helper
+    // returns Skipped without re-staging.
+    let seeds: Vec<(i32, i32)> = (1..=4).map(|i| (i, i * 10)).collect();
+    let mut h = FaultHarness::boot_with_seeds(&seeds);
+    let skip: std::collections::BTreeSet<TableIdent> = std::collections::BTreeSet::new();
+    let outcome = block_on(run_snapshot_phase(
+        &h.db,
+        h.coord.clone() as Arc<dyn Coordinator>,
+        &[schema()],
+        &skip,
+        &mut h.pipeline,
+        2,
+    ))
+    .unwrap();
+    assert!(matches!(outcome, SnapshotPhaseOutcome::Completed { .. }));
+
+    // Second call: same checkpoint says Complete → Skipped.
+    let outcome2 = block_on(run_snapshot_phase(
+        &h.db,
+        h.coord.clone() as Arc<dyn Coordinator>,
+        &[schema()],
+        &skip,
+        &mut h.pipeline,
+        2,
+    ))
+    .unwrap();
+    assert_eq!(outcome2, SnapshotPhaseOutcome::Skipped);
+}
+
+#[test]
+fn binary_snapshot_phase_skips_when_all_tables_in_skip_set() {
+    // Per-table `skip_snapshot: true` opt-out: with every configured
+    // table in the skip set, the helper returns Skipped without
+    // touching the source.
+    let mut h = FaultHarness::boot_with_seeds(&[(1, 10), (2, 20)]);
+    let mut skip = std::collections::BTreeSet::new();
+    skip.insert(ident());
+    let outcome = block_on(run_snapshot_phase(
+        &h.db,
+        h.coord.clone() as Arc<dyn Coordinator>,
+        &[schema()],
+        &skip,
+        &mut h.pipeline,
+        2,
+    ))
+    .unwrap();
+    assert_eq!(outcome, SnapshotPhaseOutcome::Skipped);
 }
 
 #[test]

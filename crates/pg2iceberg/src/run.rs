@@ -23,9 +23,8 @@ use pg2iceberg_coord::{
     Coordinator,
 };
 use crate::snapshot_src::PgSnapshotSource;
-use pg2iceberg_core::{
-    Checkpoint, Clock, IdGen, InMemoryMetrics, Lsn, Metrics, Mode, SnapshotState, TableSchema,
-};
+use pg2iceberg_core::{Clock, IdGen, InMemoryMetrics, Lsn, Metrics, Mode, TableSchema};
+use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome};
 use pg2iceberg_iceberg::{prod::IcebergRustCatalog, Catalog as _};
 use pg2iceberg_logical::{
     materializer::CounterMaterializerNamer, pipeline::BlobNamer, Handler, Materializer, Pipeline,
@@ -357,32 +356,26 @@ where
     // pg2iceberg is a *mirror*, not a CDC tool — Iceberg must reflect
     // 100% of PG state. Replication only emits events for changes
     // *after* slot creation, so without a snapshot we'd lose every row
-    // that existed beforehand. The snapshot is skipped when:
-    //  - the slot already existed (we're resuming), OR
-    //  - the persisted checkpoint says it's already complete.
-    // Per-table `skip_snapshot: true` in YAML opts a table out — for
-    // operators who already pre-loaded the table by some other means.
-    let cp_pre = coord
-        .load_checkpoint()
-        .await
-        .context("load checkpoint pre-snapshot")?;
-    let snapshot_complete = matches!(
-        cp_pre.as_ref().map(|c| c.snapshot_state),
-        Some(SnapshotState::Complete)
-    );
-    if slot_was_fresh && !snapshot_complete {
-        let skip_set: std::collections::BTreeSet<String> = cfg
+    // that existed beforehand. The orchestration logic lives in
+    // `pg2iceberg_snapshot::run_snapshot_phase` so the fault-DST
+    // exercises the *exact* code path the binary runs.
+    if slot_was_fresh {
+        // Per-table `skip_snapshot: true` opt-out, mapped to TableIdents.
+        let skip_idents: std::collections::BTreeSet<pg2iceberg_core::TableIdent> = cfg
             .tables
             .iter()
             .filter(|t| t.skip_snapshot)
-            .map(|t| t.name.clone())
+            .filter_map(|t| {
+                let (ns, name) = t.qualified().ok()?;
+                Some(pg2iceberg_core::TableIdent {
+                    namespace: pg2iceberg_core::Namespace(vec![ns]),
+                    name,
+                })
+            })
             .collect();
         let to_snapshot: Vec<TableSchema> = resolved_schemas
             .iter()
-            .filter(|s| {
-                let name = format!("{}.{}", s.ident.namespace, s.ident.name);
-                !skip_set.contains(&name)
-            })
+            .filter(|s| !skip_idents.contains(&s.ident))
             .cloned()
             .collect();
         if to_snapshot.is_empty() {
@@ -395,45 +388,43 @@ where
             let source = PgSnapshotSource::open(&cfg.source.postgres, &to_snapshot)
                 .await
                 .context("open snapshot source")?;
-            let snap_lsn = source.snapshot_lsn();
-            tracing::info!(?snap_lsn, "snapshot tx LSN captured");
-            pg2iceberg_snapshot::run_snapshot(&source, &to_snapshot, &mut pipeline)
-                .await
-                .context("run_snapshot")?;
-            // Drain anything still buffered (the per-chunk loop already
-            // flushes after each, but defensive-flush is cheap).
-            pipeline.flush().await.context("snapshot final flush")?;
-            // Ack the slot at the snapshot LSN. PG advances
-            // `confirmed_flush_lsn`; replication resumes from snap_lsn
-            // onward (events in [consistent_point, snap_lsn] already
-            // buffered on the open stream are processed in the main
-            // loop — the materializer's PK-keyed equality-delete
-            // dedup handles any overlap).
-            stream
-                .send_standby(snap_lsn, snap_lsn)
-                .await
-                .context("post-snapshot send_standby")?;
-            // Materialize once so snapshot rows land in Iceberg before
-            // we enter the live-replication loop. Subsequent live
-            // events show up via the Materialize handler.
-            materializer
-                .cycle()
-                .await
-                .context("post-snapshot materializer cycle")?;
-            // Persist snapshot-complete state.
-            let mut cp_save = cp_pre.unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
-            cp_save.snapshot_state = SnapshotState::Complete;
-            cp_save.flushed_lsn = snap_lsn;
-            cp_save.tracked_tables = to_snapshot.iter().map(|s| s.ident.clone()).collect();
-            cp_save.snapshot_progress.clear();
-            coord
-                .save_checkpoint(&cp_save)
-                .await
-                .context("save snapshot-complete checkpoint")?;
-            tracing::info!(?snap_lsn, "snapshot phase complete");
+            tracing::info!(snap_lsn = ?source.snapshot_lsn(), "snapshot tx LSN captured");
+            // Resumable orchestration. Returns Skipped if checkpoint
+            // already says Complete; otherwise drives the resumable
+            // Snapshotter and persists progress per chunk so a
+            // mid-snapshot crash + restart resumes at the next chunk.
+            match run_snapshot_phase(
+                &source,
+                coord.clone() as Arc<dyn Coordinator>,
+                &resolved_schemas,
+                &skip_idents,
+                &mut pipeline,
+                pg2iceberg_snapshot::DEFAULT_CHUNK_SIZE,
+            )
+            .await
+            .context("run_snapshot_phase")?
+            {
+                SnapshotPhaseOutcome::Skipped => {
+                    tracing::info!("snapshot phase: skipped (checkpoint says complete)");
+                }
+                SnapshotPhaseOutcome::Completed { snapshot_lsn } => {
+                    // Ack the slot — PG advances `confirmed_flush_lsn`;
+                    // replication resumes from snap_lsn onward.
+                    stream
+                        .send_standby(snapshot_lsn, snapshot_lsn)
+                        .await
+                        .context("post-snapshot send_standby")?;
+                    // Materialize once so snapshot rows land in Iceberg
+                    // before the live-replication loop. Subsequent live
+                    // events show up via the Materialize handler.
+                    materializer
+                        .cycle()
+                        .await
+                        .context("post-snapshot materializer cycle")?;
+                    tracing::info!(?snapshot_lsn, "snapshot phase complete");
+                }
+            }
         }
-    } else if slot_was_fresh && snapshot_complete {
-        tracing::info!("fresh slot but checkpoint says snapshot already complete; skipping");
     }
 
     // ── invariant watcher ──────────────────────────────────────────────

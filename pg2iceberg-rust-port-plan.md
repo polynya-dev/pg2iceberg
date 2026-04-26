@@ -307,12 +307,21 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 > covers all six iceberg transforms. Maintenance covers compaction +
 > snapshot expiry + orphan cleanup. Snapshot phase, startup validation
 > (Go's 8 checks), and the invariant watcher are all wired into the
-> binary. **Fault injection** (Phase 6.5) wires deterministic
+> binary.
+>
+> **Snapshot orchestration is now library code, not binary code:**
+> `pg2iceberg_snapshot::run_snapshot_phase` is the helper the binary
+> calls — and the same helper the fault-DST exercises end-to-end. This
+> closes the "wiring isn't tested" gap. Fixed a real bug surfaced by
+> the new test: `Snapshotter` now persists progress *after every
+> successful chunk* (was: only at end-of-pass), so a mid-chunk fault
+> resumes correctly instead of restarting from chunk 0.
+>
+> **Fault injection** (Phase 6.5) wires deterministic
 > `FaultyBlobStore` / `FaultyCoordinator` / `FaultyCatalog` wrappers +
-> a fault-DST harness with proptest + pinned regressions. **410 tests
-> pass, 4 ignored** (tier-3 contract test, one upstream iceberg-rust
-> flake, plus two `#[ignore]`-d gap-flagging tests for non-resumable
-> snapshot and materializer-crash recovery).
+> a fault-DST harness with proptest + pinned regressions. **413 tests
+> pass, 3 ignored** (tier-3 contract test, one upstream iceberg-rust
+> flake, materializer-crash recovery placeholder).
 >
 > **Pending work, prioritized:**
 >
@@ -354,12 +363,11 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 >   only the pipeline. Now that FileIndex rebuild is wired, crashing
 >   the materializer too is unblocked. (Fault DST has a pinned
 >   `#[ignore]` placeholder for it.)
-> - **Resumable snapshot via `Snapshotter` in the binary** — the fault
->   DST `mid_snapshot_blob_put_fault_recovers_via_resumable_snapshotter`
->   shows the resumable surface works under faults; the binary still
->   uses the non-resumable `run_snapshot` free function. Switch to
->   `Snapshotter` so a mid-snapshot blob/coord fault doesn't restart
->   from chunk 0 on huge tables. Plan §Phase 11.5.
+> - **More wiring extracted to libraries** — snapshot orchestration is
+>   library code now; the binary's `run_inner` main loop, query-mode
+>   poller, and verify driver are still binary-only. Same pattern
+>   applies: extract them so DST exercises the production code paths
+>   directly (not parallel hand-rolled harnesses).
 > - **Multi-table parallelism in maintenance ops** —
 >   `compact_cycle` / `expire_cycle` / `cleanup_orphans_cycle` walk
 >   tables sequentially.

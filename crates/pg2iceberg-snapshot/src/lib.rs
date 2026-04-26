@@ -171,11 +171,12 @@ where
     S: SnapshotSource + ?Sized,
     C: Coordinator,
 {
-    // Non-resumable variant: just runs a single pass with empty progress.
+    // Non-resumable variant: just runs a single pass with empty
+    // progress and no incremental saving.
     let snap_lsn = source.snapshot_lsn().await?;
     let progress = SnapshotProgressMap::default();
     let (_chunks, _end) = snapshot_one_pass(
-        source, schemas, pipeline, chunk_size, snap_lsn, progress, None,
+        source, schemas, pipeline, chunk_size, snap_lsn, progress, None, None,
     )
     .await?;
     Ok(snap_lsn)
@@ -257,7 +258,12 @@ impl Snapshotter {
             .map(|c| c.snapshot_progress.clone())
             .unwrap_or_default();
 
-        let (_chunks, end_progress) = snapshot_one_pass(
+        // Pass the coord through to snapshot_one_pass so progress is
+        // persisted *after every successful chunk*, not just at
+        // end-of-pass. Without this, a fault mid-chunk loses every
+        // chunk's progress and the resume restarts from chunk 0 —
+        // which is exactly the bug fault-DST surfaced.
+        let pass = snapshot_one_pass(
             source,
             schemas,
             pipeline,
@@ -265,11 +271,17 @@ impl Snapshotter {
             snap_lsn,
             progress,
             max_chunks,
+            Some((self.coord.as_ref(), cp.clone())),
         )
-        .await?;
+        .await;
 
-        // Save the actual end-of-pass progress to the coord. Existing
-        // checkpoint fields are preserved.
+        // The pass may have errored mid-chunk; in that case
+        // snapshot_one_pass has already persisted progress through
+        // the last successful chunk before propagating the error.
+        // Just propagate.
+        let (_chunks, end_progress) = pass?;
+
+        // End-of-pass save: marks Complete iff all tables finished.
         let mut cp_to_save = cp.unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
         cp_to_save.snapshot_progress = end_progress;
         cp_to_save.snapshot_state = if cp_to_save.snapshot_progress.is_empty() {
@@ -286,9 +298,16 @@ impl Snapshotter {
     }
 }
 
-/// Drive the actual snapshot loop. Shared by both the free-function entry
-/// point and `Snapshotter`. Returns `(chunks_processed, end_progress)` so
-/// the caller can persist the post-run progress map.
+/// Drive the actual snapshot loop. Shared by both the free-function
+/// entry point and `Snapshotter`. When `incremental_saver` is `Some`,
+/// the loop persists progress to the coord *after every successful
+/// chunk*, so a fault between chunks doesn't lose previous progress.
+/// The free `run_snapshot` passes `None` (non-resumable, single-pass).
+///
+/// On error, this function persists whatever progress was made before
+/// the error (when an `incremental_saver` is provided) and *then*
+/// propagates the error. The caller's resume picks up at the next
+/// chunk.
 async fn snapshot_one_pass<S, C>(
     source: &S,
     schemas: &[TableSchema],
@@ -297,6 +316,7 @@ async fn snapshot_one_pass<S, C>(
     snap_lsn: Lsn,
     progress: SnapshotProgressMap,
     max_chunks: Option<usize>,
+    incremental_saver: Option<(&dyn Coordinator, Option<Checkpoint>)>,
 ) -> Result<(usize, SnapshotProgressMap)>
 where
     S: SnapshotSource + ?Sized,
@@ -307,6 +327,53 @@ where
     let mut total_chunks = 0usize;
     let mut state = progress;
 
+    let res = run_chunk_loop(
+        source,
+        schemas,
+        pipeline,
+        chunk_size,
+        snap_lsn,
+        &mut state,
+        &mut total_chunks,
+        max_chunks,
+        &incremental_saver,
+    )
+    .await;
+
+    // On any error, save partial progress before propagating so the
+    // next call resumes at the next chunk. Best-effort: a save failure
+    // here gets swallowed (the original error is more interesting).
+    if let (Err(_), Some((coord, base_cp))) = (&res, &incremental_saver) {
+        let mut cp_to_save = base_cp.clone().unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
+        cp_to_save.snapshot_progress = state.clone();
+        cp_to_save.snapshot_state = if state.is_empty() {
+            SnapshotState::Complete
+        } else {
+            SnapshotState::InProgress
+        };
+        let _ = coord.save_checkpoint(&cp_to_save).await;
+    }
+
+    res?;
+    Ok((total_chunks, state))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_chunk_loop<S, C>(
+    source: &S,
+    schemas: &[TableSchema],
+    pipeline: &mut Pipeline<C>,
+    chunk_size: usize,
+    snap_lsn: Lsn,
+    state: &mut SnapshotProgressMap,
+    total_chunks: &mut usize,
+    max_chunks: Option<usize>,
+    incremental_saver: &Option<(&dyn Coordinator, Option<Checkpoint>)>,
+) -> Result<()>
+where
+    S: SnapshotSource + ?Sized,
+    C: Coordinator,
+{
     'tables: for (i, schema) in schemas.iter().enumerate() {
         let xid = SNAPSHOT_XID_BASE.wrapping_add(i as u32);
         let pk_cols: Vec<ColumnName> = schema
@@ -321,12 +388,11 @@ where
             )));
         }
 
-        // Resume from prior progress if any.
         let mut last_pk_key: Option<String> = state.get(&schema.ident).cloned();
 
         loop {
             if let Some(cap) = max_chunks {
-                if total_chunks >= cap {
+                if *total_chunks >= cap {
                     break 'tables;
                 }
             }
@@ -335,15 +401,29 @@ where
                 .read_chunk(&schema.ident, chunk_size, last_pk_key.as_deref())
                 .await?;
             if chunk.is_empty() {
-                // Table done — clear progress for it.
                 state.remove(&schema.ident);
+                // Persist the table-done state so a subsequent call
+                // doesn't try to re-read this table from scratch.
+                if let Some((coord, base_cp)) = incremental_saver {
+                    let mut cp_to_save =
+                        base_cp.clone().unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
+                    cp_to_save.snapshot_progress = state.clone();
+                    cp_to_save.snapshot_state = if state.is_empty() {
+                        SnapshotState::Complete
+                    } else {
+                        SnapshotState::InProgress
+                    };
+                    coord
+                        .save_checkpoint(&cp_to_save)
+                        .await
+                        .map_err(|e| SnapshotError::Source(format!("save_checkpoint: {e}")))?;
+                }
                 break;
             }
 
             let last_in_chunk = chunk.last().unwrap();
             let new_key = pk_key(last_in_chunk, &pk_cols);
 
-            // Defensive: source must advance the cursor strictly forward.
             if let Some(prev) = last_pk_key.as_deref() {
                 if new_key.as_str() <= prev {
                     return Err(SnapshotError::Source(format!(
@@ -359,7 +439,6 @@ where
                     xid,
                 })
                 .await?;
-
             for row in chunk {
                 pipeline
                     .process(DecodedMessage::Change(ChangeEvent {
@@ -374,7 +453,6 @@ where
                     }))
                     .await?;
             }
-
             pipeline
                 .process(DecodedMessage::Commit {
                     commit_lsn: snap_lsn,
@@ -383,13 +461,126 @@ where
                 .await?;
             pipeline.flush().await?;
 
+            // Chunk fully durable in coord. Update state + persist.
             last_pk_key = Some(new_key.clone());
             state.insert(schema.ident.clone(), new_key);
-            total_chunks += 1;
+            *total_chunks += 1;
+
+            if let Some((coord, base_cp)) = incremental_saver {
+                let mut cp_to_save =
+                    base_cp.clone().unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
+                cp_to_save.snapshot_progress = state.clone();
+                cp_to_save.snapshot_state = SnapshotState::InProgress;
+                coord
+                    .save_checkpoint(&cp_to_save)
+                    .await
+                    .map_err(|e| SnapshotError::Source(format!("save_checkpoint: {e}")))?;
+            }
         }
     }
+    Ok(())
+}
 
-    Ok((total_chunks, state))
+/// Outcome of [`run_snapshot_phase`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotPhaseOutcome {
+    /// Snapshot was skipped (already complete in checkpoint, or every
+    /// configured table is in `skip_idents`).
+    Skipped,
+    /// Snapshot ran (or resumed) and reached completion. The snapshot
+    /// LSN is the value the caller should `send_standby` to.
+    Completed { snapshot_lsn: Lsn },
+}
+
+/// **Production snapshot phase orchestration**, lifted from the binary
+/// so the fault-injection DST can exercise the *exact* logic the
+/// binary runs.
+///
+/// Steps:
+/// 1. Load checkpoint; return `Skipped` if `snapshot_state ==
+///    Complete`.
+/// 2. Filter `schemas` by `skip_idents` (per-table `skip_snapshot`
+///    opt-out).
+/// 3. Run [`Snapshotter`] (resumable surface — progress persists into
+///    `Checkpoint::snapshot_progress` after each chunk, so a
+///    mid-snapshot crash + restart resumes at the next chunk).
+/// 4. Defensive `pipeline.flush()` to drain.
+/// 5. Persist `snapshot_state: Complete` + `flushed_lsn` +
+///    `tracked_tables` + cleared progress map.
+///
+/// **What this function does not do** (caller's responsibility):
+/// - `stream.send_standby(snap_lsn, snap_lsn)` to advance the slot.
+/// - `materializer.cycle()` to publish snapshot rows to Iceberg.
+/// These are tied to the caller's replication-stream and materializer
+/// types, which the snapshot crate doesn't depend on.
+///
+/// **Resumability:** uses `Snapshotter` (not the free `run_snapshot`)
+/// so a fault during chunk K leaves the checkpoint at progress K-1.
+/// On restart, the next call re-loads progress and resumes — no
+/// re-staging of completed chunks. The fault-DST proves this:
+/// `binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault`.
+pub async fn run_snapshot_phase<S, C>(
+    source: &S,
+    coord: Arc<dyn Coordinator>,
+    schemas: &[TableSchema],
+    skip_idents: &std::collections::BTreeSet<TableIdent>,
+    pipeline: &mut Pipeline<C>,
+    chunk_size: usize,
+) -> Result<SnapshotPhaseOutcome>
+where
+    S: SnapshotSource + ?Sized,
+    C: Coordinator,
+{
+    let cp_pre = coord
+        .load_checkpoint()
+        .await
+        .map_err(|e| SnapshotError::Source(format!("load_checkpoint: {e}")))?;
+    if matches!(
+        cp_pre.as_ref().map(|c| c.snapshot_state),
+        Some(pg2iceberg_core::SnapshotState::Complete)
+    ) {
+        return Ok(SnapshotPhaseOutcome::Skipped);
+    }
+
+    let to_snapshot: Vec<TableSchema> = schemas
+        .iter()
+        .filter(|s| !skip_idents.contains(&s.ident))
+        .cloned()
+        .collect();
+    if to_snapshot.is_empty() {
+        return Ok(SnapshotPhaseOutcome::Skipped);
+    }
+
+    // Resumable snapshot. Persists progress per chunk in
+    // Checkpoint::snapshot_progress; a mid-snapshot fault + restart
+    // resumes at the next chunk.
+    let snapshotter = Snapshotter::new(coord.clone()).with_chunk_size(chunk_size);
+    let snap_lsn = snapshotter
+        .run(source, &to_snapshot, pipeline)
+        .await?;
+
+    // Defensive: ensure every staged chunk is durable in coord before
+    // we ack the slot. The Snapshotter::run loop already calls
+    // pipeline.flush() after each chunk, so this is usually a no-op,
+    // but a final flush is cheap insurance.
+    pipeline.flush().await?;
+
+    // Persist completion. `snapshot_progress` is cleared by Snapshotter
+    // when every table reaches end-of-table; we set state =
+    // Complete + flushed_lsn + tracked_tables on top of that.
+    let mut cp_save = cp_pre.unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
+    cp_save.snapshot_state = pg2iceberg_core::SnapshotState::Complete;
+    cp_save.flushed_lsn = snap_lsn;
+    cp_save.tracked_tables = to_snapshot.iter().map(|s| s.ident.clone()).collect();
+    cp_save.snapshot_progress.clear();
+    coord
+        .save_checkpoint(&cp_save)
+        .await
+        .map_err(|e| SnapshotError::Source(format!("save_checkpoint: {e}")))?;
+
+    Ok(SnapshotPhaseOutcome::Completed {
+        snapshot_lsn: snap_lsn,
+    })
 }
 
 /// Type bound the snapshotter wants on the catalog. Currently unused
