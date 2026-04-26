@@ -92,37 +92,52 @@ pub trait SnapshotSource: Send + Sync {
 /// the same buffer.
 pub const SNAPSHOT_XID_BASE: u32 = 0xFFFF_FF00;
 
-/// ## Marker-row fence (the snapshot↔CDC handoff pattern)
+/// `_pg2iceberg.markers` is a **blue-green replica alignment**
+/// feature in the Go reference (see `examples/blue-green/` in the Go
+/// repo). It is *not* the snapshot↔CDC fence — that lives in
+/// `pg2iceberg_validate::run_logical_lifecycle` and uses
+/// `pg_current_wal_lsn()` directly.
 ///
-/// In production PG, between starting the snapshot transaction and the
-/// pipeline catching up to live replication, there's a race window: rows
-/// inserted in that window could be (a) read by the snapshot's
-/// `pg_export_snapshot` view AND (b) re-emitted by the replication slot
-/// once the slot is at-or-past their LSN. Naively that produces duplicates.
+/// ## How markers work
 ///
-/// The Go reference handles this with a marker-row fence pattern: insert a
-/// marker UUID into a `_pg2iceberg.markers` table both before and after the
-/// snapshot. The pipeline drops WAL events whose source LSN is `<` the
-/// pre-marker. Rows the snapshot read are deduplicated when the materializer
-/// runs, because PK-keyed equality deletes void prior values.
+/// 1. Both blue and green PG clusters share the schema (including
+///    a `_pg2iceberg.markers` table) and one is logically
+///    replicating to the other. Both clusters' `pg2iceberg`
+///    instances include `_pg2iceberg.markers` in their publication.
+/// 2. An operator inserts a row `(uuid, ...)` into blue's
+///    `_pg2iceberg.markers`. PG logical replication ships the
+///    insert to green at the same WAL position.
+/// 3. Each pg2iceberg instance, on observing a marker INSERT in
+///    its WAL, flushes the containing transaction and triggers a
+///    materializer cycle. After the cycle succeeds, it writes
+///    `(marker_uuid, table_name, iceberg_snapshot_id)` rows into a
+///    *separate* Iceberg-side meta-markers table (in
+///    `meta_namespace`, e.g. `_pg2iceberg_blue.markers`).
+/// 4. An external diff tool (`iceberg-diff`) joins the two
+///    Iceberg-side meta-markers tables by `marker_uuid` and
+///    compares blue's snapshot vs green's snapshot per table. If
+///    EQUAL, the two replicas have produced byte-equal data at
+///    that WAL point — safe to cut over.
 ///
-/// `SimPostgres` serializes operations under one mutex, so this race
-/// doesn't exist in tests — the snapshot reads happen at exactly
-/// `current_lsn()`, and `send_standby(snap_lsn)` advances the slot past
-/// the snapshot point atomically. We document the pattern here so
-/// production impls add it deliberately.
+/// ## Status in pg2iceberg-rust
 ///
-/// Recommended fence ID format:
+/// Not implemented. Adding it requires:
+/// - `sink.meta_namespace` config field.
+/// - PG-side `_pg2iceberg.markers` table creation (in coord
+///   migrate, only if marker mode enabled).
+/// - Iceberg meta-markers table creation per-instance.
+/// - Pipeline-side detection of marker INSERTs in the WAL stream.
+/// - Materializer-side flush trigger + meta-markers row insertion
+///   keyed by `(marker_uuid, table, snapshot_id)`.
 pub const MARKER_TABLE_NAME: &str = "_pg2iceberg.markers";
 
-/// Type of fence marker; serialized into the `_pg2iceberg.markers` row.
+/// Currently unused. Reserved for the marker feature above; Go's
+/// version doesn't have a kind enum (markers are just UUIDs in PG),
+/// so this is likely to be removed when the feature is properly
+/// ported.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MarkerKind {
-    /// Inserted before snapshot reads begin. Pipeline drops every WAL
-    /// event with LSN `<` this marker's LSN.
     Pre,
-    /// Inserted after snapshot reads complete + slot is acked. Pipeline
-    /// resumes processing from this marker forward.
     Post,
 }
 

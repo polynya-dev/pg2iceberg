@@ -137,6 +137,11 @@ where
         blob_namer,
         metrics: Arc::new(InMemoryMetrics::new()),
         mode: Mode::Logical,
+        // Marker mode disabled by default; surface as a YAML knob
+        // (`sink.meta_namespace`) when wiring blue-green deployments.
+        // For now binary keeps it None — operators opt in via config
+        // once the YAML field lands.
+        meta_namespace: None,
     })
 }
 

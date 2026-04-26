@@ -217,6 +217,12 @@ impl Coordinator for PostgresCoordinator {
                 s3_path: path,
                 record_count: rc as u64,
                 byte_size: bs as u64,
+                // The prod log_index schema doesn't carry
+                // flushable_lsn yet; blue-green markers are sim-only
+                // until we add the column migration. Setting Lsn::ZERO
+                // means meta-marker emission is a no-op against the
+                // prod coord (markers remain pending forever).
+                flushable_lsn: pg2iceberg_core::Lsn::ZERO,
             });
         }
         Ok(out)

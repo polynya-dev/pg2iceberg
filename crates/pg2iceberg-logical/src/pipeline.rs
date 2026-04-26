@@ -7,11 +7,14 @@
 use crate::sink::{FlushOutput, Sink, SinkError, TableChunk};
 use async_trait::async_trait;
 use bytes::Bytes;
-use pg2iceberg_coord::{CommitBatch, CoordCommitReceipt, CoordError, Coordinator, OffsetClaim};
+use pg2iceberg_coord::{
+    CommitBatch, CoordCommitReceipt, CoordError, Coordinator, MarkerInfo, OffsetClaim,
+};
 use pg2iceberg_core::metrics::{names, Labels};
-use pg2iceberg_core::{Lsn, Metrics, NoopMetrics};
+use pg2iceberg_core::{ColumnName, Lsn, Metrics, NoopMetrics, Op, PgValue, TableIdent};
 use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_stream::{BlobStore, StreamError};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -74,6 +77,18 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     /// True after `shutdown` runs; further `process` calls become no-ops.
     /// Tested for in flush so a forgotten shutdown sequence stays correct.
     shut_down: bool,
+    /// Optional marker-table identity. When set, INSERTs to this table
+    /// are intercepted (filtered out of staging) and their `uuid` column
+    /// captured; the resulting marker UUID + commit LSN is included in
+    /// the next [`CommitBatch`]. Defaults to `_pg2iceberg.markers` when
+    /// marker mode is on; `None` disables.
+    markers_table: Option<TableIdent>,
+    /// Per-tx pending markers, by xid. Filled from `Change` events,
+    /// drained on `Commit` into [`Self::ready_markers`].
+    pending_markers_by_xid: BTreeMap<u32, Vec<String>>,
+    /// Markers from committed txs awaiting flush. Drained into
+    /// `CommitBatch.markers` on each successful `claim_offsets`.
+    ready_markers: Vec<MarkerInfo>,
 }
 
 impl<C: Coordinator + ?Sized> Pipeline<C> {
@@ -107,7 +122,29 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             flushed_lsn: AtomicU64::new(0),
             metrics,
             shut_down: false,
+            markers_table: None,
+            pending_markers_by_xid: BTreeMap::new(),
+            ready_markers: Vec::new(),
         }
+    }
+
+    /// Enable blue-green marker detection. INSERTs to `table` are
+    /// intercepted (not staged as user data) and their `uuid` column
+    /// is included in the next flush's [`CommitBatch.markers`].
+    /// `table` is typically `_pg2iceberg.markers` per the Go
+    /// reference's blue-green example.
+    pub fn enable_markers(&mut self, table: TableIdent) {
+        self.markers_table = Some(table);
+    }
+
+    /// `true` iff at least one marker has been observed in a
+    /// committed tx and is awaiting a flush. The lifecycle main loop
+    /// uses this to trigger an immediate flush+materialize on
+    /// marker observation, instead of waiting for the next periodic
+    /// tick — that's what gives blue-green replicas wall-clock-
+    /// independent alignment.
+    pub fn has_pending_marker(&self) -> bool {
+        !self.ready_markers.is_empty()
     }
 
     /// Highest LSN whose underlying batch has committed in the coordinator.
@@ -124,8 +161,42 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         }
         match msg {
             DecodedMessage::Begin { xid, .. } => self.sink.begin_tx(xid),
-            DecodedMessage::Commit { xid, commit_lsn } => self.sink.commit_tx(xid, commit_lsn),
-            DecodedMessage::Change(evt) => self.sink.record_change(evt)?,
+            DecodedMessage::Commit { xid, commit_lsn } => {
+                // Drain any markers observed in this tx before
+                // committing. Flushed atomically with the rest of
+                // the tx via the next claim_offsets call.
+                if let Some(uuids) = self.pending_markers_by_xid.remove(&xid) {
+                    for uuid in uuids {
+                        self.ready_markers.push(MarkerInfo { uuid, commit_lsn });
+                    }
+                }
+                self.sink.commit_tx(xid, commit_lsn);
+            }
+            DecodedMessage::Change(evt) => {
+                if let Some(marker_table) = &self.markers_table {
+                    if evt.table == *marker_table && evt.op == Op::Insert {
+                        // Intercept: extract uuid, don't stage as
+                        // user data. The marker is operator metadata
+                        // observable in PG but materialized only as
+                        // an Iceberg-side meta-marker row by the
+                        // materializer.
+                        if let Some(row) = &evt.after {
+                            if let Some(PgValue::Text(uuid)) =
+                                row.get(&ColumnName("uuid".into()))
+                            {
+                                if let Some(xid) = evt.xid {
+                                    self.pending_markers_by_xid
+                                        .entry(xid)
+                                        .or_default()
+                                        .push(uuid.clone());
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+                self.sink.record_change(evt)?;
+            }
             DecodedMessage::Relation { .. } => {
                 // Schema evolution lands in Phase 7.
             }
@@ -138,14 +209,30 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
 
     /// Drain all committed-but-unflushed transactions: encode → upload →
     /// `claim_offsets` → advance `flushedLSN` via the receipt. No-op if
-    /// nothing is ready.
+    /// nothing is ready (no staged events AND no markers awaiting
+    /// emission).
     pub async fn flush(&mut self) -> Result<Option<Lsn>> {
-        let Some(FlushOutput {
-            chunks,
-            flushable_lsn,
-        }) = self.sink.flush()?
-        else {
-            return Ok(None);
+        let sink_output = self.sink.flush()?;
+        // Markers can ride alone in an otherwise-empty flush — a tx
+        // that contains only a marker INSERT (no user-data events)
+        // still needs to write the marker into coord. Use the
+        // marker's commit LSN as the batch's flushable_lsn in that
+        // case.
+        let (chunks, flushable_lsn) = match sink_output {
+            Some(FlushOutput {
+                chunks,
+                flushable_lsn,
+            }) => (chunks, flushable_lsn),
+            None if !self.ready_markers.is_empty() => {
+                let max_marker_lsn = self
+                    .ready_markers
+                    .iter()
+                    .map(|m| m.commit_lsn)
+                    .max()
+                    .expect("non-empty checked above");
+                (Vec::new(), max_marker_lsn)
+            }
+            None => return Ok(None),
         };
         if chunks.is_empty() {
             // Possible if every committed tx was empty. Still advance the LSN
@@ -180,11 +267,21 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         }
         let _ = total_records;
 
+        // Drain ready markers into the batch. claim_offsets writes
+        // them atomically with the log_index rows so a crash
+        // between staging and marker-record can't drop them.
+        // Markers stay in `ready_markers` until claim_offsets
+        // returns Ok — a failed flush retries them on the next
+        // call. Re-flushing markers is idempotent (uuid is the PK
+        // in coord's pending_markers).
+        let markers_for_batch = self.ready_markers.clone();
         let batch = CommitBatch {
             claims,
             flushable_lsn,
+            markers: markers_for_batch,
         };
         let receipt = self.coord.claim_offsets(&batch).await?;
+        self.ready_markers.clear();
         self.advance_flushed_lsn(receipt);
 
         // Emit per-flush counters + the flushed_lsn gauge.

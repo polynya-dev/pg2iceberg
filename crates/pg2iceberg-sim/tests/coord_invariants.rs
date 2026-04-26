@@ -43,7 +43,7 @@ fn empty_batch_returns_receipt_with_no_grants() {
     let (c, _) = coord_at_t0();
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![],
-        flushable_lsn: Lsn(42),
+        flushable_lsn: Lsn(42), markers: vec![],
     }))
     .unwrap();
     assert_eq!(r.flushable_lsn, Lsn(42));
@@ -55,7 +55,7 @@ fn first_claim_starts_at_zero_and_grants_match() {
     let (c, _) = coord_at_t0();
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![claim("a", 5, "s3://a/0.parquet")],
-        flushable_lsn: Lsn(100),
+        flushable_lsn: Lsn(100), markers: vec![],
     }))
     .unwrap();
     assert_eq!(r.flushable_lsn, Lsn(100));
@@ -70,12 +70,12 @@ fn successive_claims_form_contiguous_offset_ranges() {
     let (c, _) = coord_at_t0();
     block_on(c.claim_offsets(&CommitBatch {
         claims: vec![claim("a", 3, "p0")],
-        flushable_lsn: Lsn(1),
+        flushable_lsn: Lsn(1), markers: vec![],
     }))
     .unwrap();
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![claim("a", 7, "p1")],
-        flushable_lsn: Lsn(2),
+        flushable_lsn: Lsn(2), markers: vec![],
     }))
     .unwrap();
     assert_eq!(r.grants[0].start_offset, 3);
@@ -87,7 +87,7 @@ fn batches_with_multiple_tables_assign_independently() {
     let (c, _) = coord_at_t0();
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![claim("a", 4, "pa"), claim("b", 6, "pb")],
-        flushable_lsn: Lsn(1),
+        flushable_lsn: Lsn(1), markers: vec![],
     }))
     .unwrap();
     let by_table: std::collections::BTreeMap<_, _> = r
@@ -110,7 +110,7 @@ fn multiple_claims_for_same_table_in_one_batch_chain_offsets() {
             claim("a", 3, "p1"),
             claim("a", 1, "p2"),
         ],
-        flushable_lsn: Lsn(1),
+        flushable_lsn: Lsn(1), markers: vec![],
     }))
     .unwrap();
     assert_eq!(r.grants[0].start_offset, 0);
@@ -130,7 +130,7 @@ fn read_log_filters_by_offset_and_orders_ascending() {
             claim("a", 5, "p1"),
             claim("a", 5, "p2"),
         ],
-        flushable_lsn: Lsn(1),
+        flushable_lsn: Lsn(1), markers: vec![],
     }))
     .unwrap();
     // After offset 5, expect the latter two entries.
@@ -146,7 +146,7 @@ fn read_log_respects_limit() {
     let claims: Vec<_> = (0..5).map(|i| claim("a", 1, &format!("p{i}"))).collect();
     block_on(c.claim_offsets(&CommitBatch {
         claims,
-        flushable_lsn: Lsn(1),
+        flushable_lsn: Lsn(1), markers: vec![],
     }))
     .unwrap();
     let entries = block_on(c.read_log(&ident("a"), 0, 3)).unwrap();
@@ -163,7 +163,7 @@ fn truncate_log_returns_paths_and_drops_rows() {
             claim("a", 3, "p1"),
             claim("a", 3, "p2"),
         ],
-        flushable_lsn: Lsn(1),
+        flushable_lsn: Lsn(1), markers: vec![],
     }))
     .unwrap();
     let dropped = block_on(c.truncate_log(&ident("a"), 6)).unwrap();

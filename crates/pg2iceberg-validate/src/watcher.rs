@@ -237,6 +237,7 @@ mod tests {
                 s3_path: "p0".into(),
             }],
             flushable_lsn: Lsn(1),
+            markers: vec![],
         }))
         .unwrap();
         block_on(coord.ensure_cursor("default", &ident())).unwrap();

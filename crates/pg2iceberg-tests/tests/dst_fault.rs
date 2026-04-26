@@ -931,6 +931,7 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
         )),
         metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
         mode: Mode::Logical,
+        meta_namespace: None,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1081,6 +1082,7 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
         )),
         metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
         mode: Mode::Logical,
+        meta_namespace: None,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1200,6 +1202,7 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
         )),
         metrics: Arc::new(InMemoryMetrics::new()),
         mode: Mode::Logical,
+        meta_namespace: None,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -1328,6 +1331,7 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
         )),
         metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
         mode: Mode::Logical,
+        meta_namespace: None,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

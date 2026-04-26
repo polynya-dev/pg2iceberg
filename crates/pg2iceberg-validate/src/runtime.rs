@@ -194,6 +194,17 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// follow-on Prometheus exporter wraps the same trait.
     pub metrics: Arc<dyn pg2iceberg_core::Metrics>,
     pub mode: Mode,
+    /// Blue-green marker mode. When `Some(meta_namespace)`,
+    /// pg2iceberg watches `_pg2iceberg.markers` in the source PG
+    /// (auto-included in the publication) and emits
+    /// `(uuid, table_name, snapshot_id)` rows to a meta-marker
+    /// Iceberg table at `<meta_namespace>.markers`. Each marker
+    /// observation also triggers an immediate flush+materialize so
+    /// the meta-marker rows on blue and green converge to the same
+    /// WAL point regardless of timer skew.
+    ///
+    /// `None` disables marker mode (default).
+    pub meta_namespace: Option<String>,
 }
 
 /// Boxed future returning the snapshot source. Awkward but unavoidable
@@ -259,10 +270,23 @@ where
     //    format.
     let slot_was_fresh = !lc.pg.slot_exists(&lc.slot_name).await?;
     let table_idents: Vec<TableIdent> = lc.schemas.iter().map(|s| s.ident.clone()).collect();
+    // Auto-include `_pg2iceberg.markers` in the publication when
+    // marker mode is enabled. The bluegreen replication
+    // publication (between blue and green PGs) must ALSO include
+    // it — that's the operator's responsibility, documented in
+    // the blue-green example README.
+    let markers_table_ident = TableIdent {
+        namespace: pg2iceberg_core::Namespace(vec!["_pg2iceberg".into()]),
+        name: "markers".into(),
+    };
+    let mut pub_table_idents = table_idents.clone();
+    if lc.meta_namespace.is_some() {
+        pub_table_idents.push(markers_table_ident.clone());
+    }
     if slot_was_fresh {
         if let Err(e) = lc
             .pg
-            .create_publication(&lc.publication_name, &table_idents)
+            .create_publication(&lc.publication_name, &pub_table_idents)
             .await
         {
             tracing::warn!(error = %e, "create_publication failed; assuming it exists");
@@ -280,6 +304,9 @@ where
         Arc::clone(&lc.blob_namer),
         lc.flush_rows,
     );
+    if lc.meta_namespace.is_some() {
+        pipeline.enable_markers(markers_table_ident.clone());
+    }
     let mut materializer: Materializer<Cat> = Materializer::new(
         Arc::clone(&lc.coord),
         Arc::clone(&lc.blob),
@@ -291,6 +318,19 @@ where
     for schema in &lc.schemas {
         materializer
             .register_table(schema.clone())
+            .await
+            .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
+    }
+    if let Some(meta_ns) = &lc.meta_namespace {
+        // Enable meta-marker emission. The materializer creates the
+        // meta-marker Iceberg table in `<meta_namespace>.markers`
+        // if missing.
+        let meta_schema = pg2iceberg_logical::materializer::meta_marker_table_schema(
+            meta_ns,
+            "markers",
+        );
+        materializer
+            .enable_meta_markers(meta_schema)
             .await
             .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
     }
@@ -522,6 +562,20 @@ where
                     .map_err(|e| MainLoopError::Process(e.to_string()))?;
             }
             _ = tokio::time::sleep(tick_sleep) => {}
+        }
+
+        // Blue-green marker fast-path. When the pipeline observes a
+        // marker INSERT in a committed tx, drive flush + materialize
+        // immediately — don't wait for the next periodic Flush /
+        // Materialize tick. This is what aligns blue and green
+        // pg2iceberg instances even when their materializer
+        // intervals differ wildly: each one acts on the marker as
+        // soon as its WAL stream delivers it, and the meta-marker
+        // emission ends up pointing at the same logical
+        // (uuid, table, snapshot) tuple on both sides.
+        if loop_state.pipeline.has_pending_marker() {
+            dispatch_handler(&mut loop_state, Handler::Flush).await?;
+            dispatch_handler(&mut loop_state, Handler::Materialize).await?;
         }
 
         let now = loop_state.clock.now();

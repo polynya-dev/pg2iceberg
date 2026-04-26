@@ -12,9 +12,10 @@ use crate::clock::{duration_to_micros, TestClock};
 use async_trait::async_trait;
 use pg2iceberg_coord::{
     receipt, schema::CoordSchema, CommitBatch, CoordCommitReceipt, CoordError, Coordinator,
-    LogEntry, OffsetGrant, Result,
+    LogEntry, MarkerInfo, OffsetGrant, Result,
 };
-use pg2iceberg_core::{Checkpoint, Clock, TableIdent, Timestamp, WorkerId};
+use pg2iceberg_core::{Checkpoint, Clock, Lsn, TableIdent, Timestamp, WorkerId};
+use std::collections::BTreeSet;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,6 +40,16 @@ struct State {
     locks: BTreeMap<TableIdent, (WorkerId, Timestamp)>,
     /// `checkpoints` (one row in this design).
     checkpoint: Option<Checkpoint>,
+    /// Pending marker UUIDs observed by `claim_offsets`. Persisted
+    /// alongside the log_index rows so the materializer can read
+    /// them post-cycle (see [`Coordinator::pending_markers_for_table`]).
+    /// Keyed by uuid for dedup; commit_lsn is the source-WAL LSN.
+    pending_markers: BTreeMap<String, Lsn>,
+    /// `(uuid, table)` pairs that have been emitted to Iceberg
+    /// meta-marker tables. Emission is per-table because each
+    /// pg2iceberg instance writes one meta-marker row per tracked
+    /// user table per marker.
+    marker_emissions: BTreeSet<(String, TableIdent)>,
 }
 
 #[derive(Clone)]
@@ -77,6 +88,17 @@ fn ttl_expiry(now: Timestamp, ttl: Duration) -> Timestamp {
 impl Coordinator for MemoryCoordinator {
     async fn claim_offsets(&self, batch: &CommitBatch) -> Result<CoordCommitReceipt> {
         if batch.claims.is_empty() {
+            // No log_index rows to write — but markers still need
+            // to be persisted (a marker-only flush has no claims).
+            if !batch.markers.is_empty() {
+                let mut state = self.state.lock().unwrap();
+                for m in &batch.markers {
+                    state
+                        .pending_markers
+                        .entry(m.uuid.clone())
+                        .or_insert(m.commit_lsn);
+                }
+            }
             return Ok(receipt::mint(batch.flushable_lsn, Vec::new()));
         }
 
@@ -114,6 +136,7 @@ impl Coordinator for MemoryCoordinator {
                 s3_path: c.s3_path.clone(),
                 record_count: c.record_count,
                 byte_size: c.byte_size,
+                flushable_lsn: batch.flushable_lsn,
             };
             // PK violation check — should never fire because next_offset is
             // monotonic, but we surface it as a Conflict to mirror PG's
@@ -135,6 +158,21 @@ impl Coordinator for MemoryCoordinator {
                 end_offset: entry.end_offset,
                 s3_path: entry.s3_path,
             });
+        }
+
+        // Markers are persisted atomically with the log_index rows
+        // — same PG transaction in prod, same mutex section here. A
+        // crash between staging Parquet and recording markers in
+        // coord can't drop the marker because it's part of the same
+        // claim_offsets call.
+        for m in &batch.markers {
+            // Idempotent: re-flushing a marker (e.g. on replay) is a
+            // no-op. Keys by uuid mean the entry stays at its first
+            // observed LSN.
+            state
+                .pending_markers
+                .entry(m.uuid.clone())
+                .or_insert(m.commit_lsn);
         }
 
         Ok(receipt::mint(batch.flushable_lsn, grants))
@@ -285,6 +323,57 @@ impl Coordinator for MemoryCoordinator {
 
     async fn save_checkpoint(&self, cp: &Checkpoint) -> Result<()> {
         self.state.lock().unwrap().checkpoint = Some(cp.clone());
+        Ok(())
+    }
+
+    async fn pending_markers_for_table(
+        &self,
+        table: &TableIdent,
+        cursor: i64,
+    ) -> Result<Vec<MarkerInfo>> {
+        let state = self.state.lock().unwrap();
+        let mut out: Vec<MarkerInfo> = state
+            .pending_markers
+            .iter()
+            .filter(|(uuid, lsn)| {
+                // Skip markers already emitted for this table.
+                if state
+                    .marker_emissions
+                    .contains(&((*uuid).clone(), table.clone()))
+                {
+                    return false;
+                }
+                // Eligibility: every log_index entry for `table`
+                // with flushable_lsn <= marker.commit_lsn must have
+                // end_offset <= cursor. Otherwise the materializer
+                // hasn't caught up to the marker's WAL point yet.
+                let any_unprocessed_at_or_below = state
+                    .log
+                    .iter()
+                    .filter(|e| e.table == *table)
+                    .any(|e| e.flushable_lsn <= **lsn && (e.end_offset as i64) > cursor);
+                !any_unprocessed_at_or_below
+            })
+            .map(|(uuid, lsn)| MarkerInfo {
+                uuid: uuid.clone(),
+                commit_lsn: *lsn,
+            })
+            .collect();
+        // Deterministic order so emit order is stable.
+        out.sort_by(|a, b| a.commit_lsn.cmp(&b.commit_lsn).then(a.uuid.cmp(&b.uuid)));
+        Ok(out)
+    }
+
+    async fn record_marker_emitted(
+        &self,
+        uuid: &str,
+        table: &TableIdent,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .marker_emissions
+            .insert((uuid.to_string(), table.clone()));
         Ok(())
     }
 }

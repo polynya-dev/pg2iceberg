@@ -60,6 +60,44 @@ pub struct CommitBatch {
     /// [`Coordinator::claim_offsets`] returns, the pipeline may advance
     /// `flushedLSN` to this value via [`set_flushed_lsn_with`].
     pub flushable_lsn: Lsn,
+    /// Marker UUIDs observed in this flush's transactions, with their
+    /// commit LSNs. Persisted atomically with the log_index rows so a
+    /// crash between flush and marker-write can't drop them. The
+    /// materializer reads these via
+    /// [`Coordinator::pending_markers_for_table`] after each cycle and
+    /// emits Iceberg meta-marker rows; see [`MarkerInfo`] for the
+    /// blue-green replica-alignment design.
+    #[serde(default)]
+    pub markers: Vec<MarkerInfo>,
+}
+
+impl CommitBatch {
+    /// Construct a marker-less batch — convenience for tests and
+    /// callers that don't enable blue-green markers.
+    pub fn without_markers(claims: Vec<OffsetClaim>, flushable_lsn: Lsn) -> Self {
+        Self {
+            claims,
+            flushable_lsn,
+            markers: Vec::new(),
+        }
+    }
+}
+
+/// One observation of a `_pg2iceberg.markers` INSERT in the source PG's
+/// WAL. The pipeline extracts the `uuid` column from the INSERT and
+/// pairs it with the containing transaction's commit LSN.
+///
+/// Markers are the blue-green replica-alignment primitive (see
+/// `examples/blue-green/` in the Go reference). When both blue and
+/// green pg2iceberg instances see the same marker UUID at equivalent
+/// WAL points, each emits a row to its own Iceberg meta-marker table
+/// recording the snapshot ID per tracked table at that moment.
+/// External `iceberg-diff` then verifies blue/green equivalence at
+/// the WAL point identified by the marker UUID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkerInfo {
+    pub uuid: String,
+    pub commit_lsn: Lsn,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,6 +159,14 @@ pub struct LogEntry {
     pub s3_path: String,
     pub record_count: u64,
     pub byte_size: u64,
+    /// Highest source-WAL LSN covered by the events in this entry's
+    /// staged Parquet object. Lets the materializer compute "this
+    /// cycle covered up to LSN X" so it can emit blue-green
+    /// meta-marker rows for any pending marker with `commit_lsn <= X`.
+    /// Default `Lsn::ZERO` for backward compat with old log_index
+    /// rows that predate the field.
+    #[serde(default)]
+    pub flushable_lsn: Lsn,
 }
 
 #[async_trait]
@@ -167,4 +213,42 @@ pub trait Coordinator: Send + Sync {
 
     async fn load_checkpoint(&self) -> Result<Option<Checkpoint>>;
     async fn save_checkpoint(&self, cp: &Checkpoint) -> Result<()>;
+
+    /// Read pending [`MarkerInfo`]s eligible for emission as
+    /// meta-marker rows for `table`. A marker is *eligible* iff:
+    ///
+    /// 1. It exists in `pending_markers` (durable in coord).
+    /// 2. It has not been emitted for this table (idempotence).
+    /// 3. Every `log_index` entry for `table` with
+    ///    `flushable_lsn <= marker.commit_lsn` has
+    ///    `end_offset <= cursor` — i.e. the materializer has caught
+    ///    up past every event for this table that committed at or
+    ///    before the marker.
+    ///
+    /// (3) covers two cases cleanly: tables with no events at the
+    /// marker's WAL point are eligible immediately; tables that
+    /// were touched in (or before) the marker's tx are only
+    /// eligible after the materializer commits those events.
+    ///
+    /// Default impl returns empty (marker mode disabled).
+    async fn pending_markers_for_table(
+        &self,
+        table: &TableIdent,
+        cursor: i64,
+    ) -> Result<Vec<MarkerInfo>> {
+        let _ = (table, cursor);
+        Ok(Vec::new())
+    }
+
+    /// Record that the meta-marker row `(uuid, table)` has been
+    /// written to Iceberg. Idempotent. Used by the materializer to
+    /// dedup emissions across crashes/replays. Default no-op.
+    async fn record_marker_emitted(
+        &self,
+        uuid: &str,
+        table: &TableIdent,
+    ) -> Result<()> {
+        let _ = (uuid, table);
+        Ok(())
+    }
 }

@@ -26,7 +26,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pg2iceberg_coord::{Coordinator, LogEntry};
 use pg2iceberg_core::metrics::{names, Labels};
-use pg2iceberg_core::{ColumnName, Metrics, NoopMetrics, Row, TableIdent, TableSchema};
+use pg2iceberg_core::typemap::IcebergType;
+use pg2iceberg_core::{
+    ColumnName, ColumnSchema, Lsn, Metrics, Namespace, NoopMetrics, Op, PgValue, Row, TableIdent,
+    TableSchema,
+};
 use pg2iceberg_iceberg::{
     fold_events, promote_re_inserts, read_data_file, rebuild_from_catalog, resolve_unchanged_cols,
     Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PreparedCommit, TableWriter,
@@ -37,6 +41,48 @@ use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
+
+/// Build the [`TableSchema`] for the blue-green meta-marker table.
+/// Each pg2iceberg instance writes one row per `(marker_uuid, table)`
+/// pair to its instance-local meta-marker table; an external
+/// `iceberg-diff` tool joins blue's and green's tables on
+/// `marker_uuid` to verify replica equivalence at WAL points.
+///
+/// Composite PK on `(uuid, table_name)` so re-emission (e.g. across
+/// crash + replay) deduplicates idempotently via the materializer's
+/// PK-keyed equality-delete write path.
+pub fn meta_marker_table_schema(meta_namespace: &str, table_name: &str) -> TableSchema {
+    TableSchema {
+        ident: TableIdent {
+            namespace: Namespace(vec![meta_namespace.to_string()]),
+            name: table_name.to_string(),
+        },
+        columns: vec![
+            ColumnSchema {
+                name: "uuid".into(),
+                field_id: 1,
+                ty: IcebergType::String,
+                nullable: false,
+                is_primary_key: true,
+            },
+            ColumnSchema {
+                name: "table_name".into(),
+                field_id: 2,
+                ty: IcebergType::String,
+                nullable: false,
+                is_primary_key: true,
+            },
+            ColumnSchema {
+                name: "snapshot_id".into(),
+                field_id: 3,
+                ty: IcebergType::Long,
+                nullable: false,
+                is_primary_key: false,
+            },
+        ],
+        partition_spec: Vec::new(),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum MaterializerError {
@@ -108,6 +154,23 @@ pub struct Materializer<C: Catalog> {
     group: String,
     cycle_limit: usize,
     metrics: Arc<dyn Metrics>,
+    /// Optional meta-marker table state. When `Some`, every
+    /// successful `cycle_table` queries pending markers from the
+    /// coord and emits `(uuid, table_name, snapshot_id)` rows to
+    /// this table — that's what gives blue-green replicas WAL-aligned
+    /// snapshot pointers for `iceberg-diff` to compare.
+    meta_marker: Option<MetaMarkerWriter>,
+}
+
+struct MetaMarkerWriter {
+    schema: TableSchema,
+    writer: TableWriter,
+    /// Empty FileIndex used for meta-marker writes. The meta-marker
+    /// table is append-only from this materializer's perspective —
+    /// we never rewrite it, just insert. (Merge-on-read on the
+    /// reader side handles dedup if a marker is re-emitted across a
+    /// crash.)
+    file_index: FileIndex,
 }
 
 impl<C: Catalog> Materializer<C> {
@@ -149,7 +212,29 @@ impl<C: Catalog> Materializer<C> {
             group: group.into(),
             cycle_limit,
             metrics,
+            meta_marker: None,
         }
+    }
+
+    /// Enable blue-green meta-marker emission. After every successful
+    /// `cycle_table`, the materializer queries pending markers up
+    /// to that cycle's max LSN and writes
+    /// `(uuid, table_name, snapshot_id)` rows to the meta-marker
+    /// Iceberg table. Caller must have already created the
+    /// meta-marker table in the catalog (e.g. via
+    /// `catalog.create_table(&schema)`).
+    pub async fn enable_meta_markers(&mut self, schema: TableSchema) -> Result<()> {
+        self.catalog.ensure_namespace(&schema.ident.namespace).await?;
+        if self.catalog.load_table(&schema.ident).await?.is_none() {
+            self.catalog.create_table(&schema).await?;
+        }
+        let writer = TableWriter::new(schema.clone());
+        self.meta_marker = Some(MetaMarkerWriter {
+            schema,
+            writer,
+            file_index: FileIndex::new(),
+        });
+        Ok(())
     }
 
     /// Register a materialized table. Creates the catalog table if missing,
@@ -364,6 +449,14 @@ impl<C: Catalog> Materializer<C> {
             .read_log(ident, after_offset, self.cycle_limit)
             .await?;
         if entries.is_empty() {
+            // No new events for this table — but a marker may have
+            // landed in coord that this table is now eligible to
+            // emit (because it has nothing pending past the
+            // marker's commit_lsn). Ask the coord; emit if any
+            // pending markers pass the eligibility check.
+            if self.meta_marker.is_some() {
+                self.emit_pending_markers(ident, cursor).await?;
+            }
             return Ok(0);
         }
         let max_end_offset = entries.iter().map(|e| e.end_offset).max().unwrap();
@@ -469,10 +562,119 @@ impl<C: Catalog> Materializer<C> {
             entry_mut.file_index.add_file(path, pks, partition_values);
         }
 
+        // 9. Blue-green meta-marker emission. After cursor +
+        //    FileIndex are durable, query the coord for any pending
+        //    markers covered by this cycle's LSN window. Writes
+        //    `(uuid, table_name, snapshot_id)` rows to the
+        //    meta-marker Iceberg table — that's the per-instance
+        //    audit trail for blue-green replica diffing.
+        // Pass the *new* cursor (= max_end_offset) so the coord's
+        // eligibility check considers everything we just committed
+        // as processed.
+        if self.meta_marker.is_some() {
+            self.emit_pending_markers(ident, max_end_offset as i64)
+                .await?;
+        }
+
         let folded_len = folded.len();
         self.metrics
             .counter(names::MATERIALIZER_ROWS_TOTAL, &labels, folded_len as u64);
         Ok(folded_len)
+    }
+
+    /// Emit meta-marker rows for any pending markers eligible for
+    /// `user_table` given its current `cursor` (see
+    /// [`Coordinator::pending_markers_for_table`] for the
+    /// eligibility rule). Idempotent across crashes/replays via
+    /// `coord.record_marker_emitted`. No-op if marker mode is off.
+    /// Returns the number of meta-marker rows written.
+    pub async fn emit_pending_markers(
+        &mut self,
+        user_table: &TableIdent,
+        cursor: i64,
+    ) -> Result<usize> {
+        let pending = self
+            .coord
+            .pending_markers_for_table(user_table, cursor)
+            .await?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let meta = match &mut self.meta_marker {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+
+        // Look up the *user* table's current snapshot id — that's
+        // the value that goes into each meta-marker row, pointing
+        // at the snapshot blue/green should be diffed at.
+        let user_meta = self
+            .catalog
+            .load_table(user_table)
+            .await?
+            .ok_or_else(|| MaterializerError::UnknownTable(user_table.clone()))?;
+        let snapshot_id = user_meta.current_snapshot_id.unwrap_or(0);
+
+        // Build one row per pending marker. PK is `(uuid,
+        // table_name)`, so duplicates between cycles dedup at
+        // read-time via merge-on-read.
+        let table_name_str = format!("{}", user_table);
+        let rows: Vec<MaterializedRow> = pending
+            .iter()
+            .map(|m| {
+                let mut row: Row = std::collections::BTreeMap::new();
+                row.insert(ColumnName("uuid".into()), PgValue::Text(m.uuid.clone()));
+                row.insert(
+                    ColumnName("table_name".into()),
+                    PgValue::Text(table_name_str.clone()),
+                );
+                row.insert(ColumnName("snapshot_id".into()), PgValue::Int8(snapshot_id));
+                MaterializedRow {
+                    op: Op::Insert,
+                    row,
+                    unchanged_cols: Vec::new(),
+                }
+            })
+            .collect();
+
+        // Stage + commit to the meta-marker Iceberg table.
+        let prepared = meta.writer.prepare(&rows, &meta.file_index)?;
+        let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared.data.len());
+        for chunk in prepared.data {
+            let path = self
+                .namer
+                .next_path(&meta.schema.ident, "meta-marker")
+                .await;
+            let byte_size = chunk.chunk.bytes.len() as u64;
+            self.blob_store
+                .put(&path, Bytes::clone(&chunk.chunk.bytes))
+                .await?;
+            data_files.push(DataFile {
+                path,
+                record_count: chunk.chunk.record_count,
+                byte_size,
+                equality_field_ids: vec![],
+                partition_values: chunk.partition_values,
+            });
+        }
+        // Re-emission of an already-emitted marker would conflict on
+        // the (uuid, table_name) PK. We rely on `record_marker_emitted`
+        // dedup in the coord to prevent that, but the materializer's
+        // PK-keyed equality-delete dedup also catches it on read if
+        // a write slips through.
+        self.catalog
+            .commit_snapshot(PreparedCommit {
+                ident: meta.schema.ident.clone(),
+                data_files,
+                equality_deletes: Vec::new(),
+            })
+            .await?;
+        for m in &pending {
+            self.coord
+                .record_marker_emitted(&m.uuid, user_table)
+                .await?;
+        }
+        Ok(pending.len())
     }
 
     async fn fetch_prior_rows(

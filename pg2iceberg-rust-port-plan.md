@@ -335,11 +335,12 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 > `pg_current_wal_lsn()` *before* `BEGIN ISOLATION LEVEL REPEATABLE
 > READ` so concurrent commits in `[snap_lsn, BEGIN-time]` get
 > deduplicated by the materializer's PK-keyed equality-deletes
-> instead of being lost — Go's marker-row tradeoff. Two pinned
-> fault-DST tests verify both:
+> instead of being lost. Two pinned fault-DST tests verify both:
 > `snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream`
 > and
 > `fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity`.
+> (Note: `_pg2iceberg.markers` is a separate mechanism, unrelated
+> to this fence — purpose TBD from Go reference.)
 >
 > **Fault injection** (Phase 6.5) wires deterministic
 > `FaultyBlobStore` / `FaultyCoordinator` / `FaultyCatalog` wrappers +
