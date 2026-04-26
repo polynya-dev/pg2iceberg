@@ -328,29 +328,30 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 >   `Snapshotter` now persists progress *after every successful
 >   chunk* (was: only at end-of-pass).
 >
+> **Snapshot↔CDC fence wired.** Lifecycle now opens replication
+> *after* the snapshot phase, passing `snap_lsn` as the start LSN
+> so the server's replication-slot fence skips events committed
+> before the snapshot view. `PgSnapshotSource` captures
+> `pg_current_wal_lsn()` *before* `BEGIN ISOLATION LEVEL REPEATABLE
+> READ` so concurrent commits in `[snap_lsn, BEGIN-time]` get
+> deduplicated by the materializer's PK-keyed equality-deletes
+> instead of being lost — Go's marker-row tradeoff. Two pinned
+> fault-DST tests verify both:
+> `snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream`
+> and
+> `fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity`.
+>
 > **Fault injection** (Phase 6.5) wires deterministic
 > `FaultyBlobStore` / `FaultyCoordinator` / `FaultyCatalog` wrappers +
 > a fault-DST harness with proptest + pinned regressions including
-> end-to-end lifecycle tests. **418 tests pass, 4 ignored** (tier-3
-> contract test, one upstream iceberg-rust flake, materializer-crash
-> recovery placeholder, lifecycle-resume placeholder pending
-> Iceberg-state setup helpers).
+> end-to-end lifecycle + fence tests. **420 tests pass, 4 ignored**
+> (tier-3 contract test, one upstream iceberg-rust flake,
+> materializer-crash recovery placeholder, lifecycle-resume
+> placeholder pending Iceberg-state setup helpers).
 >
 > **Pending work, prioritized:**
 >
 > **P0.5 (deployment-quality but optional):**
-> - **Marker-row fence for snapshot↔CDC handoff** — wire the Pre/Post
->   marker rows (`_pg2iceberg.markers`) so rows in the
->   `[consistent_point, snap_lsn]` window aren't double-emitted by the
->   replication slot after the snapshot phase. The materializer's
->   PK-keyed equality-delete dedup makes this *correctness-safe*
->   today, but on a hot table the duplicate WAL events produce extra
->   delete files. Plan §Phase 11.5.
-> - **Resumable snapshot mid-crash** — `Snapshotter::run_chunks`
->   library exists; the binary uses the single-pass `run_snapshot`
->   free function which restarts from chunk 0 on crash. Switch to
->   `Snapshotter` to skip already-completed chunks on resume. Plan
->   §Phase 11.5.
 > - **Testcontainers integration tests** — sim DST covers correctness
 >   end-to-end; testcontainers covers protocol-level fidelity. Colima
 >   runbook ready ([reference_integration_tests.md]), harness

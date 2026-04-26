@@ -247,7 +247,16 @@ where
     )
     .await?;
 
-    // 2. Slot setup.
+    // 2. Slot setup. Don't `start_replication` yet — we want the
+    //    snapshot phase to run first so we can pass `snap_lsn` as
+    //    the stream's start LSN. That way the server-side fence
+    //    skips events in `[consistent_point, snap_lsn]` which are
+    //    already covered by the snapshot view. Mirrors the
+    //    snapshot↔CDC marker-row fence pattern from Go's
+    //    `pg2iceberg`, but uses the snapshot tx's
+    //    `pg_current_wal_lsn()` directly instead of a real WAL
+    //    marker row — same correctness guarantee, simpler wire
+    //    format.
     let slot_was_fresh = !lc.pg.slot_exists(&lc.slot_name).await?;
     let table_idents: Vec<TableIdent> = lc.schemas.iter().map(|s| s.ident.clone()).collect();
     if slot_was_fresh {
@@ -264,13 +273,7 @@ where
         tracing::info!(slot = %lc.slot_name, "replication slot exists, resuming");
     }
 
-    // 3. start_replication.
-    let stream = lc
-        .pg
-        .start_replication(&lc.slot_name, Lsn(0), &lc.publication_name)
-        .await?;
-
-    // 4-5. Build pipeline + materializer + register tables.
+    // 3. Build pipeline + materializer + register tables.
     let mut pipeline = Pipeline::new(
         Arc::clone(&lc.coord),
         Arc::clone(&lc.blob),
@@ -293,7 +296,7 @@ where
     }
     tracing::info!(count = lc.schemas.len(), "tables registered");
 
-    // 6. Consumer heartbeat.
+    // 4. Consumer heartbeat.
     let worker_id = WorkerId(format!(
         "lifecycle-{}",
         lc.id_gen.new_uuid().iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()
@@ -303,9 +306,10 @@ where
         .await
         .map_err(|e| LifecycleError::Coord(e.to_string()))?;
 
-    // 7. Snapshot phase (only on fresh slot).
-    let mut stream = stream;
-    if slot_was_fresh {
+    // 5. Snapshot phase (only on fresh slot). Returns the snapshot
+    //    LSN we'll use as the replication start LSN — this is the
+    //    snapshot↔CDC fence.
+    let snap_lsn: Option<Lsn> = if slot_was_fresh {
         let to_snapshot: Vec<TableSchema> = lc
             .schemas
             .iter()
@@ -316,6 +320,7 @@ where
             tracing::info!(
                 "snapshot phase: every configured table is skip_snapshot=true; nothing to do"
             );
+            None
         } else {
             let source = (lc.snapshot_source_factory)(&to_snapshot).await?;
             tracing::info!(
@@ -335,16 +340,37 @@ where
             {
                 SnapshotPhaseOutcome::Skipped => {
                     tracing::info!("snapshot phase: skipped (checkpoint says complete)");
+                    None
                 }
                 SnapshotPhaseOutcome::Completed { snapshot_lsn } => {
-                    stream
-                        .send_standby(snapshot_lsn, snapshot_lsn)
-                        .await?;
                     run_materialize_tick(&mut materializer, None).await?;
                     tracing::info!(?snapshot_lsn, "snapshot phase complete");
+                    Some(snapshot_lsn)
                 }
             }
         }
+    } else {
+        None
+    };
+
+    // 6. start_replication AT the right LSN. Snapshot↔CDC fence:
+    //    - Fresh slot + snapshot ran: start at snap_lsn. Server
+    //      skips events in [consistent_point, snap_lsn] which are
+    //      already covered by the snapshot. No duplicates.
+    //    - Fresh slot + snapshot skipped: start at consistent_point
+    //      (Lsn 0 = "use confirmed_flush_lsn", which is the slot's
+    //      initial position).
+    //    - Resuming slot: start at confirmed_flush_lsn (Lsn 0
+    //      semantics).
+    let start_lsn = snap_lsn.unwrap_or(Lsn::ZERO);
+    let mut stream = lc
+        .pg
+        .start_replication(&lc.slot_name, start_lsn, &lc.publication_name)
+        .await?;
+    // 7. Initial standby ack so the slot's confirmed_flush_lsn
+    //    advances to start_lsn — server can recycle WAL behind it.
+    if let Some(snapshot_lsn) = snap_lsn {
+        stream.send_standby(snapshot_lsn, snapshot_lsn).await?;
     }
 
     // 8-9. Main loop + drain.

@@ -604,6 +604,16 @@ impl SimReplicationStream {
     pub fn cursor_lsn(&self) -> Lsn {
         self.cursor_lsn
     }
+
+    /// Mimic the prod server-side snapshot↔CDC fence: skip emitting
+    /// events whose LSN is at or below `lsn`. Used by
+    /// [`SimPgClient::start_replication`] when the lifecycle helper
+    /// passes `start = snap_lsn` after the snapshot phase.
+    pub fn advance_cursor_to(&mut self, lsn: Lsn) {
+        if lsn > self.cursor_lsn {
+            self.cursor_lsn = lsn;
+        }
+    }
 }
 
 /// Wraps a `SimReplicationStream` so it satisfies the
@@ -850,15 +860,19 @@ impl PgClient for SimPgClient {
     async fn start_replication(
         &self,
         slot: &str,
-        _start: Lsn,
+        start: Lsn,
         _publication: &str,
     ) -> std::result::Result<Box<dyn ReplicationStream>, PgError> {
-        // Sim's stream resumes from the slot's restart_lsn — `start`
-        // is informational; callers ack via send_standby to advance.
-        let stream = self
+        // Honor the snapshot↔CDC fence: when the lifecycle passes
+        // `start = snap_lsn`, advance the stream's cursor so events
+        // committed before the snapshot view aren't re-emitted. (In
+        // prod, the server applies this fence; the sim emulates by
+        // advancing its in-memory cursor.)
+        let mut stream = self
             .db
             .start_replication(slot)
             .map_err(|e| PgError::Other(e.to_string()))?;
+        stream.advance_cursor_to(start);
         Ok(Box::new(AsyncSimStream::new(stream)))
     }
 }

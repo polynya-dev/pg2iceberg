@@ -841,6 +841,279 @@ fn binary_materialize_tick_compaction_disabled_skips_compaction() {
 // injection automatically.
 
 #[test]
+fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
+    // **The marker-row fence test.** Pre-seed rows into PG (commits
+    // 1..=4 at LSNs L1..L4 < snap_lsn). After slot creation +
+    // snapshot, replication should NOT re-emit those events — the
+    // server-side fence (sim emulates via cursor) drops them.
+    //
+    // Without the fence, the materializer's PK-keyed equality-delete
+    // dedup would handle correctness, but produce extra delete files
+    // per duplicate row. The fence avoids that overhead entirely.
+    use pg2iceberg_core::{Mode, WorkerId};
+    use pg2iceberg_logical::Schedule;
+    use pg2iceberg_sim::postgres::SimPgClient;
+    use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
+    use std::time::Duration;
+
+    let db = pg2iceberg_sim::postgres::SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    // 4 pre-seed rows. These commit BEFORE the slot is created, so
+    // the replication slot's consistent_point >= their LSNs but the
+    // slot itself never replicates them. They're only visible via
+    // the snapshot phase.
+    let mut tx = db.begin_tx();
+    for i in 1..=4 {
+        tx.insert(&ident(), row(i, i * 10));
+    }
+    tx.commit(pg2iceberg_core::Timestamp(0)).unwrap();
+
+    let clock = pg2iceberg_sim::clock::TestClock::at(0);
+    let arc_clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(clock);
+    let coord_inner = Arc::new(pg2iceberg_sim::coord::MemoryCoordinator::new(
+        pg2iceberg_coord::schema::CoordSchema::default_name(),
+        arc_clock.clone(),
+    ));
+    let blob_inner = Arc::new(MemoryBlobStore::new());
+    let catalog_inner = Arc::new(pg2iceberg_sim::catalog::MemoryCatalog::new());
+
+    let pg_client = Arc::new(SimPgClient::new(db.clone()));
+    let pg: Arc<dyn pg2iceberg_pg::PgClient> = pg_client.clone();
+    let slot_monitor: Arc<dyn pg2iceberg_pg::SlotMonitor> = pg_client.clone();
+
+    use pg2iceberg_core::IdGen;
+    struct DeterministicIdGen;
+    impl IdGen for DeterministicIdGen {
+        fn new_uuid(&self) -> [u8; 16] {
+            [0u8; 16]
+        }
+        fn worker_id(&self) -> WorkerId {
+            WorkerId("dst-fence".into())
+        }
+    }
+    let id_gen: Arc<dyn IdGen> = Arc::new(DeterministicIdGen);
+
+    let snapshot_db = db.clone();
+    let snapshot_factory: Box<
+        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut + Send,
+    > = Box::new(move |_schemas| {
+        Box::pin(async move {
+            Ok::<Box<dyn pg2iceberg_snapshot::SnapshotSource>, pg2iceberg_validate::LifecycleError>(
+                Box::new(snapshot_db),
+            )
+        })
+    });
+
+    let lifecycle = LogicalLifecycle {
+        pg,
+        slot_monitor,
+        coord: coord_inner.clone() as Arc<dyn Coordinator>,
+        catalog: catalog_inner.clone(),
+        blob: blob_inner.clone() as Arc<dyn pg2iceberg_stream::BlobStore>,
+        clock: arc_clock,
+        id_gen,
+        schemas: vec![schema()],
+        skip_snapshot_idents: std::collections::BTreeSet::new(),
+        slot_name: "fence-slot".into(),
+        publication_name: "fence-pub".into(),
+        group: "default".into(),
+        schedule: Schedule::default(),
+        compaction: None,
+        flush_rows: 64,
+        mat_cycle_limit: 128,
+        consumer_ttl: Duration::from_secs(60),
+        snapshot_source_factory: snapshot_factory,
+        materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
+            "s3://fence-table",
+        )),
+        blob_namer: Arc::new(pg2iceberg_logical::pipeline::CounterBlobNamer::new(
+            "s3://fence-stage",
+        )),
+        metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
+        mode: Mode::Logical,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = rt.block_on(async move {
+        run_logical_main_loop_with_immediate_shutdown(lifecycle).await
+    });
+    assert!(outcome.is_ok(), "lifecycle: {outcome:?}");
+
+    // The fence proof: no log_index entries for the table beyond
+    // those produced by the snapshot phase. If the fence were
+    // missing, replication would re-stage the 4 pre-seed inserts
+    // as additional log_index entries (or worse, treat them as
+    // re-inserts triggering equality deletes).
+    let entries = block_on(coord_inner.read_log(&ident(), 0, 1_000_000)).unwrap();
+    let total_records: u64 = entries.iter().map(|e| e.record_count).sum();
+    assert_eq!(
+        total_records, 4,
+        "expected exactly 4 staged events (the 4 pre-seed rows via snapshot); \
+         got {total_records}. If this is higher, replication is re-emitting \
+         pre-snapshot events — the fence broke."
+    );
+
+    // Iceberg state == PG ground truth.
+    let mut iceberg = block_on(read_materialized_state(
+        catalog_inner.as_ref(),
+        blob_inner.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    ))
+    .unwrap();
+    sort_by_pk(&mut iceberg);
+    let mut pg_rows = db.read_table(&ident()).unwrap();
+    sort_by_pk(&mut pg_rows);
+    assert_eq!(iceberg, pg_rows, "PG ↔ Iceberg parity");
+}
+
+/// Helper: run lifecycle and shut down immediately.
+async fn run_logical_main_loop_with_immediate_shutdown<Cat>(
+    lc: pg2iceberg_validate::LogicalLifecycle<Cat>,
+) -> Result<(), pg2iceberg_validate::LifecycleError>
+where
+    Cat: pg2iceberg_iceberg::Catalog + 'static,
+{
+    pg2iceberg_validate::run_logical_lifecycle(lc, Box::pin(std::future::ready(()))).await
+}
+
+#[test]
+fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
+    // The "duplicate-tolerant" fence test: simulate concurrent
+    // writes that commit between the slot's consistent_point and
+    // the snapshot LSN. Those events are in BOTH the snapshot view
+    // AND the replication stream (because snap_lsn is captured
+    // BEFORE BEGIN, so events in `[snap_lsn, BEGIN-time]` flow
+    // through both). The materializer's PK-keyed
+    // equality-delete dedup must collapse them so PG ↔ Iceberg
+    // stays at parity.
+    use pg2iceberg_core::{IdGen, Mode, WorkerId};
+    use pg2iceberg_logical::Schedule;
+    use pg2iceberg_sim::postgres::SimPgClient;
+    use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
+    use std::time::Duration;
+
+    let db = pg2iceberg_sim::postgres::SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    // Pre-seed rows that exist BEFORE slot creation. Snapshot only.
+    let mut tx = db.begin_tx();
+    for i in 1..=2 {
+        tx.insert(&ident(), row(i, i * 10));
+    }
+    tx.commit(pg2iceberg_core::Timestamp(0)).unwrap();
+
+    // The factory below simulates "concurrent writes during snapshot
+    // BEGIN" by inserting more rows between the snap_lsn capture and
+    // the snapshot read. Those rows commit AFTER snap_lsn but appear
+    // in the snapshot view (which is captured here, in the factory)
+    // — and they'll also flow through replication because their LSN
+    // > snap_lsn. The dedup must absorb the overlap.
+    let snapshot_db = db.clone();
+    let snapshot_factory: Box<
+        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut + Send,
+    > = Box::new(move |_schemas| {
+        Box::pin(async move {
+            // Concurrent writes. These commit after the lifecycle's
+            // pre-BEGIN fence-LSN capture, but the snapshot source's
+            // view sees them.
+            let mut tx = snapshot_db.begin_tx();
+            for i in 3..=4 {
+                tx.insert(&ident(), row(i, i * 100));
+            }
+            tx.commit(pg2iceberg_core::Timestamp(0)).unwrap();
+            Ok::<Box<dyn pg2iceberg_snapshot::SnapshotSource>, pg2iceberg_validate::LifecycleError>(
+                Box::new(snapshot_db),
+            )
+        })
+    });
+
+    let clock = pg2iceberg_sim::clock::TestClock::at(0);
+    let arc_clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(clock);
+    let coord_inner = Arc::new(pg2iceberg_sim::coord::MemoryCoordinator::new(
+        pg2iceberg_coord::schema::CoordSchema::default_name(),
+        arc_clock.clone(),
+    ));
+    let blob_inner = Arc::new(MemoryBlobStore::new());
+    let catalog_inner = Arc::new(pg2iceberg_sim::catalog::MemoryCatalog::new());
+    let pg_client = Arc::new(SimPgClient::new(db.clone()));
+    let pg: Arc<dyn pg2iceberg_pg::PgClient> = pg_client.clone();
+    let slot_monitor: Arc<dyn pg2iceberg_pg::SlotMonitor> = pg_client.clone();
+
+    struct DeterministicIdGen;
+    impl IdGen for DeterministicIdGen {
+        fn new_uuid(&self) -> [u8; 16] {
+            [0u8; 16]
+        }
+        fn worker_id(&self) -> WorkerId {
+            WorkerId("dst-fence-concurrent".into())
+        }
+    }
+    let id_gen: Arc<dyn IdGen> = Arc::new(DeterministicIdGen);
+
+    let lifecycle = LogicalLifecycle {
+        pg,
+        slot_monitor,
+        coord: coord_inner.clone() as Arc<dyn Coordinator>,
+        catalog: catalog_inner.clone(),
+        blob: blob_inner.clone() as Arc<dyn pg2iceberg_stream::BlobStore>,
+        clock: arc_clock,
+        id_gen,
+        schemas: vec![schema()],
+        skip_snapshot_idents: std::collections::BTreeSet::new(),
+        slot_name: "fence-concurrent-slot".into(),
+        publication_name: "fence-concurrent-pub".into(),
+        group: "default".into(),
+        schedule: Schedule::default(),
+        compaction: None,
+        flush_rows: 64,
+        mat_cycle_limit: 128,
+        consumer_ttl: Duration::from_secs(60),
+        snapshot_source_factory: snapshot_factory,
+        materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
+            "s3://fence-conc",
+        )),
+        blob_namer: Arc::new(pg2iceberg_logical::pipeline::CounterBlobNamer::new(
+            "s3://fence-conc-stage",
+        )),
+        metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
+        mode: Mode::Logical,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        run_logical_lifecycle(lifecycle, Box::pin(std::future::ready(()))).await
+    })
+    .expect("lifecycle should succeed");
+
+    // The headline assertion: PG and Iceberg agree on row state, even
+    // with the snapshot/CDC overlap window. Dedup must have absorbed
+    // the duplicate inserts of ids 3 and 4.
+    let mut iceberg = block_on(read_materialized_state(
+        catalog_inner.as_ref(),
+        blob_inner.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    ))
+    .unwrap();
+    sort_by_pk(&mut iceberg);
+    let mut pg_rows = db.read_table(&ident()).unwrap();
+    sort_by_pk(&mut pg_rows);
+    assert_eq!(
+        iceberg, pg_rows,
+        "PG ↔ Iceberg parity must hold despite snapshot↔CDC overlap"
+    );
+    assert_eq!(pg_rows.len(), 4, "all 4 rows visible in PG");
+}
+
+#[test]
 fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
     // Exercises the *complete* binary lifecycle via
     // `pg2iceberg_validate::run_logical_lifecycle` against sim

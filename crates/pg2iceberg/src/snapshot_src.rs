@@ -96,20 +96,39 @@ impl PgSnapshotSource {
         let conn = coord_connect_with(&pg_cfg.dsn(), tls)
             .await
             .context("connect snapshot source")?;
+        // **Snapshot↔CDC fence (the "marker" LSN).**
+        //
+        // Capture `pg_current_wal_lsn()` *before* BEGIN. The
+        // snapshot-view boundary `B` set by BEGIN is >= this LSN.
+        // We use this LSN as the replication start point. The
+        // tradeoff:
+        //
+        // - Events in `[snap_lsn, B]` (committed between this query
+        //   and BEGIN) are visible in the snapshot view *and* in
+        //   replication → duplicates. The materializer's PK-keyed
+        //   equality-delete dedup absorbs them; the cost is some
+        //   extra delete files on hot tables.
+        // - Events in `[B, ∞)` are visible only via replication →
+        //   correctly emitted exactly once.
+        //
+        // The opposite order (BEGIN first, then `pg_current_wal_lsn`)
+        // produces snap_lsn > `B` in the presence of concurrent
+        // commits, which would *lose* events in `[B, snap_lsn]` that
+        // are neither in the snapshot view nor (with start LSN
+        // = snap_lsn) replicated. Mirrors Go's marker-row fence:
+        // accept duplicates, never lose events.
+        let lsn_text = simple_query_one_value(&conn.client, "SELECT pg_current_wal_lsn()::text")
+            .await
+            .context("pg_current_wal_lsn (pre-BEGIN fence)")?
+            .ok_or_else(|| anyhow::anyhow!("pg_current_wal_lsn returned no rows"))?;
+        let snapshot_lsn = parse_lsn(&lsn_text).with_context(|| format!("parse LSN {lsn_text:?}"))?;
         // BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY locks in a
-        // consistent view across every read_chunk call.
+        // consistent view for every read_chunk call. Any tx that
+        // committed in `[snap_lsn, BEGIN-time]` is in the view.
         conn.client
             .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .context("BEGIN snapshot tx")?;
-        // Capture current WAL position. This is the LSN we'll ack the
-        // slot at after snapshot reads complete; replication then
-        // resumes from the same point.
-        let lsn_text = simple_query_one_value(&conn.client, "SELECT pg_current_wal_lsn()::text")
-            .await
-            .context("pg_current_wal_lsn")?
-            .ok_or_else(|| anyhow::anyhow!("pg_current_wal_lsn returned no rows"))?;
-        let snapshot_lsn = parse_lsn(&lsn_text).with_context(|| format!("parse LSN {lsn_text:?}"))?;
 
         let mut by_ident = BTreeMap::new();
         for s in schemas {
