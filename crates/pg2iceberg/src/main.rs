@@ -15,6 +15,7 @@
 mod config;
 mod realio;
 mod run;
+mod snapshot_src;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -71,6 +72,20 @@ enum Command {
         #[arg(long)]
         retention: Option<String>,
     },
+    /// Diff PG ground truth against Iceberg materialized state for
+    /// every configured table. Prints per-table counts of `pg_only`,
+    /// `iceberg_only`, and `mismatched` rows. Exits non-zero if any
+    /// table reports a non-empty diff. Day-2 confidence check: "is
+    /// my mirror correct?"
+    Verify {
+        #[arg(long)]
+        config: PathBuf,
+        /// Per-PG-read chunk cap. Tradeoff: larger chunks = fewer
+        /// round-trips, larger peak memory. 1024 mirrors the snapshot
+        /// phase default.
+        #[arg(long, default_value_t = 1024)]
+        chunk_size: usize,
+    },
 }
 
 #[tokio::main]
@@ -91,6 +106,9 @@ async fn main() -> Result<()> {
         Command::Compact { config } => run::run_compact(Config::load_from(config)?).await,
         Command::Maintain { config, retention } => {
             run::run_maintain(Config::load_from(config)?, retention).await
+        }
+        Command::Verify { config, chunk_size } => {
+            run::run_verify(Config::load_from(config)?, chunk_size).await
         }
     }
 }

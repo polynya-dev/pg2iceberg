@@ -8,8 +8,9 @@
 //! 2. Each `recv` yields a `DecodedMessage` we feed to
 //!    `Pipeline::process`.
 //! 3. When the ticker fires, we run the due handlers in stable order:
-//!    Flush → Standby → Materialize → Watcher (Watcher is a no-op
-//!    today; the watcher crate isn't wired in).
+//!    Flush → Standby → Materialize → Watcher. Watcher runs the
+//!    `pg2iceberg-validate` invariant checks against live coord +
+//!    pipeline + slot state and logs/counts any violations.
 //! 4. SIGINT calls `Pipeline::shutdown` and exits cleanly.
 
 use crate::config::Config;
@@ -21,8 +22,11 @@ use pg2iceberg_coord::{
     schema::CoordSchema,
     Coordinator,
 };
-use pg2iceberg_core::{Clock, IdGen, Lsn};
-use pg2iceberg_iceberg::prod::IcebergRustCatalog;
+use crate::snapshot_src::PgSnapshotSource;
+use pg2iceberg_core::{
+    Checkpoint, Clock, IdGen, InMemoryMetrics, Lsn, Metrics, Mode, SnapshotState, TableSchema,
+};
+use pg2iceberg_iceberg::{prod::IcebergRustCatalog, Catalog as _};
 use pg2iceberg_logical::{
     materializer::CounterMaterializerNamer, pipeline::BlobNamer, Handler, Materializer, Pipeline,
     Schedule, Ticker,
@@ -32,6 +36,10 @@ use pg2iceberg_pg::{
     PgClient,
 };
 use pg2iceberg_stream::{prod::ObjectStoreBlobStore, BlobStore};
+use pg2iceberg_validate::{
+    validate_startup, InvariantWatcher, SlotState, StartupValidation, TableExistence,
+    WatcherInputs,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,7 +81,14 @@ pub async fn run(cfg: Config) -> Result<()> {
         anyhow::bail!("sink.catalog_uri is required");
     }
     let catalog = build_rest_catalog(&cfg).await?;
-    run_inner(cfg, IcebergRustCatalog::new(Arc::new(catalog)), blob).await
+    let catalog = IcebergRustCatalog::new(Arc::new(catalog));
+    match cfg.source.mode.as_str() {
+        "" | "logical" => run_inner(cfg, catalog, blob).await,
+        "query" => run_query(cfg, catalog, blob).await,
+        other => anyhow::bail!(
+            "unknown source.mode {other:?}; expected one of: logical, query"
+        ),
+    }
 }
 
 /// Build a REST `iceberg::Catalog` from sink config. We default to the
@@ -277,11 +292,24 @@ where
     let table_idents: Vec<_> = resolved_schemas.iter().map(|s| s.ident.clone()).collect();
     let slot_name = &cfg.source.logical.slot_name;
     let publication_name = &cfg.source.logical.publication_name;
-    if !pg
+
+    // ── startup validation (Go's `pipeline/validate.go`) ───────────────
+    // Inspect coord checkpoint, source PG slot, and Iceberg table state
+    // for the 8 invariants from the Go reference. Refuse to start (with
+    // an actionable error) when something is off — e.g. a fresh
+    // checkpoint paired with an existing slot, or a slot that has
+    // recycled past the last-flushed LSN. Runs before we'd auto-create
+    // any state, so an operator who forgot to drop a slot doesn't end
+    // up silently re-snapshotting on top of one.
+    run_startup_validation(&pg, catalog.as_ref(), &coord, &resolved_schemas, slot_name)
+        .await
+        .context("startup validation")?;
+
+    let slot_was_fresh = !pg
         .slot_exists(slot_name)
         .await
-        .context("slot exists check")?
-    {
+        .context("slot exists check")?;
+    if slot_was_fresh {
         if let Err(e) = pg.create_publication(publication_name, &table_idents).await {
             tracing::warn!(error = %e, "create_publication failed; assuming it exists");
         }
@@ -324,6 +352,106 @@ where
         .register_consumer(&cfg.state.group, &worker_id, Duration::from_secs(60))
         .await
         .context("register_consumer")?;
+
+    // ── snapshot phase (fresh-slot bootstrap) ──────────────────────────
+    // pg2iceberg is a *mirror*, not a CDC tool — Iceberg must reflect
+    // 100% of PG state. Replication only emits events for changes
+    // *after* slot creation, so without a snapshot we'd lose every row
+    // that existed beforehand. The snapshot is skipped when:
+    //  - the slot already existed (we're resuming), OR
+    //  - the persisted checkpoint says it's already complete.
+    // Per-table `skip_snapshot: true` in YAML opts a table out — for
+    // operators who already pre-loaded the table by some other means.
+    let cp_pre = coord
+        .load_checkpoint()
+        .await
+        .context("load checkpoint pre-snapshot")?;
+    let snapshot_complete = matches!(
+        cp_pre.as_ref().map(|c| c.snapshot_state),
+        Some(SnapshotState::Complete)
+    );
+    if slot_was_fresh && !snapshot_complete {
+        let skip_set: std::collections::BTreeSet<String> = cfg
+            .tables
+            .iter()
+            .filter(|t| t.skip_snapshot)
+            .map(|t| t.name.clone())
+            .collect();
+        let to_snapshot: Vec<TableSchema> = resolved_schemas
+            .iter()
+            .filter(|s| {
+                let name = format!("{}.{}", s.ident.namespace, s.ident.name);
+                !skip_set.contains(&name)
+            })
+            .cloned()
+            .collect();
+        if to_snapshot.is_empty() {
+            tracing::info!("snapshot phase: every configured table is skip_snapshot=true; nothing to do");
+        } else {
+            tracing::info!(
+                count = to_snapshot.len(),
+                "snapshot phase starting (fresh slot bootstrap)"
+            );
+            let source = PgSnapshotSource::open(&cfg.source.postgres, &to_snapshot)
+                .await
+                .context("open snapshot source")?;
+            let snap_lsn = source.snapshot_lsn();
+            tracing::info!(?snap_lsn, "snapshot tx LSN captured");
+            pg2iceberg_snapshot::run_snapshot(&source, &to_snapshot, &mut pipeline)
+                .await
+                .context("run_snapshot")?;
+            // Drain anything still buffered (the per-chunk loop already
+            // flushes after each, but defensive-flush is cheap).
+            pipeline.flush().await.context("snapshot final flush")?;
+            // Ack the slot at the snapshot LSN. PG advances
+            // `confirmed_flush_lsn`; replication resumes from snap_lsn
+            // onward (events in [consistent_point, snap_lsn] already
+            // buffered on the open stream are processed in the main
+            // loop — the materializer's PK-keyed equality-delete
+            // dedup handles any overlap).
+            stream
+                .send_standby(snap_lsn, snap_lsn)
+                .await
+                .context("post-snapshot send_standby")?;
+            // Materialize once so snapshot rows land in Iceberg before
+            // we enter the live-replication loop. Subsequent live
+            // events show up via the Materialize handler.
+            materializer
+                .cycle()
+                .await
+                .context("post-snapshot materializer cycle")?;
+            // Persist snapshot-complete state.
+            let mut cp_save = cp_pre.unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
+            cp_save.snapshot_state = SnapshotState::Complete;
+            cp_save.flushed_lsn = snap_lsn;
+            cp_save.tracked_tables = to_snapshot.iter().map(|s| s.ident.clone()).collect();
+            cp_save.snapshot_progress.clear();
+            coord
+                .save_checkpoint(&cp_save)
+                .await
+                .context("save snapshot-complete checkpoint")?;
+            tracing::info!(?snap_lsn, "snapshot phase complete");
+        }
+    } else if slot_was_fresh && snapshot_complete {
+        tracing::info!("fresh slot but checkpoint says snapshot already complete; skipping");
+    }
+
+    // ── invariant watcher ──────────────────────────────────────────────
+    // Plan §9 invariants checked at every Watcher tick:
+    //   1. pipeline.flushed_lsn ≤ slot.confirmed_flush_lsn
+    //   2. mat_cursor[t] ≤ max(log_index.end_offset[t])
+    //   3. pipeline.flushed_lsn monotonic
+    // Violations are logged + counted on the metrics surface; we don't
+    // exit because they're observability signals, not operator-fatal
+    // state. (A real prod metrics backend lands when we wire Prometheus
+    // — for now `InMemoryMetrics` keeps the surface complete without an
+    // exporter dep.)
+    let metrics: Arc<dyn Metrics> = Arc::new(InMemoryMetrics::new());
+    let watcher = InvariantWatcher::new(coord.clone() as Arc<dyn Coordinator>, metrics.clone());
+    let watched_tables: Vec<pg2iceberg_core::TableIdent> = resolved_schemas
+        .iter()
+        .map(|s| s.ident.clone())
+        .collect();
 
     // ── main loop ──────────────────────────────────────────────────────
     let mut ticker = Ticker::new(clock.now(), Schedule::default());
@@ -403,7 +531,24 @@ where
                         }
                     }
                 }
-                Handler::Watcher => {}
+                Handler::Watcher => {
+                    let confirmed = pg
+                        .slot_confirmed_flush_lsn(slot_name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or(Lsn::ZERO);
+                    let inputs = WatcherInputs {
+                        pipeline_flushed_lsn: pipeline.flushed_lsn(),
+                        slot_confirmed_flush_lsn: confirmed,
+                        group: cfg.state.group.clone(),
+                        watched_tables: watched_tables.clone(),
+                    };
+                    let violations = watcher.check(&inputs).await;
+                    for v in &violations {
+                        tracing::warn!(violation = %v, "invariant violation");
+                    }
+                }
             }
         }
 
@@ -425,6 +570,169 @@ where
         .unregister_consumer(&cfg.state.group, &worker_id)
         .await;
     tracing::info!(?final_lsn, "exited cleanly");
+    Ok(())
+}
+
+/// Query-mode driver. Polls each table for rows whose watermark
+/// column has advanced past the stored cursor, dedups by PK, writes
+/// directly to the materialized Iceberg table — no replication slot,
+/// no staging Parquet, no coord log_seq/log_index. Persistence of the
+/// per-table watermark goes into the same `_pg2iceberg.checkpoints`
+/// table (`Checkpoint::query_watermarks`) so a restarted process
+/// resumes from where the prior left off.
+///
+/// Each table needs `watermark_column` set in YAML. Watermark column
+/// must be int/long/date/timestamp/timestamptz; other types are
+/// rejected at startup.
+async fn run_query<C>(
+    cfg: Config,
+    catalog: IcebergRustCatalog<C>,
+    blob: Arc<dyn BlobStore>,
+) -> Result<()>
+where
+    C: iceberg::Catalog + Send + Sync + 'static,
+{
+    use crate::snapshot_src::PgWatermarkSource;
+    use pg2iceberg_logical::materializer::CounterMaterializerNamer;
+    use pg2iceberg_query::QueryPipeline;
+
+    let clock = Arc::new(RealClock);
+    let id_gen = Arc::new(RealIdGen::new());
+    tracing::info!(worker = %id_gen.worker_id().0, "starting pg2iceberg in query mode");
+
+    // ── coord (still needed for checkpoint watermark persistence) ────
+    let coord_dsn = cfg.coord_dsn();
+    let coord_tls = match cfg.source.postgres.tls_label() {
+        "webpki" => CoordTls::Webpki,
+        _ => CoordTls::Disable,
+    };
+    let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
+        .await
+        .context("coord connect")?;
+    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
+    coord_concrete.migrate().await.context("coord migrate")?;
+    let coord: Arc<dyn Coordinator> = coord_concrete.clone();
+
+    let catalog = Arc::new(catalog);
+
+    // ── pg connection for schema discovery (replication-mode is fine
+    // ── here; we only run SELECTs against pg_catalog).
+    let pg_tls = match cfg.source.postgres.tls_label() {
+        "webpki" => PgTls::Webpki,
+        _ => PgTls::Disable,
+    };
+    let pg = PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+        .await
+        .context("PG connect")?;
+
+    // Resolve schemas + watermark columns.
+    let mut tables: Vec<(TableSchema, String)> = Vec::with_capacity(cfg.tables.len());
+    for t in &cfg.tables {
+        if t.watermark_column.is_empty() {
+            anyhow::bail!(
+                "query mode requires `watermark_column` on every table; missing on {}",
+                t.name
+            );
+        }
+        let schema = if t.has_explicit_columns() {
+            t.to_table_schema()?
+        } else {
+            let (ns, name) = t.qualified()?;
+            tracing::info!(table = %t.name, "discovering schema from PG");
+            let mut s = pg
+                .discover_schema(&ns, &name)
+                .await
+                .with_context(|| format!("discover schema for {}", t.name))?;
+            if !t.primary_key.is_empty() {
+                let pk_set: std::collections::BTreeSet<&str> =
+                    t.primary_key.iter().map(String::as_str).collect();
+                for col in &mut s.columns {
+                    let now_pk = pk_set.contains(col.name.as_str());
+                    col.is_primary_key = now_pk;
+                    if now_pk {
+                        col.nullable = false;
+                    }
+                }
+            }
+            s.partition_spec = pg2iceberg_core::parse_partition_spec(&t.iceberg.partition)
+                .map_err(|e| anyhow::anyhow!("partition spec for {}: {e}", t.name))?;
+            s
+        };
+        if !schema.columns.iter().any(|c| c.is_primary_key) {
+            anyhow::bail!(
+                "table {} has no primary key; query mode requires PKs for dedup",
+                t.name
+            );
+        }
+        tables.push((schema, t.watermark_column.clone()));
+    }
+
+    let source = PgWatermarkSource::open(&cfg.source.postgres, &tables)
+        .await
+        .context("open watermark source")?;
+
+    let mat_namer = Arc::new(CounterMaterializerNamer::new("materialized"));
+    let mut pipeline: QueryPipeline<IcebergRustCatalog<C>> =
+        QueryPipeline::new(coord.clone(), catalog.clone(), blob.clone(), mat_namer);
+    for (schema, wm_col) in &tables {
+        pipeline
+            .register_table(schema.clone(), wm_col.clone())
+            .await
+            .with_context(|| format!("register {}", schema.ident))?;
+    }
+    tracing::info!(count = tables.len(), "query-mode tables registered");
+
+    // Poll interval — Go uses `query.poll_interval`; default to 30s.
+    let poll_interval = if cfg.source.query.poll_interval.is_empty() {
+        Duration::from_secs(30)
+    } else {
+        humantime::parse_duration(&cfg.source.query.poll_interval)
+            .with_context(|| {
+                format!(
+                    "parse query.poll_interval `{}`",
+                    cfg.source.query.poll_interval
+                )
+            })?
+    };
+    tracing::info!(?poll_interval, "query-mode poll interval");
+
+    let _ = clock;
+
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+
+    loop {
+        // First-cycle no-wait so a fresh deploy doesn't sit idle.
+        match pipeline.poll(&source).await {
+            Ok(n) if n > 0 => tracing::info!(rows = n, "query-mode poll"),
+            Ok(_) => {} // quiet on no-op cycles
+            Err(e) => tracing::warn!(error = %e, "query-mode poll failed"),
+        }
+        match pipeline.flush().await {
+            Ok(n) if n > 0 => tracing::info!(rows = n, "query-mode flush"),
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "query-mode flush failed"),
+        }
+
+        tokio::select! {
+            biased;
+            _ = sigint.recv() => {
+                tracing::info!("SIGINT received, query-mode shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received, query-mode shutting down");
+                break;
+            }
+            _ = tokio::time::sleep(poll_interval) => {}
+        }
+    }
+
+    // Final flush on exit.
+    if let Err(e) = pipeline.flush().await {
+        tracing::warn!(error = %e, "final query-mode flush failed");
+    }
     Ok(())
 }
 
@@ -626,6 +934,190 @@ async fn build_one_shot_materializer(
             .with_context(|| format!("register {}", s.ident))?;
     }
     Ok(materializer)
+}
+
+/// One-shot: diff every configured table against PG ground truth.
+/// Mirrors Go's `pg2iceberg verify` semantics: open a snapshot tx
+/// against the source, read each table's rows at that view, read the
+/// materialized Iceberg state, compare PK-by-PK. Returns non-zero
+/// exit on any non-empty diff so CI / cron can detect drift.
+pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
+    let blob = build_blob(&cfg).context("build blob store")?;
+    if cfg.sink.catalog_uri.is_empty() {
+        anyhow::bail!("sink.catalog_uri is required");
+    }
+    let catalog: Arc<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> = Arc::new(
+        IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?)),
+    );
+
+    // Resolve schemas (mirrors `build_one_shot_materializer`). Verify
+    // needs the same column-aware schema as the snapshot to know
+    // which columns to SELECT and decode.
+    let needs_pg = cfg.tables.iter().any(|t| !t.has_explicit_columns());
+    let pg_for_discovery = if needs_pg {
+        let pg_tls = match cfg.source.postgres.tls_label() {
+            "webpki" => PgTls::Webpki,
+            _ => PgTls::Disable,
+        };
+        Some(
+            PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+                .await
+                .context("PG connect for schema discovery")?,
+        )
+    } else {
+        None
+    };
+    let mut schemas: Vec<TableSchema> = Vec::with_capacity(cfg.tables.len());
+    for t in &cfg.tables {
+        let schema = if t.has_explicit_columns() {
+            t.to_table_schema()?
+        } else {
+            let (ns, name) = t.qualified()?;
+            let pg = pg_for_discovery
+                .as_ref()
+                .expect("needs_pg above guards this");
+            let mut s = pg
+                .discover_schema(&ns, &name)
+                .await
+                .with_context(|| format!("discover schema for {}", t.name))?;
+            if !t.primary_key.is_empty() {
+                let pk_set: std::collections::BTreeSet<&str> =
+                    t.primary_key.iter().map(String::as_str).collect();
+                for col in &mut s.columns {
+                    let now_pk = pk_set.contains(col.name.as_str());
+                    col.is_primary_key = now_pk;
+                    if now_pk {
+                        col.nullable = false;
+                    }
+                }
+            }
+            s.partition_spec = pg2iceberg_core::parse_partition_spec(&t.iceberg.partition)
+                .map_err(|e| anyhow::anyhow!("partition spec for {}: {e}", t.name))?;
+            s
+        };
+        if !schema.columns.iter().any(|c| c.is_primary_key) {
+            anyhow::bail!(
+                "table {} has no primary key; verify requires PKs to compare rows",
+                t.name
+            );
+        }
+        schemas.push(schema);
+    }
+
+    let source = PgSnapshotSource::open(&cfg.source.postgres, &schemas)
+        .await
+        .context("open verify source")?;
+
+    let mut total_diffs = 0usize;
+    for schema in &schemas {
+        let diff = pg2iceberg_validate::verify::verify_table(
+            &source,
+            catalog.as_ref(),
+            blob.as_ref(),
+            schema,
+            chunk_size,
+        )
+        .await
+        .with_context(|| format!("verify {}", schema.ident))?;
+        let n = diff.total_diffs();
+        total_diffs += n;
+        if diff.is_empty() {
+            tracing::info!(table = %schema.ident, "verify: ok (no diffs)");
+        } else {
+            tracing::warn!(
+                table = %schema.ident,
+                pg_only = diff.pg_only.len(),
+                iceberg_only = diff.iceberg_only.len(),
+                mismatched = diff.mismatched.len(),
+                "verify: diff detected",
+            );
+            for r in diff.pg_only.iter().take(5) {
+                tracing::warn!(table = %schema.ident, ?r, "pg_only");
+            }
+            for r in diff.iceberg_only.iter().take(5) {
+                tracing::warn!(table = %schema.ident, ?r, "iceberg_only");
+            }
+            for (pg_r, ice_r) in diff.mismatched.iter().take(5) {
+                tracing::warn!(table = %schema.ident, ?pg_r, ?ice_r, "mismatched");
+            }
+        }
+    }
+    if total_diffs > 0 {
+        anyhow::bail!("verify: {total_diffs} total row-level diffs across all tables");
+    }
+    println!("OK: {} table(s) match PG ground truth", schemas.len());
+    Ok(())
+}
+
+/// Run the 8 plan-§Phase-12 startup validations from
+/// `pg2iceberg-validate`. Reads the coord checkpoint, queries each
+/// configured table's existence + current snapshot id from the
+/// catalog, and reads the slot's `restart_lsn` /
+/// `confirmed_flush_lsn` from the source PG. Refuses to start on any
+/// violation with an actionable error message.
+async fn run_startup_validation<C>(
+    pg: &PgClientImpl,
+    catalog: &IcebergRustCatalog<C>,
+    coord: &Arc<PostgresCoordinator>,
+    schemas: &[TableSchema],
+    slot_name: &str,
+) -> Result<()>
+where
+    C: iceberg::Catalog + Send + Sync + 'static,
+{
+    let checkpoint = coord.load_checkpoint().await.context("load checkpoint")?;
+
+    let mut tables: Vec<TableExistence> = Vec::with_capacity(schemas.len());
+    for schema in schemas {
+        let meta = catalog
+            .load_table(&schema.ident)
+            .await
+            .with_context(|| format!("load_table({}) for validation", schema.ident))?;
+        let iceberg_name = format!("{}.{}", schema.ident.namespace, schema.ident.name);
+        tables.push(TableExistence {
+            pg_table: schema.ident.clone(),
+            iceberg_name,
+            existed: meta.is_some(),
+            current_snapshot_id: meta.and_then(|m| m.current_snapshot_id),
+        });
+    }
+
+    let slot_exists = pg
+        .slot_exists(slot_name)
+        .await
+        .context("slot_exists for validation")?;
+    let slot = if slot_exists {
+        let restart_lsn = pg
+            .slot_restart_lsn(slot_name)
+            .await
+            .context("slot_restart_lsn for validation")?
+            .unwrap_or(Lsn::ZERO);
+        let confirmed_flush_lsn = pg
+            .slot_confirmed_flush_lsn(slot_name)
+            .await
+            .context("slot_confirmed_flush_lsn for validation")?
+            .unwrap_or(Lsn::ZERO);
+        Some(SlotState {
+            exists: true,
+            restart_lsn,
+            confirmed_flush_lsn,
+        })
+    } else {
+        Some(SlotState {
+            exists: false,
+            restart_lsn: Lsn::ZERO,
+            confirmed_flush_lsn: Lsn::ZERO,
+        })
+    };
+
+    let v = StartupValidation {
+        checkpoint,
+        tables,
+        slot,
+        config_mode: Mode::Logical,
+        slot_name: slot_name.to_string(),
+    };
+    validate_startup(&v).map_err(|e| anyhow::anyhow!(e))
 }
 
 #[cfg(test)]

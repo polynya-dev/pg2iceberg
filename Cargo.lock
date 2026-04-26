@@ -2398,6 +2398,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "clap",
  "humantime",
  "iceberg",
@@ -2413,8 +2414,10 @@ dependencies = [
  "pg2iceberg-stream",
  "pg2iceberg-validate",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "tracing-subscriber",
  "uuid",

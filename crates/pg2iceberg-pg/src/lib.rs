@@ -71,6 +71,12 @@ pub trait PgClient: Send + Sync {
     async fn create_slot(&self, slot: &str) -> Result<Lsn>;
     async fn slot_exists(&self, slot: &str) -> Result<bool>;
     async fn slot_restart_lsn(&self, slot: &str) -> Result<Option<Lsn>>;
+    /// `confirmed_flush_lsn` is the LSN downstream has acked. The watcher
+    /// uses it to enforce invariant 1 (`pipeline.flushed_lsn ≤
+    /// slot.confirmed_flush_lsn`). Returns `None` when the slot doesn't
+    /// exist; returns `Some(Lsn::ZERO)` when the slot exists but no
+    /// confirmed_flush has been reported yet.
+    async fn slot_confirmed_flush_lsn(&self, slot: &str) -> Result<Option<Lsn>>;
 
     async fn export_snapshot(&self) -> Result<SnapshotId>;
 

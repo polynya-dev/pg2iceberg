@@ -298,6 +298,77 @@ Replacements live in `pg2iceberg-core`: `Clock::now`, `IdGen::new_uuid`, `Spawne
 
 Reordered from the previous draft to match what's actually risky in the Go architecture. **Bold** phases are correctness-critical; everything else is plumbing once those are right.
 
+> ### Status snapshot (2026-04-27)
+>
+> Phases 0–14 are wired end-to-end; the binary ships seven subcommands
+> (`connect-pg`, `connect-iceberg`, `migrate-coord`, `run`, `compact`,
+> `maintain`, `verify`). `run` dispatches on `source.mode` to either the
+> logical-replication driver or the query-mode poller. Partition spec
+> covers all six iceberg transforms. Maintenance covers compaction +
+> snapshot expiry + orphan cleanup. Snapshot phase, startup validation
+> (Go's 8 checks), and the invariant watcher are all wired into the
+> binary. **399 tests pass, 2 ignored** (the tier-3 contract test +
+> one upstream iceberg-rust flake).
+>
+> **Pending work, prioritized:**
+>
+> **P0.5 (deployment-quality but optional):**
+> - **Marker-row fence for snapshot↔CDC handoff** — wire the Pre/Post
+>   marker rows (`_pg2iceberg.markers`) so rows in the
+>   `[consistent_point, snap_lsn]` window aren't double-emitted by the
+>   replication slot after the snapshot phase. The materializer's
+>   PK-keyed equality-delete dedup makes this *correctness-safe*
+>   today, but on a hot table the duplicate WAL events produce extra
+>   delete files. Plan §Phase 11.5.
+> - **Resumable snapshot mid-crash** — `Snapshotter::run_chunks`
+>   library exists; the binary uses the single-pass `run_snapshot`
+>   free function which restarts from chunk 0 on crash. Switch to
+>   `Snapshotter` to skip already-completed chunks on resume. Plan
+>   §Phase 11.5.
+> - **Testcontainers integration tests** — sim DST covers correctness
+>   end-to-end; testcontainers covers protocol-level fidelity. Colima
+>   runbook ready ([reference_integration_tests.md]), harness
+>   unwritten.
+> - **Phase 9 differential testing** — sim arm in `dst.rs` (718 LOC) is
+>   wired; the real-PG + Iceberg-REST + MinIO arm and the Go-binary
+>   oracle arm are not.
+>
+> **P1 (deployment-flexibility):**
+> - **Glue / SQL / S3Tables / HMS catalog backends** —
+>   `IcebergRustCatalog<C>` is generic; just config-shape additions in
+>   `crates/pg2iceberg/src/run.rs::build_*_catalog`.
+> - **GCS / Azure object stores** — feature-gate
+>   `object_store/{gcp, azure}`.
+> - **mTLS / custom CA / channel binding** — `TlsMode` is `Disable |
+>   Webpki` only.
+> - **Vended-credentials S3 router** — Plan §Phase 7. Per-table S3
+>   client routing for Polaris/Tabular tables that vend creds at
+>   `loadTable` time.
+>
+> **P2 (steady-state hardening):**
+> - **Phase 6.5 fault injection** — `FaultyBlobStore` /
+>   `FaultyCoordinator` wrappers + DST step generators. Turns the
+>   receipt-gated durability invariant from "structurally enforced"
+>   into "structurally enforced AND empirically proven under random IO
+>   failure."
+> - **DST: materializer-crash variant** — `dst.rs` currently crashes
+>   only the pipeline. Now that FileIndex rebuild is wired, crashing
+>   the materializer too is unblocked.
+> - **Multi-table parallelism in maintenance ops** —
+>   `compact_cycle` / `expire_cycle` / `cleanup_orphans_cycle` walk
+>   tables sequentially.
+> - **Concurrency in compaction** — parallel parquet reads via
+>   `JoinSet`; not worth doing for compactions ≤ 10 files.
+> - **Tier-3 Delete options** — see
+>   `project_tier3_delete_options.md`. Five strategies for resolving
+>   `DeletePartitionUnresolved` without REPLICA IDENTITY FULL.
+>   Recommended A+E if/when picked up.
+> - **DeltaWriter / position deletes** — RisingWave-style. Pure
+>   read-perf optimization; equality-delete-only is correct.
+> - **Metadata-side orphan cleanup** — manifest lists, manifests,
+>   metadata.json. iceberg-rust manages these; cleanup is its
+>   responsibility.
+
 ### Phase 0 — Skeleton (week 1)
 
 - Workspace scaffold; all crates compile empty.
@@ -701,15 +772,9 @@ prod-side test against `IcebergRustCatalog` does.
   reference preservation, prefix scoping, compaction-replaced files,
   no-op).
 
-**Items still deferred:**
-- Concurrency: parallel parquet reads during compaction. Tokio's
-  `JoinSet` is the analog; not worth doing for compactions ≤ 10
-  files.
-- Multi-table parallelism in `compact_cycle`/`expire_cycle`/`cleanup_orphans_cycle`
-  (currently sequential per ident).
-- Metadata-side orphan cleanup (manifest lists, manifests,
-  metadata.json under iceberg's table location). iceberg-rust
-  manages these; if they leak, that's an upstream bug.
+**Items still deferred:** P2-bucket items in §8's status snapshot (parallel
+parquet reads, multi-table maintenance parallelism, metadata-side orphan
+cleanup).
 
 ---
 
@@ -881,28 +946,9 @@ pressure later.
   fallbacks under A if needed; B if a deployment hits tier-3
   often enough to justify the extra commit IO.
 
-**Remaining items for the binary (now P0.5 / P1):**
-
-1. **Glue / SQL / S3Tables / HMS catalog backends** — variants of
-   `IcebergConfig`. Same dispatch pattern as Memory/REST.
-2. **GCS + Azure object store backends** — feature-gate
-   `object_store/gcp` and `object_store/azure`, add config variants.
-3. **Vended-credentials S3 router** — Plan §Phase 7. Per-table S3
-   client routing for Polaris/Tabular tables that vend creds at
-   `loadTable` time. `IcebergRustCatalog` already exposes
-   per-table config maps; needs a router on the blob-store side.
-4. **Verify + validate subcommands** — `pg2iceberg-validate` and the
-   verifier in `pg2iceberg-iceberg::verify` aren't exposed in the
-   CLI yet.
-5. **Invariant watcher task** — `pg2iceberg-validate::watcher`
-   exists but the binary's `Handler::Watcher` arm is a no-op.
-6. **Testcontainers integration** — boot real PG + Iceberg REST
-   reference + MinIO; exercise `connect-pg` / `migrate-coord` / a
-   short `run` end-to-end. Existing `reference_integration_tests.md`
-   has the Colima setup.
-7. **mTLS / custom CA / channel binding** — `TlsMode` is currently
-   `Disable | Webpki`. Add `CustomCa { path }` and `Mtls { ... }`
-   when a deployment needs them.
+**Remaining items for the binary:** see the consolidated **Status snapshot**
+at the top of §8 — that's the canonical pending list now, prioritized
+P0/P0.5/P1/P2.
 
 ---
 

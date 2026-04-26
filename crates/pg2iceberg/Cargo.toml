@@ -55,3 +55,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+# Snapshot/verify SnapshotSource impl needs to format dates/timestamps
+# back into SQL literals for keyset pagination cursors.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
+# Direct tokio-postgres dep so the snapshot source can run regular SQL
+# (the prod PgClient is replication-mode only).
+tokio-postgres = { version = "0.7", default-features = false, features = [
+    "runtime",
+    "with-chrono-0_4",
+    "with-uuid-1",
+    "with-serde_json-1",
+] }

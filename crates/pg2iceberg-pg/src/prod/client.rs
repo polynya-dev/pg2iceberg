@@ -221,6 +221,30 @@ impl PgClient for PgClientImpl {
         Err(PgError::SlotNotFound(slot.to_string()))
     }
 
+    async fn slot_confirmed_flush_lsn(&self, slot: &str) -> Result<Option<Lsn>> {
+        let q = format!(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = {}",
+            quote_lit(slot)
+        );
+        let rows = self
+            .client
+            .simple_query(&q)
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let v: Option<&str> = row
+                    .try_get("confirmed_flush_lsn")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
+                return match v {
+                    Some(s) => Ok(Some(parse_lsn(s)?)),
+                    None => Ok(Some(Lsn(0))),
+                };
+            }
+        }
+        Ok(None)
+    }
+
     async fn export_snapshot(&self) -> Result<SnapshotId> {
         // Begin a REPEATABLE READ transaction and call
         // `pg_export_snapshot()`. The caller is responsible for closing
