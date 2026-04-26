@@ -51,6 +51,26 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// One-shot: run a single compaction pass over every configured
+    /// table and exit. Mirrors Go's `pg2iceberg compact` — for cron /
+    /// k8s CronJob deployments where compaction runs out-of-band from
+    /// the replication loop.
+    Compact {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// One-shot: run snapshot expiry over every configured table and
+    /// exit. Mirrors Go's `pg2iceberg maintain`. Reads
+    /// `sink.maintenance_retention` from YAML; CLI override takes
+    /// precedence when supplied.
+    Maintain {
+        #[arg(long)]
+        config: PathBuf,
+        /// Override `sink.maintenance_retention`. Format matches Go's
+        /// `time.ParseDuration` (e.g. `168h`, `7d`, `30m`).
+        #[arg(long)]
+        retention: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +88,10 @@ async fn main() -> Result<()> {
         Command::ConnectIceberg { config } => connect_iceberg(&Config::load_from(config)?).await,
         Command::MigrateCoord { config } => migrate_coord(&Config::load_from(config)?).await,
         Command::Run { config } => run::run(Config::load_from(config)?).await,
+        Command::Compact { config } => run::run_compact(Config::load_from(config)?).await,
+        Command::Maintain { config, retention } => {
+            run::run_maintain(Config::load_from(config)?, retention).await
+        }
     }
 }
 

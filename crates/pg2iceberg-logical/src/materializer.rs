@@ -222,6 +222,26 @@ impl<C: Catalog> Materializer<C> {
         Ok(out)
     }
 
+    /// Run a snapshot-expiry pass over every registered table. Returns
+    /// `(ident, expired_count)` for tables that actually had snapshots
+    /// dropped. `retention_ms` is the maximum age (in ms) a non-current
+    /// snapshot may have before it's expired.
+    pub async fn expire_cycle(&mut self, retention_ms: i64) -> Result<Vec<(TableIdent, usize)>> {
+        let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
+        let mut out = Vec::new();
+        for ident in idents {
+            let n = self
+                .catalog
+                .expire_snapshots(&ident, retention_ms)
+                .await
+                .map_err(MaterializerError::Catalog)?;
+            if n > 0 {
+                out.push((ident, n));
+            }
+        }
+        Ok(out)
+    }
+
     /// Compact a single table. After a successful compaction commit, the
     /// table's in-memory FileIndex is rebuilt from the catalog so
     /// subsequent materializer cycles route deletes against the new file

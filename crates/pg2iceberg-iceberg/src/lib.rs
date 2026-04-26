@@ -109,6 +109,12 @@ pub struct Snapshot {
     /// File paths superseded by this snapshot. Empty for non-compaction
     /// snapshots.
     pub removed_paths: Vec<String>,
+    /// Wall-clock timestamp in milliseconds since epoch. Used by
+    /// snapshot expiry — `expire_snapshots(retention)` drops snapshots
+    /// older than `now - retention`. Surfaced from
+    /// `iceberg::spec::Snapshot::timestamp_ms()` in the prod path; the
+    /// sim catalog populates it from its `Clock` source.
+    pub timestamp_ms: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +200,19 @@ pub trait Catalog: Send + Sync {
         ident: &TableIdent,
         changes: Vec<SchemaChange>,
     ) -> Result<TableMetadata>;
+    /// Drop snapshots older than `retention` (in milliseconds since
+    /// the most recent snapshot — *not* wall clock — so tests with
+    /// `TestClock` work deterministically). Never drops the current
+    /// snapshot. Returns the number of expired snapshots.
+    ///
+    /// Default impl errors so impls that don't yet support expiry
+    /// surface a clear error rather than silently no-op.
+    async fn expire_snapshots(&self, ident: &TableIdent, retention_ms: i64) -> Result<usize> {
+        let _ = (ident, retention_ms);
+        Err(IcebergError::Other(
+            "expire_snapshots not implemented for this Catalog impl".into(),
+        ))
+    }
     /// Append-only snapshot history for `ident`. Used by the verifier (MoR
     /// reads) and by materializer restart code (FileIndex rebuild). Ordered
     /// by snapshot id ascending.

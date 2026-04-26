@@ -2399,6 +2399,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "humantime",
  "iceberg",
  "iceberg-catalog-rest",
  "object_store",

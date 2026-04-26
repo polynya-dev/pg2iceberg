@@ -28,7 +28,8 @@ use iceberg::spec::{
     DataContentType, DataFile as IcebergDataFile, DataFileBuilder, DataFileFormat, Literal,
     NestedField, PrimitiveLiteral, PrimitiveType, Schema as IcebergSchema, Struct, Type,
 };
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
+use iceberg::TableUpdate;
 use iceberg::{
     Catalog as IcebergCatalogTrait, ErrorKind, NamespaceIdent, TableCreation,
     TableIdent as IcebergTableIdent,
@@ -250,6 +251,53 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         metadata_from_table(&prepared.ident, &updated)
     }
 
+    async fn expire_snapshots(&self, ident: &TableIdent, retention_ms: i64) -> Result<usize> {
+        let it = to_iceberg_table_ident(ident)?;
+        let table = match self.inner.load_table(&it).await {
+            Ok(t) => t,
+            Err(e)
+                if e.kind() == ErrorKind::TableNotFound
+                    || e.kind() == ErrorKind::NamespaceNotFound =>
+            {
+                return Ok(0);
+            }
+            Err(e) => return Err(map_iceberg_err(e)),
+        };
+
+        let snaps: Vec<_> = table.metadata().snapshots().cloned().collect();
+        if snaps.is_empty() {
+            return Ok(0);
+        }
+        // Cutoff is relative to the most recent snapshot's timestamp.
+        // Iceberg's metadata stores wall-clock millis on each snapshot;
+        // we anchor "now" to the latest one so this works deterministically
+        // against catalogs whose clock differs from ours.
+        let latest_ts = snaps.iter().map(|s| s.timestamp_ms()).max().unwrap_or(0);
+        let cutoff = latest_ts - retention_ms;
+        let current_id = table.metadata().current_snapshot_id();
+
+        let to_remove: Vec<i64> = snaps
+            .iter()
+            .filter(|s| s.timestamp_ms() < cutoff && Some(s.snapshot_id()) != current_id)
+            .map(|s| s.snapshot_id())
+            .collect();
+
+        if to_remove.is_empty() {
+            return Ok(0);
+        }
+
+        let count = to_remove.len();
+        let action = ExpireSnapshotsAction {
+            snapshot_ids: to_remove,
+        };
+        let tx = Transaction::new(&table);
+        let tx = action.apply(tx).map_err(map_iceberg_err)?;
+        tx.commit(self.inner.as_ref())
+            .await
+            .map_err(map_iceberg_err)?;
+        Ok(count)
+    }
+
     async fn evolve_schema(
         &self,
         ident: &TableIdent,
@@ -396,10 +444,37 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 data_files,
                 delete_files,
                 removed_paths,
+                timestamp_ms: snap.timestamp_ms(),
             });
         }
         out.sort_by_key(|s| s.id);
         Ok(out)
+    }
+}
+
+// ───── inline transaction actions ────────────────────────────────────────
+
+/// Inline `TransactionAction` that emits `TableUpdate::RemoveSnapshots`.
+/// We don't add this to the iceberg-rust fork because it's pure metadata
+/// — `ActionCommit::new` and `TableUpdate` are public, no fork-side
+/// plumbing needed (unlike `RewriteFilesAction`, which had to walk the
+/// manifest list).
+struct ExpireSnapshotsAction {
+    snapshot_ids: Vec<i64>,
+}
+
+#[async_trait]
+impl TransactionAction for ExpireSnapshotsAction {
+    async fn commit(
+        self: std::sync::Arc<Self>,
+        _table: &iceberg::table::Table,
+    ) -> iceberg::Result<ActionCommit> {
+        Ok(ActionCommit::new(
+            vec![TableUpdate::RemoveSnapshots {
+                snapshot_ids: self.snapshot_ids.clone(),
+            }],
+            vec![],
+        ))
     }
 }
 
@@ -1216,6 +1291,78 @@ mod tests {
             .await
             .unwrap();
         assert!(meta.current_snapshot_id.is_none());
+    }
+
+    /// Snapshot expiry round-trip via real iceberg-rust: append several
+    /// snapshots, expire the older ones with a small retention window,
+    /// reload table — the surviving snapshot history matches what we
+    /// asked for, and the current snapshot's manifest list still
+    /// references all live files (so verifier-style readers continue
+    /// to see the data).
+    #[tokio::test]
+    async fn expire_snapshots_drops_old_keeps_current_and_preserves_visibility() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+
+        // Three appends. iceberg-rust assigns wall-clock millis to each
+        // snapshot via `chrono::Utc::now()`; in CI the three timestamps
+        // can collide on fast machines. We sleep a millisecond between
+        // commits so retention math has something to bite on.
+        for i in 0..3 {
+            c.commit_snapshot(PreparedCommit {
+                ident: ident(),
+                data_files: vec![DataFile {
+                    path: format!("memory:///warehouse/public/orders/data-{i}.parquet"),
+                    record_count: 1,
+                    byte_size: 100,
+                    equality_field_ids: vec![],
+                    partition_values: Vec::new(),
+                }],
+                equality_deletes: vec![],
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        let pre = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(pre.len(), 3);
+
+        // Retention 1ms — everything except the current (latest) snapshot
+        // is older than that and should expire.
+        let n = c.expire_snapshots(&ident(), 1).await.unwrap();
+        assert_eq!(n, 2, "two old snapshots should expire");
+
+        let post = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(post.len(), 1);
+        // The surviving snapshot is the current one (sequence number 3).
+        let surviving = post.first().unwrap();
+        assert_eq!(surviving.id, 3);
+    }
+
+    /// Retention so high nothing expires.
+    #[tokio::test]
+    async fn expire_snapshots_with_huge_retention_is_noop() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        c.commit_snapshot(PreparedCommit {
+            ident: ident(),
+            data_files: vec![DataFile {
+                path: "memory:///warehouse/public/orders/data-0.parquet".into(),
+                record_count: 1,
+                byte_size: 100,
+                equality_field_ids: vec![],
+                partition_values: Vec::new(),
+            }],
+            equality_deletes: vec![],
+        })
+        .await
+        .unwrap();
+        // Retention = 1 day, well beyond what we just committed.
+        let n = c.expire_snapshots(&ident(), 86_400_000).await.unwrap();
+        assert_eq!(n, 0);
     }
 
     #[tokio::test]

@@ -239,6 +239,12 @@ pub struct SinkConfig {
     #[serde(default = "default_target_file_size")]
     pub target_file_size: u64,
 
+    /// Snapshot retention as a duration string (e.g. `"168h"` for 7
+    /// days). Matches Go's `maintenance_retention`. Empty means no
+    /// expiry. Used by the `pg2iceberg maintain` subcommand.
+    #[serde(default)]
+    pub maintenance_retention: String,
+
     /// Free-form REST-catalog props passthrough. Not in the Go YAML
     /// shape but useful for vendor-specific settings (Polaris OAuth2
     /// server URI, etc.) without us having to enumerate every quirk.
@@ -266,6 +272,7 @@ impl Default for SinkConfig {
             compaction_data_files: default_compaction_data_files(),
             compaction_delete_files: default_compaction_delete_files(),
             target_file_size: default_target_file_size(),
+            maintenance_retention: String::new(),
             catalog_props: BTreeMap::new(),
         }
     }
@@ -280,6 +287,21 @@ impl SinkConfig {
             delete_file_threshold: self.compaction_delete_files,
             target_size_bytes: self.target_file_size,
         }
+    }
+
+    /// Parse `maintenance_retention` ("168h", "7d", "30m", etc.) into
+    /// milliseconds. Returns `Ok(None)` when the field is empty.
+    pub fn maintenance_retention_ms(&self) -> Result<Option<i64>> {
+        if self.maintenance_retention.is_empty() {
+            return Ok(None);
+        }
+        let dur = humantime::parse_duration(&self.maintenance_retention).with_context(|| {
+            format!(
+                "parse maintenance_retention `{}`",
+                self.maintenance_retention
+            )
+        })?;
+        Ok(Some(dur.as_millis().try_into().unwrap_or(i64::MAX)))
     }
 }
 

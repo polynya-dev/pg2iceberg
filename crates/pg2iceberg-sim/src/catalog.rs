@@ -100,11 +100,16 @@ impl Catalog for MemoryCatalog {
 
         let id = table.next_snapshot_id;
         table.next_snapshot_id += 1;
+        // Sim has no real Clock; timestamp is derived from the monotonic
+        // snapshot id (multiplied by 1000 so retention-by-ms tests can
+        // discriminate). Real catalogs surface iceberg's own
+        // wall-clock millis here.
         table.snapshots.push(Snapshot {
             id,
             data_files: prepared.data_files,
             delete_files: prepared.equality_deletes,
             removed_paths: Vec::new(),
+            timestamp_ms: id * 1000,
         });
         table.metadata.current_snapshot_id = Some(id);
         Ok(table.metadata.clone())
@@ -132,9 +137,40 @@ impl Catalog for MemoryCatalog {
             data_files: prepared.added_data_files,
             delete_files: Vec::new(),
             removed_paths: prepared.removed_paths,
+            timestamp_ms: id * 1000,
         });
         table.metadata.current_snapshot_id = Some(id);
         Ok(table.metadata.clone())
+    }
+
+    async fn expire_snapshots(&self, ident: &TableIdent, retention_ms: i64) -> Result<usize> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| IcebergError::NotFound(format!("table: {}", ident)))?;
+
+        if table.snapshots.is_empty() {
+            return Ok(0);
+        }
+        // Cutoff is relative to the most recent snapshot's timestamp.
+        // Real catalogs use wall-clock now() instead; the sim uses the
+        // monotonic surrogate so tests stay deterministic.
+        let latest_ts = table
+            .snapshots
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .max()
+            .unwrap_or(0);
+        let cutoff = latest_ts - retention_ms;
+        // Never drop the current snapshot (Iceberg invariant).
+        let current_id = table.metadata.current_snapshot_id;
+
+        let before = table.snapshots.len();
+        table
+            .snapshots
+            .retain(|snap| snap.timestamp_ms >= cutoff || Some(snap.id) == current_id);
+        Ok(before - table.snapshots.len())
     }
 
     async fn evolve_schema(

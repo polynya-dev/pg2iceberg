@@ -92,6 +92,12 @@ sink:
   compaction_delete_files: 4
   target_file_size: 134217728   # 128 MiB
 
+  # Snapshot retention for `pg2iceberg maintain`. Format matches Go's
+  # time.ParseDuration ("168h", "7d", "30m"). Empty/missing disables
+  # expiry entirely. The maintain subcommand is one-shot; operators
+  # typically run it via cron or a Kubernetes CronJob.
+  # maintenance_retention: 168h
+
   # Free-form REST catalog props passthrough. Useful for
   # vendor-specific settings the Go config doesn't have a dedicated
   # field for.

@@ -49,6 +49,8 @@ serde = { version = "1", features = ["derive"] }
 # documented in `config.rs`).
 serde_yaml = "0.9"
 anyhow = "1"
+# `pg2iceberg maintain --retention 168h` — same parser as Go's time.ParseDuration.
+humantime = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = { workspace = true }

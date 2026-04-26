@@ -428,6 +428,160 @@ where
     Ok(())
 }
 
+/// One-shot: run a compaction pass over every configured table, log
+/// outcomes, exit. Mirrors Go's `pg2iceberg compact`.
+pub async fn run_compact(cfg: Config) -> Result<()> {
+    if cfg.sink.target_file_size == 0 {
+        anyhow::bail!(
+            "sink.target_file_size is 0 — compaction is disabled. \
+             Set a non-zero value (e.g. 134217728 for 128 MiB) to enable."
+        );
+    }
+    let mut materializer = build_one_shot_materializer(cfg.clone()).await?;
+    let cfg_compact = cfg.sink.compaction_config();
+    let outcomes = materializer
+        .compact_cycle(&cfg_compact)
+        .await
+        .context("compact_cycle")?;
+    if outcomes.is_empty() {
+        tracing::info!("compaction: every table below threshold, nothing rewritten");
+    } else {
+        for (ident, o) in &outcomes {
+            tracing::info!(
+                table = %ident,
+                in_data = o.input_data_files,
+                in_del = o.input_delete_files,
+                out_data = o.output_data_files,
+                rows = o.rows_rewritten,
+                rows_removed = o.rows_removed_by_deletes,
+                bytes_before = o.bytes_before,
+                bytes_after = o.bytes_after,
+                "compacted"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One-shot: run snapshot expiry over every configured table, log
+/// counts, exit. Mirrors Go's `pg2iceberg maintain`. CLI `--retention`
+/// (e.g. `168h`) overrides `sink.maintenance_retention`. Errors if
+/// neither is set.
+pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Result<()> {
+    let retention_str = retention_override
+        .clone()
+        .unwrap_or_else(|| cfg.sink.maintenance_retention.clone());
+    if retention_str.is_empty() {
+        anyhow::bail!(
+            "no retention configured: set `sink.maintenance_retention` in YAML \
+             or pass `--retention 168h`"
+        );
+    }
+    let dur = humantime::parse_duration(&retention_str)
+        .with_context(|| format!("parse retention `{retention_str}`"))?;
+    let retention_ms: i64 = dur.as_millis().try_into().unwrap_or(i64::MAX);
+
+    let mut materializer = build_one_shot_materializer(cfg).await?;
+    let outcomes = materializer
+        .expire_cycle(retention_ms)
+        .await
+        .context("expire_cycle")?;
+    if outcomes.is_empty() {
+        tracing::info!(retention = %retention_str, "maintain: no snapshots to expire");
+    } else {
+        for (ident, n) in &outcomes {
+            tracing::info!(table = %ident, expired = n, "expired snapshots");
+        }
+    }
+    Ok(())
+}
+
+/// Set up the same Materializer the main run loop builds, but without
+/// opening the replication slot or installing signal handlers — for
+/// one-shot subcommands (`compact`, `maintain`).
+async fn build_one_shot_materializer(
+    cfg: Config,
+) -> Result<Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>>> {
+    let blob = build_blob(&cfg).context("build blob store")?;
+    if cfg.sink.catalog_uri.is_empty() {
+        anyhow::bail!("sink.catalog_uri is required");
+    }
+    let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(
+        build_rest_catalog(&cfg).await?,
+    )));
+
+    let coord_dsn = cfg.coord_dsn();
+    let coord_tls = match cfg.source.postgres.tls_label() {
+        "webpki" => CoordTls::Webpki,
+        _ => CoordTls::Disable,
+    };
+    let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
+        .await
+        .context("coord connect")?;
+    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord: Arc<dyn Coordinator> = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
+
+    // Resolve schemas. Discovery requires PG; tables with explicit
+    // columns can skip it.
+    let needs_pg = cfg.tables.iter().any(|t| !t.has_explicit_columns());
+    let pg_for_discovery = if needs_pg {
+        let pg_tls = match cfg.source.postgres.tls_label() {
+            "webpki" => PgTls::Webpki,
+            _ => PgTls::Disable,
+        };
+        Some(
+            PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+                .await
+                .context("PG connect for schema discovery")?,
+        )
+    } else {
+        None
+    };
+
+    let mut resolved_schemas: Vec<pg2iceberg_core::TableSchema> =
+        Vec::with_capacity(cfg.tables.len());
+    for t in &cfg.tables {
+        let schema = if t.has_explicit_columns() {
+            t.to_table_schema()?
+        } else {
+            let (ns, name) = t.qualified()?;
+            let pg = pg_for_discovery
+                .as_ref()
+                .expect("needs_pg above guards this");
+            let mut s = pg
+                .discover_schema(&ns, &name)
+                .await
+                .with_context(|| format!("discover schema for {}", t.name))?;
+            if !t.primary_key.is_empty() {
+                let pk_set: std::collections::BTreeSet<&str> =
+                    t.primary_key.iter().map(String::as_str).collect();
+                for col in &mut s.columns {
+                    let now_pk = pk_set.contains(col.name.as_str());
+                    col.is_primary_key = now_pk;
+                    if now_pk {
+                        col.nullable = false;
+                    }
+                }
+            }
+            s.partition_spec = pg2iceberg_core::parse_partition_spec(&t.iceberg.partition)
+                .map_err(|e| anyhow::anyhow!("partition spec for {}: {e}", t.name))?;
+            s
+        };
+        resolved_schemas.push(schema);
+    }
+
+    let mat_namer = Arc::new(CounterMaterializerNamer::new("materialized"));
+    let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
+        Materializer::new(coord, blob, catalog, mat_namer, &cfg.state.group, 64);
+    for s in &resolved_schemas {
+        materializer
+            .register_table(s.clone())
+            .await
+            .with_context(|| format!("register {}", s.ident))?;
+    }
+    Ok(materializer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
