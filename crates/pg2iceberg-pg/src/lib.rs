@@ -1,7 +1,11 @@
 //! Postgres client + replication trait surface.
 //!
-//! Production impls live further down the workspace and depend on
-//! `tokio-postgres`. This crate is sim-friendly: it has no network deps.
+//! Production impls live in [`prod`] (gated behind the `prod` feature),
+//! built on `tokio-postgres` + `postgres-replication`. The trait surface
+//! is sim-friendly: nothing outside `prod` pulls a network dep.
+
+#[cfg(feature = "prod")]
+pub mod prod;
 
 use async_trait::async_trait;
 use pg2iceberg_core::{ChangeEvent, Lsn, TableIdent};

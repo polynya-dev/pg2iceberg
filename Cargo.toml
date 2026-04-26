@@ -44,10 +44,22 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
-# Pin iceberg to our fork's `polynya-patches` branch. The fork is based on
-# v0.9.0 plus two non-invasive patches: `TransactionAction` visibility
-# (`pub(crate)` → `pub`) and a new `UpdateSchemaAction`. Both are intended
-# to be upstreamed; until they land we carry the diff in the fork.
-# See `crates/pg2iceberg-iceberg/src/prod/gap_audit.rs` for context.
+# `[patch.crates-io]` and matching git overrides for the two ecosystem
+# forks pg2iceberg-rust depends on:
+#
+# 1. `iceberg` → `polynya-dev/iceberg-rust@polynya-patches`. Based on
+#    upstream v0.9.0 plus three non-invasive patches: `TransactionAction`
+#    visibility, a new `UpdateSchemaAction`, and a mixed-content
+#    `FastAppendAction` that accepts both data and equality-delete files.
+#    See `crates/pg2iceberg-iceberg/src/prod/gap_audit.rs` for context.
+#
+# 2. `tokio-postgres` + `postgres-replication` → `iambriccardo/rust-postgres`
+#    at the same rev Supabase's etl pins. Upstream `sfackler/rust-postgres`
+#    doesn't ship a `postgres-replication` crate, so a fork is unavoidable
+#    for native pgoutput decoding in Rust. We use Riccardo's fork
+#    (Supabase's etl maintainer) rather than rolling our own to avoid the
+#    maintenance burden of two forks.
 [patch.crates-io]
 iceberg = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches" }
+tokio-postgres = { git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }
+postgres-replication = { git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }

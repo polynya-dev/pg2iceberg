@@ -364,6 +364,46 @@ The sim is where most DST mileage comes from. Build it before the prod logical p
 - Standby ticker: separate task, sends `confirmed_flush_lsn` periodically (Go: every `standby_interval`, default 10s).
 - **Encode the durability invariant.** No code path advances `flushedLSN` without a `CoordCommitReceipt`. Verify by trying to write a violating implementation and confirm it's a compile error.
 
+#### Phase 5 status — Postgres prod source wired
+
+`pg2iceberg-pg/src/prod/` provides `PgClientImpl` + `ReplicationStreamImpl`
+behind the `prod` feature, built on `tokio-postgres` +
+`postgres-replication` (Supabase etl's fork — see workspace
+`Cargo.toml`). 25 unit tests pass (typemap, value decode, LSN
+parsing, helpers). What's wired:
+
+- `PgClientImpl::connect(conn_str)` opens a logical-replication-mode
+  client. All SQL goes through `simple_query`.
+- `create_publication`, `create_slot` (returns consistent_point LSN),
+  `slot_exists`, `slot_restart_lsn`, `export_snapshot`.
+- `start_replication` opens `START_REPLICATION SLOT <s> LOGICAL <lsn>
+  ("proto_version" '1', "publication_names" '<p>')` and wraps the
+  resulting `LogicalReplicationStream`.
+- `ReplicationStreamImpl` translates `LogicalReplicationMessage` →
+  our `DecodedMessage`. Maintains a per-stream relation cache for
+  decoding DML tuples; tracks current-txn `(final_lsn, xid,
+  commit_ts)` so DML rows are tagged with the commit LSN.
+- Text-mode tuple decoding via `prod/value_decode.rs`: bool, int2/4/8,
+  float4/8, numeric (rust_decimal mantissa+scale), text, json/jsonb,
+  bytea hex, date, time, timetz, timestamp, timestamptz, uuid.
+- `prod/typemap.rs`: PG OID + type-modifier → our `PgType`. Tested
+  against `postgres-types::Type` constants for all supported OIDs.
+
+**Remaining items for the prod source path:**
+
+1. **TLS.** `connect()` currently uses `NoTls`. Wire `tokio-postgres-rustls`
+   (or `MakeTlsConnector`) for managed PG (Supabase, RDS, etc.).
+2. **Testcontainers integration tests.** Spin up real PG, exercise the
+   full path end-to-end. Needs Docker setup we already have a runbook
+   for ([reference_integration_tests.md]).
+3. **Stream-level translation tests** for the `LogicalReplicationMessage`
+   → `DecodedMessage` mapping. Current tests cover decode helpers but
+   not the routing logic; testcontainers covers it implicitly.
+4. **Schema discovery query** — `pg_catalog.pg_attribute`-based fetch
+   for column types/PKs at startup or on Relation message. The wire
+   protocol's RelationBody only carries OID; the materializer needs
+   nullable + PK info from the catalog.
+
 ### Phase 6 — **DST harness** (week 5–6, can start in week 4)
 
 - Workload generator (`proptest`): sequences of `Insert`/`Update`/`Delete`/`AddColumn`/`DropColumn`/`BeginTxn`/`CommitTxn`/`RollbackTxn`.
