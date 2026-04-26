@@ -259,13 +259,16 @@ impl<C: Catalog> Materializer<C> {
 
         // 5. Prepare + upload. Output is one parquet file per (partition,
         //    kind) — for unpartitioned tables that's a single file per kind.
-        let prepared_files = entry.writer.prepare(&folded)?;
+        //    The writer consults FileIndex for tier-2 resolution of
+        //    partition tuples on `Delete` rows whose row payload doesn't
+        //    carry the partition source columns.
+        let prepared_files = entry.writer.prepare(&folded, &entry.file_index)?;
         let pk_field_ids = entry.writer.pk_field_ids();
 
         // Track per-data-file which PKs ended up where, so the FileIndex
         // update below points at the right partition file.
         let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared_files.data.len());
-        let mut data_pk_groups: Vec<(String, Vec<String>)> =
+        let mut data_pk_groups: Vec<(String, Vec<String>, Vec<pg2iceberg_core::PartitionLiteral>)> =
             Vec::with_capacity(prepared_files.data.len());
         let mut deleted_pks: Vec<String> = Vec::new();
 
@@ -280,9 +283,9 @@ impl<C: Catalog> Materializer<C> {
                 record_count: chunk.chunk.record_count,
                 byte_size,
                 equality_field_ids: vec![],
-                partition_values: chunk.partition_values,
+                partition_values: chunk.partition_values.clone(),
             });
-            data_pk_groups.push((path, chunk.pk_keys));
+            data_pk_groups.push((path, chunk.pk_keys, chunk.partition_values));
         }
 
         let mut delete_files: Vec<DataFile> =
@@ -321,8 +324,8 @@ impl<C: Catalog> Materializer<C> {
         let entry_mut = self.tables.get_mut(ident).expect("checked above");
         // Removed PKs first (so a later add for the same PK overrides cleanly).
         entry_mut.file_index.remove_pks(&deleted_pks);
-        for (path, pks) in data_pk_groups {
-            entry_mut.file_index.add_file(path, pks);
+        for (path, pks, partition_values) in data_pk_groups {
+            entry_mut.file_index.add_file(path, pks, partition_values);
         }
 
         let folded_len = folded.len();

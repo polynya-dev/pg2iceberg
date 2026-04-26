@@ -149,7 +149,7 @@ mod tests {
                 unchanged_cols: vec![],
             },
         ];
-        let prepared = w.prepare(&rows).unwrap();
+        let prepared = w.prepare(&rows, &crate::FileIndex::new()).unwrap();
         let bytes = prepared.data.into_iter().next().unwrap().chunk.bytes;
         let decoded = read_data_file(&bytes, &schema.columns).unwrap();
         assert_eq!(decoded.len(), 2);
@@ -187,11 +187,14 @@ mod tests {
         r.insert(col("id"), PgValue::Int4(7));
         r.insert(col("note"), PgValue::Null);
         let prepared = w
-            .prepare(&[MaterializedRow {
-                op: Op::Insert,
-                row: r,
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: r,
+                    unchanged_cols: vec![],
+                }],
+                &crate::FileIndex::new(),
+            )
             .unwrap();
         let decoded = read_data_file(
             &prepared.data.into_iter().next().unwrap().chunk.bytes,

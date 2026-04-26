@@ -128,7 +128,7 @@ mod tests {
         let mut fi = FileIndex::new();
         let pk_cols = vec![c("id")];
         let key = pk_key(&row(1, 0), &pk_cols);
-        fi.add_file("p0".into(), vec![key]);
+        fi.add_file("p0".into(), vec![key], Vec::new());
 
         let mut rows = vec![mat(Op::Insert, row(1, 99), vec![])];
         promote_re_inserts(&mut rows, &fi, &pk_cols);
@@ -149,7 +149,7 @@ mod tests {
         let mut fi = FileIndex::new();
         let pk_cols = vec![c("id")];
         let key = pk_key(&row(1, 0), &pk_cols);
-        fi.add_file("p0".into(), vec![key]);
+        fi.add_file("p0".into(), vec![key], Vec::new());
 
         let mut rows = vec![
             mat(Op::Update, row(1, 99), vec![]),
@@ -167,7 +167,7 @@ mod tests {
         let pk_cols = vec![c("id")];
         let mut fi = FileIndex::new();
         let key = pk_key(&row(1, 0), &pk_cols);
-        fi.add_file("p0".into(), vec![key]);
+        fi.add_file("p0".into(), vec![key], Vec::new());
 
         // Prior row had qty=42; the staged update marks `qty` as unchanged
         // (TOAST placeholder) and we want resolve to fill it back in.
@@ -209,7 +209,7 @@ mod tests {
         let pk_cols = vec![c("id")];
         let mut fi = FileIndex::new();
         let key = pk_key(&row(1, 0), &pk_cols);
-        fi.add_file("p0".into(), vec![key]);
+        fi.add_file("p0".into(), vec![key], Vec::new());
         // prior_rows_by_path is empty — caller forgot to fetch p0.
         let prior = BTreeMap::new();
         let mut rows = vec![mat(Op::Update, row(1, 0), vec!["qty"])];

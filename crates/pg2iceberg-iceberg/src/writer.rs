@@ -5,6 +5,7 @@
 //! `(partition_tuple, kind)` group; the materializer then commits each group
 //! as a separate `DataFile` with its `partition_values` carried through.
 
+use crate::file_index::FileIndex;
 use crate::fold::{pk_key, MaterializedRow};
 use arrow_array::builder::{
     BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int32Builder, Int64Builder,
@@ -16,8 +17,8 @@ use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use pg2iceberg_core::{
-    apply_transform, ColumnName, ColumnSchema, IcebergType, Op, PartitionField, PartitionLiteral,
-    PgValue, Row, TableSchema,
+    apply_transform, ColumnName, ColumnSchema, IcebergType, Op, PartitionLiteral, PgValue, Row,
+    TableSchema,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,13 +40,27 @@ pub enum WriterError {
     /// Phase 7 doesn't yet wire decimal/uuid/binary builders.
     #[error("type {0:?} is not yet supported by the writer (Phase 7.5)")]
     TypeNotYetSupported(IcebergType),
-    /// Partition column missing from a row (typical for `Delete` rows on a
-    /// partitioned table where the partition column is not in the PK).
-    #[error(
-        "partition column `{column}` missing from {op:?} row on partitioned table; \
-         move the column into the PK or set REPLICA IDENTITY FULL on the source table"
-    )]
+    /// Partition column missing from a non-Delete row. For Insert/Update
+    /// rows this should never happen — they always carry full row data.
+    /// For Delete rows we resolve via FileIndex first; this fires only
+    /// when `Insert`/`Update` is missing a partition column, which
+    /// indicates a fold/TOAST-resolution bug upstream.
+    #[error("partition column `{column}` missing from {op:?} row on partitioned table")]
     PartitionColumnMissing { column: String, op: Op },
+    /// Cross-batch `Delete` whose PK isn't in the FileIndex — we have no
+    /// way to recover the partition tuple. Mirrors Go's behavior where
+    /// the delete is silently dropped if `fileIdx.PkToFile` doesn't have
+    /// the PK, but we surface it as an error rather than silently lose
+    /// the delete.
+    #[error(
+        "delete for PK `{pk_key}` cannot be routed: row carries no partition \
+         columns and FileIndex has no entry for this PK. Either set REPLICA \
+         IDENTITY FULL on the source table so delete tuples carry partition \
+         values, move partition columns into the PK, or wait for FileIndex \
+         rebuild to complete (a fresh process before `rebuild_from_catalog` \
+         finishes will hit this transiently)"
+    )]
+    DeletePartitionUnresolved { pk_key: String },
     #[error("partition transform failure on column `{column}`: {source}")]
     PartitionTransform {
         column: String,
@@ -134,7 +149,21 @@ impl TableWriter {
     /// Take folded rows, split by op into data + equality-delete buckets,
     /// then group each bucket by partition tuple. Each group is serialized
     /// to one parquet chunk; the caller flushes per materializer cycle.
-    pub fn prepare(&self, rows: &[MaterializedRow]) -> Result<PreparedFiles> {
+    ///
+    /// `file_index` is consulted only for partitioned tables to recover
+    /// partition values for `Delete` rows that don't carry the partition
+    /// source column on the row payload (replica identity DEFAULT case
+    /// when partition col isn't in the PK). Mirrors Go's
+    /// `tablewriter.go:230-244` two-tier resolution: row first, then
+    /// FileIndex. Unlike Go, a tier-3 miss surfaces as
+    /// `WriterError::DeletePartitionUnresolved` rather than a silent
+    /// drop. Pass `&FileIndex::new()` for unpartitioned schemas or when
+    /// the caller has no file index (e.g. test harnesses).
+    pub fn prepare(
+        &self,
+        rows: &[MaterializedRow],
+        file_index: &FileIndex,
+    ) -> Result<PreparedFiles> {
         if rows.is_empty() {
             return Ok(PreparedFiles {
                 data: Vec::new(),
@@ -163,10 +192,18 @@ impl TableWriter {
             }
         }
 
-        let data =
-            self.group_and_encode(&data_rows, &self.full_arrow_schema, &self.schema.columns)?;
-        let equality_deletes =
-            self.group_and_encode(&delete_rows, &self.pk_arrow_schema, &self.pk_columns)?;
+        let data = self.group_and_encode(
+            &data_rows,
+            &self.full_arrow_schema,
+            &self.schema.columns,
+            file_index,
+        )?;
+        let equality_deletes = self.group_and_encode(
+            &delete_rows,
+            &self.pk_arrow_schema,
+            &self.pk_columns,
+            file_index,
+        )?;
 
         Ok(PreparedFiles {
             data,
@@ -180,6 +217,7 @@ impl TableWriter {
         rows: &[&MaterializedRow],
         arrow_schema: &Arc<Schema>,
         cols: &[ColumnSchema],
+        file_index: &FileIndex,
     ) -> Result<Vec<PreparedChunk>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -210,7 +248,7 @@ impl TableWriter {
         type Group<'a> = (Vec<PartitionLiteral>, Vec<&'a MaterializedRow>);
         let mut groups: Vec<Group> = Vec::new();
         for r in rows {
-            let tuple = self.compute_partition_tuple(r)?;
+            let tuple = self.compute_partition_tuple(r, file_index)?;
             if let Some(slot) = groups.iter_mut().find(|(k, _)| k == &tuple) {
                 slot.1.push(r);
             } else {
@@ -235,31 +273,66 @@ impl TableWriter {
         Ok(out)
     }
 
-    fn compute_partition_tuple(&self, r: &MaterializedRow) -> Result<Vec<PartitionLiteral>> {
-        self.schema
-            .partition_spec
-            .iter()
-            .map(|f| compute_partition_literal(f, r))
-            .collect()
-    }
-}
+    /// Compute the partition tuple for one row. Tier-1: read partition
+    /// source columns from the row. Tier-2 (Delete only): consult FileIndex.
+    /// Tier-3 (Delete only): error.
+    fn compute_partition_tuple(
+        &self,
+        r: &MaterializedRow,
+        file_index: &FileIndex,
+    ) -> Result<Vec<PartitionLiteral>> {
+        // Tier 1: row-direct. Works for Insert/Update always; works for
+        // Delete iff every partition source column is in the PK.
+        let mut tuple: Vec<PartitionLiteral> = Vec::with_capacity(self.schema.partition_spec.len());
+        let mut missing: Option<&str> = None;
+        for f in &self.schema.partition_spec {
+            let key = ColumnName(f.source_column.clone());
+            match r.row.get(&key) {
+                Some(value) => {
+                    let lit = apply_transform(value, f.transform).map_err(|e| {
+                        WriterError::PartitionTransform {
+                            column: f.source_column.clone(),
+                            source: e,
+                        }
+                    })?;
+                    tuple.push(lit);
+                }
+                None => {
+                    missing = Some(f.source_column.as_str());
+                    break;
+                }
+            }
+        }
+        if missing.is_none() {
+            return Ok(tuple);
+        }
 
-fn compute_partition_literal(
-    field: &PartitionField,
-    r: &MaterializedRow,
-) -> Result<PartitionLiteral> {
-    let key = ColumnName(field.source_column.clone());
-    let value = r
-        .row
-        .get(&key)
-        .ok_or_else(|| WriterError::PartitionColumnMissing {
-            column: field.source_column.clone(),
-            op: r.op,
-        })?;
-    apply_transform(value, field.transform).map_err(|e| WriterError::PartitionTransform {
-        column: field.source_column.clone(),
-        source: e,
-    })
+        // Tier 1 missed. For Insert/Update this is a programming error
+        // upstream — those rows must carry full data after fold +
+        // resolve_unchanged_cols.
+        if r.op != Op::Delete {
+            return Err(WriterError::PartitionColumnMissing {
+                column: missing.unwrap().to_string(),
+                op: r.op,
+            });
+        }
+
+        // Tier 2: FileIndex resolves Delete to its prior data file's
+        // partition tuple.
+        let key_str = pk_key(&r.row, &self.pk_col_names);
+        if let Some(values) = file_index.partition_values_for_pk(&key_str) {
+            if values.len() == self.schema.partition_spec.len() {
+                return Ok(values.to_vec());
+            }
+            // FileIndex is partitioned-arity-mismatched (e.g. partition spec
+            // changed). Fall through to tier-3.
+        }
+
+        // Tier 3: nowhere left to look. Error rather than silently drop —
+        // a dropped delete is a correctness bug that's invisible in normal
+        // operation (Go's behavior); we'd rather fail loudly.
+        Err(WriterError::DeletePartitionUnresolved { pk_key: key_str })
+    }
 }
 
 fn arrow_schema_for(cols: &[ColumnSchema]) -> Schema {
@@ -511,7 +584,7 @@ mod tests {
     #[test]
     fn empty_input_returns_empty_prepared_files() {
         let w = TableWriter::new(schema_id_qty());
-        let p = w.prepare(&[]).unwrap();
+        let p = w.prepare(&[], &FileIndex::new()).unwrap();
         assert!(p.data.is_empty());
         assert!(p.equality_deletes.is_empty());
     }
@@ -520,11 +593,14 @@ mod tests {
     fn single_insert_produces_data_file_only() {
         let w = TableWriter::new(schema_id_qty());
         let p = w
-            .prepare(&[MaterializedRow {
-                op: Op::Insert,
-                row: row(1, 10),
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: row(1, 10),
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(p.data.len(), 1);
         assert!(p.equality_deletes.is_empty());
@@ -553,11 +629,14 @@ mod tests {
     fn single_delete_produces_equality_delete_only_with_pk_columns() {
         let w = TableWriter::new(schema_id_qty());
         let p = w
-            .prepare(&[MaterializedRow {
-                op: Op::Delete,
-                row: pk_only(7),
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Delete,
+                    row: pk_only(7),
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert!(p.data.is_empty());
         assert_eq!(p.equality_deletes.len(), 1);
@@ -587,11 +666,14 @@ mod tests {
     fn single_update_produces_both_files() {
         let w = TableWriter::new(schema_id_qty());
         let p = w
-            .prepare(&[MaterializedRow {
-                op: Op::Update,
-                row: row(3, 99),
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Update,
+                    row: row(3, 99),
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(p.data.len(), 1);
         assert_eq!(p.equality_deletes.len(), 1);
@@ -624,23 +706,26 @@ mod tests {
     fn mixed_iud_partitioned_correctly() {
         let w = TableWriter::new(schema_id_qty());
         let p = w
-            .prepare(&[
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row(1, 10),
-                    unchanged_cols: vec![],
-                },
-                MaterializedRow {
-                    op: Op::Update,
-                    row: row(2, 20),
-                    unchanged_cols: vec![],
-                },
-                MaterializedRow {
-                    op: Op::Delete,
-                    row: pk_only(3),
-                    unchanged_cols: vec![],
-                },
-            ])
+            .prepare(
+                &[
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row(1, 10),
+                        unchanged_cols: vec![],
+                    },
+                    MaterializedRow {
+                        op: Op::Update,
+                        row: row(2, 20),
+                        unchanged_cols: vec![],
+                    },
+                    MaterializedRow {
+                        op: Op::Delete,
+                        row: pk_only(3),
+                        unchanged_cols: vec![],
+                    },
+                ],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(p.data.len(), 1);
         assert_eq!(p.data[0].chunk.record_count, 2); // I + U
@@ -652,11 +737,14 @@ mod tests {
     fn field_ids_in_arrow_schema_metadata() {
         let w = TableWriter::new(schema_id_qty());
         let p = w
-            .prepare(&[MaterializedRow {
-                op: Op::Insert,
-                row: row(1, 10),
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: row(1, 10),
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap();
         let batch = read_parquet(&p.data[0].chunk.bytes);
         for (i, field) in batch.schema().fields().iter().enumerate() {
@@ -714,11 +802,14 @@ mod tests {
         r.insert(col("active"), PgValue::Bool(true));
         r.insert(col("score"), PgValue::Int8(1_000_000));
         let p = w
-            .prepare(&[MaterializedRow {
-                op: Op::Insert,
-                row: r,
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: r,
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap();
         let batch = read_parquet(&p.data[0].chunk.bytes);
         assert_eq!(
@@ -757,11 +848,14 @@ mod tests {
         r.insert(col("id"), PgValue::Int4(1));
         // qty omitted entirely.
         let err = w
-            .prepare(&[MaterializedRow {
-                op: Op::Insert,
-                row: r,
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: r,
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap_err();
         assert!(matches!(err, WriterError::MissingColumn { ref col } if col == "qty"));
     }
@@ -786,11 +880,14 @@ mod tests {
         let mut r = BTreeMap::new();
         r.insert(col("id"), PgValue::Uuid([0u8; 16]));
         let err = w
-            .prepare(&[MaterializedRow {
-                op: Op::Insert,
-                row: r,
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: r,
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -841,23 +938,26 @@ mod tests {
     fn identity_partition_splits_data_by_partition_value() {
         let w = TableWriter::new(schema_partitioned_by_region());
         let p = w
-            .prepare(&[
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row_with_region(1, "us"),
-                    unchanged_cols: vec![],
-                },
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row_with_region(2, "us"),
-                    unchanged_cols: vec![],
-                },
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row_with_region(3, "eu"),
-                    unchanged_cols: vec![],
-                },
-            ])
+            .prepare(
+                &[
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row_with_region(1, "us"),
+                        unchanged_cols: vec![],
+                    },
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row_with_region(2, "us"),
+                        unchanged_cols: vec![],
+                    },
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row_with_region(3, "eu"),
+                        unchanged_cols: vec![],
+                    },
+                ],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(p.data.len(), 2, "two distinct regions → two data chunks");
         assert!(p.equality_deletes.is_empty());
@@ -923,23 +1023,26 @@ mod tests {
         // Two rows on day 19_723 (2024-01-01), one on day 19_724.
         let day_micros: i64 = 86_400_000_000;
         let p = w
-            .prepare(&[
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row_with_ts(1, 19_723 * day_micros + 3_600_000_000),
-                    unchanged_cols: vec![],
-                },
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row_with_ts(2, 19_723 * day_micros + 7_200_000_000),
-                    unchanged_cols: vec![],
-                },
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row_with_ts(3, 19_724 * day_micros + 1),
-                    unchanged_cols: vec![],
-                },
-            ])
+            .prepare(
+                &[
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row_with_ts(1, 19_723 * day_micros + 3_600_000_000),
+                        unchanged_cols: vec![],
+                    },
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row_with_ts(2, 19_723 * day_micros + 7_200_000_000),
+                        unchanged_cols: vec![],
+                    },
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row_with_ts(3, 19_724 * day_micros + 1),
+                        unchanged_cols: vec![],
+                    },
+                ],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(p.data.len(), 2);
         let mut by_day: BTreeMap<i32, u64> = BTreeMap::new();
@@ -961,11 +1064,14 @@ mod tests {
         let w = TableWriter::new(schema_partitioned_by_day_of_created_at_pk());
         let day_micros: i64 = 86_400_000_000;
         let p = w
-            .prepare(&[MaterializedRow {
-                op: Op::Delete,
-                row: row_with_ts(1, 19_723 * day_micros),
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Delete,
+                    row: row_with_ts(1, 19_723 * day_micros),
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(p.equality_deletes.len(), 1);
         match &p.equality_deletes[0].partition_values[0] {
@@ -975,19 +1081,93 @@ mod tests {
     }
 
     #[test]
-    fn delete_missing_partition_column_errors_clearly() {
-        // Schema partitions by `region`, but delete row has only `id`.
+    fn delete_with_partition_col_outside_pk_recovers_via_file_index() {
+        // Schema partitions by `region`, delete row has only `id`. With a
+        // populated FileIndex the writer recovers the partition tuple via
+        // tier-2 lookup and emits the equality-delete in the right
+        // partition. Mirrors Go's `tablewriter.go:233` behavior but with
+        // structured partition values per file rather than path mining.
+        let w = TableWriter::new(schema_partitioned_by_region());
+        let mut fi = FileIndex::new();
+        // Pretend a prior cycle wrote PK=1 into the "us" partition.
+        let pk = pk_key(&pk_only(1), &[col("id")]);
+        fi.add_file(
+            "data/region=us/abc.parquet".into(),
+            vec![pk],
+            vec![PartitionLiteral::String("us".into())],
+        );
+
+        let p = w
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Delete,
+                    row: pk_only(1),
+                    unchanged_cols: vec![],
+                }],
+                &fi,
+            )
+            .unwrap();
+        assert_eq!(p.equality_deletes.len(), 1);
+        assert_eq!(
+            p.equality_deletes[0].partition_values,
+            vec![PartitionLiteral::String("us".into())]
+        );
+    }
+
+    #[test]
+    fn insert_missing_partition_column_still_errors_at_tier_1() {
+        // Insert/Update rows must always carry full data after fold +
+        // resolve_unchanged_cols. Tier-2 doesn't help these — a row with
+        // missing partition cols here means upstream bug. Should error
+        // with PartitionColumnMissing rather than fall through to tier-3.
         let w = TableWriter::new(schema_partitioned_by_region());
         let err = w
-            .prepare(&[MaterializedRow {
-                op: Op::Delete,
-                row: pk_only(1),
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: pk_only(1), // missing `region`
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap_err();
         assert!(matches!(
             err,
-            WriterError::PartitionColumnMissing { ref column, op: Op::Delete } if column == "region"
+            WriterError::PartitionColumnMissing { ref column, op: Op::Insert } if column == "region"
+        ));
+    }
+
+    /// Tier-3 contract test: a `Delete` on a partitioned table whose PK
+    /// is unknown to the FileIndex (no row data, no prior file) errors
+    /// with `DeletePartitionUnresolved`. Disabled-by-default because:
+    ///
+    /// - The condition is *transient* in normal operation (a fresh
+    ///   process before `rebuild_from_catalog` finishes; an old cycle
+    ///   replaying after compaction). Asserting it as a hard contract
+    ///   in CI risks pinning behavior we may want to relax later
+    ///   (e.g. fall back to "delete with null partition" or fan-out).
+    /// - Go's reference silently drops in this case; if we ever decide
+    ///   the silent-drop is acceptable for parity, this test would
+    ///   need to flip.
+    ///
+    /// Run on demand with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "tier-3 contract; documents the error path without enforcing it in CI"]
+    fn tier_3_delete_with_no_row_data_and_no_file_index_entry_errors() {
+        let w = TableWriter::new(schema_partitioned_by_region());
+        let err = w
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Delete,
+                    row: pk_only(99), // PK absent from FileIndex
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(), // empty index
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            WriterError::DeletePartitionUnresolved { ref pk_key } if pk_key.contains("99")
         ));
     }
 
@@ -995,18 +1175,21 @@ mod tests {
     fn pk_keys_are_carried_per_chunk() {
         let w = TableWriter::new(schema_partitioned_by_region());
         let p = w
-            .prepare(&[
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row_with_region(1, "us"),
-                    unchanged_cols: vec![],
-                },
-                MaterializedRow {
-                    op: Op::Insert,
-                    row: row_with_region(2, "eu"),
-                    unchanged_cols: vec![],
-                },
-            ])
+            .prepare(
+                &[
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row_with_region(1, "us"),
+                        unchanged_cols: vec![],
+                    },
+                    MaterializedRow {
+                        op: Op::Insert,
+                        row: row_with_region(2, "eu"),
+                        unchanged_cols: vec![],
+                    },
+                ],
+                &FileIndex::new(),
+            )
             .unwrap();
         let mut by_region: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for chunk in &p.data {
@@ -1024,11 +1207,14 @@ mod tests {
     fn update_on_partitioned_table_emits_data_and_delete_in_same_partition() {
         let w = TableWriter::new(schema_partitioned_by_region());
         let p = w
-            .prepare(&[MaterializedRow {
-                op: Op::Update,
-                row: row_with_region(1, "us"),
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Update,
+                    row: row_with_region(1, "us"),
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(p.data.len(), 1);
         assert_eq!(p.equality_deletes.len(), 1);
@@ -1076,7 +1262,7 @@ mod tests {
                 }
             })
             .collect();
-        let p = w.prepare(&rows).unwrap();
+        let p = w.prepare(&rows, &FileIndex::new()).unwrap();
         // At least 2 buckets should be hit with 20 rows (probabilistically
         // all 4); cap at 4 since N=4.
         assert!(p.data.len() >= 2 && p.data.len() <= 4);
@@ -1136,12 +1322,15 @@ mod tests {
             }
         };
         let p = w
-            .prepare(&[
-                row(1, "alice"),
-                row(2, "alex"),
-                row(3, "bob"),
-                row(4, "alfred"),
-            ])
+            .prepare(
+                &[
+                    row(1, "alice"),
+                    row(2, "alex"),
+                    row(3, "bob"),
+                    row(4, "alfred"),
+                ],
+                &FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(p.data.len(), 2, "two distinct prefixes → two chunks");
         let mut by_prefix: BTreeMap<String, u64> = BTreeMap::new();
@@ -1189,11 +1378,14 @@ mod tests {
         r.insert(col("id"), PgValue::Int4(1));
         r.insert(col("d"), PgValue::Date(DaysSinceEpoch(20_000)));
         let p = w
-            .prepare(&[MaterializedRow {
-                op: Op::Insert,
-                row: r,
-                unchanged_cols: vec![],
-            }])
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: r,
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
             .unwrap();
         match &p.data[0].partition_values[0] {
             PartitionLiteral::Int(20_000) => {}

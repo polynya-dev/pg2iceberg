@@ -234,7 +234,7 @@ mod tests {
     ) {
         use pollster::block_on;
         let w = TableWriter::new(s.clone());
-        let prepared = w.prepare(rows).unwrap();
+        let prepared = w.prepare(rows, &crate::FileIndex::new()).unwrap();
         let mut data_files = Vec::new();
         let mut delete_files = Vec::new();
         for (i, chunk) in prepared.data.into_iter().enumerate() {

@@ -655,13 +655,26 @@ See `config.example.yaml` for the full surface.
   -inf, first W code points for strings, first W bytes for binary,
   unscaled-i128 floor for decimals — iceberg's 38-digit precision cap
   fits in i128, so no big-int dep needed).
-- **Operational constraint.** The writer needs partition source
-  columns present on every row it sees. For `Insert`/`Update` rows
-  this is automatic; for `Delete` rows the row carries only PK
-  columns, so partition columns must either (a) be in the PK, or
-  (b) be present via `REPLICA IDENTITY FULL` on the source table.
-  The writer errors clearly with `WriterError::PartitionColumnMissing`
-  if neither holds.
+- **Delete partition resolution (three-tier, mirrors Go).**
+  - Tier 1 — **row-direct**: read partition cols off the row.
+    Always works for `Insert`/`Update`; works for `Delete` iff
+    every partition source column is in the PK *or* the source
+    has `REPLICA IDENTITY FULL`.
+  - Tier 2 — **FileIndex lookup**: the materializer's `FileIndex`
+    carries `path → partition_values` per data file (populated on
+    each commit and on `rebuild_from_catalog`). For a `Delete`
+    whose row lacks partition cols, look up the prior data file by
+    PK and reuse its partition tuple. Equivalent to Go's
+    `ExtractPartBucketKey` + `ParsePartitionPath`
+    ([iceberg/tablewriter.go:230-244](../pg2iceberg/iceberg/tablewriter.go#L230-L244))
+    but with structured values per file instead of hive-path
+    mining, so foreign engines that write with non-hive paths
+    still round-trip.
+  - Tier 3 — **error**: PK isn't in the FileIndex (transient on a
+    fresh process before `rebuild_from_catalog` finishes; an old
+    cycle replaying after compaction). Surfaces as
+    `WriterError::DeletePartitionUnresolved` rather than Go's
+    silent drop, so the failure is visible in logs/metrics.
 
 **Remaining items for the binary (now P0.5 / P1):**
 

@@ -243,14 +243,14 @@ impl<C: Catalog> QueryPipeline<C> {
         let mut rows = entry.buffer.drain();
         promote_re_inserts(&mut rows, &entry.file_index, &entry.pk_cols);
 
-        let prepared = entry.writer.prepare(&rows)?;
+        let prepared = entry.writer.prepare(&rows, &entry.file_index)?;
 
         let pk_field_ids = entry.writer.pk_field_ids();
 
         // Track per-data-file PK group so the FileIndex update points each
         // PK at its partition file.
         let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared.data.len());
-        let mut data_pk_groups: Vec<(String, Vec<String>)> =
+        let mut data_pk_groups: Vec<(String, Vec<String>, Vec<pg2iceberg_core::PartitionLiteral>)> =
             Vec::with_capacity(prepared.data.len());
         let mut deleted_pks: Vec<String> = Vec::new();
 
@@ -265,9 +265,9 @@ impl<C: Catalog> QueryPipeline<C> {
                 record_count: chunk.chunk.record_count,
                 byte_size,
                 equality_field_ids: vec![],
-                partition_values: chunk.partition_values,
+                partition_values: chunk.partition_values.clone(),
             });
-            data_pk_groups.push((path, chunk.pk_keys));
+            data_pk_groups.push((path, chunk.pk_keys, chunk.partition_values));
         }
 
         let mut delete_files: Vec<DataFile> = Vec::with_capacity(prepared.equality_deletes.len());
@@ -298,8 +298,8 @@ impl<C: Catalog> QueryPipeline<C> {
         // Update FileIndex post-commit (mirrors the materializer ordering).
         let entry_mut = self.tables.get_mut(ident).expect("checked above");
         entry_mut.file_index.remove_pks(&deleted_pks);
-        for (path, pks) in data_pk_groups {
-            entry_mut.file_index.add_file(path, pks);
+        for (path, pks, partition_values) in data_pk_groups {
+            entry_mut.file_index.add_file(path, pks, partition_values);
         }
 
         // Persist the updated watermark snapshot. Order: catalog commit

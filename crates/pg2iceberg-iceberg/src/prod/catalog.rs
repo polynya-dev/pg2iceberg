@@ -853,23 +853,26 @@ mod tests {
         row_c.insert(ColumnName("qty".into()), PgValue::Int8(30));
         row_c.insert(ColumnName("note".into()), PgValue::Text("eu".into()));
         let prepared = w
-            .prepare(&[
-                crate::MaterializedRow {
-                    op: Op::Insert,
-                    row: row_a,
-                    unchanged_cols: vec![],
-                },
-                crate::MaterializedRow {
-                    op: Op::Insert,
-                    row: row_b,
-                    unchanged_cols: vec![],
-                },
-                crate::MaterializedRow {
-                    op: Op::Insert,
-                    row: row_c,
-                    unchanged_cols: vec![],
-                },
-            ])
+            .prepare(
+                &[
+                    crate::MaterializedRow {
+                        op: Op::Insert,
+                        row: row_a,
+                        unchanged_cols: vec![],
+                    },
+                    crate::MaterializedRow {
+                        op: Op::Insert,
+                        row: row_b,
+                        unchanged_cols: vec![],
+                    },
+                    crate::MaterializedRow {
+                        op: Op::Insert,
+                        row: row_c,
+                        unchanged_cols: vec![],
+                    },
+                ],
+                &crate::FileIndex::new(),
+            )
             .unwrap();
         assert_eq!(prepared.data.len(), 2);
 
