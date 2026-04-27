@@ -596,6 +596,270 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
 }
 
 
+/// One-shot: drop the replication slot, drop the publication, and
+/// drop the coordinator schema (CASCADE). Mirrors Go's
+/// `--cleanup`. Idempotent per resource — a missing slot /
+/// publication / schema is silently skipped — but errors out if the
+/// slot is still active (i.e. some consumer is connected). Stop the
+/// running process before invoking cleanup.
+///
+/// Each step opens a *fresh* connection because the source PG and
+/// the coord PG can live on different hosts (separate state DSN).
+/// In single-DB setups they happen to be the same, and the two
+/// connections just fan out to the same instance.
+pub async fn run_cleanup(cfg: Config) -> Result<()> {
+    use pg2iceberg_pg::PgClient;
+
+    // ── 1. Drop slot + publication on the *source* PG. ─────────────
+    let pg_tls = match cfg.source.postgres.tls_label() {
+        "webpki" => PgTls::Webpki,
+        _ => PgTls::Disable,
+    };
+    let pg = PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+        .await
+        .context("source PG connect")?;
+    let slot = &cfg.source.logical.slot_name;
+    let pub_name = &cfg.source.logical.publication_name;
+    if !slot.is_empty() {
+        pg.drop_slot(slot)
+            .await
+            .with_context(|| format!("drop replication slot {slot:?}"))?;
+        tracing::info!(slot = %slot, "replication slot dropped (or absent)");
+    }
+    if !pub_name.is_empty() {
+        pg.drop_publication(pub_name)
+            .await
+            .with_context(|| format!("drop publication {pub_name:?}"))?;
+        tracing::info!(publication = %pub_name, "publication dropped (or absent)");
+    }
+    drop(pg);
+
+    // ── 2. Drop coord schema CASCADE on the *coord* PG. ────────────
+    // This wipes every coordinator table the migration created,
+    // including log_index, log_seq, cursors, consumers, locks,
+    // checkpoints, and pending_markers / marker_emissions.
+    let coord_dsn = cfg.coord_dsn();
+    let coord_tls = match cfg.source.postgres.tls_label() {
+        "webpki" => CoordTls::Webpki,
+        _ => CoordTls::Disable,
+    };
+    let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
+        .await
+        .context("coord connect")?;
+    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord = PostgresCoordinator::new(coord_conn, coord_schema.clone());
+    coord
+        .teardown()
+        .await
+        .with_context(|| format!("drop coordinator schema {coord_schema:?}"))?;
+    tracing::info!(schema = %coord_schema, "coordinator schema dropped (CASCADE)");
+
+    println!(
+        "OK: cleanup complete. \
+         Materialized Iceberg tables remain — drop them via the catalog if you \
+         intend a full re-bootstrap."
+    );
+    Ok(())
+}
+
+/// One-shot: run the initial snapshot phase for every configured
+/// table, mark `snapshot_complete = true` in the checkpoint, and
+/// exit. Mirrors Go's `--snapshot-only`.
+///
+/// The replication slot is created here if missing — that pins the
+/// WAL from `consistent_point` onward, so a subsequent `run` doesn't
+/// lose any commits between snapshot completion and CDC start. This
+/// is **safer than Go's behavior**, which doesn't create the slot
+/// in `--snapshot-only` mode and assumes the operator has already
+/// done so out-of-band.
+///
+/// On a checkpoint that already says `snapshot_complete = true`,
+/// returns `Ok(())` immediately without touching PG or the catalog.
+pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
+    use pg2iceberg_logical::pipeline::Pipeline;
+    use pg2iceberg_logical::Materializer;
+    use pg2iceberg_pg::PgClient;
+    use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome};
+    use pg2iceberg_validate::LifecycleError;
+
+    let id_gen = Arc::new(crate::realio::RealIdGen::new());
+    let blob = build_blob(&cfg).context("build blob store")?;
+    if cfg.sink.catalog_uri.is_empty() {
+        anyhow::bail!("sink.catalog_uri is required");
+    }
+    let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(
+        build_rest_catalog(&cfg).await?,
+    )));
+
+    // ── coord ──────────────────────────────────────────────────────
+    let coord_dsn = cfg.coord_dsn();
+    let coord_tls = match cfg.source.postgres.tls_label() {
+        "webpki" => CoordTls::Webpki,
+        _ => CoordTls::Disable,
+    };
+    let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
+        .await
+        .context("coord connect")?;
+    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
+    coord_concrete.migrate().await.context("coord migrate")?;
+    let coord: Arc<dyn Coordinator> = coord_concrete;
+
+    // ── early exit: snapshot already done ──────────────────────────
+    // Use system_id=0 to skip the cluster fingerprint check — the
+    // first run hasn't stamped one yet and we don't want
+    // snapshot-only to fail loudly on a brand-new install. The full
+    // `Run` lifecycle re-validates on every start.
+    if let Some(cp) = coord
+        .load_checkpoint(0)
+        .await
+        .context("load checkpoint")?
+    {
+        if cp.snapshot_complete {
+            println!(
+                "OK: snapshot already complete (per checkpoint at LSN {:?}); nothing to do",
+                cp.flushed_lsn
+            );
+            return Ok(());
+        }
+    }
+
+    // ── pg + slot ──────────────────────────────────────────────────
+    let pg_tls = match cfg.source.postgres.tls_label() {
+        "webpki" => PgTls::Webpki,
+        _ => PgTls::Disable,
+    };
+    let pg = Arc::new(
+        PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+            .await
+            .context("source PG connect")?,
+    );
+    let schemas = crate::setup::__discover_schemas_for_snapshot(&cfg.tables, pg.as_ref())
+        .await
+        .context("discover schemas")?;
+
+    // Auto-create slot + publication if missing. This pins the WAL
+    // from `consistent_point` onward so a later `Run` doesn't lose
+    // any commits between snapshot and CDC start.
+    let slot = &cfg.source.logical.slot_name;
+    let pub_name = &cfg.source.logical.publication_name;
+    if pg.slot_exists(slot).await.context("check slot")? {
+        tracing::info!(slot = %slot, "replication slot exists, reusing");
+    } else {
+        let table_idents: Vec<pg2iceberg_core::TableIdent> =
+            schemas.iter().map(|s| s.ident.clone()).collect();
+        if let Err(e) = pg.create_publication(pub_name, &table_idents).await {
+            tracing::warn!(
+                error = %e,
+                publication = %pub_name,
+                "create_publication failed; assuming it exists"
+            );
+        }
+        let cp = pg.create_slot(slot).await.context("create slot")?;
+        tracing::info!(
+            slot = %slot,
+            consistent_point = ?cp,
+            "replication slot created (WAL pinned for later Run)"
+        );
+    }
+
+    // ── pipeline + materializer ────────────────────────────────────
+    let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
+        Arc::new(UuidBlobNamer::new(id_gen.clone(), "staged"));
+    let mut pipeline: Pipeline<dyn Coordinator> = Pipeline::new(
+        Arc::clone(&coord),
+        Arc::clone(&blob),
+        blob_namer,
+        cfg.sink.flush_rows,
+    );
+    for s in &schemas {
+        let pk_cols: Vec<pg2iceberg_core::ColumnName> = s
+            .primary_key_columns()
+            .map(|c| pg2iceberg_core::ColumnName(c.name.clone()))
+            .collect();
+        if !pk_cols.is_empty() {
+            pipeline.register_primary_keys(s.ident.clone(), pk_cols);
+        }
+    }
+
+    let mat_namer = Arc::new(
+        pg2iceberg_logical::materializer::CounterMaterializerNamer::new("materialized"),
+    );
+    let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
+        Materializer::new(
+            Arc::clone(&coord),
+            Arc::clone(&blob),
+            Arc::clone(&catalog),
+            mat_namer,
+            &cfg.state.group,
+            64,
+        );
+    for schema in &schemas {
+        materializer
+            .register_table(schema.clone())
+            .await
+            .with_context(|| format!("register {}", schema.ident))?;
+    }
+
+    // ── run snapshot phase ─────────────────────────────────────────
+    let pg_cfg = cfg.source.postgres.clone();
+    let to_snapshot = schemas.clone();
+    let source = crate::snapshot_src::PgSnapshotSource::open(&pg_cfg, &to_snapshot)
+        .await
+        .map_err(|e| {
+            anyhow::Error::from(LifecycleError::Snapshot(
+                pg2iceberg_snapshot::SnapshotError::Source(format!("{e:#}")),
+            ))
+        })
+        .context("open snapshot source")?;
+
+    let mut table_oids: std::collections::BTreeMap<pg2iceberg_core::TableIdent, u32> =
+        std::collections::BTreeMap::new();
+    for s in &schemas {
+        if let Some(v) = pg
+            .table_oid(&s.ident.namespace.0.join("."), &s.ident.name)
+            .await
+            .with_context(|| format!("table_oid for {}", s.ident))?
+        {
+            table_oids.insert(s.ident.clone(), v);
+        }
+    }
+
+    let outcome = run_snapshot_phase(
+        &source,
+        Arc::clone(&coord),
+        &schemas,
+        &std::collections::BTreeSet::new(),
+        &table_oids,
+        &mut pipeline,
+        pg2iceberg_snapshot::DEFAULT_CHUNK_SIZE,
+    )
+    .await
+    .context("run_snapshot_phase")?;
+
+    match outcome {
+        SnapshotPhaseOutcome::Skipped => {
+            println!("OK: snapshot already complete; nothing to do");
+        }
+        SnapshotPhaseOutcome::Completed { snapshot_lsn } => {
+            // Publish staged snapshot rows to Iceberg via one
+            // materializer cycle. Without this, the staged Parquet
+            // sits in coord but no Iceberg snapshot exists, and a
+            // later `Run` would commit them — which works, but
+            // surprises the operator who'd expect snapshot-only to
+            // produce visible Iceberg state.
+            materializer
+                .cycle()
+                .await
+                .context("materialize snapshot rows")?;
+            println!("OK: snapshot complete at LSN {snapshot_lsn:?}");
+        }
+    }
+
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

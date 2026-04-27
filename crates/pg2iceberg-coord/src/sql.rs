@@ -14,6 +14,14 @@ pub fn create_schema(schema: &CoordSchema) -> String {
     format!("CREATE SCHEMA IF NOT EXISTS {}", schema)
 }
 
+/// `DROP SCHEMA IF EXISTS … CASCADE`. Used by the `cleanup`
+/// subcommand to tear down all coordinator state — every table the
+/// migration created lives under this schema, so a CASCADE drop
+/// removes the whole footprint atomically.
+pub fn drop_schema(schema: &CoordSchema) -> String {
+    format!("DROP SCHEMA IF EXISTS {} CASCADE", schema)
+}
+
 /// DDL for the six coord tables. Each statement is idempotent
 /// (`CREATE TABLE IF NOT EXISTS`). Mirrors `stream/coordinator_pg.go:73-104`
 /// plus a single-row `checkpoints` table for [`crate::Coordinator::save_checkpoint`].
@@ -420,5 +428,15 @@ mod tests {
         let s = CoordSchema::sanitize("Tenant_42");
         let q = read_log(&s);
         assert!(q.contains("tenant_42.log_index"));
+    }
+
+    #[test]
+    fn drop_schema_uses_cascade_and_if_exists() {
+        let s = CoordSchema::default_name();
+        let q = drop_schema(&s);
+        assert!(q.contains("DROP SCHEMA"));
+        assert!(q.contains("IF EXISTS"));
+        assert!(q.contains("CASCADE"));
+        assert!(q.contains("_pg2iceberg"));
     }
 }

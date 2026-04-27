@@ -275,6 +275,16 @@ where
     })
 }
 
+/// Crate-public alias used by the snapshot-only subcommand. Same body
+/// as `discover_schemas`; renamed so the call site reads as a public
+/// helper instead of a private module-internal one.
+pub(crate) async fn __discover_schemas_for_snapshot(
+    tables: &[TableConfig],
+    pg: &PgClientImpl,
+) -> Result<Vec<TableSchema>> {
+    discover_schemas(tables, pg).await
+}
+
 async fn discover_schemas(
     tables: &[TableConfig],
     pg: &PgClientImpl,

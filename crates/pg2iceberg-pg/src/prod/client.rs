@@ -495,6 +495,57 @@ impl PgClient for PgClientImpl {
             LogicalReplicationStream::new(copy_stream),
         )))
     }
+
+    async fn drop_slot(&self, slot: &str) -> Result<()> {
+        // Probe `pg_replication_slots` first so we can: (a) treat
+        // missing slots as a no-op (idempotent) and (b) refuse to
+        // drop an active slot — `pg_drop_replication_slot` would
+        // error in that case anyway, but we surface a clearer
+        // message and skip the round-trip.
+        let probe = format!(
+            "SELECT active FROM pg_replication_slots WHERE slot_name = {}",
+            quote_lit(slot)
+        );
+        let rows = self
+            .client
+            .simple_query(&probe)
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        let mut found = false;
+        let mut active = false;
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                found = true;
+                if let Some(s) = row
+                    .try_get(0)
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                {
+                    // Boolean comes back as "t"/"f" in simple-query mode.
+                    active = s == "t" || s == "true";
+                }
+            }
+        }
+        if !found {
+            return Ok(());
+        }
+        if active {
+            return Err(PgError::Other(format!(
+                "replication slot {slot:?} is still active; \
+                 stop the consumer (e.g. by terminating the running \
+                 pg2iceberg process) before running cleanup"
+            )));
+        }
+        let q = format!(
+            "SELECT pg_drop_replication_slot({})",
+            quote_lit(slot)
+        );
+        simple_exec(&self.client, &q).await
+    }
+
+    async fn drop_publication(&self, name: &str) -> Result<()> {
+        let q = format!("DROP PUBLICATION IF EXISTS {}", quote_ident(name));
+        simple_exec(&self.client, &q).await
+    }
 }
 
 async fn simple_exec(client: &Client, q: &str) -> Result<()> {

@@ -254,4 +254,16 @@ pub trait PgClient: Send + Sync {
         start: Lsn,
         publication: &str,
     ) -> Result<Box<dyn ReplicationStream>>;
+
+    /// Drop the named replication slot. Idempotent — returns `Ok(())`
+    /// if the slot doesn't exist. Errors if the slot is currently
+    /// `active` (some consumer is connected); the caller must stop
+    /// the consumer first. Used by the operational `cleanup`
+    /// subcommand to tear down a pipeline's PG-side state.
+    async fn drop_slot(&self, slot: &str) -> Result<()>;
+
+    /// Drop the named publication. Idempotent — runs `DROP PUBLICATION
+    /// IF EXISTS`, which is a noop on a missing publication. Used by
+    /// the operational `cleanup` subcommand alongside [`Self::drop_slot`].
+    async fn drop_publication(&self, name: &str) -> Result<()>;
 }

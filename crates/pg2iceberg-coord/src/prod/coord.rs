@@ -63,6 +63,24 @@ impl PostgresCoordinator {
         }
         Ok(())
     }
+
+    /// `DROP SCHEMA … CASCADE` — wipe every coordinator table this
+    /// instance owns. Used by the `cleanup` subcommand to tear down
+    /// pipeline state ahead of a re-bootstrap. Idempotent: a missing
+    /// schema is silently ignored.
+    ///
+    /// Aborts the in-process connection task on completion is
+    /// **not** done here — the caller drops `self` to do that. We
+    /// intentionally don't close the connection so callers can chain
+    /// teardown calls if needed.
+    pub async fn teardown(&self) -> Result<()> {
+        let client = self.client.lock().await;
+        client
+            .batch_execute(&sql::drop_schema(&self.schema))
+            .await
+            .map_err(pg)?;
+        Ok(())
+    }
 }
 
 impl Drop for PostgresCoordinator {

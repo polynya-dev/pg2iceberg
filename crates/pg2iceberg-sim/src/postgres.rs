@@ -423,6 +423,25 @@ impl SimPostgres {
             .unwrap_or_default()
     }
 
+    /// Test hook: drop a replication slot. Idempotent — returns
+    /// `Ok(())` if the slot doesn't exist, mirroring the prod
+    /// [`PgClient::drop_slot`] semantics. The sim has no notion of
+    /// "active" slots (no concurrent consumer model), so this never
+    /// rejects on activeness.
+    pub fn drop_slot(&self, name: &str) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.slots.remove(name);
+        Ok(())
+    }
+
+    /// Test hook: drop a publication. Idempotent — `IF EXISTS`
+    /// semantics, mirrors the prod [`PgClient::drop_publication`].
+    pub fn drop_publication(&self, name: &str) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.publications.remove(name);
+        Ok(())
+    }
+
     pub fn create_publication(&self, name: &str, tables: &[TableIdent]) -> Result<()> {
         let mut s = self.state.lock().unwrap();
         if s.publications.contains_key(name) {
@@ -1321,5 +1340,13 @@ impl PgClient for SimPgClient {
             .map_err(|e| PgError::Other(e.to_string()))?;
         stream.advance_cursor_to(start);
         Ok(Box::new(AsyncSimStream::new(stream)))
+    }
+
+    async fn drop_slot(&self, slot: &str) -> std::result::Result<(), PgError> {
+        self.db.drop_slot(slot).map_err(|e| PgError::Other(e.to_string()))
+    }
+
+    async fn drop_publication(&self, name: &str) -> std::result::Result<(), PgError> {
+        self.db.drop_publication(name).map_err(|e| PgError::Other(e.to_string()))
     }
 }

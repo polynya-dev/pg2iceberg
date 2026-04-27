@@ -517,3 +517,126 @@ async fn discover_schema_against_real_pg() {
     assert!(!bio.is_primary_key);
     assert!(bio.nullable);
 }
+
+#[tokio::test]
+async fn drop_slot_and_publication_against_real_pg() {
+    // End-to-end: create slot + publication, then drop both via
+    // the new `PgClient::drop_slot` / `drop_publication` methods.
+    // Verifies the SQL is valid and the operations are idempotent.
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+
+    let table = format!("cleanup_{}", uniq());
+    regular
+        .batch_execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY)"))
+        .await
+        .expect("create");
+
+    let client = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("repl connect");
+
+    let slot = format!("s_{}", uniq());
+    let pubname = format!("p_{}", uniq());
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: table.clone(),
+    };
+    client
+        .create_publication(&pubname, &[ident])
+        .await
+        .expect("create_publication");
+    client.create_slot(&slot).await.expect("create slot");
+    assert!(client.slot_exists(&slot).await.unwrap());
+
+    // First drop succeeds.
+    client.drop_slot(&slot).await.expect("drop_slot");
+    assert!(!client.slot_exists(&slot).await.unwrap());
+
+    // Idempotent — second drop is a no-op (slot is gone).
+    client
+        .drop_slot(&slot)
+        .await
+        .expect("idempotent drop_slot");
+
+    // Drop publication, then idempotent re-drop.
+    client
+        .drop_publication(&pubname)
+        .await
+        .expect("drop_publication");
+    client
+        .drop_publication(&pubname)
+        .await
+        .expect("idempotent drop_publication");
+    client
+        .drop_publication("never_existed_pub")
+        .await
+        .expect("drop missing publication");
+}
+
+#[tokio::test]
+async fn drop_slot_rejects_active_slot() {
+    // While a START_REPLICATION is in flight, the slot is `active =
+    // true`. Cleanup must refuse to drop it — silently dropping
+    // would yank WAL out from under a live consumer.
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+
+    let table = format!("active_{}", uniq());
+    regular
+        .batch_execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY)"))
+        .await
+        .expect("create");
+
+    // Open one client to create + START_REPLICATION the slot, and a
+    // *separate* client to attempt the drop. PG enforces "can't drop
+    // an active slot" between sessions.
+    let writer = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("writer connect");
+    let pubname = format!("p_{}", uniq());
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: table.clone(),
+    };
+    writer
+        .create_publication(&pubname, &[ident])
+        .await
+        .expect("create_publication");
+    let slot = format!("s_{}", uniq());
+    writer.create_slot(&slot).await.expect("create slot");
+
+    // Hold the replication stream so the slot is `active`.
+    let _stream = writer
+        .start_replication(&slot, pg2iceberg_core::Lsn::ZERO, &pubname)
+        .await
+        .expect("start_replication");
+    // Tiny pause so PG marks the slot active before the drop attempt.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let dropper = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("dropper connect");
+    let err = dropper
+        .drop_slot(&slot)
+        .await
+        .expect_err("active slot must reject drop");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("active") || msg.contains("still active"),
+        "error must call out activeness; got: {msg}"
+    );
+
+    // Drop the stream (release the slot), then the cleanup succeeds.
+    drop(_stream);
+    // Need to also drop the writer client because it holds the
+    // replication-mode connection that's pinning the slot active.
+    drop(writer);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    dropper.drop_slot(&slot).await.expect("drop after release");
+
+    dropper
+        .drop_publication(&pubname)
+        .await
+        .expect("drop publication");
+}

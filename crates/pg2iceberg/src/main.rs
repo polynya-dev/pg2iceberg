@@ -82,6 +82,33 @@ enum Command {
         #[arg(long, default_value_t = 1024)]
         chunk_size: usize,
     },
+    /// One-shot: run the initial snapshot phase for every configured
+    /// table, persist `snapshot_complete` in the checkpoint, and exit.
+    /// A subsequent `run` invocation will skip the snapshot and start
+    /// CDC from `flushed_lsn`.
+    ///
+    /// Mirrors Go's `--snapshot-only`. Creates the replication slot
+    /// before snapshotting if it doesn't exist yet — that pins the WAL
+    /// from `consistent_point` onward so a later `run` doesn't lose
+    /// any data committed between snapshot completion and CDC start.
+    Snapshot {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// One-shot: drop the replication slot, drop the publication, and
+    /// drop the coordinator schema (CASCADE). Used to tear down all
+    /// PG-side state created by a pg2iceberg pipeline ahead of a
+    /// re-bootstrap or final retirement.
+    ///
+    /// Mirrors Go's `--cleanup`. The slot must be inactive — stop
+    /// any running consumer first. Idempotent in the per-resource
+    /// sense (missing slot/publication/schema are skipped silently),
+    /// but does **not** delete the materialized Iceberg tables — that
+    /// has to be done out-of-band against the catalog.
+    Cleanup {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -106,6 +133,8 @@ async fn main() -> Result<()> {
         Command::Verify { config, chunk_size } => {
             run::run_verify(Config::load_from(config)?, chunk_size).await
         }
+        Command::Snapshot { config } => run::run_snapshot_only(Config::load_from(config)?).await,
+        Command::Cleanup { config } => run::run_cleanup(Config::load_from(config)?).await,
     }
 }
 
