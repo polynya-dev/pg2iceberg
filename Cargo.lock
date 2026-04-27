@@ -2922,6 +2922,7 @@ dependencies = [
  "pg2iceberg-stream",
  "pg2iceberg-validate",
  "pollster",
+ "serde_json",
  "thiserror",
 ]
 

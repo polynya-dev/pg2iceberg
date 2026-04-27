@@ -447,7 +447,7 @@ async fn start_replication_streams_insert_events() {
             ),
         };
         match msg {
-            DecodedMessage::Relation { ident: t } => {
+            DecodedMessage::Relation { ident: t, .. } => {
                 if t.name == table {
                     relation_seen = true;
                 }

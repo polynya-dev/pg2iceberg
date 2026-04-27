@@ -278,6 +278,83 @@ impl<C: Catalog> Materializer<C> {
         Ok(())
     }
 
+    /// Apply a pgoutput Relation message: diff `incoming_columns`
+    /// against the registered schema for `ident`, build a
+    /// `Vec<SchemaChange>`, and call `Catalog::evolve_schema`. The
+    /// in-memory `TableEntry::schema` and `TableWriter` are
+    /// rebuilt from the post-evolution schema so subsequent
+    /// materialize cycles encode rows with the new shape.
+    ///
+    /// **No-op when the table isn't registered** (the lifecycle
+    /// only registers tables in YAML — incoming Relations for
+    /// untracked tables, e.g. `_pg2iceberg.markers`, are silently
+    /// skipped).
+    ///
+    /// **No-op when columns match.** pgoutput re-emits Relation
+    /// messages liberally (e.g. on every cache invalidation, even
+    /// for unchanged schemas); the diff just produces an empty
+    /// change list and we return without touching the catalog.
+    pub async fn apply_relation(
+        &mut self,
+        ident: &TableIdent,
+        incoming_columns: &[pg2iceberg_pg::RelationColumn],
+    ) -> Result<()> {
+        let entry = match self.tables.get_mut(ident) {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+
+        let mut current_names: std::collections::BTreeSet<String> =
+            entry.schema.columns.iter().map(|c| c.name.clone()).collect();
+        let incoming_names: std::collections::BTreeSet<String> = incoming_columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        let mut changes: Vec<pg2iceberg_iceberg::SchemaChange> = Vec::new();
+        for c in incoming_columns {
+            if !current_names.contains(&c.name) {
+                changes.push(pg2iceberg_iceberg::SchemaChange::AddColumn {
+                    name: c.name.clone(),
+                    ty: c.ty,
+                    nullable: c.nullable,
+                });
+            }
+        }
+        for c in &entry.schema.columns {
+            // PK columns are immutable in our model — pgoutput won't
+            // drop them anyway. Skip to avoid soft-dropping a PK
+            // (which would set `nullable = true` on the PK column).
+            if c.is_primary_key {
+                continue;
+            }
+            if !incoming_names.contains(&c.name) {
+                changes.push(pg2iceberg_iceberg::SchemaChange::DropColumn {
+                    name: c.name.clone(),
+                });
+            }
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Catalog-side first so a failure leaves the materializer's
+        // in-memory state unchanged (next Relation will re-trigger
+        // the diff). After success, rebuild the TableWriter so it
+        // encodes with the new column set.
+        self.catalog.evolve_schema(ident, changes.clone()).await?;
+        pg2iceberg_iceberg::apply_schema_changes(&mut entry.schema, &changes)
+            .map_err(MaterializerError::Catalog)?;
+        entry.writer = TableWriter::new(entry.schema.clone());
+        // current_names is rebuilt next call from the updated schema;
+        // explicit insertion keeps Clippy happy + makes the
+        // post-state self-consistent within this call.
+        for c in &entry.schema.columns {
+            current_names.insert(c.name.clone());
+        }
+        Ok(())
+    }
+
     pub async fn cycle(&mut self) -> Result<usize> {
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut total = 0;
@@ -468,6 +545,14 @@ impl<C: Catalog> Materializer<C> {
             let mut chunk = decode_chunk(&bytes)?;
             all_events.append(&mut chunk);
         }
+
+        // 3b. Expand any TRUNCATE events into per-PK deletes against
+        //     the current FileIndex. A `TRUNCATE` in PG drops every
+        //     row; in Iceberg we model that as one equality-delete
+        //     per known PK so the next snapshot's MoR reads return
+        //     zero rows. Subsequent same-tx INSERTs survive the
+        //     fold's last-write-wins on the same PK.
+        all_events = expand_truncates(all_events, &entry.file_index, &entry.pk_cols);
 
         // Fold + TOAST + re-insert. Pre-fetch any prior data files needed
         // for TOAST resolution; that's cheap when no UPDATE has unchanged_cols.
@@ -690,6 +775,63 @@ impl<C: Catalog> Materializer<C> {
         }
         Ok(out)
     }
+}
+
+/// Expand `Op::Truncate` events into per-PK `Op::Delete` events
+/// against the current FileIndex. Mirrors PG's TRUNCATE semantics:
+/// every row known to Iceberg right now is wiped, so the materializer
+/// emits an equality-delete for each.
+///
+/// Subsequent post-truncate Insert/Update events for the same PK
+/// will overwrite the synthetic Delete during the fold (last-write-
+/// wins keyed by PK). PKs not touched post-truncate stay as Delete.
+///
+/// The Truncate sentinel events are dropped from the output — they
+/// have no row payload of their own and the writer would reject
+/// them.
+fn expand_truncates(
+    events: Vec<MatEvent>,
+    file_index: &FileIndex,
+    pk_cols: &[ColumnName],
+) -> Vec<MatEvent> {
+    if !events.iter().any(|e| e.op == Op::Truncate) {
+        return events;
+    }
+    let mut out: Vec<MatEvent> = Vec::with_capacity(events.len() + file_index.live_pk_count());
+    for evt in events {
+        if evt.op != Op::Truncate {
+            out.push(evt);
+            continue;
+        }
+        // Decode each PK key (a JSON array of PgValues) back into a
+        // PK-only Row keyed by the schema's PK columns. Bad keys
+        // (shouldn't happen — FileIndex stores what `pk_key` produces)
+        // are skipped rather than crashing the cycle.
+        for pk_key_str in file_index.all_pks() {
+            let values: Vec<pg2iceberg_core::PgValue> =
+                match serde_json::from_str(pk_key_str) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+            if values.len() != pk_cols.len() {
+                continue;
+            }
+            let mut row = Row::new();
+            for (col, val) in pk_cols.iter().zip(values.into_iter()) {
+                row.insert(col.clone(), val);
+            }
+            out.push(MatEvent {
+                op: Op::Delete,
+                lsn: evt.lsn,
+                commit_ts: evt.commit_ts,
+                xid: evt.xid,
+                unchanged_cols: Vec::new(),
+                row,
+            });
+        }
+        // Drop the Truncate sentinel itself — its expansion is in `out`.
+    }
+    out
 }
 
 fn collect_toast_paths(

@@ -89,6 +89,16 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     /// Markers from committed txs awaiting flush. Drained into
     /// `CommitBatch.markers` on each successful `claim_offsets`.
     ready_markers: Vec<MarkerInfo>,
+    /// Per-table primary-key column list. Lets the pipeline detect
+    /// `UPDATE` events that change the primary key (`before.pk !=
+    /// after.pk`) and split them into a synthetic `Delete` (old PK)
+    /// + `Update` (new PK) so the materializer drops the old row.
+    /// Without this, the old PK becomes orphaned in Iceberg.
+    /// Empty when not configured — pipeline falls back to the
+    /// previous "stage `after` only" behavior, which is wrong for
+    /// PK changes but matches the prior shape for tests that
+    /// haven't registered PKs.
+    primary_keys: BTreeMap<TableIdent, Vec<ColumnName>>,
 }
 
 impl<C: Coordinator + ?Sized> Pipeline<C> {
@@ -125,7 +135,20 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             markers_table: None,
             pending_markers_by_xid: BTreeMap::new(),
             ready_markers: Vec::new(),
+            primary_keys: BTreeMap::new(),
         }
+    }
+
+    /// Register the primary-key columns for `table`. Required for
+    /// correct UPDATE-with-PK-change handling — without it, the
+    /// pipeline can't tell whether a PG `UPDATE` changed the PK and
+    /// the old row stays orphaned in Iceberg.
+    pub fn register_primary_keys(
+        &mut self,
+        table: TableIdent,
+        pk_cols: Vec<ColumnName>,
+    ) {
+        self.primary_keys.insert(table, pk_cols);
     }
 
     /// Enable blue-green marker detection. INSERTs to `table` are
@@ -193,6 +216,44 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                             }
                         }
                         return Ok(());
+                    }
+                }
+                // UPDATE with PK change → split into Delete(old PK) +
+                // Update(new full row). Without this, the materializer
+                // folds-by-new-PK and the old row stays orphaned in
+                // Iceberg. Skipped silently when PKs aren't registered
+                // (legacy / test path).
+                if evt.op == Op::Update {
+                    if let (Some(pks), Some(before), Some(after)) = (
+                        self.primary_keys.get(&evt.table),
+                        evt.before.as_ref(),
+                        evt.after.as_ref(),
+                    ) {
+                        let before_pk: Vec<&PgValue> =
+                            pks.iter().filter_map(|c| before.get(c)).collect();
+                        let after_pk: Vec<&PgValue> =
+                            pks.iter().filter_map(|c| after.get(c)).collect();
+                        if !before_pk.is_empty()
+                            && before_pk.len() == after_pk.len()
+                            && before_pk != after_pk
+                        {
+                            // Split. Delete carries `before` (full or
+                            // PK-only — whichever pgoutput sent us),
+                            // which `staged_row(Delete)` will pull as
+                            // the staged row. Update carries `after`
+                            // for the new-PK insert.
+                            let mut del = evt.clone();
+                            del.op = Op::Delete;
+                            del.after = None;
+                            self.sink.record_change(del)?;
+
+                            let mut upd = evt;
+                            // Strip `before` so the staging layer
+                            // doesn't carry duplicate data.
+                            upd.before = None;
+                            self.sink.record_change(upd)?;
+                            return Ok(());
+                        }
                     }
                 }
                 self.sink.record_change(evt)?;

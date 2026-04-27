@@ -35,13 +35,19 @@ pub fn read_data_file(bytes: &[u8], cols: &[ColumnSchema]) -> Result<Vec<Row>> {
         for i in 0..batch.num_rows() {
             let mut row: Row = BTreeMap::new();
             for col in cols {
-                let arr =
-                    batch
-                        .column_by_name(&col.name)
-                        .ok_or_else(|| WriterError::MissingColumn {
-                            col: col.name.clone(),
-                        })?;
                 let key = ColumnName(col.name.clone());
+                // Schema-evolution-tolerant read: if the parquet
+                // file pre-dates an `AddColumn`, the file simply
+                // doesn't carry the new column and Iceberg readers
+                // project NULL. Mirrors that behavior here so a
+                // mid-stream `ALTER TABLE ADD COLUMN` doesn't
+                // require backfilling old data files. Equality-delete
+                // reads (cols = PK-only) still hit every column
+                // they need, since PKs aren't dropped.
+                let Some(arr) = batch.column_by_name(&col.name) else {
+                    row.insert(key, PgValue::Null);
+                    continue;
+                };
                 if arr.is_null(i) {
                     row.insert(key, PgValue::Null);
                 } else {

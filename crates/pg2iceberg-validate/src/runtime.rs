@@ -347,6 +347,19 @@ where
         Arc::clone(&lc.blob_namer),
         lc.flush_rows,
     );
+    // Register per-table primary keys so the pipeline can split
+    // `UPDATE` events that change the PK into `Delete(old)` +
+    // `Update(new)` — otherwise the old PK would stay orphaned in
+    // Iceberg.
+    for s in &lc.schemas {
+        let pk_cols: Vec<pg2iceberg_core::ColumnName> = s
+            .primary_key_columns()
+            .map(|c| pg2iceberg_core::ColumnName(c.name.clone()))
+            .collect();
+        if !pk_cols.is_empty() {
+            pipeline.register_primary_keys(s.ident.clone(), pk_cols);
+        }
+    }
     if lc.meta_namespace.is_some() {
         pipeline.enable_markers(markers_table_ident.clone());
     }
@@ -657,6 +670,20 @@ where
             _ = &mut shutdown => break,
             res = loop_state.stream.recv() => {
                 let msg = res.map_err(|e| MainLoopError::Recv(e.to_string()))?;
+                // Relation messages drive schema evolution: diff
+                // incoming columns against the materializer's
+                // registered schema, call `Catalog::evolve_schema`
+                // for any AddColumn / DropColumn, and update the
+                // materializer's in-memory schema + writer. Forward
+                // a payload-less Relation to the pipeline anyway so
+                // future hooks (metrics, etc.) keep firing.
+                if let pg2iceberg_pg::DecodedMessage::Relation { ident, columns } = &msg {
+                    loop_state
+                        .materializer
+                        .apply_relation(ident, columns)
+                        .await
+                        .map_err(|e| MainLoopError::Catalog(e.to_string()))?;
+                }
                 loop_state
                     .pipeline
                     .process(msg)

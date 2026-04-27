@@ -122,6 +122,14 @@ impl FileIndex {
     pub fn live_pk_count(&self) -> usize {
         self.pk_to_file.len()
     }
+
+    /// Iterate every currently-live PK key. Used by the
+    /// materializer's TRUNCATE expansion: a `TRUNCATE` event has no
+    /// per-row payload, so we materialize it by emitting one
+    /// equality-delete per known PK before continuing the cycle.
+    pub fn all_pks(&self) -> impl Iterator<Item = &str> {
+        self.pk_to_file.keys().map(String::as_str)
+    }
 }
 
 /// Rebuild a `FileIndex` for `ident` from the catalog's snapshot history.

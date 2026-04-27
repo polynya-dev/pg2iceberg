@@ -71,9 +71,14 @@ fn op_to_str(op: Op) -> Option<&'static str> {
         Op::Insert => Some("I"),
         Op::Update => Some("U"),
         Op::Delete => Some("D"),
-        // Begin/Commit/Relation/Truncate aren't staged — they're control
-        // events consumed by the pipeline before reaching the writer.
-        Op::Relation | Op::Truncate => None,
+        // Truncate is staged as a sentinel with empty `_data` so the
+        // materializer can expand it into per-PK deletes against the
+        // current FileIndex. Without staging, a TRUNCATE in PG would
+        // silently leave Iceberg with the pre-truncate rows.
+        Op::Truncate => Some("T"),
+        // Begin/Commit/Relation are control events consumed by the
+        // pipeline before reaching the writer.
+        Op::Relation => None,
     }
 }
 
@@ -82,6 +87,7 @@ fn op_from_str(s: &str) -> Option<Op> {
         "I" => Some(Op::Insert),
         "U" => Some(Op::Update),
         "D" => Some(Op::Delete),
+        "T" => Some(Op::Truncate),
         _ => None,
     }
 }
@@ -134,11 +140,20 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
         let Some(op_str) = op_to_str(evt.op) else {
             continue;
         };
-        let Some(row) = staged_row(evt) else {
-            return Err(StreamError::Encode(format!(
-                "DML event {:?} has no row payload",
-                evt.op
-            )));
+        // Truncate is the one staged op without a row payload — the
+        // sentinel encodes as empty-object JSON so decode round-trips
+        // cleanly. Every other DML op MUST carry a row.
+        let row_json = if matches!(evt.op, Op::Truncate) {
+            String::from("{}")
+        } else {
+            let Some(row) = staged_row(evt) else {
+                return Err(StreamError::Encode(format!(
+                    "DML event {:?} has no row payload",
+                    evt.op
+                )));
+            };
+            serde_json::to_string(row)
+                .map_err(|e| StreamError::Encode(format!("encode _data: {e}")))?
         };
 
         op_b.append_value(op_str);
@@ -148,9 +163,7 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
             Some(s) => unchanged_b.append_value(s),
             None => unchanged_b.append_null(),
         }
-        let data_json = serde_json::to_string(row)
-            .map_err(|e| StreamError::Encode(format!("encode _data: {e}")))?;
-        data_b.append_value(data_json);
+        data_b.append_value(row_json);
         match evt.xid {
             Some(xid) => xid_b.append_value(xid as i64),
             None => xid_b.append_null(),

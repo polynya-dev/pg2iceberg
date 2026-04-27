@@ -137,9 +137,13 @@ enum WalKind {
     Change(ChangeEvent),
     Commit,
     /// Schema published for a relation; emitted on `create_table` so existing
-    /// streams pick it up. (Real PG sends Relation lazily before the first
-    /// change; close enough for the sim.)
-    Relation(TableIdent),
+    /// streams pick it up, and on `alter_add_column` / `alter_drop_column`
+    /// so the materializer can `evolve_schema` the Iceberg side. Carries a
+    /// snapshot of the table's current columns at WAL-emit time.
+    Relation {
+        ident: TableIdent,
+        columns: Vec<pg2iceberg_pg::RelationColumn>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +180,26 @@ impl Default for DbState {
             wal: Vec::new(),
         }
     }
+}
+
+/// Snapshot a TableSchema as the Vec<RelationColumn> the sim stream
+/// emits in `WalKind::Relation`. Mirrors what a real pgoutput
+/// Relation message would look like — but the sim stamps
+/// `is_primary_key` from the schema (we know it explicitly) instead
+/// of inferring from REPLICA IDENTITY flags like prod does.
+fn relation_columns_from_schema(
+    schema: &TableSchema,
+) -> Vec<pg2iceberg_pg::RelationColumn> {
+    schema
+        .columns
+        .iter()
+        .map(|c| pg2iceberg_pg::RelationColumn {
+            name: c.name.clone(),
+            ty: c.ty,
+            is_primary_key: c.is_primary_key,
+            nullable: c.nullable,
+        })
+        .collect()
 }
 
 impl DbState {
@@ -217,6 +241,7 @@ impl SimPostgres {
             return Err(SimError::DuplicateTable(schema.ident));
         }
         let ident = schema.ident.clone();
+        let columns = relation_columns_from_schema(&schema);
         let pg_oid = s.alloc_oid();
         s.tables.insert(
             ident.clone(),
@@ -230,7 +255,77 @@ impl SimPostgres {
         s.wal.push(WalEntry {
             lsn,
             xid: None,
-            kind: WalKind::Relation(ident),
+            kind: WalKind::Relation { ident, columns },
+        });
+        Ok(())
+    }
+
+    /// Test hook: `ALTER TABLE … ADD COLUMN`. Appends `col` to the
+    /// table's schema and emits a fresh Relation WAL event so any
+    /// active replication stream picks up the change. The column
+    /// auto-allocates the next field id (matching Iceberg's
+    /// monotonic-only field-id rule). Used by DST to drive
+    /// `Materializer::apply_relation` end-to-end.
+    pub fn alter_add_column(
+        &self,
+        ident: &TableIdent,
+        col: pg2iceberg_core::ColumnSchema,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
+        // Field id must be unique within the table; auto-pick.
+        let next_id = table
+            .schema
+            .columns
+            .iter()
+            .map(|c| c.field_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut new_col = col;
+        new_col.field_id = next_id;
+        table.schema.columns.push(new_col);
+        let columns = relation_columns_from_schema(&table.schema);
+        let lsn = s.alloc_lsn();
+        s.wal.push(WalEntry {
+            lsn,
+            xid: None,
+            kind: WalKind::Relation {
+                ident: ident.clone(),
+                columns,
+            },
+        });
+        Ok(())
+    }
+
+    /// Test hook: `ALTER TABLE … DROP COLUMN`. Removes the named
+    /// column from the table's schema and emits a fresh Relation
+    /// event. Iceberg-side this is a soft-drop (column stays in
+    /// the schema as nullable), so subsequent reads are
+    /// backward-compatible.
+    pub fn alter_drop_column(
+        &self,
+        ident: &TableIdent,
+        col_name: &str,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
+        table.schema.columns.retain(|c| c.name != col_name);
+        let columns = relation_columns_from_schema(&table.schema);
+        let lsn = s.alloc_lsn();
+        s.wal.push(WalEntry {
+            lsn,
+            xid: None,
+            kind: WalKind::Relation {
+                ident: ident.clone(),
+                columns,
+            },
         });
         Ok(())
     }
@@ -446,9 +541,26 @@ enum TxOp {
         new_row: Row,
         unchanged_cols: Vec<ColumnName>,
     },
+    /// PG `UPDATE` that changes the primary key. Emits an event with
+    /// `before` = old-PK row, `after` = new full row. The sim removes
+    /// the row at the old PK and inserts at the new PK. Mirrors what
+    /// real PG sends with `REPLICA IDENTITY FULL` (or `DEFAULT` when
+    /// the PK column itself changes).
+    UpdatePkChange {
+        table: TableIdent,
+        before_row: Row,
+        new_row: Row,
+        unchanged_cols: Vec<ColumnName>,
+    },
     Delete {
         table: TableIdent,
         pk_row: Row,
+    },
+    /// `TRUNCATE` — clears all rows and emits an `Op::Truncate`
+    /// ChangeEvent with no before/after, matching pgoutput's
+    /// behavior.
+    Truncate {
+        table: TableIdent,
     },
 }
 
@@ -492,6 +604,34 @@ impl TxHandle {
         self.ops.push(TxOp::Delete {
             table: table.clone(),
             pk_row,
+        });
+        self
+    }
+
+    /// `UPDATE` that changes the primary key. Use when the test
+    /// needs to reproduce the "old PK becomes orphan in Iceberg"
+    /// scenario. `before_row` should be the full old row (matches
+    /// `REPLICA IDENTITY FULL`); `new_row` is the full new row.
+    pub fn update_with_pk_change(
+        &mut self,
+        table: &TableIdent,
+        before_row: Row,
+        new_row: Row,
+    ) -> &mut Self {
+        self.ops.push(TxOp::UpdatePkChange {
+            table: table.clone(),
+            before_row,
+            new_row,
+            unchanged_cols: Vec::new(),
+        });
+        self
+    }
+
+    /// `TRUNCATE` the table. Drops every row and emits a single
+    /// `Op::Truncate` event with no payload, matching pgoutput.
+    pub fn truncate(&mut self, table: &TableIdent) -> &mut Self {
+        self.ops.push(TxOp::Truncate {
+            table: table.clone(),
         });
         self
     }
@@ -543,6 +683,36 @@ impl TxHandle {
                             table: table.clone(),
                             op: "delete",
                         });
+                    }
+                }
+                TxOp::UpdatePkChange {
+                    table,
+                    before_row,
+                    new_row,
+                    ..
+                } => {
+                    let t = s
+                        .tables
+                        .get(table)
+                        .ok_or_else(|| SimError::UnknownTable(table.clone()))?;
+                    let old_key = t.pk_key(before_row)?;
+                    if !t.rows.contains_key(&old_key) {
+                        return Err(SimError::RowNotFound {
+                            table: table.clone(),
+                            op: "update-pk-change(before)",
+                        });
+                    }
+                    let new_key = t.pk_key(new_row)?;
+                    if t.rows.contains_key(&new_key) {
+                        return Err(SimError::PkConflict {
+                            table: table.clone(),
+                            detail: format!("update-pk-change collides at {new_key}"),
+                        });
+                    }
+                }
+                TxOp::Truncate { table } => {
+                    if !s.tables.contains_key(table) {
+                        return Err(SimError::UnknownTable(table.clone()));
                     }
                 }
             }
@@ -618,6 +788,52 @@ impl TxHandle {
                             commit_ts,
                             xid: Some(self.xid),
                             before,
+                            after: None,
+                            unchanged_cols: vec![],
+                        }),
+                    });
+                }
+                TxOp::UpdatePkChange {
+                    table,
+                    before_row,
+                    new_row,
+                    unchanged_cols,
+                } => {
+                    let lsn = s.alloc_lsn();
+                    let t = s.tables.get_mut(&table).expect("validated above");
+                    let old_key = t.pk_key(&before_row)?;
+                    let new_key = t.pk_key(&new_row)?;
+                    t.rows.remove(&old_key);
+                    t.rows.insert(new_key, new_row.clone());
+                    s.wal.push(WalEntry {
+                        lsn,
+                        xid: Some(self.xid),
+                        kind: WalKind::Change(ChangeEvent {
+                            table,
+                            op: Op::Update,
+                            lsn,
+                            commit_ts,
+                            xid: Some(self.xid),
+                            before: Some(before_row),
+                            after: Some(new_row),
+                            unchanged_cols,
+                        }),
+                    });
+                }
+                TxOp::Truncate { table } => {
+                    let lsn = s.alloc_lsn();
+                    let t = s.tables.get_mut(&table).expect("validated above");
+                    t.rows.clear();
+                    s.wal.push(WalEntry {
+                        lsn,
+                        xid: Some(self.xid),
+                        kind: WalKind::Change(ChangeEvent {
+                            table,
+                            op: Op::Truncate,
+                            lsn,
+                            commit_ts,
+                            xid: Some(self.xid),
+                            before: None,
                             after: None,
                             unchanged_cols: vec![],
                         }),
@@ -701,7 +917,7 @@ impl SimReplicationStream {
                         xid: entry.xid.unwrap_or(0),
                     });
                 }
-                WalKind::Relation(ident) => {
+                WalKind::Relation { ident, columns } => {
                     if !pub_tables.contains(ident) {
                         self.cursor_lsn = entry.lsn;
                         continue;
@@ -709,6 +925,7 @@ impl SimReplicationStream {
                     self.cursor_lsn = entry.lsn;
                     return Some(DecodedMessage::Relation {
                         ident: ident.clone(),
+                        columns: columns.clone(),
                     });
                 }
                 WalKind::Change(evt) => {

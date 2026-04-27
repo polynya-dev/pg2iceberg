@@ -96,6 +96,27 @@ pub enum PgError {
 
 pub type Result<T> = std::result::Result<T, PgError>;
 
+/// One column observed in a pgoutput Relation message. Pre-mapped
+/// to our [`pg2iceberg_core::IcebergType`] so the materializer
+/// doesn't need to redo the OID-to-type mapping on its hot path.
+///
+/// pgoutput Relation messages don't carry nullability info — only
+/// name, type-id, type-modifier, and a flag indicating REPLICA
+/// IDENTITY membership. We stamp `nullable = true` on every
+/// non-PK column for safety; that matches what real PG accepts on
+/// `ALTER TABLE ADD COLUMN` without a `DEFAULT` clause, and
+/// downstream readers tolerate an over-permissive nullable flag.
+#[derive(Clone, Debug)]
+pub struct RelationColumn {
+    pub name: String,
+    pub ty: pg2iceberg_core::IcebergType,
+    /// `true` when pgoutput's column flags include the
+    /// REPLICA-IDENTITY-key bit (typically: PK columns + columns
+    /// in a `USING INDEX` index).
+    pub is_primary_key: bool,
+    pub nullable: bool,
+}
+
 /// Decoded pgoutput message. Matches the variants in `logical/decode.go:41-58`.
 #[derive(Clone, Debug)]
 pub enum DecodedMessage {
@@ -107,10 +128,15 @@ pub enum DecodedMessage {
         commit_lsn: Lsn,
         xid: u32,
     },
-    /// Schema for a relation. Sent before any change events for that relation.
+    /// Schema for a relation. Sent before any change events for that
+    /// relation, and re-sent after `ALTER TABLE` invalidates PG's
+    /// cache. The lifecycle compares incoming columns against the
+    /// materializer's registered schema; differences become
+    /// `SchemaChange::AddColumn` / `DropColumn` and trigger
+    /// `Catalog::evolve_schema`.
     Relation {
         ident: TableIdent,
-        // Columns omitted from this skeleton — Phase 5 wires them through.
+        columns: Vec<RelationColumn>,
     },
     Change(ChangeEvent),
     /// Periodic primary keepalive; carries the server's WAL end position.

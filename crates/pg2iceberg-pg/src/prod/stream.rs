@@ -24,7 +24,7 @@
 
 use crate::prod::typemap::pg_type_from_oid;
 use crate::prod::value_decode::decode_text;
-use crate::{ChangeEvent, DecodedMessage, PgError, ReplicationStream, Result};
+use crate::{ChangeEvent, DecodedMessage, PgError, RelationColumn, ReplicationStream, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use pg2iceberg_core::typemap::PgType;
@@ -162,23 +162,53 @@ impl ReplicationStreamImpl {
                     r.namespace().map_err(io_to_pg)?,
                     r.name().map_err(io_to_pg)?,
                 );
-                let columns: Vec<ColumnInfo> = r
-                    .columns()
-                    .iter()
-                    .map(|c| {
-                        let name = c.name().map_err(io_to_pg)?.to_string();
-                        let pg_type = pg_type_from_oid(c.type_id() as u32, c.type_modifier());
-                        Ok::<_, PgError>(ColumnInfo { name, pg_type })
-                    })
-                    .collect::<Result<_>>()?;
+                let mut internal_columns: Vec<ColumnInfo> = Vec::with_capacity(r.columns().len());
+                let mut decoded_columns: Vec<RelationColumn> =
+                    Vec::with_capacity(r.columns().len());
+                for c in r.columns() {
+                    let name = c.name().map_err(io_to_pg)?.to_string();
+                    let pg_type = pg_type_from_oid(c.type_id() as u32, c.type_modifier());
+                    internal_columns.push(ColumnInfo {
+                        name: name.clone(),
+                        pg_type,
+                    });
+                    // pgoutput Relation column flags: bit 0 = column
+                    // is part of REPLICA IDENTITY (PK or USING INDEX).
+                    let is_pk = (c.flags() & 1) != 0;
+                    // pgoutput doesn't carry nullability; we stamp
+                    // nullable=true on every non-PK column. PG only
+                    // permits adding non-nullable columns with a
+                    // DEFAULT, and for that case `apply_relation`
+                    // would still see a nullable add (which Iceberg
+                    // tolerates).
+                    let pg_type_unwrapped = pg_type.ok_or_else(|| {
+                        PgError::Protocol(format!(
+                            "unsupported PG type for column {name} at oid {} (modifier {})",
+                            c.type_id(),
+                            c.type_modifier()
+                        ))
+                    })?;
+                    let ty = pg2iceberg_core::map_pg_to_iceberg(pg_type_unwrapped)
+                        .map_err(|e| PgError::Protocol(format!("type map for {name}: {e}")))?
+                        .iceberg;
+                    decoded_columns.push(RelationColumn {
+                        name,
+                        ty,
+                        is_primary_key: is_pk,
+                        nullable: !is_pk,
+                    });
+                }
                 self.relations.insert(
                     r.rel_id(),
                     RelationCache {
                         ident: ident.clone(),
-                        columns,
+                        columns: internal_columns,
                     },
                 );
-                Ok(Some(DecodedMessage::Relation { ident }))
+                Ok(Some(DecodedMessage::Relation {
+                    ident,
+                    columns: decoded_columns,
+                }))
             }
             PgMsg::Insert(ins) => {
                 let rel = self.lookup_relation(ins.rel_id())?;

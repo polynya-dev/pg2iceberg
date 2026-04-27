@@ -17,6 +17,7 @@ pg2iceberg-pg.workspace = true
 pg2iceberg-coord.workspace = true
 pg2iceberg-stream.workspace = true
 pg2iceberg-iceberg.workspace = true
+serde_json = "1"
 thiserror.workspace = true
 
 [dev-dependencies]
