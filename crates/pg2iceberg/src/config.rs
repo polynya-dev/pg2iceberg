@@ -264,6 +264,23 @@ pub struct SinkConfig {
     /// server URI, etc.) without us having to enumerate every quirk.
     #[serde(default, rename = "catalog_props")]
     pub catalog_props: BTreeMap<String, String>,
+
+    /// Blue-green replica-alignment marker mode (per Go's
+    /// `examples/blue-green/`). When set, pg2iceberg watches
+    /// `_pg2iceberg.markers` in the source PG, includes it in the
+    /// publication, and emits `(uuid, table_name, snapshot_id)` rows
+    /// to a meta-marker Iceberg table at `<meta_namespace>.markers`.
+    /// External `iceberg-diff` joins blue's and green's tables on
+    /// `marker_uuid` to verify replica equivalence at WAL points.
+    /// Empty → marker mode disabled (default).
+    ///
+    /// **Operator precondition**: the bluegreen PG↔PG replication
+    /// publication must also include `_pg2iceberg.markers` so the
+    /// marker INSERT is replicated to green. pg2iceberg can't
+    /// enforce this — see `examples/blue-green/` from the Go
+    /// reference for the bootstrap.
+    #[serde(default)]
+    pub meta_namespace: String,
 }
 
 impl Default for SinkConfig {
@@ -290,6 +307,7 @@ impl Default for SinkConfig {
             maintenance_grace: default_maintenance_grace(),
             materialized_prefix: default_materialized_prefix(),
             catalog_props: BTreeMap::new(),
+            meta_namespace: String::new(),
         }
     }
 }

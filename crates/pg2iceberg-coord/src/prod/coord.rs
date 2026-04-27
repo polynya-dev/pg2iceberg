@@ -16,11 +16,11 @@ use crate::prod::connect::PgConn;
 use crate::schema::CoordSchema;
 use crate::sql;
 use crate::{
-    receipt, CommitBatch, CoordCommitReceipt, CoordError, Coordinator, LogEntry, OffsetGrant,
-    Result,
+    receipt, CommitBatch, CoordCommitReceipt, CoordError, Coordinator, LogEntry, MarkerInfo,
+    OffsetGrant, Result,
 };
 use async_trait::async_trait;
-use pg2iceberg_core::{Checkpoint, TableIdent, WorkerId};
+use pg2iceberg_core::{Checkpoint, Lsn, TableIdent, WorkerId};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -95,10 +95,36 @@ fn duration_as_interval(d: Duration) -> String {
     format!("{micros} microseconds")
 }
 
+/// `Lsn` → BIGINT for storage. PG's BIGINT is i64; LSNs are u64. We
+/// reinterpret the bits — LSNs in practice fit comfortably in i64 (PG
+/// itself uses int8 internally).
+fn lsn_to_i64(lsn: Lsn) -> i64 {
+    lsn.0 as i64
+}
+
+/// Inverse of [`lsn_to_i64`].
+fn i64_to_lsn(v: i64) -> Lsn {
+    Lsn(v as u64)
+}
+
 #[async_trait]
 impl Coordinator for PostgresCoordinator {
     async fn claim_offsets(&self, batch: &CommitBatch) -> Result<CoordCommitReceipt> {
+        // Marker-only flush (no log_index rows but markers to record).
+        // Persists markers atomically inside its own short tx.
         if batch.claims.is_empty() {
+            if !batch.markers.is_empty() {
+                let mut client = self.client.lock().await;
+                let tx = client.transaction().await.map_err(pg)?;
+                let insert_marker = sql::insert_pending_marker(&self.schema);
+                for m in &batch.markers {
+                    let lsn_i64 = lsn_to_i64(m.commit_lsn);
+                    tx.execute(&insert_marker, &[&m.uuid, &lsn_i64])
+                        .await
+                        .map_err(pg)?;
+                }
+                tx.commit().await.map_err(pg)?;
+            }
             return Ok(receipt::mint(batch.flushable_lsn, Vec::new()));
         }
 
@@ -111,7 +137,10 @@ impl Coordinator for PostgresCoordinator {
         }
 
         // Single transaction: ensure log_seq rows, claim ranges, insert
-        // log_index rows. Mints the receipt only after COMMIT returns.
+        // log_index rows, write markers. Mints the receipt only after
+        // COMMIT returns. The atomicity is what makes the durability
+        // invariant work — pipeline either sees its log_index rows AND
+        // its markers persisted together, or neither.
         let mut client = self.client.lock().await;
         let tx = client.transaction().await.map_err(pg)?;
 
@@ -147,6 +176,7 @@ impl Coordinator for PostgresCoordinator {
                 (k.clone(), *e - total)
             })
             .collect();
+        let flushable_lsn_i64 = lsn_to_i64(batch.flushable_lsn);
         let mut grants: Vec<OffsetGrant> = Vec::with_capacity(batch.claims.len());
         for c in &batch.claims {
             let key = table_key(&c.table);
@@ -167,6 +197,7 @@ impl Coordinator for PostgresCoordinator {
                     &c.s3_path,
                     &record_count_i32,
                     &byte_size_i64,
+                    &flushable_lsn_i64,
                 ],
             )
             .await
@@ -178,6 +209,17 @@ impl Coordinator for PostgresCoordinator {
                 end_offset: end as u64,
                 s3_path: c.s3_path.clone(),
             });
+        }
+
+        // Markers ride the same transaction as the log_index rows.
+        if !batch.markers.is_empty() {
+            let insert_marker = sql::insert_pending_marker(&self.schema);
+            for m in &batch.markers {
+                let lsn_i64 = lsn_to_i64(m.commit_lsn);
+                tx.execute(&insert_marker, &[&m.uuid, &lsn_i64])
+                    .await
+                    .map_err(pg)?;
+            }
         }
 
         tx.commit().await.map_err(pg)?;
@@ -210,6 +252,7 @@ impl Coordinator for PostgresCoordinator {
             let path: String = r.get("s3_path");
             let rc: i32 = r.get("record_count");
             let bs: i64 = r.get("byte_size");
+            let flushable_lsn_raw: i64 = r.get("flushable_lsn");
             out.push(LogEntry {
                 table: table.clone(),
                 start_offset: start as u64,
@@ -217,12 +260,7 @@ impl Coordinator for PostgresCoordinator {
                 s3_path: path,
                 record_count: rc as u64,
                 byte_size: bs as u64,
-                // The prod log_index schema doesn't carry
-                // flushable_lsn yet; blue-green markers are sim-only
-                // until we add the column migration. Setting Lsn::ZERO
-                // means meta-marker emission is a no-op against the
-                // prod coord (markers remain pending forever).
-                flushable_lsn: pg2iceberg_core::Lsn::ZERO,
+                flushable_lsn: i64_to_lsn(flushable_lsn_raw),
             });
         }
         Ok(out)
@@ -384,6 +422,57 @@ impl Coordinator for PostgresCoordinator {
         let client = self.client.lock().await;
         client
             .execute(&sql::upsert_checkpoint(&self.schema), &[&payload])
+            .await
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    async fn pending_markers_for_table(
+        &self,
+        table: &TableIdent,
+        cursor: i64,
+    ) -> Result<Vec<MarkerInfo>> {
+        // Per the trait doc: a marker is eligible iff every
+        // log_index entry for `table` with
+        // `flushable_lsn <= marker.commit_lsn` has
+        // `end_offset <= cursor` (i.e. processed past the marker's
+        // WAL point), and the marker hasn't already been emitted
+        // for this table.
+        //
+        // The SQL in `sql::pending_markers_eligible` joins
+        // `pending_markers` with `marker_emissions` (NOT EXISTS) and
+        // `log_index` (NOT EXISTS for unprocessed). The qualified
+        // table key (e.g. `"public.accounts"`) is built in PG by
+        // `$1 || '.' || $2`.
+        let namespace = table.namespace.0.join(".");
+        let q = sql::pending_markers_eligible(&self.schema);
+        let client = self.client.lock().await;
+        let rows = client
+            .query(&q, &[&namespace, &table.name, &cursor])
+            .await
+            .map_err(pg)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let uuid: String = r.get("uuid");
+            let lsn_i64: i64 = r.get("commit_lsn");
+            out.push(MarkerInfo {
+                uuid,
+                commit_lsn: i64_to_lsn(lsn_i64),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn record_marker_emitted(
+        &self,
+        uuid: &str,
+        table: &TableIdent,
+    ) -> Result<()> {
+        let namespace = table.namespace.0.join(".");
+        let q = sql::insert_marker_emission(&self.schema);
+        let client = self.client.lock().await;
+        client
+            .execute(&q, &[&uuid, &namespace, &table.name])
             .await
             .map_err(pg)?;
         Ok(())

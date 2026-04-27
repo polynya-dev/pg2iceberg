@@ -336,22 +336,31 @@ Reordered from the previous draft to match what's actually risky in the Go archi
 > READ` so concurrent commits in `[snap_lsn, BEGIN-time]` get
 > deduplicated. Two pinned tests verify.
 >
-> **Blue-green marker alignment wired (sim-only).**
+> **Blue-green marker alignment wired in sim + prod.**
 > `_pg2iceberg.markers` is the operator-driven WAL-aligned snapshot
 > primitive for blue-green replica diffs (per Go's
 > `examples/blue-green/`). Lifecycle gains an opt-in
-> `meta_namespace`; pipeline filters marker INSERTs from user
-> staging, packages them in CommitBatch; coord persists +
-> dedup-emits per-table; materializer writes
+> `sink.meta_namespace` YAML knob; pipeline filters marker INSERTs
+> from user staging, packages them in CommitBatch; coord persists
+> + dedup-emits per-table; materializer writes
 > `(uuid, table_name, snapshot_id)` to `<meta_namespace>.markers`.
 > Marker fast-path in main loop triggers immediate
 > flush+materialize on observation — guarantees alignment even
-> when blue and green have different materializer intervals. **5
-> pinned DST tests** (`dst_markers.rs`) cover the alignment
+> when blue and green have different materializer intervals.
+>
+> **Prod path:** new `_pg2iceberg.pending_markers` +
+> `_pg2iceberg.marker_emissions` tables; `log_index` gains a
+> `flushable_lsn` column (idempotent migration);
+> `PostgresCoordinator` overrides `pending_markers_for_table` +
+> `record_marker_emitted` with PG-backed impls; marker writes ride
+> the same atomic transaction as `claim_offsets`'s log_index
+> writes. Real-PG validation pending testcontainers.
+>
+> **5 pinned DST tests** (`dst_markers.rs`) cover the alignment
 > guarantees. Surfaced + fixed a real bug in the process:
 > `MemoryCoordinator::claim_offsets` was dropping markers from
-> empty-claims flushes. Prod emission is no-op until the
-> `log_index.flushable_lsn` schema migration lands.
+> empty-claims flushes — exactly the blue-green production
+> pattern.
 >
 > **Fault injection** (Phase 6.5) wires deterministic
 > `FaultyBlobStore` / `FaultyCoordinator` / `FaultyCatalog` wrappers +

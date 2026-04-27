@@ -137,11 +137,14 @@ where
         blob_namer,
         metrics: Arc::new(InMemoryMetrics::new()),
         mode: Mode::Logical,
-        // Marker mode disabled by default; surface as a YAML knob
-        // (`sink.meta_namespace`) when wiring blue-green deployments.
-        // For now binary keeps it None — operators opt in via config
-        // once the YAML field lands.
-        meta_namespace: None,
+        // Blue-green marker mode. Operators set
+        // `sink.meta_namespace: "_pg2iceberg_<env>"` in YAML to
+        // opt in.
+        meta_namespace: if cfg.sink.meta_namespace.is_empty() {
+            None
+        } else {
+            Some(cfg.sink.meta_namespace.clone())
+        },
     })
 }
 
