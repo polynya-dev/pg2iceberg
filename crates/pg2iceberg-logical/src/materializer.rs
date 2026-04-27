@@ -31,6 +31,9 @@ use pg2iceberg_core::{
     ColumnName, ColumnSchema, Lsn, Metrics, Namespace, NoopMetrics, Op, PgValue, Row, TableIdent,
     TableSchema,
 };
+use pg2iceberg_iceberg::meta::{
+    self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
+};
 use pg2iceberg_iceberg::{
     fold_events, promote_re_inserts, read_data_file, rebuild_from_catalog, resolve_unchanged_cols,
     Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PreparedCommit, TableWriter,
@@ -160,6 +163,13 @@ pub struct Materializer<C: Catalog> {
     /// this table — that's what gives blue-green replicas WAL-aligned
     /// snapshot pointers for `iceberg-diff` to compare.
     meta_marker: Option<MetaMarkerWriter>,
+    /// Optional control-plane meta tables (commits / checkpoints /
+    /// compactions / maintenance). Enabled via
+    /// [`Self::enable_meta_recording`]. When set, each user-table
+    /// commit / compaction / expiry / orphan-cleanup auto-buffers a
+    /// row and `flush_meta` (called at end of each cycle) commits
+    /// the buffered rows to Iceberg.
+    meta_recorder: Option<MetaRecorder>,
 }
 
 struct MetaMarkerWriter {
@@ -171,6 +181,58 @@ struct MetaMarkerWriter {
     /// reader side handles dedup if a marker is re-emitted across a
     /// crash.)
     file_index: FileIndex,
+}
+
+/// One control-plane meta table's writer + buffered rows. Flush
+/// converts buffered rows into a single Iceberg snapshot (one
+/// `commit_snapshot` call per non-empty buffer per `flush_meta()`
+/// invocation). Append-only — no equality deletes, no FileIndex
+/// updates needed; downstream consumers expect monotonic snapshot
+/// history over the meta tables.
+struct MetaTableState {
+    schema: TableSchema,
+    writer: TableWriter,
+    file_index: FileIndex,
+    pending: Vec<MaterializedRow>,
+}
+
+impl MetaTableState {
+    fn new(schema: TableSchema) -> Self {
+        let writer = TableWriter::new(schema.clone());
+        Self {
+            schema,
+            writer,
+            file_index: FileIndex::new(),
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// Holds writers for the four control-plane meta tables (commits,
+/// checkpoints, compactions, maintenance). The `markers` table is
+/// handled separately by [`MetaMarkerWriter`] because its rows come
+/// from coordinator state rather than materializer outcomes.
+///
+/// Rows are buffered and flushed in batches via
+/// [`Materializer::flush_meta`]. The materializer auto-flushes at
+/// the end of each `cycle_table` / `compact_table` / `expire_cycle`
+/// / `cleanup_orphans_cycle` so the meta tables stay caught up
+/// without explicit caller orchestration.
+///
+/// A failure inside `flush_meta` does **not** roll back already-
+/// committed data snapshots — meta is best-effort observability,
+/// not part of the durability contract. We log the failure and
+/// drop the buffer so a poison-pill row doesn't pin every later
+/// flush.
+struct MetaRecorder {
+    commits: MetaTableState,
+    checkpoints: MetaTableState,
+    compactions: MetaTableState,
+    maintenance: MetaTableState,
+    /// Set on every recorded row's `worker_id` field if the per-stat
+    /// caller leaves it blank. Empty here means "not in distributed
+    /// mode" and stays NULL in the resulting parquet.
+    worker_id: String,
 }
 
 impl<C: Catalog> Materializer<C> {
@@ -213,6 +275,7 @@ impl<C: Catalog> Materializer<C> {
             cycle_limit,
             metrics,
             meta_marker: None,
+            meta_recorder: None,
         }
     }
 
@@ -234,6 +297,181 @@ impl<C: Catalog> Materializer<C> {
             writer,
             file_index: FileIndex::new(),
         });
+        Ok(())
+    }
+
+    /// Enable control-plane meta-table recording. Creates the four
+    /// meta tables (`<meta_namespace>.{commits, checkpoints,
+    /// compactions, maintenance}`) in the catalog if they don't
+    /// already exist, then attaches a [`MetaRecorder`] that buffers
+    /// row data on every user-table commit / compaction / maintenance
+    /// op. Buffered rows are committed to their respective Iceberg
+    /// table on each cycle's tail call to [`Self::flush_meta`].
+    ///
+    /// Idempotent — safe to call repeatedly with the same
+    /// `meta_namespace`. The materializer no-ops if a table
+    /// already exists in the catalog with the matching schema; an
+    /// existing table with a *different* schema (e.g. an old
+    /// version pre-dating a column add) returns the catalog's error
+    /// because we don't auto-evolve the meta schema yet.
+    ///
+    /// `worker_id` is stamped on every recorded row's
+    /// `worker_id` column when the per-stat caller leaves it
+    /// blank. Pass an empty string when not running in
+    /// distributed/horizontal mode.
+    pub async fn enable_meta_recording(
+        &mut self,
+        meta_namespace: &str,
+        worker_id: impl Into<String>,
+    ) -> Result<()> {
+        let ns = pg2iceberg_core::Namespace(vec![meta_namespace.to_string()]);
+        self.catalog.ensure_namespace(&ns).await?;
+
+        let commits_schema = meta_schema::meta_commits_schema(meta_namespace);
+        let checkpoints_schema = meta_schema::meta_checkpoints_schema(meta_namespace);
+        let compactions_schema = meta_schema::meta_compactions_schema(meta_namespace);
+        let maintenance_schema = meta_schema::meta_maintenance_schema(meta_namespace);
+
+        for s in [
+            &commits_schema,
+            &checkpoints_schema,
+            &compactions_schema,
+            &maintenance_schema,
+        ] {
+            if self.catalog.load_table(&s.ident).await?.is_none() {
+                self.catalog.create_table(s).await?;
+            }
+        }
+
+        self.meta_recorder = Some(MetaRecorder {
+            commits: MetaTableState::new(commits_schema),
+            checkpoints: MetaTableState::new(checkpoints_schema),
+            compactions: MetaTableState::new(compactions_schema),
+            maintenance: MetaTableState::new(maintenance_schema),
+            worker_id: worker_id.into(),
+        });
+        Ok(())
+    }
+
+    /// Buffer a `<meta_ns>.commits` row. No-op when meta recording is
+    /// disabled. Worker id is filled in from the recorder's default
+    /// when the stat's worker_id is empty.
+    pub fn record_flush(&mut self, mut stats: FlushStats) {
+        let mr = match self.meta_recorder.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        if stats.worker_id.is_empty() {
+            stats.worker_id = mr.worker_id.clone();
+        }
+        mr.commits.pending.push(MaterializedRow {
+            op: Op::Insert,
+            row: stats.to_row(),
+            unchanged_cols: Vec::new(),
+        });
+    }
+
+    /// Buffer a `<meta_ns>.checkpoints` row.
+    pub fn record_checkpoint(&mut self, mut stats: CheckpointStats) {
+        let mr = match self.meta_recorder.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        if stats.worker_id.is_empty() {
+            stats.worker_id = mr.worker_id.clone();
+        }
+        mr.checkpoints.pending.push(MaterializedRow {
+            op: Op::Insert,
+            row: stats.to_row(),
+            unchanged_cols: Vec::new(),
+        });
+    }
+
+    /// Buffer a `<meta_ns>.compactions` row.
+    pub fn record_compaction(&mut self, mut stats: CompactionStats) {
+        let mr = match self.meta_recorder.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        if stats.worker_id.is_empty() {
+            stats.worker_id = mr.worker_id.clone();
+        }
+        mr.compactions.pending.push(MaterializedRow {
+            op: Op::Insert,
+            row: stats.to_row(),
+            unchanged_cols: Vec::new(),
+        });
+    }
+
+    /// Buffer a `<meta_ns>.maintenance` row.
+    pub fn record_maintenance(&mut self, mut stats: MaintenanceStats) {
+        let mr = match self.meta_recorder.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        if stats.worker_id.is_empty() {
+            stats.worker_id = mr.worker_id.clone();
+        }
+        mr.maintenance.pending.push(MaterializedRow {
+            op: Op::Insert,
+            row: stats.to_row(),
+            unchanged_cols: Vec::new(),
+        });
+    }
+
+    /// Drain every meta-table buffer and commit one Iceberg snapshot
+    /// per non-empty buffer. Called automatically at the tail of
+    /// each `cycle_table` / `compact_table` / `expire_cycle` /
+    /// `cleanup_orphans_cycle`, and exposed publicly so external
+    /// drivers (snapshot-only mode, custom one-shots) can flush
+    /// after their own record_* calls.
+    ///
+    /// Errors are returned but do **not** roll back already-committed
+    /// data snapshots — meta is observability-only. The caller
+    /// typically logs and continues; a transient catalog blip
+    /// shouldn't take down the data path.
+    pub async fn flush_meta(&mut self) -> Result<()> {
+        // Flush each meta table independently. Splitting the
+        // borrows by-table lets us hold a single &mut to one buffer
+        // at a time without juggling a self-referencing struct.
+        let mut tables: Vec<&mut MetaTableState> = match self.meta_recorder.as_mut() {
+            Some(r) => vec![
+                &mut r.commits,
+                &mut r.checkpoints,
+                &mut r.compactions,
+                &mut r.maintenance,
+            ],
+            None => return Ok(()),
+        };
+        for state in tables.iter_mut() {
+            if state.pending.is_empty() {
+                continue;
+            }
+            let rows = std::mem::take(&mut state.pending);
+            let prepared = state.writer.prepare(&rows, &state.file_index)?;
+            let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared.data.len());
+            for chunk in prepared.data {
+                let path = self.namer.next_path(&state.schema.ident, "meta").await;
+                let byte_size = chunk.chunk.bytes.len() as u64;
+                self.blob_store
+                    .put(&path, Bytes::clone(&chunk.chunk.bytes))
+                    .await?;
+                data_files.push(DataFile {
+                    path,
+                    record_count: chunk.chunk.record_count,
+                    byte_size,
+                    equality_field_ids: vec![],
+                    partition_values: chunk.partition_values,
+                });
+            }
+            self.catalog
+                .commit_snapshot(PreparedCommit {
+                    ident: state.schema.ident.clone(),
+                    data_files,
+                    equality_deletes: Vec::new(),
+                })
+                .await?;
+        }
         Ok(())
     }
 
@@ -449,8 +687,13 @@ impl<C: Catalog> Materializer<C> {
     /// per-table to avoid scanning the entire prefix on every cycle.
     /// `now_ms` is the current wall-clock time (or test clock); orphans
     /// younger than `now_ms - grace_period_ms` are protected.
+    ///
+    /// Per-table outcomes are also recorded into `<meta_ns>.maintenance`
+    /// when meta recording is enabled, with `operation =
+    /// "clean_orphans"`. Meta-flush errors are logged and swallowed so
+    /// observability blips don't block cleanup retries.
     pub async fn cleanup_orphans_cycle(
-        &self,
+        &mut self,
         prefix: &str,
         now_ms: i64,
         grace_period_ms: i64,
@@ -465,6 +708,7 @@ impl<C: Catalog> Materializer<C> {
             );
             // The leading `prefix.trim_end_matches('/').to_string() + "/"`
             // normalizes any trailing slash so `format!` doesn't double-up.
+            let started_micros = now_micros();
             let outcome = pg2iceberg_iceberg::cleanup_orphans(
                 self.catalog.as_ref(),
                 self.blob_store.as_ref(),
@@ -476,7 +720,24 @@ impl<C: Catalog> Materializer<C> {
             .await
             .map_err(|e| MaterializerError::Cleanup(e.to_string()))?;
             if outcome.deleted > 0 || outcome.grace_protected > 0 {
+                if self.meta_recorder.is_some() {
+                    self.record_maintenance(MaintenanceStats {
+                        ts_micros: started_micros,
+                        worker_id: String::new(),
+                        table_name: format!("{}", ident),
+                        operation: meta_schema::MAINTENANCE_OP_CLEAN_ORPHANS.into(),
+                        items_affected: outcome.deleted as i32,
+                        bytes_freed: outcome.bytes_freed as i64,
+                        duration_ms: (now_micros() - started_micros) / 1000,
+                        pg2iceberg_commit_sha: String::new(),
+                    });
+                }
                 out.push((ident, outcome));
+            }
+        }
+        if self.meta_recorder.is_some() {
+            if let Err(e) = self.flush_meta().await {
+                tracing::warn!(error = %e, "orphan-cleanup meta flush failed");
             }
         }
         Ok(out)
@@ -486,17 +747,39 @@ impl<C: Catalog> Materializer<C> {
     /// `(ident, expired_count)` for tables that actually had snapshots
     /// dropped. `retention_ms` is the maximum age (in ms) a non-current
     /// snapshot may have before it's expired.
+    ///
+    /// Per-table outcomes are recorded into `<meta_ns>.maintenance`
+    /// when meta recording is enabled, with `operation =
+    /// "expire_snapshots"`.
     pub async fn expire_cycle(&mut self, retention_ms: i64) -> Result<Vec<(TableIdent, usize)>> {
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
         for ident in idents {
+            let started_micros = now_micros();
             let n = self
                 .catalog
                 .expire_snapshots(&ident, retention_ms)
                 .await
                 .map_err(MaterializerError::Catalog)?;
             if n > 0 {
+                if self.meta_recorder.is_some() {
+                    self.record_maintenance(MaintenanceStats {
+                        ts_micros: started_micros,
+                        worker_id: String::new(),
+                        table_name: format!("{}", ident),
+                        operation: meta_schema::MAINTENANCE_OP_EXPIRE_SNAPSHOTS.into(),
+                        items_affected: n as i32,
+                        bytes_freed: 0,
+                        duration_ms: (now_micros() - started_micros) / 1000,
+                        pg2iceberg_commit_sha: String::new(),
+                    });
+                }
                 out.push((ident, n));
+            }
+        }
+        if self.meta_recorder.is_some() {
+            if let Err(e) = self.flush_meta().await {
+                tracing::warn!(error = %e, "expire-snapshots meta flush failed");
             }
         }
         Ok(out)
@@ -519,6 +802,7 @@ impl<C: Catalog> Materializer<C> {
         let pk_cols = entry.pk_cols.clone();
 
         let namer = self.namer.clone();
+        let started_micros = now_micros();
         let outcome = pg2iceberg_iceberg::compact_table(
             self.catalog.as_ref(),
             self.blob_store.as_ref(),
@@ -538,7 +822,7 @@ impl<C: Catalog> Materializer<C> {
         // If we actually rewrote anything, rebuild FileIndex from the
         // new catalog state. Stale entries pointing at compacted-away
         // files would route deletes incorrectly.
-        if outcome.is_some() {
+        if let Some(o) = &outcome {
             let entry_mut = self.tables.get_mut(ident).expect("checked above");
             let fresh = pg2iceberg_iceberg::rebuild_from_catalog(
                 self.catalog.as_ref(),
@@ -550,6 +834,37 @@ impl<C: Catalog> Materializer<C> {
             .await
             .map_err(|e| MaterializerError::Compact(e.to_string()))?;
             entry_mut.file_index = fresh;
+
+            // Record + flush a meta `compactions` row. Best-effort:
+            // any meta-write error is logged but doesn't roll back
+            // the compaction snapshot (already durable above).
+            if self.meta_recorder.is_some() {
+                let post = self.catalog.load_table(ident).await?;
+                let snap_id = post
+                    .as_ref()
+                    .and_then(|m| m.current_snapshot_id)
+                    .unwrap_or(0);
+                self.record_compaction(CompactionStats {
+                    ts_micros: started_micros,
+                    worker_id: String::new(),
+                    table_name: format!("{}", ident),
+                    partition: String::new(),
+                    snapshot_id: snap_id,
+                    sequence_number: snap_id,
+                    input_data_files: o.input_data_files as i32,
+                    input_delete_files: o.input_delete_files as i32,
+                    output_data_files: o.output_data_files as i32,
+                    rows_rewritten: o.rows_rewritten as i64,
+                    rows_removed: o.rows_removed_by_deletes as i64,
+                    bytes_before: o.bytes_before as i64,
+                    bytes_after: o.bytes_after as i64,
+                    duration_ms: (now_micros() - started_micros) / 1000,
+                    pg2iceberg_commit_sha: String::new(),
+                });
+                if let Err(e) = self.flush_meta().await {
+                    tracing::warn!(error = %e, table = %ident, "compaction meta flush failed");
+                }
+            }
         }
 
         Ok(outcome)
@@ -600,7 +915,29 @@ impl<C: Catalog> Materializer<C> {
             all_events.append(&mut chunk);
         }
 
-        // 3b. Expand any TRUNCATE events into per-PK deletes against
+        // 3b. Capture per-cycle observability stats from `all_events`
+        //     BEFORE the fold collapses them to per-PK. We need the
+        //     full event stream to compute max LSN, max source-side
+        //     ts, and the distinct-xid count for the meta `commits`
+        //     row.
+        let max_lsn: i64 = all_events
+            .iter()
+            .map(|e| e.lsn.0 as i64)
+            .max()
+            .unwrap_or(0);
+        let max_source_ts_micros: i64 =
+            all_events.iter().map(|e| e.commit_ts.0).max().unwrap_or(0);
+        let tx_count: i32 = {
+            let mut xids: BTreeSet<u32> = BTreeSet::new();
+            for e in &all_events {
+                if let Some(x) = e.xid {
+                    xids.insert(x);
+                }
+            }
+            xids.len() as i32
+        };
+
+        // 3c. Expand any TRUNCATE events into per-PK deletes against
         //     the current FileIndex. A `TRUNCATE` in PG drops every
         //     row; in Iceberg we model that as one equality-delete
         //     per known PK so the next snapshot's MoR reads return
@@ -680,13 +1017,23 @@ impl<C: Catalog> Materializer<C> {
         }
 
         // 6. Commit catalog snapshot — durability gate.
-        self.catalog
+        let data_files_count = data_files.len() as i32;
+        let delete_files_count = delete_files.len() as i32;
+        let bytes_written: i64 = data_files
+            .iter()
+            .chain(delete_files.iter())
+            .map(|f| f.byte_size as i64)
+            .sum();
+        let cycle_started_micros = now_micros();
+        let post_commit_meta = self
+            .catalog
             .commit_snapshot(PreparedCommit {
                 ident: ident.clone(),
                 data_files,
                 equality_deletes: delete_files,
             })
             .await?;
+        let commit_duration_ms = (now_micros() - cycle_started_micros) / 1000;
 
         // 7. Advance cursor only after commit success.
         self.coord
@@ -715,7 +1062,39 @@ impl<C: Catalog> Materializer<C> {
                 .await?;
         }
 
+        // 10. Control-plane meta `commits` row + flush. Best-effort:
+        //     a meta-flush failure is logged but doesn't roll back
+        //     the user-table commit (already durable above).
         let folded_len = folded.len();
+        if self.meta_recorder.is_some() {
+            let snap_id = post_commit_meta.current_snapshot_id.unwrap_or(0);
+            self.record_flush(FlushStats {
+                ts_micros: cycle_started_micros,
+                worker_id: String::new(),
+                table_name: format!("{}", ident),
+                mode: "logical".into(),
+                snapshot_id: snap_id,
+                sequence_number: snap_id,
+                lsn: max_lsn,
+                rows: folded_len as i64,
+                bytes: bytes_written,
+                duration_ms: commit_duration_ms,
+                data_files: data_files_count,
+                delete_files: delete_files_count,
+                max_source_ts_micros,
+                schema_id: 0,
+                tx_count,
+                pg2iceberg_commit_sha: String::new(),
+            });
+            if let Err(e) = self.flush_meta().await {
+                tracing::warn!(
+                    error = %e,
+                    table = %ident,
+                    "flush_meta failed; data commit was successful"
+                );
+            }
+        }
+
         self.metrics
             .counter(names::MATERIALIZER_ROWS_TOTAL, &labels, folded_len as u64);
         Ok(folded_len)
@@ -829,6 +1208,17 @@ impl<C: Catalog> Materializer<C> {
         }
         Ok(out)
     }
+}
+
+/// Wall-clock micros since unix epoch. Used by meta-table rows for
+/// `ts` / `last_flush_at`. We don't read this from a `Clock` trait
+/// because the meta tables are observability-only — drift between
+/// `Clock`-driven test time and wall-clock here is acceptable.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 /// Expand `Op::Truncate` events into per-PK `Op::Delete` events

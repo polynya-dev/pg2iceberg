@@ -2924,6 +2924,7 @@ dependencies = [
  "pollster",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

@@ -7,6 +7,7 @@ pub mod compact;
 pub mod file_index;
 pub mod fold;
 pub mod materialize;
+pub mod meta;
 pub mod orphan;
 #[cfg(feature = "prod")]
 pub mod prod;

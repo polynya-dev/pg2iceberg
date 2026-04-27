@@ -389,6 +389,17 @@ where
             .enable_meta_markers(meta_schema)
             .await
             .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
+        // Enable the four control-plane meta tables (commits,
+        // checkpoints, compactions, maintenance). They share the
+        // same `meta_ns` as the markers table — a single config
+        // toggle (`sink.meta_namespace`) opts in to the full
+        // observability surface. Worker id stays empty in the
+        // single-process port; distributed mode (gap #3) will
+        // populate it.
+        materializer
+            .enable_meta_recording(meta_ns, "")
+            .await
+            .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
     }
     tracing::info!(count = lc.schemas.len(), "tables registered");
 
