@@ -170,6 +170,31 @@ pub struct Materializer<C: Catalog> {
     /// row and `flush_meta` (called at end of each cycle) commits
     /// the buffered rows to Iceberg.
     meta_recorder: Option<MetaRecorder>,
+    /// Distributed-materializer mode toggle. When `Some`, each
+    /// `cycle()` invocation:
+    ///   1. Refreshes this worker's heartbeat via
+    ///      `Coordinator::register_consumer`.
+    ///   2. Reads the active-worker list and deterministically
+    ///      round-robins tables across them (sorted tables, sorted
+    ///      workers, `table[i]` → `workers[i % N]`).
+    ///   3. Skips `cycle_table` for tables not assigned to this
+    ///      worker.
+    /// When `None`, every registered table runs every cycle —
+    /// the single-process default. The `consumer_ttl` field
+    /// controls how long a missed heartbeat survives before the
+    /// worker drops out of the active list.
+    distributed: Option<DistributedMode>,
+}
+
+/// Distributed-mode parameters. Built by
+/// [`Materializer::enable_distributed_mode`].
+#[derive(Clone)]
+struct DistributedMode {
+    worker_id: pg2iceberg_core::WorkerId,
+    consumer_ttl: std::time::Duration,
+    /// Cached previous assignment so we can log rebalance deltas
+    /// (added/removed tables) when the active worker set changes.
+    last_assigned: Option<std::collections::BTreeSet<TableIdent>>,
 }
 
 struct MetaMarkerWriter {
@@ -276,6 +301,7 @@ impl<C: Catalog> Materializer<C> {
             metrics,
             meta_marker: None,
             meta_recorder: None,
+            distributed: None,
         }
     }
 
@@ -647,8 +673,123 @@ impl<C: Catalog> Materializer<C> {
         Ok(())
     }
 
+    /// Enable distributed-materializer mode. Subsequent [`Self::cycle`]
+    /// calls will heartbeat this worker, read the active-worker
+    /// list, and round-robin tables across workers. Pass a stable,
+    /// process-unique `worker_id` (e.g. a k8s pod name); two
+    /// processes claiming the same id race to refresh the same
+    /// `_pg2iceberg.consumers` row and produce undefined assignment.
+    /// `consumer_ttl` is how long a worker survives without
+    /// heartbeating — Go's default is 30s, which we mirror.
+    pub fn enable_distributed_mode(
+        &mut self,
+        worker_id: pg2iceberg_core::WorkerId,
+        consumer_ttl: std::time::Duration,
+    ) {
+        self.distributed = Some(DistributedMode {
+            worker_id,
+            consumer_ttl,
+            last_assigned: None,
+        });
+    }
+
+    /// Drop this worker from the coordinator's active set so peer
+    /// workers rebalance immediately rather than waiting for the
+    /// heartbeat TTL to expire. No-op when distributed mode is off.
+    /// Logs but doesn't propagate errors — shutdown ergonomics
+    /// shouldn't be tripped by a transient coord blip.
+    pub async fn shutdown_distributed(&mut self) {
+        let dm = match self.distributed.as_ref() {
+            Some(d) => d,
+            None => return,
+        };
+        if let Err(e) = self
+            .coord
+            .unregister_consumer(&self.group, &dm.worker_id)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                worker = %dm.worker_id.0,
+                "unregister_consumer failed during shutdown"
+            );
+        } else {
+            tracing::info!(
+                worker = %dm.worker_id.0,
+                group = %self.group,
+                "worker unregistered from consumer group"
+            );
+        }
+    }
+
     pub async fn cycle(&mut self) -> Result<usize> {
-        let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
+        // 1. Default path: process every registered table.
+        let mut idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
+
+        // 2. Distributed path: refresh heartbeat, read active-worker
+        //    list, compute deterministic round-robin assignment,
+        //    filter `idents` to just our slice.
+        //
+        //    Mirrors `pg2iceberg/logical/materializer.go:225-282`. No
+        //    locks — every worker computes the same assignment from
+        //    the same active-worker list, and rebalances are
+        //    "atomic" in the sense that the assignment changes the
+        //    moment the active-worker list does.
+        if let Some(dm) = self.distributed.clone() {
+            self.coord
+                .register_consumer(&self.group, &dm.worker_id, dm.consumer_ttl)
+                .await?;
+            let mut workers = self.coord.active_consumers(&self.group).await?;
+            // Coordinator returns workers sorted by id (per the trait
+            // contract on `pg2iceberg-coord`); enforce here so a
+            // misbehaving impl can't break determinism.
+            workers.sort_by(|a, b| a.0.cmp(&b.0));
+            if workers.is_empty() {
+                return Ok(0);
+            }
+            // Sort tables for deterministic distribution. Without
+            // this, a HashMap iteration order would yield different
+            // assignments on different workers.
+            idents.sort();
+            let n = workers.len();
+            let assigned: std::collections::BTreeSet<TableIdent> = idents
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| workers[i % n] == dm.worker_id)
+                .map(|(_, t)| t.clone())
+                .collect();
+            // Log rebalance deltas. The first cycle prints `assigned`
+            // unconditionally; subsequent cycles only when membership
+            // changed.
+            let dm_state = self
+                .distributed
+                .as_mut()
+                .expect("distributed checked above");
+            match &dm_state.last_assigned {
+                None => tracing::info!(
+                    worker = %dm.worker_id.0,
+                    workers = workers.len(),
+                    tables = assigned.len(),
+                    "distributed assignment computed"
+                ),
+                Some(prev) if prev != &assigned => {
+                    let added: Vec<&TableIdent> = assigned.difference(prev).collect();
+                    let removed: Vec<&TableIdent> = prev.difference(&assigned).collect();
+                    tracing::info!(
+                        worker = %dm.worker_id.0,
+                        workers = workers.len(),
+                        added = ?added,
+                        removed = ?removed,
+                        tables = assigned.len(),
+                        "distributed assignment rebalanced"
+                    );
+                }
+                _ => {}
+            }
+            dm_state.last_assigned = Some(assigned.clone());
+            idents.retain(|t| assigned.contains(t));
+        }
+
         let mut total = 0;
         for ident in idents {
             total += self.cycle_table(&ident).await?;

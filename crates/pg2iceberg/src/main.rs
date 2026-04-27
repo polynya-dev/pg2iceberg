@@ -109,6 +109,36 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Distributed mode: WAL writer only. Captures pgoutput, stages
+    /// parquet to S3, advances the slot. **Does not run the
+    /// materializer cycle** — pair with one or more
+    /// `materializer-only` workers reading from the same coord.
+    ///
+    /// Mirrors Go's `--stream-only`. Only one stream-only process
+    /// per slot (PG enforces single consumer); scale the
+    /// materializer side instead.
+    StreamOnly {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Distributed mode: materializer worker only. Reads staged
+    /// parquet from coord + S3 and writes to Iceberg. **Does not
+    /// open a replication slot**. Multiple workers register under
+    /// the same `consumer_group` and round-robin tables across
+    /// themselves; rebalances automatically on join/leave.
+    ///
+    /// Mirrors Go's `--materializer-only`. The `--worker-id` must
+    /// be process-unique (e.g. a k8s pod name) and stable across
+    /// restarts of the same process.
+    MaterializerOnly {
+        #[arg(long)]
+        config: PathBuf,
+        /// Process-unique worker identity. Two workers claiming the
+        /// same id will trample each other's heartbeat row in
+        /// `_pg2iceberg.consumers` and produce undefined assignment.
+        #[arg(long)]
+        worker_id: String,
+    },
 }
 
 #[tokio::main]
@@ -135,6 +165,10 @@ async fn main() -> Result<()> {
         }
         Command::Snapshot { config } => run::run_snapshot_only(Config::load_from(config)?).await,
         Command::Cleanup { config } => run::run_cleanup(Config::load_from(config)?).await,
+        Command::StreamOnly { config } => run::run_stream_only(Config::load_from(config)?).await,
+        Command::MaterializerOnly { config, worker_id } => {
+            run::run_materializer_only(Config::load_from(config)?, worker_id).await
+        }
     }
 }
 

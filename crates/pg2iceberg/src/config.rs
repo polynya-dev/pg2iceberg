@@ -223,6 +223,12 @@ pub struct SinkConfig {
     pub flush_interval: String,
     #[serde(default = "default_flush_rows")]
     pub flush_rows: usize,
+    /// Materializer cycle interval. Matches Go's `materializer_interval`.
+    /// Empty = use the lifecycle's default (10s). Only consulted by the
+    /// `materializer-only` subcommand; the integrated `run` mode uses
+    /// `Schedule::materialize` from the runner module.
+    #[serde(default)]
+    pub materializer_interval: String,
 
     /// Compaction file-count thresholds. Names match Go
     /// (`compaction_data_files`, `compaction_delete_files`). Compaction
@@ -300,6 +306,7 @@ impl Default for SinkConfig {
             s3_region: default_region(),
             flush_interval: String::new(),
             flush_rows: default_flush_rows(),
+            materializer_interval: String::new(),
             compaction_data_files: default_compaction_data_files(),
             compaction_delete_files: default_compaction_delete_files(),
             target_file_size: default_target_file_size(),

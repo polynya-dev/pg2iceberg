@@ -255,10 +255,136 @@ fn prefix_from_warehouse(warehouse: &str) -> Option<String> {
     }
 }
 
+/// Distributed mode: WAL writer only. Same as [`run`] in logical mode,
+/// but disables the materializer cycle handler so a paired
+/// `materializer-only` process (or several, round-robined across
+/// tables) does the catalog commits.
+///
+/// Implementation: run the regular logical lifecycle but stamp the
+/// `Schedule::materialize` interval to a duration that effectively
+/// never fires. Flush + Standby + Watcher still run on their normal
+/// cadences so the slot stays advanced and invariants stay
+/// monitored.
+pub async fn run_stream_only(cfg: Config) -> Result<()> {
+    if cfg.sink.catalog_uri.is_empty() {
+        anyhow::bail!("sink.catalog_uri is required");
+    }
+    let catalog = build_rest_catalog(&cfg).await?;
+    let catalog = IcebergRustCatalog::new(Arc::new(catalog));
+    let blob = build_blob_for_run(&cfg, &catalog)
+        .await
+        .context("build blob store")?;
+    if cfg.source.mode != "" && cfg.source.mode != "logical" {
+        anyhow::bail!(
+            "stream-only is logical-mode only; got source.mode={:?}",
+            cfg.source.mode
+        );
+    }
+    run_inner_with_schedule(
+        cfg,
+        catalog,
+        blob,
+        // 100 years — fire_due never matches, so the materializer
+        // handler is effectively disabled. Picked over Duration::MAX
+        // because some duration math saturates to MAX and would
+        // never sleep.
+        Some(std::time::Duration::from_secs(100 * 365 * 24 * 60 * 60)),
+    )
+    .await
+}
+
+/// Distributed mode: materializer worker only. Builds catalog + coord
+/// + materializer, registers tables, enables distributed mode with
+/// the operator-supplied `worker_id`, and loops `cycle()` on the
+/// configured interval. **No PG replication slot is opened** —
+/// staged parquet comes from the coord log written by a paired
+/// `stream-only` process.
+///
+/// Multiple workers under the same `state.group` heartbeat into
+/// `_pg2iceberg.consumers` and round-robin tables across themselves
+/// deterministically (sorted tables → sorted workers → `[i % N]`).
+/// Joins and leaves rebalance on the next cycle automatically.
+pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()> {
+    use pg2iceberg_core::WorkerId;
+
+    if worker_id.is_empty() {
+        anyhow::bail!("--worker-id is required for materializer-only mode");
+    }
+    let mut materializer = build_one_shot_materializer(cfg.clone()).await?;
+
+    // Heartbeat TTL mirrors Go's `lockTTL = 30 * time.Second` in
+    // `logical/materializer.go:222`. The lifecycle's main-loop
+    // ticker fires `cycle()` (and thus the heartbeat refresh)
+    // typically every 10s, so a 30s TTL gives ~3 missed cycles
+    // before a worker drops out of the active list.
+    let consumer_ttl = std::time::Duration::from_secs(30);
+    materializer.enable_distributed_mode(WorkerId(worker_id.clone()), consumer_ttl);
+
+    // Cycle interval. Mirrors Go's `MaterializerInterval` (default 10s).
+    let cycle_interval = if cfg.sink.materializer_interval.is_empty() {
+        std::time::Duration::from_secs(10)
+    } else {
+        humantime::parse_duration(&cfg.sink.materializer_interval).with_context(|| {
+            format!(
+                "parse sink.materializer_interval `{}`",
+                cfg.sink.materializer_interval
+            )
+        })?
+    };
+
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+
+    tracing::info!(
+        worker = %worker_id,
+        group = %cfg.state.group,
+        interval = ?cycle_interval,
+        "materializer-only worker starting"
+    );
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = sigint.recv() => {
+                tracing::info!("SIGINT received, materializer-only shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received, materializer-only shutting down");
+                break;
+            }
+            _ = tokio::time::sleep(cycle_interval) => {
+                if let Err(e) = materializer.cycle().await {
+                    // Log but don't fail loudly: a transient blob /
+                    // coord error shouldn't take the worker out of
+                    // the rotation. Persistent errors will surface
+                    // via metrics + the next operator-side check.
+                    tracing::warn!(error = %e, "materializer cycle failed; will retry next interval");
+                }
+            }
+        }
+    }
+
+    materializer.shutdown_distributed().await;
+    Ok(())
+}
+
 async fn run_inner<C>(
     cfg: Config,
     catalog: IcebergRustCatalog<C>,
     blob: Arc<dyn BlobStore>,
+) -> Result<()>
+where
+    C: iceberg::Catalog + Send + Sync + 'static,
+{
+    run_inner_with_schedule(cfg, catalog, blob, None).await
+}
+
+async fn run_inner_with_schedule<C>(
+    cfg: Config,
+    catalog: IcebergRustCatalog<C>,
+    blob: Arc<dyn BlobStore>,
+    materialize_override: Option<std::time::Duration>,
 ) -> Result<()>
 where
     C: iceberg::Catalog + Send + Sync + 'static,
@@ -274,9 +400,20 @@ where
     let id_gen = Arc::new(crate::realio::RealIdGen::new());
     let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
         Arc::new(UuidBlobNamer::new(id_gen.clone(), "staged"));
-    let lifecycle = crate::setup::build_logical_lifecycle(&cfg, catalog, blob, blob_namer)
-        .await
-        .context("build logical lifecycle")?;
+    let mut lifecycle =
+        crate::setup::build_logical_lifecycle(&cfg, catalog, blob, blob_namer)
+            .await
+            .context("build logical lifecycle")?;
+    if let Some(d) = materialize_override {
+        // Stream-only: bump the materialize handler interval so far
+        // out it never fires. Keeps the shape of the lifecycle the
+        // same — slot management, snapshot phase, flush, standby,
+        // watcher all run normally.
+        lifecycle.schedule.materialize = d;
+        tracing::info!(
+            "stream-only mode: materializer cycle disabled (interval set to {d:?})"
+        );
+    }
 
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
