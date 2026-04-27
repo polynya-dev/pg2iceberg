@@ -33,7 +33,7 @@ use pg2iceberg_coord::{
 use pg2iceberg_core::{Checkpoint, Lsn, Mode, Namespace, TableIdent, WorkerId};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::ContainerAsync;
+use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
 use tokio::sync::OnceCell;
 
 /// One PG container per test binary, lazily started. Tests isolate
@@ -48,6 +48,12 @@ struct SharedPg {
 async fn shared_pg() -> &'static SharedPg {
     PG.get_or_init(|| async {
         let container = Postgres::default()
+            // Pin a current PG so the coord schema migrations and
+            // SQL idioms run against the same version operators
+            // most likely deploy to. testcontainers-modules' default
+            // is `11-alpine`, which is too old for some of our
+            // queries (e.g. `pg_replication_slots.wal_status`).
+            .with_tag("16-alpine")
             .start()
             .await
             .expect("start postgres container");

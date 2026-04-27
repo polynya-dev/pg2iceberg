@@ -97,6 +97,33 @@ pub struct SlotState {
     pub restart_lsn: Lsn,
     /// LSN the consumer has acknowledged as durably committed downstream.
     pub confirmed_flush_lsn: Lsn,
+    /// Mirrors `pg_replication_slots.wal_status` (PG 13+). Defaults
+    /// to [`SimWalStatus::Reserved`] (healthy). Tests can override
+    /// via [`SimPostgres::set_slot_wal_status`] to model a slot
+    /// transitioning toward `lost`.
+    pub wal_status: SimWalStatus,
+    /// Mirrors `pg_replication_slots.conflicting` (PG 14+). Tests
+    /// can flip to `true` via
+    /// [`SimPostgres::set_slot_conflicting`] to model a slot killed
+    /// by physical-replication conflict.
+    pub conflicting: bool,
+    /// Mirrors `pg_replication_slots.safe_wal_size`. Defaults to a
+    /// large positive value. Tests don't typically read this; it's
+    /// here for the metric surface.
+    pub safe_wal_size: i64,
+}
+
+/// Sim-side mirror of [`pg2iceberg_pg::WalStatus`]. Kept as a
+/// separate type so the sim crate doesn't pull `pg2iceberg_pg` as
+/// a non-test dep — the conversion happens at the
+/// [`SimPgClient`] boundary.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum SimWalStatus {
+    #[default]
+    Reserved,
+    Extended,
+    Unreserved,
+    Lost,
 }
 
 #[derive(Clone, Debug)]
@@ -214,9 +241,37 @@ impl SimPostgres {
                 publication: publication.to_string(),
                 restart_lsn: lsn,
                 confirmed_flush_lsn: lsn,
+                wal_status: SimWalStatus::default(),
+                conflicting: false,
+                safe_wal_size: 1024 * 1024 * 1024,
             },
         );
         Ok(lsn)
+    }
+
+    /// Test hook: force a slot's `wal_status` to model PG's
+    /// `unreserved` / `lost` transitions. Used by DST to drive
+    /// startup-validation + watcher coverage of the slot-loss path.
+    pub fn set_slot_wal_status(&self, name: &str, status: SimWalStatus) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let slot = s
+            .slots
+            .get_mut(name)
+            .ok_or_else(|| SimError::UnknownSlot(name.to_string()))?;
+        slot.wal_status = status;
+        Ok(())
+    }
+
+    /// Test hook: flip a slot's `conflicting` flag. Models PG 14+'s
+    /// physical-replication-conflict slot kill.
+    pub fn set_slot_conflicting(&self, name: &str, conflicting: bool) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let slot = s
+            .slots
+            .get_mut(name)
+            .ok_or_else(|| SimError::UnknownSlot(name.to_string()))?;
+        slot.conflicting = conflicting;
+        Ok(())
     }
 
     pub fn slot_state(&self, name: &str) -> Result<SlotState> {
@@ -847,6 +902,30 @@ impl PgClient for SimPgClient {
             Ok(s) => Ok(Some(s.confirmed_flush_lsn)),
             Err(_) => Ok(None),
         }
+    }
+
+    async fn slot_health(
+        &self,
+        slot: &str,
+    ) -> std::result::Result<Option<pg2iceberg_pg::SlotHealth>, PgError> {
+        let s = match self.db.slot_state(slot) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let wal_status = Some(match s.wal_status {
+            crate::postgres::SimWalStatus::Reserved => pg2iceberg_pg::WalStatus::Reserved,
+            crate::postgres::SimWalStatus::Extended => pg2iceberg_pg::WalStatus::Extended,
+            crate::postgres::SimWalStatus::Unreserved => pg2iceberg_pg::WalStatus::Unreserved,
+            crate::postgres::SimWalStatus::Lost => pg2iceberg_pg::WalStatus::Lost,
+        });
+        Ok(Some(pg2iceberg_pg::SlotHealth {
+            exists: true,
+            restart_lsn: s.restart_lsn,
+            confirmed_flush_lsn: s.confirmed_flush_lsn,
+            wal_status,
+            conflicting: s.conflicting,
+            safe_wal_size: Some(s.safe_wal_size),
+        }))
     }
 
     async fn export_snapshot(&self) -> std::result::Result<SnapshotId, PgError> {

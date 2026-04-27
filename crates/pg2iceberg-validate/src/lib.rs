@@ -47,11 +47,19 @@ pub struct TableExistence {
     pub current_snapshot_id: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SlotState {
     pub exists: bool,
     pub restart_lsn: Lsn,
     pub confirmed_flush_lsn: Lsn,
+    /// `Some` on PG 13+; `None` on older versions. Drives the
+    /// `wal_status = lost` startup-validation invariant — without
+    /// this we'd attempt `START_REPLICATION` on a slot whose WAL
+    /// is gone and surface a confusing PG error mid-startup.
+    pub wal_status: Option<pg2iceberg_pg::WalStatus>,
+    /// PG 14+. `true` indicates the slot was killed by physical-
+    /// replication conflict during recovery — also unrecoverable.
+    pub conflicting: bool,
 }
 
 /// One violation found during startup validation. Each variant prints an
@@ -118,6 +126,24 @@ pub enum Violation {
          have been recreated externally; delete the checkpoint to re-snapshot"
     )]
     SnapshotCompleteButTableNoSnapshot { table: String },
+
+    #[error(
+        "replication slot {slot_name:?} has wal_status=lost; the WAL behind \
+         restart_lsn ({restart_lsn}) has been recycled past `max_slot_wal_keep_size` \
+         and the slot cannot be resumed. drop the slot and the Iceberg tables, then \
+         re-snapshot from scratch — there is no safe way to skip ahead"
+    )]
+    SlotLost {
+        slot_name: String,
+        restart_lsn: Lsn,
+    },
+
+    #[error(
+        "replication slot {slot_name:?} is conflicting (killed by physical-replication \
+         conflict during recovery); the slot cannot be resumed safely. drop the slot \
+         and the Iceberg tables, then re-snapshot from scratch"
+    )]
+    SlotConflicting { slot_name: String },
 }
 
 /// Aggregate error returned by [`validate_startup`].
@@ -232,6 +258,30 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
                     });
                 }
             }
+        }
+    }
+
+    // 9. Slot is `lost` — WAL recycled past `max_slot_wal_keep_size`.
+    //    `wal_status = None` (pre-PG-13) skips this check; `Reserved`
+    //    / `Extended` / `Unreserved` are non-fatal at startup
+    //    (`Unreserved` is a *warning* surfaced by the watcher).
+    if let Some(slot) = &v.slot {
+        if slot.exists
+            && matches!(slot.wal_status, Some(pg2iceberg_pg::WalStatus::Lost))
+        {
+            violations.push(Violation::SlotLost {
+                slot_name: v.slot_name.clone(),
+                restart_lsn: slot.restart_lsn,
+            });
+        }
+    }
+
+    // 10. Slot is `conflicting` (PG 14+) — killed by physical-rep conflict.
+    if let Some(slot) = &v.slot {
+        if slot.exists && slot.conflicting {
+            violations.push(Violation::SlotConflicting {
+                slot_name: v.slot_name.clone(),
+            });
         }
     }
 

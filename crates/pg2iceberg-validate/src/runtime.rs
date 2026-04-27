@@ -92,10 +92,14 @@ where
 /// Run one watcher tick — builds [`WatcherInputs`] and calls
 /// [`InvariantWatcher::check`]. Mirrors the binary's
 /// `Handler::Watcher` arm.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_watcher_tick(
     watcher: &InvariantWatcher,
     pipeline_flushed_lsn: Lsn,
     slot_confirmed_flush_lsn: Lsn,
+    slot_wal_status: Option<pg2iceberg_pg::WalStatus>,
+    slot_safe_wal_size: Option<i64>,
+    slot_name: &str,
     group: &str,
     watched_tables: &[TableIdent],
 ) -> Vec<InvariantViolation> {
@@ -104,6 +108,9 @@ pub async fn run_watcher_tick(
         slot_confirmed_flush_lsn,
         group: group.to_string(),
         watched_tables: watched_tables.to_vec(),
+        slot_wal_status,
+        slot_safe_wal_size,
+        slot_name: slot_name.to_string(),
     };
     watcher.check(&inputs).await
 }
@@ -490,24 +497,25 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
             current_snapshot_id: meta.and_then(|m| m.current_snapshot_id),
         });
     }
-    let slot_exists = pg.slot_exists(slot_name).await?;
-    let slot = if slot_exists {
-        let restart_lsn = pg.slot_restart_lsn(slot_name).await?.unwrap_or(Lsn::ZERO);
-        let confirmed_flush_lsn = pg
-            .slot_confirmed_flush_lsn(slot_name)
-            .await?
-            .unwrap_or(Lsn::ZERO);
-        Some(SlotState {
+    // One round-trip combined slot probe — covers exists,
+    // restart_lsn, confirmed_flush_lsn, wal_status, conflicting,
+    // safe_wal_size. The two new health fields drive invariants 9
+    // and 10 in `validate_startup`.
+    let slot = match pg.slot_health(slot_name).await? {
+        Some(h) => Some(SlotState {
             exists: true,
-            restart_lsn,
-            confirmed_flush_lsn,
-        })
-    } else {
-        Some(SlotState {
+            restart_lsn: h.restart_lsn,
+            confirmed_flush_lsn: h.confirmed_flush_lsn,
+            wal_status: h.wal_status,
+            conflicting: h.conflicting,
+        }),
+        None => Some(SlotState {
             exists: false,
             restart_lsn: Lsn::ZERO,
             confirmed_flush_lsn: Lsn::ZERO,
-        })
+            wal_status: None,
+            conflicting: false,
+        }),
     };
     let v = StartupValidation {
         checkpoint,
@@ -655,17 +663,31 @@ where
             }
         }
         Handler::Watcher => {
-            let confirmed = loop_state
+            // One combined slot probe per tick covers
+            // confirmed_flush_lsn (invariant 1) + wal_status
+            // (invariant 4: SlotWalUnreserved warning before the
+            // slot transitions to `lost`). Falling back to
+            // `confirmed_flush_lsn`-only if the health probe
+            // errors (transient — same drop-tick policy as before).
+            let health = loop_state
                 .slot_monitor
-                .confirmed_flush_lsn(&loop_state.slot_name)
+                .slot_health_for_watcher(&loop_state.slot_name)
                 .await
                 .ok()
-                .flatten()
+                .flatten();
+            let confirmed = health
+                .as_ref()
+                .map(|h| h.confirmed_flush_lsn)
                 .unwrap_or(Lsn::ZERO);
+            let wal_status = health.as_ref().and_then(|h| h.wal_status);
+            let safe_wal_size = health.as_ref().and_then(|h| h.safe_wal_size);
             let violations = run_watcher_tick(
                 &loop_state.watcher,
                 loop_state.pipeline.flushed_lsn(),
                 confirmed,
+                wal_status,
+                safe_wal_size,
+                &loop_state.slot_name,
                 &loop_state.group,
                 &loop_state.watched_tables,
             )

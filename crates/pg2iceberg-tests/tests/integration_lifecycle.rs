@@ -133,7 +133,10 @@ async fn bring_up_stack() -> Stack {
     let rest_url = format!("http://{rest_host}:{rest_port}");
 
     // ── Source PG ────────────────────────────────────────────────
+    // Pin to 16-alpine so the slot-health columns we query
+    // (`wal_status`, `safe_wal_size`, `conflicting`) are present.
     let src_pg: ContainerAsync<Postgres> = Postgres::default()
+        .with_tag("16-alpine")
         .with_cmd([
             "-c",
             "fsync=off",

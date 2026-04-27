@@ -50,12 +50,29 @@ pub enum InvariantViolation {
          watcher ticks; production should never observe this outside a documented restart"
     )]
     FlushedLsnRegressed { prior: Lsn, current: Lsn },
+
+    /// Slot's `wal_status = unreserved` — past `max_slot_wal_keep_size`.
+    /// At the next checkpoint, PG will recycle the WAL behind this slot
+    /// and transition to `lost`, breaking replication. Operator's last
+    /// chance to scale up the consumer / fix lag. Surfaced as a
+    /// non-fatal warning (the pipeline keeps running until the slot
+    /// actually transitions to `lost`).
+    #[error(
+        "invariant 4: replication slot {slot_name:?} is in `unreserved` state \
+         (safe_wal_size={safe_wal_size:?}); WAL will be recycled at the next \
+         checkpoint and the slot will transition to `lost`. fix consumer lag \
+         or raise `max_slot_wal_keep_size` immediately"
+    )]
+    SlotWalUnreserved {
+        slot_name: String,
+        safe_wal_size: Option<i64>,
+    },
 }
 
 /// Snapshot of state the watcher needs from one tick. The binary populates
 /// `slot_confirmed_flush_lsn` from the source PG; the rest are direct reads
 /// from the coord.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct WatcherInputs {
     pub pipeline_flushed_lsn: Lsn,
     pub slot_confirmed_flush_lsn: Lsn,
@@ -64,6 +81,18 @@ pub struct WatcherInputs {
     /// `max(end_offset)`.
     pub group: String,
     pub watched_tables: Vec<TableIdent>,
+    /// Slot's `wal_status` (PG 13+). `None` skips invariant 4.
+    /// Drives the `SlotWalUnreserved` warning: when the slot is past
+    /// `max_slot_wal_keep_size` but not yet `lost`, the watcher logs
+    /// a warning so the operator gets paged before the transition
+    /// to `lost` breaks replication.
+    pub slot_wal_status: Option<pg2iceberg_pg::WalStatus>,
+    /// Slot's `safe_wal_size` (PG 13+) — bytes until the slot
+    /// crosses into `unreserved`. Surfaced verbatim in the warning
+    /// for operator triage; no invariant logic uses it directly.
+    pub slot_safe_wal_size: Option<i64>,
+    /// Slot name — purely for the warning message body.
+    pub slot_name: String,
 }
 
 pub struct InvariantWatcher {
@@ -135,6 +164,21 @@ impl InvariantWatcher {
         // recovery rewind).
         self.last_flushed_lsn.store(current, Ordering::SeqCst);
 
+        // 4. Slot wal_status == Unreserved → warn (last chance before lost).
+        //    `Lost` is fatal and caught by startup validation; mid-run
+        //    transitions to `Lost` would also surface here on the next
+        //    tick — same pattern, but the lifecycle would have already
+        //    bounced on a `START_REPLICATION` error.
+        if matches!(
+            inputs.slot_wal_status,
+            Some(pg2iceberg_pg::WalStatus::Unreserved)
+        ) {
+            violations.push(InvariantViolation::SlotWalUnreserved {
+                slot_name: inputs.slot_name.clone(),
+                safe_wal_size: inputs.slot_safe_wal_size,
+            });
+        }
+
         // Emit one counter per violation for the metrics dashboard.
         for v in &violations {
             let mut labels = Labels::new();
@@ -142,6 +186,7 @@ impl InvariantWatcher {
                 InvariantViolation::PipelineAheadOfSlot { .. } => "pipeline_ahead_of_slot",
                 InvariantViolation::CursorAheadOfLogIndex { .. } => "cursor_ahead_of_log_index",
                 InvariantViolation::FlushedLsnRegressed { .. } => "flushed_lsn_regressed",
+                InvariantViolation::SlotWalUnreserved { .. } => "slot_wal_unreserved",
             };
             labels.insert("invariant".into(), invariant_id.into());
             self.metrics
@@ -193,7 +238,8 @@ mod tests {
             slot_confirmed_flush_lsn: Lsn(100),
             group: "default".into(),
             watched_tables: vec![],
-        };
+            ..Default::default()
+};
         let v = block_on(watcher.check(&inputs));
         assert!(v.is_empty());
     }
@@ -206,7 +252,8 @@ mod tests {
             slot_confirmed_flush_lsn: Lsn(100),
             group: "default".into(),
             watched_tables: vec![],
-        };
+            ..Default::default()
+};
         let v = block_on(watcher.check(&inputs));
         assert_eq!(v.len(), 1);
         assert!(matches!(
@@ -248,7 +295,8 @@ mod tests {
             slot_confirmed_flush_lsn: Lsn(0),
             group: "default".into(),
             watched_tables: vec![ident()],
-        };
+            ..Default::default()
+};
         let v = block_on(watcher.check(&inputs));
         assert_eq!(v.len(), 1);
         assert!(matches!(
@@ -266,7 +314,8 @@ mod tests {
             slot_confirmed_flush_lsn: Lsn(100),
             group: "default".into(),
             watched_tables: vec![],
-        }));
+            ..Default::default()
+}));
         assert!(v1.is_empty());
 
         // Second tick: LSN went backwards. Flag it.
@@ -275,7 +324,8 @@ mod tests {
             slot_confirmed_flush_lsn: Lsn(50),
             group: "default".into(),
             watched_tables: vec![],
-        }));
+            ..Default::default()
+}));
         assert_eq!(v2.len(), 1);
         assert!(matches!(
             v2[0],
@@ -291,7 +341,8 @@ mod tests {
             slot_confirmed_flush_lsn: Lsn(50),
             group: "default".into(),
             watched_tables: vec![],
-        }));
+            ..Default::default()
+}));
         assert!(v3.is_empty());
     }
 
@@ -305,7 +356,8 @@ mod tests {
             slot_confirmed_flush_lsn: Lsn(0),
             group: "default".into(),
             watched_tables: vec![ident()],
-        };
+            ..Default::default()
+};
         let v = block_on(watcher.check(&inputs));
         assert!(v.is_empty(), "got: {v:?}");
     }

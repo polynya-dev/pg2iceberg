@@ -19,7 +19,10 @@
 //! disconnects through a side channel today.
 
 use crate::prod::tls::{build_rustls_connector, TlsMode};
-use crate::{DecodedMessage, PgClient, PgError, ReplicationStream, Result, SnapshotId};
+use crate::{
+    DecodedMessage, PgClient, PgError, ReplicationStream, Result, SlotHealth, SnapshotId,
+    WalStatus,
+};
 use async_trait::async_trait;
 use pg2iceberg_core::{Lsn, TableIdent};
 use postgres_replication::LogicalReplicationStream;
@@ -240,6 +243,82 @@ impl PgClient for PgClientImpl {
                     Some(s) => Ok(Some(parse_lsn(s)?)),
                     None => Ok(Some(Lsn(0))),
                 };
+            }
+        }
+        Ok(None)
+    }
+
+    async fn slot_health(&self, slot: &str) -> Result<Option<SlotHealth>> {
+        // One query covering every slot field we use: restart_lsn,
+        // confirmed_flush_lsn, wal_status, safe_wal_size, conflicting.
+        //
+        // We use `to_jsonb(pg_replication_slots.*)` for `wal_status`,
+        // `safe_wal_size`, and `conflicting` so that PG versions that
+        // don't have those columns return NULL instead of a parse
+        // error. Specifically:
+        //   - PG ≤ 12: no `wal_status` / `safe_wal_size`.
+        //   - PG ≤ 13: no `conflicting`.
+        // The base columns (`restart_lsn`, `confirmed_flush_lsn`)
+        // exist on every supported PG version, so we read them
+        // directly. Result: a single SQL works on PG 12+; older
+        // versions just surface the new fields as None/false.
+        let q = format!(
+            "SELECT \
+                restart_lsn::text AS restart_lsn, \
+                confirmed_flush_lsn::text AS confirmed_flush_lsn, \
+                (to_jsonb(pg_replication_slots.*) ->> 'wal_status') AS wal_status, \
+                NULLIF(to_jsonb(pg_replication_slots.*) ->> 'safe_wal_size', '') AS safe_wal_size, \
+                COALESCE((to_jsonb(pg_replication_slots.*) ->> 'conflicting')::boolean, false) AS conflicting \
+             FROM pg_replication_slots \
+             WHERE slot_name = {}",
+            quote_lit(slot)
+        );
+        let rows = self
+            .client
+            .simple_query(&q)
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let restart_text: Option<&str> = row
+                    .try_get("restart_lsn")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
+                let confirmed_text: Option<&str> = row
+                    .try_get("confirmed_flush_lsn")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
+                let wal_status_text: Option<&str> = row
+                    .try_get("wal_status")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
+                let safe_wal_size_text: Option<&str> = row
+                    .try_get("safe_wal_size")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
+                let conflicting_text: Option<&str> = row
+                    .try_get("conflicting")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
+
+                let restart_lsn = restart_text
+                    .map(parse_lsn)
+                    .transpose()?
+                    .unwrap_or(Lsn(0));
+                let confirmed_flush_lsn = confirmed_text
+                    .map(parse_lsn)
+                    .transpose()?
+                    .unwrap_or(Lsn(0));
+                let wal_status = wal_status_text.map(WalStatus::parse).transpose()?;
+                let safe_wal_size = safe_wal_size_text
+                    .and_then(|s| s.parse::<i64>().ok());
+                let conflicting = conflicting_text
+                    .map(|s| s == "t" || s == "true")
+                    .unwrap_or(false);
+
+                return Ok(Some(SlotHealth {
+                    exists: true,
+                    restart_lsn,
+                    confirmed_flush_lsn,
+                    wal_status,
+                    conflicting,
+                    safe_wal_size,
+                }));
             }
         }
         Ok(None)

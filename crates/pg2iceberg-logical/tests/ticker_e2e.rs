@@ -169,6 +169,7 @@ fn pump(h: &mut Harness) {
                     slot_confirmed_flush_lsn: slot.confirmed_flush_lsn,
                     group: "default".into(),
                     watched_tables: vec![ident()],
+                    ..Default::default()
                 };
                 let violations = block_on(h.watcher.check(&inputs));
                 assert!(

@@ -39,7 +39,14 @@ async fn shared_pg() -> &'static SharedPg {
     PG.get_or_init(|| async {
         // Override the default Postgres cmd to enable logical replication.
         // `-c fsync=off` is the upstream default we preserve.
+        // We pin `16-alpine` (rather than testcontainers-modules' default
+        // `11-alpine`) so the PG 13+ slot-health columns
+        // (`wal_status`, `safe_wal_size`, `conflicting`) are actually
+        // populated when the integration test calls `slot_health`. PG 11
+        // doesn't have them, and the prod query gracefully returns NULL
+        // there — but exercising real values needs a current PG.
         let container = Postgres::default()
+            .with_tag("16-alpine")
             .with_cmd([
                 "-c",
                 "fsync=off",
@@ -137,6 +144,71 @@ async fn slot_lifecycle_create_inspect_drop() {
 
     // Drop slot via the regular client (replication-mode SQL is too
     // restricted for pg_drop_replication_slot()).
+    regular
+        .execute(
+            "SELECT pg_drop_replication_slot($1)",
+            &[&slot.as_str()],
+        )
+        .await
+        .expect("drop slot");
+}
+
+#[tokio::test]
+async fn slot_health_query_works_against_real_pg() {
+    // Validates the `to_jsonb` indirection trick in the prod slot_health
+    // query — confirms PG accepts the SQL and returns the expected
+    // shape on a healthy slot. The watcher's wal_status invariant
+    // depends on this query path.
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+
+    let table = format!("t_{}", uniq());
+    regular
+        .batch_execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY)"))
+        .await
+        .expect("create table");
+
+    let client = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("repl connect");
+
+    // Probing a non-existent slot returns None (not an error).
+    let slot = format!("s_{}", uniq());
+    let none = client
+        .slot_health(&slot)
+        .await
+        .expect("slot_health on missing slot");
+    assert!(none.is_none(), "missing slot should return None");
+
+    // Create the slot and probe again.
+    let cp = client.create_slot(&slot).await.expect("create_slot");
+    let h = client
+        .slot_health(&slot)
+        .await
+        .expect("slot_health on existing slot")
+        .expect("slot exists");
+
+    assert!(h.exists);
+    assert_eq!(
+        h.confirmed_flush_lsn, cp,
+        "confirmed_flush starts at consistent_point"
+    );
+    assert!(h.restart_lsn.0 > 0, "restart_lsn populated after create");
+
+    // PG 13+ should report `wal_status` (most likely `reserved` for a
+    // fresh slot under normal config). PG 12 returns None — this test
+    // assumes the test container is PG 13+, which testcontainers'
+    // default Postgres image satisfies.
+    assert_eq!(
+        h.wal_status,
+        Some(pg2iceberg_pg::WalStatus::Reserved),
+        "fresh slot should be Reserved under default settings"
+    );
+    // PG 14+ has the `conflicting` column and reports false on a
+    // healthy non-physical slot.
+    assert!(!h.conflicting);
+
+    // Cleanup.
     regular
         .execute(
             "SELECT pg_drop_replication_slot($1)",

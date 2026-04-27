@@ -24,6 +24,7 @@ fn fresh_logical() -> StartupValidation {
             exists: false,
             restart_lsn: Lsn::ZERO,
             confirmed_flush_lsn: Lsn::ZERO,
+            ..Default::default()
         }),
         config_mode: Mode::Logical,
         slot_name: "pg2iceberg".into(),
@@ -98,6 +99,7 @@ fn orphaned_slot_violation() {
         exists: true,
         restart_lsn: Lsn(50),
         confirmed_flush_lsn: Lsn(50),
+        ..Default::default()
     });
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
@@ -125,6 +127,7 @@ fn missing_tables_violation() {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(100),
+        ..Default::default()
     });
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
@@ -144,6 +147,7 @@ fn slot_gone_but_lsn_exists_violation() {
         exists: false, // slot disappeared
         restart_lsn: Lsn::ZERO,
         confirmed_flush_lsn: Lsn::ZERO,
+        ..Default::default()
     });
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
@@ -164,6 +168,7 @@ fn slot_ahead_of_checkpoint_violation() {
         exists: true,
         restart_lsn: Lsn(200), // WAL recycled past checkpoint
         confirmed_flush_lsn: Lsn(200),
+        ..Default::default()
     });
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
@@ -187,6 +192,7 @@ fn snapshot_complete_but_lsn_zero_violation() {
         exists: true,
         restart_lsn: Lsn::ZERO,
         confirmed_flush_lsn: Lsn::ZERO,
+        ..Default::default()
     });
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(&err, &Violation::SnapshotCompleteButLsnZero);
@@ -215,6 +221,7 @@ fn snapshot_complete_but_table_has_no_snapshot_violation() {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(100),
+        ..Default::default()
     });
     v.tables.push(TableExistence {
         pg_table: ident("orders"),
@@ -227,6 +234,68 @@ fn snapshot_complete_but_table_has_no_snapshot_violation() {
         &err,
         &Violation::SnapshotCompleteButTableNoSnapshot {
             table: "orders".into(),
+        },
+    );
+}
+
+// 9. Slot wal_status == Lost — WAL recycled past `max_slot_wal_keep_size`.
+#[test]
+fn slot_lost_violation() {
+    let mut v = fresh_logical();
+    v.checkpoint = Some(cp_logical(100));
+    v.slot = Some(SlotState {
+        exists: true,
+        restart_lsn: Lsn(50),
+        confirmed_flush_lsn: Lsn(50),
+        wal_status: Some(pg2iceberg_pg::WalStatus::Lost),
+        conflicting: false,
+    });
+    let err = validate_startup(&v).unwrap_err();
+    assert_one_violation(
+        &err,
+        &Violation::SlotLost {
+            slot_name: "pg2iceberg".into(),
+            restart_lsn: Lsn(50),
+        },
+    );
+}
+
+// 9b. wal_status = Reserved/Extended/Unreserved is NOT a startup violation.
+//     `Unreserved` is a watcher warning, not a startup-fail. The pipeline
+//     should still attempt to start so the operator can act on the
+//     warning before WAL is actually recycled.
+#[test]
+fn slot_unreserved_does_not_fail_startup() {
+    let mut v = fresh_logical();
+    v.checkpoint = Some(cp_logical(100));
+    v.slot = Some(SlotState {
+        exists: true,
+        restart_lsn: Lsn(100),
+        confirmed_flush_lsn: Lsn(100),
+        wal_status: Some(pg2iceberg_pg::WalStatus::Unreserved),
+        conflicting: false,
+    });
+    // Healthy + LSN-aligned + Unreserved → no violations from startup.
+    assert!(validate_startup(&v).is_ok());
+}
+
+// 10. Slot conflicting (PG 14+) — physical-rep conflict killed the slot.
+#[test]
+fn slot_conflicting_violation() {
+    let mut v = fresh_logical();
+    v.checkpoint = Some(cp_logical(100));
+    v.slot = Some(SlotState {
+        exists: true,
+        restart_lsn: Lsn(100),
+        confirmed_flush_lsn: Lsn(100),
+        wal_status: Some(pg2iceberg_pg::WalStatus::Reserved),
+        conflicting: true,
+    });
+    let err = validate_startup(&v).unwrap_err();
+    assert_one_violation(
+        &err,
+        &Violation::SlotConflicting {
+            slot_name: "pg2iceberg".into(),
         },
     );
 }
@@ -246,6 +315,7 @@ fn multiple_violations_all_reported() {
         exists: true,
         restart_lsn: Lsn(50),
         confirmed_flush_lsn: Lsn(50),
+        ..Default::default()
     });
     let err = validate_startup(&v).unwrap_err();
     assert_eq!(err.violations.len(), 2, "got: {:?}", err.violations);

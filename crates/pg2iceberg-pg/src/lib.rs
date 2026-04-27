@@ -16,6 +16,70 @@ use thiserror::Error;
 #[serde(transparent)]
 pub struct SnapshotId(pub String);
 
+/// PG replication slot WAL retention state. Mirrors the
+/// `pg_replication_slots.wal_status` column added in PG 13.
+///
+/// State machine: `reserved` → `extended` → `unreserved` → `lost`.
+/// A slot can transition from `unreserved` back to `reserved`/`extended`
+/// if the consumer catches up, but `lost` is terminal — the WAL
+/// behind the slot's `restart_lsn` is gone.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+pub enum WalStatus {
+    /// WAL pinned by this slot is within `max_wal_size`. Healthy.
+    Reserved,
+    /// Past `max_wal_size` but within `max_slot_wal_keep_size`. Normal under load.
+    Extended,
+    /// Past `max_slot_wal_keep_size`; WAL will be removed at the next checkpoint.
+    /// Operator's last chance to fix consumer lag before data loss.
+    Unreserved,
+    /// WAL has been recycled. The slot is unrecoverable — `START_REPLICATION`
+    /// will fail because `restart_lsn` no longer exists in the WAL stream.
+    /// The only recovery is to drop the slot, drop the Iceberg tables,
+    /// and re-snapshot.
+    Lost,
+}
+
+impl WalStatus {
+    /// Parse from the text form returned by `pg_replication_slots.wal_status::text`.
+    /// PG 13+ only — older versions simply don't have this column.
+    pub fn parse(s: &str) -> std::result::Result<Self, PgError> {
+        match s {
+            "reserved" => Ok(WalStatus::Reserved),
+            "extended" => Ok(WalStatus::Extended),
+            "unreserved" => Ok(WalStatus::Unreserved),
+            "lost" => Ok(WalStatus::Lost),
+            other => Err(PgError::Protocol(format!(
+                "unknown pg_replication_slots.wal_status value: {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Combined view of a replication slot's health, suitable for
+/// startup validation and the invariant watcher's per-tick probe.
+/// Built by [`PgClient::slot_health`] in one round-trip rather than
+/// the previous N round-trips for the individual fields.
+#[derive(Clone, Debug)]
+pub struct SlotHealth {
+    pub exists: bool,
+    pub restart_lsn: Lsn,
+    pub confirmed_flush_lsn: Lsn,
+    /// `Some` on PG 13+; `None` on older versions where the column
+    /// doesn't exist (the prod query uses `to_jsonb` to degrade
+    /// gracefully). The startup `wal_status = lost` check is a
+    /// no-op on older PGs.
+    pub wal_status: Option<WalStatus>,
+    /// PG 14+. `false` on older versions. `true` indicates the slot
+    /// was killed by a physical-replication conflict during recovery
+    /// — also unrecoverable.
+    pub conflicting: bool,
+    /// PG 13+. Bytes until the slot crosses into `unreserved`. Negative
+    /// when already past. `None` when the column doesn't exist or is
+    /// NULL. Useful for metrics / dashboards; not directly consumed
+    /// by validation today.
+    pub safe_wal_size: Option<i64>,
+}
+
 #[derive(Clone, Debug, Error)]
 pub enum PgError {
     #[error("connection error: {0}")]
@@ -72,12 +136,31 @@ pub trait ReplicationStream: Send {
 #[async_trait]
 pub trait SlotMonitor: Send + Sync {
     async fn confirmed_flush_lsn(&self, slot: &str) -> Result<Option<Lsn>>;
+    /// Full health probe — used by the watcher to flag
+    /// `wal_status = unreserved` (last warning before WAL loss) and
+    /// to surface `safe_wal_size` as a metric. Default impl falls
+    /// back to a minimal record built from `confirmed_flush_lsn` so
+    /// non-PG monitor backends keep working.
+    async fn slot_health_for_watcher(&self, slot: &str) -> Result<Option<SlotHealth>> {
+        let cfl = self.confirmed_flush_lsn(slot).await?;
+        Ok(cfl.map(|lsn| SlotHealth {
+            exists: true,
+            restart_lsn: Lsn::ZERO,
+            confirmed_flush_lsn: lsn,
+            wal_status: None,
+            conflicting: false,
+            safe_wal_size: None,
+        }))
+    }
 }
 
 #[async_trait]
 impl<P: PgClient + ?Sized> SlotMonitor for P {
     async fn confirmed_flush_lsn(&self, slot: &str) -> Result<Option<Lsn>> {
         PgClient::slot_confirmed_flush_lsn(self, slot).await
+    }
+    async fn slot_health_for_watcher(&self, slot: &str) -> Result<Option<SlotHealth>> {
+        PgClient::slot_health(self, slot).await
     }
 }
 
@@ -100,6 +183,17 @@ pub trait PgClient: Send + Sync {
     async fn slot_confirmed_flush_lsn(&self, slot: &str) -> Result<Option<Lsn>>;
 
     async fn export_snapshot(&self) -> Result<SnapshotId>;
+
+    /// Combined slot health probe. Returns the `restart_lsn`,
+    /// `confirmed_flush_lsn`, `wal_status`, `conflicting`, and
+    /// `safe_wal_size` columns of `pg_replication_slots` in a single
+    /// round-trip. Returns `None` when the slot doesn't exist.
+    ///
+    /// Pre-PG 13 doesn't have `wal_status` / `safe_wal_size`; pre-PG 14
+    /// doesn't have `conflicting`. The prod impl uses `to_jsonb` to
+    /// degrade gracefully on older versions — those fields surface as
+    /// `None` / `false`.
+    async fn slot_health(&self, slot: &str) -> Result<Option<SlotHealth>>;
 
     /// PostgreSQL cluster system identifier — unique per `initdb`,
     /// survives replication/clone, differs between blue and green
