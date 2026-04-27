@@ -54,8 +54,9 @@ pub enum CheckpointError {
     ConcurrentUpdate,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Default, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Mode {
+    #[default]
     Logical,
     Query,
 }
@@ -109,6 +110,17 @@ pub struct Checkpoint {
     /// is the same — false means snapshot in progress / interrupted.
     #[serde(default)]
     pub snapshoted_tables: BTreeMap<String, bool>,
+    /// Per-table PG `pg_class.oid` captured at snapshot time. Used
+    /// to detect identity changes — `DROP TABLE` + recreate gives
+    /// a new oid even with identical schema, and the Iceberg state
+    /// pre-drop is now stale. Startup validation's invariant 11
+    /// compares this against the current oid and refuses to start
+    /// on mismatch (operator must drop the Iceberg table for the
+    /// snapshot to re-run). Keys match `snapshoted_tables`.
+    /// Absent on legacy / sim runs (oid 0 means "unknown" — invariant
+    /// 11 skips).
+    #[serde(default)]
+    pub snapshoted_table_oids: BTreeMap<String, u32>,
     /// Per-table snapshot progress cursor. Keyed by
     /// `"<namespace>.<name>"`; value is the JSON-encoded canonical
     /// PK key of the last row staged. [`Snapshotter`] resumes from
@@ -145,6 +157,7 @@ impl Checkpoint {
             system_identifier: 0,
             snapshot_complete: false,
             snapshoted_tables: BTreeMap::new(),
+            snapshoted_table_oids: BTreeMap::new(),
             snapshot_progress: BTreeMap::new(),
             query_watermarks: BTreeMap::new(),
             updated_at: None,
@@ -238,6 +251,12 @@ impl Checkpoint {
                     &self.snapshoted_tables,
                     |v| v.to_string(),
                 )
+            ));
+        }
+        if !self.snapshoted_table_oids.is_empty() {
+            parts.push(format!(
+                "snapshoted_table_oids={}",
+                sorted_map_str(&self.snapshoted_table_oids, |v| v.to_string())
             ));
         }
         if !self.snapshot_progress.is_empty() {

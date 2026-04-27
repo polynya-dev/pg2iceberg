@@ -536,6 +536,7 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
+        &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
     ))
@@ -564,6 +565,7 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
+        &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
     ))
@@ -612,6 +614,7 @@ fn binary_snapshot_phase_skips_when_checkpoint_already_complete() {
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
+        &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
     ))
@@ -624,6 +627,7 @@ fn binary_snapshot_phase_skips_when_checkpoint_already_complete() {
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
+        &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
     ))
@@ -644,6 +648,7 @@ fn binary_snapshot_phase_skips_when_all_tables_in_skip_set() {
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
+        &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
     ))

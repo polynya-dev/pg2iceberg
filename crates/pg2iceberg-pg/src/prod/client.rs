@@ -324,6 +324,80 @@ impl PgClient for PgClientImpl {
         Ok(None)
     }
 
+    async fn table_oid(&self, namespace: &str, name: &str) -> Result<Option<u32>> {
+        // `pg_class.oid` joined to `pg_namespace.nspname` for the
+        // (schema, table) tuple. Returns NULL when the table doesn't
+        // exist; we map that to None.
+        let q = format!(
+            "SELECT c.oid::int8 AS oid \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {} AND c.relname = {}",
+            quote_lit(namespace),
+            quote_lit(name),
+        );
+        let rows = self
+            .client
+            .simple_query(&q)
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let v: Option<&str> = row
+                    .try_get("oid")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
+                return match v {
+                    Some(s) => s
+                        .parse::<u32>()
+                        .map(Some)
+                        .map_err(|e| PgError::Protocol(format!("parse oid {s:?}: {e}"))),
+                    None => Ok(None),
+                };
+            }
+        }
+        Ok(None)
+    }
+
+    async fn publication_tables(
+        &self,
+        publication_name: &str,
+    ) -> Result<Vec<TableIdent>> {
+        let q = format!(
+            "SELECT schemaname, tablename \
+             FROM pg_publication_tables \
+             WHERE pubname = {} \
+             ORDER BY schemaname, tablename",
+            quote_lit(publication_name)
+        );
+        let rows = self
+            .client
+            .simple_query(&q)
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        let mut out = Vec::new();
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let schema: &str = row
+                    .try_get("schemaname")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                    .ok_or_else(|| {
+                        PgError::Protocol("schemaname returned NULL".into())
+                    })?;
+                let name: &str = row
+                    .try_get("tablename")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                    .ok_or_else(|| {
+                        PgError::Protocol("tablename returned NULL".into())
+                    })?;
+                out.push(TableIdent {
+                    namespace: pg2iceberg_core::Namespace(vec![schema.into()]),
+                    name: name.into(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     async fn export_snapshot(&self) -> Result<SnapshotId> {
         // Begin a REPEATABLE READ transaction and call
         // `pg_export_snapshot()`. The caller is responsible for closing

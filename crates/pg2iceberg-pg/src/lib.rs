@@ -184,6 +184,23 @@ pub trait PgClient: Send + Sync {
 
     async fn export_snapshot(&self) -> Result<SnapshotId>;
 
+    /// Look up a table's `pg_class.oid` for the given
+    /// `(namespace, name)`. Returns `None` if the table doesn't
+    /// exist. Used by startup validation to detect identity
+    /// changes — `DROP TABLE` + recreate gives a new oid even with
+    /// the same schema, and the pre-drop Iceberg data is now
+    /// stale.
+    async fn table_oid(&self, namespace: &str, name: &str) -> Result<Option<u32>>;
+
+    /// List the tables currently bound to `publication_name`.
+    /// Empty vec for an empty / non-existent publication. Used by
+    /// startup validation to detect the case where an operator
+    /// removed a tracked table from the publication mid-run — any
+    /// DML during the gap was filtered by the slot, so re-adding
+    /// the table requires a full re-snapshot.
+    async fn publication_tables(&self, publication_name: &str)
+        -> Result<Vec<TableIdent>>;
+
     /// Combined slot health probe. Returns the `restart_lsn`,
     /// `confirmed_flush_lsn`, `wal_status`, `conflicting`, and
     /// `safe_wal_size` columns of `pg_replication_slots` in a single

@@ -295,6 +295,7 @@ where
         lc.catalog.as_ref(),
         &lc.schemas,
         &lc.slot_name,
+        &lc.publication_name,
         lc.mode,
         connected_system_id,
     )
@@ -410,11 +411,27 @@ where
                 snap_lsn = ?source.snapshot_lsn().await?,
                 "snapshot phase starting"
             );
+            // Look up `pg_class.oid` for each schema so the snapshotter
+            // can stamp `cp.snapshoted_table_oids` on completion. This
+            // is what powers startup invariant 11 (TableIdentityChanged)
+            // on subsequent runs.
+            let mut table_oids: std::collections::BTreeMap<TableIdent, u32> =
+                std::collections::BTreeMap::new();
+            for s in &lc.schemas {
+                let oid = lc
+                    .pg
+                    .table_oid(&s.ident.namespace.0.join("."), &s.ident.name)
+                    .await?;
+                if let Some(v) = oid {
+                    table_oids.insert(s.ident.clone(), v);
+                }
+            }
             match run_snapshot_phase(
                 source.as_ref(),
                 Arc::clone(&lc.coord),
                 &lc.schemas,
                 &lc.skip_snapshot_idents,
+                &table_oids,
                 &mut pipeline,
                 pg2iceberg_snapshot::DEFAULT_CHUNK_SIZE,
             )
@@ -482,12 +499,14 @@ where
 /// helper. Loads coord checkpoint, queries each table's catalog state
 /// + slot state, runs the 8 invariants. Errors with
 /// [`LifecycleError::Validation`] on any violation.
+#[allow(clippy::too_many_arguments)]
 async fn run_startup_validation<Cat: Catalog + ?Sized>(
     pg: &dyn PgClient,
     coord: &dyn Coordinator,
     catalog: &Cat,
     schemas: &[TableSchema],
     slot_name: &str,
+    publication_name: &str,
     mode: Mode,
     connected_system_id: u64,
 ) -> Result<(), LifecycleError> {
@@ -495,6 +514,15 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
         .load_checkpoint(connected_system_id)
         .await
         .map_err(|e| LifecycleError::Coord(e.to_string()))?;
+    // One round-trip lookup of the publication's current tables;
+    // we'll cross-reference each schema below. Empty list when the
+    // publication doesn't exist (covered by the OrphanedSlot /
+    // create_publication paths in step 2 of the lifecycle).
+    let pub_members: std::collections::BTreeSet<TableIdent> = pg
+        .publication_tables(publication_name)
+        .await
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default();
     let mut tables: Vec<TableExistence> = Vec::with_capacity(schemas.len());
     for schema in schemas {
         let meta = catalog
@@ -502,12 +530,41 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
             .await
             .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
         let iceberg_name = format!("{}.{}", schema.ident.namespace, schema.ident.name);
+        let pg_oid = pg
+            .table_oid(
+                &schema.ident.namespace.0.join("."),
+                &schema.ident.name,
+            )
+            .await?;
         tables.push(TableExistence {
             pg_table: schema.ident.clone(),
             iceberg_name,
             existed: meta.is_some(),
             current_snapshot_id: meta.and_then(|m| m.current_snapshot_id),
+            current_pg_oid: pg_oid,
+            in_publication: pub_members.contains(&schema.ident),
         });
+    }
+
+    // (3) Hygiene warning — surface tables previously snapshotted
+    // but no longer in YAML. log_index for these still accumulates;
+    // operator should clean up. Doesn't block startup.
+    if let Some(cp) = &checkpoint {
+        let yaml_keys: std::collections::BTreeSet<String> =
+            schemas.iter().map(|s| s.ident.to_string()).collect();
+        for stale in cp
+            .snapshoted_tables
+            .keys()
+            .filter(|k| !yaml_keys.contains(k.as_str()))
+        {
+            tracing::warn!(
+                table = %stale,
+                "table previously snapshotted but no longer in YAML config; \
+                 its log_index entries will accumulate. drop the table from \
+                 the publication and clear its `snapshoted_tables` entry to \
+                 stop tracking it."
+            );
+        }
     }
     // One round-trip combined slot probe — covers exists,
     // restart_lsn, confirmed_flush_lsn, wal_status, conflicting,
@@ -535,6 +592,7 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
         slot,
         config_mode: mode,
         slot_name: slot_name.to_string(),
+        publication_name: publication_name.to_string(),
     };
     validate_startup(&v).map_err(|e| LifecycleError::Validation(e.to_string()))
 }

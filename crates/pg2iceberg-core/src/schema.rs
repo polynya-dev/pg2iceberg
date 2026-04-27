@@ -3,7 +3,7 @@ use crate::typemap::IcebergType;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Eq, Ord, PartialEq, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Namespace(pub Vec<String>);
 
@@ -13,7 +13,7 @@ impl fmt::Display for Namespace {
     }
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Eq, Ord, PartialEq, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 pub struct TableIdent {
     pub namespace: Namespace,
     pub name: String,

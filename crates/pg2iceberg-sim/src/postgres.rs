@@ -63,6 +63,11 @@ struct TableData {
     /// Rows keyed by canonical-JSON of the PK columns. BTreeMap keeps a
     /// deterministic iteration order, which matters for tests that scan.
     rows: BTreeMap<String, Row>,
+    /// Sim-side mirror of `pg_class.oid`. Auto-assigned at
+    /// `create_table` time from a monotonic counter; exposed via
+    /// [`SimPostgres::table_oid`] so DST can model `DROP TABLE` +
+    /// recreate (which yields a fresh oid).
+    pg_oid: u32,
 }
 
 impl TableData {
@@ -144,14 +149,33 @@ struct WalEntry {
     kind: WalKind,
 }
 
-#[derive(Default)]
 struct DbState {
     next_lsn: u64,
     next_xid: u32,
+    /// Counter-allocated per `create_table`. Mirrors PG's behavior
+    /// where each `CREATE TABLE` gets a fresh `pg_class.oid`. Real
+    /// PG starts at much higher numbers; the sim starts at 16384
+    /// (the conventional first user-defined oid) just to avoid
+    /// conflating "0 = unknown" with a valid value.
+    next_oid: u32,
     tables: BTreeMap<TableIdent, TableData>,
     publications: BTreeMap<String, Publication>,
     slots: BTreeMap<String, SlotState>,
     wal: Vec<WalEntry>,
+}
+
+impl Default for DbState {
+    fn default() -> Self {
+        Self {
+            next_lsn: 0,
+            next_xid: 0,
+            next_oid: 16384,
+            tables: BTreeMap::new(),
+            publications: BTreeMap::new(),
+            slots: BTreeMap::new(),
+            wal: Vec::new(),
+        }
+    }
 }
 
 impl DbState {
@@ -162,6 +186,10 @@ impl DbState {
     fn alloc_xid(&mut self) -> u32 {
         self.next_xid += 1;
         self.next_xid
+    }
+    fn alloc_oid(&mut self) -> u32 {
+        self.next_oid += 1;
+        self.next_oid
     }
     fn current_lsn(&self) -> Lsn {
         Lsn(self.next_lsn)
@@ -189,11 +217,13 @@ impl SimPostgres {
             return Err(SimError::DuplicateTable(schema.ident));
         }
         let ident = schema.ident.clone();
+        let pg_oid = s.alloc_oid();
         s.tables.insert(
             ident.clone(),
             TableData {
                 schema,
                 rows: BTreeMap::new(),
+                pg_oid,
             },
         );
         let lsn = s.alloc_lsn();
@@ -203,6 +233,60 @@ impl SimPostgres {
             kind: WalKind::Relation(ident),
         });
         Ok(())
+    }
+
+    /// Test hook: drop a table and (optionally) recreate it under
+    /// the same identifier. Models PG's `DROP TABLE` + recreate
+    /// flow that yields a fresh `pg_class.oid`. Used by DST to
+    /// drive the `TableIdentityChanged` startup invariant.
+    pub fn drop_and_recreate_table(&self, schema: TableSchema) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.tables.remove(&schema.ident);
+        let ident = schema.ident.clone();
+        let pg_oid = s.alloc_oid();
+        s.tables.insert(
+            ident,
+            TableData {
+                schema,
+                rows: BTreeMap::new(),
+                pg_oid,
+            },
+        );
+        Ok(())
+    }
+
+    /// Test hook: peek at a table's current oid. Real PG users get
+    /// this from `pg_class.oid`; the sim mirrors it via
+    /// [`SimPgClient::table_oid`].
+    pub fn table_oid(&self, ident: &TableIdent) -> Option<u32> {
+        self.state.lock().unwrap().tables.get(ident).map(|t| t.pg_oid)
+    }
+
+    /// Test hook: drop a table from a publication. Models the
+    /// `ALTER PUBLICATION DROP TABLE` operator action that triggers
+    /// the `TableMissingFromPublication` startup invariant.
+    pub fn drop_table_from_publication(
+        &self,
+        publication: &str,
+        ident: &TableIdent,
+    ) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let pubrec = s
+            .publications
+            .get_mut(publication)
+            .ok_or_else(|| SimError::UnknownPublication(publication.into()))?;
+        pubrec.tables.remove(ident);
+        Ok(())
+    }
+
+    /// Test hook: list a publication's current tables. Mirrors
+    /// `pg_publication_tables`.
+    pub fn publication_tables(&self, publication: &str) -> Vec<TableIdent> {
+        let s = self.state.lock().unwrap();
+        s.publications
+            .get(publication)
+            .map(|p| p.tables.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn create_publication(&self, name: &str, tables: &[TableIdent]) -> Result<()> {
@@ -934,6 +1018,25 @@ impl PgClient for SimPgClient {
         // Return a placeholder ID; callers that actually use the
         // string would be testing prod-only behavior.
         Ok(SnapshotId("sim-placeholder".into()))
+    }
+
+    async fn table_oid(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> std::result::Result<Option<u32>, PgError> {
+        let ident = TableIdent {
+            namespace: pg2iceberg_core::Namespace(vec![namespace.into()]),
+            name: name.into(),
+        };
+        Ok(self.db.table_oid(&ident))
+    }
+
+    async fn publication_tables(
+        &self,
+        publication_name: &str,
+    ) -> std::result::Result<Vec<TableIdent>, PgError> {
+        Ok(self.db.publication_tables(publication_name))
     }
 
     async fn identify_system_id(&self) -> std::result::Result<u64, PgError> {

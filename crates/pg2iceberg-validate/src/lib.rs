@@ -28,7 +28,7 @@ use thiserror::Error;
 /// coord (for the persisted checkpoint), the source PG (for replication
 /// slot info), and the catalog (for which tables exist + their snapshot
 /// status).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct StartupValidation {
     pub checkpoint: Option<pg2iceberg_core::Checkpoint>,
     pub tables: Vec<TableExistence>,
@@ -36,15 +36,30 @@ pub struct StartupValidation {
     pub slot: Option<SlotState>,
     pub config_mode: Mode,
     pub slot_name: String,
+    /// Publication name — used in the `TableMissingFromPublication`
+    /// violation message. Empty in query mode.
+    pub publication_name: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TableExistence {
     pub pg_table: TableIdent,
     pub iceberg_name: String,
     pub existed: bool,
     /// `None` for tables that didn't exist or have no snapshots yet.
     pub current_snapshot_id: Option<i64>,
+    /// PG `pg_class.oid` of the source table at validation time.
+    /// `None` if the table doesn't exist in PG. Compared against
+    /// `cp.snapshoted_table_oids` to detect identity changes
+    /// (`DROP TABLE` + recreate).
+    pub current_pg_oid: Option<u32>,
+    /// `true` if the source table is currently a member of the
+    /// configured publication. `false` (combined with
+    /// `cp.snapshoted_tables` containing this key) signals that the
+    /// operator removed the table from the publication mid-run —
+    /// any DML during the gap was filtered, and re-adding the
+    /// table requires a re-snapshot.
+    pub in_publication: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -144,6 +159,32 @@ pub enum Violation {
          and the Iceberg tables, then re-snapshot from scratch"
     )]
     SlotConflicting { slot_name: String },
+
+    #[error(
+        "table {table:?} pg_class.oid changed from {stored_oid} to {current_oid}; \
+         the table was dropped + recreated, so the pre-drop Iceberg data is now \
+         stale (rows no longer in PG, and CDC won't re-emit them). drop the \
+         Iceberg table and the corresponding `_pg2iceberg.checkpoints` row's \
+         `snapshoted_tables`/`snapshoted_table_oids` entry to trigger a fresh \
+         snapshot"
+    )]
+    TableIdentityChanged {
+        table: String,
+        stored_oid: u32,
+        current_oid: u32,
+    },
+
+    #[error(
+        "table {table:?} is in YAML and was previously snapshotted but is no longer \
+         a member of publication {publication_name:?}; any DML that occurred while \
+         the table was outside the publication was filtered by the slot. \
+         drop the Iceberg table and the corresponding `snapshoted_tables` entry \
+         to trigger a re-snapshot, then re-add to the publication"
+    )]
+    TableMissingFromPublication {
+        table: String,
+        publication_name: String,
+    },
 }
 
 /// Aggregate error returned by [`validate_startup`].
@@ -282,6 +323,52 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
             violations.push(Violation::SlotConflicting {
                 slot_name: v.slot_name.clone(),
             });
+        }
+    }
+
+    // 11. Tracked table's `pg_class.oid` changed → `DROP TABLE` +
+    //     recreate. Old Iceberg rows are stale; CDC won't replay
+    //     them. `stored_oid == 0` is treated as "not yet recorded"
+    //     and skipped (legacy / first run).
+    if let Some(cp) = &v.checkpoint {
+        for t in &v.tables {
+            let key = t.pg_table.to_string();
+            let stored_oid = cp.snapshoted_table_oids.get(&key).copied().unwrap_or(0);
+            if stored_oid == 0 {
+                continue;
+            }
+            let current_oid = match t.current_pg_oid {
+                Some(o) => o,
+                None => continue, // table missing — caught by invariant 4
+            };
+            if stored_oid != current_oid {
+                violations.push(Violation::TableIdentityChanged {
+                    table: t.iceberg_name.clone(),
+                    stored_oid,
+                    current_oid,
+                });
+            }
+        }
+    }
+
+    // 12. Tracked table missing from current publication. If we
+    //     previously snapshotted it (it's in `snapshoted_tables`)
+    //     but it's not in the publication right now, then any DML
+    //     during the gap was filtered — re-snapshot is required.
+    if let Some(cp) = &v.checkpoint {
+        for t in &v.tables {
+            let key = t.pg_table.to_string();
+            let was_snapshotted = cp
+                .snapshoted_tables
+                .get(&key)
+                .copied()
+                .unwrap_or(false);
+            if was_snapshotted && !t.in_publication {
+                violations.push(Violation::TableMissingFromPublication {
+                    table: t.iceberg_name.clone(),
+                    publication_name: v.publication_name.clone(),
+                });
+            }
         }
     }
 

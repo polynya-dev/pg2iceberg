@@ -154,6 +154,117 @@ async fn slot_lifecycle_create_inspect_drop() {
 }
 
 #[tokio::test]
+async fn table_oid_changes_after_drop_recreate() {
+    // Validates the prod `table_oid()` query path and the assumption
+    // it depends on: PG's `pg_class.oid` increments on `DROP TABLE` +
+    // recreate. Without this, our `TableIdentityChanged` startup
+    // invariant has nothing to match on.
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+
+    let table = format!("ident_{}", uniq());
+    regular
+        .batch_execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY)"))
+        .await
+        .expect("create");
+
+    let client = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("repl connect");
+
+    let oid_before = client
+        .table_oid("public", &table)
+        .await
+        .expect("table_oid")
+        .expect("table exists");
+    assert!(oid_before > 0, "real-PG oid is positive");
+
+    regular
+        .batch_execute(&format!(
+            "DROP TABLE {table}; CREATE TABLE {table} (id INT PRIMARY KEY)"
+        ))
+        .await
+        .expect("drop+recreate");
+
+    let oid_after = client
+        .table_oid("public", &table)
+        .await
+        .expect("table_oid")
+        .expect("table exists");
+    assert_ne!(
+        oid_before, oid_after,
+        "PG must assign a fresh oid on recreate; that's what \
+         drives the TableIdentityChanged startup invariant"
+    );
+
+    // Probing a non-existent table returns None.
+    let none = client
+        .table_oid("public", "definitely_not_a_real_table")
+        .await
+        .expect("table_oid on missing");
+    assert!(none.is_none());
+}
+
+#[tokio::test]
+async fn publication_tables_reflects_alter_publication() {
+    // Validates the prod `publication_tables()` query and the
+    // `ALTER PUBLICATION` round-trip the
+    // `TableMissingFromPublication` invariant relies on.
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+
+    let table = format!("pub_{}", uniq());
+    regular
+        .batch_execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY)"))
+        .await
+        .expect("create");
+
+    let client = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("repl connect");
+
+    let pubname = format!("p_{}", uniq());
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: table.clone(),
+    };
+    client
+        .create_publication(&pubname, &[ident.clone()])
+        .await
+        .expect("create_publication");
+
+    let members = client
+        .publication_tables(&pubname)
+        .await
+        .expect("publication_tables");
+    assert!(members.contains(&ident), "table must be in pub: {members:?}");
+
+    // Drop the table from the publication.
+    regular
+        .batch_execute(&format!(
+            "ALTER PUBLICATION {pubname} DROP TABLE {table}"
+        ))
+        .await
+        .expect("alter pub");
+
+    let members = client
+        .publication_tables(&pubname)
+        .await
+        .expect("publication_tables");
+    assert!(
+        !members.contains(&ident),
+        "table must be gone from pub: {members:?}"
+    );
+
+    // Empty/non-existent publication returns empty list, not error.
+    let none = client
+        .publication_tables("definitely_not_a_real_publication")
+        .await
+        .expect("publication_tables on missing");
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
 async fn slot_health_query_works_against_real_pg() {
     // Validates the `to_jsonb` indirection trick in the prod slot_health
     // query — confirms PG accepts the SQL and returns the expected

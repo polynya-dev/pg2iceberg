@@ -111,10 +111,16 @@ async fn build_startup_validation(
             iceberg_name: "public.orders".into(),
             existed: true,
             current_snapshot_id: Some(1),
+            current_pg_oid: db.table_oid(&ident()),
+            in_publication: db
+                .publication_tables(PUB)
+                .into_iter()
+                .any(|t| t == ident()),
         }],
         slot,
         config_mode: Mode::Logical,
         slot_name: slot_name.into(),
+        publication_name: PUB.into(),
     }
 }
 

@@ -28,6 +28,7 @@ fn fresh_logical() -> StartupValidation {
         }),
         config_mode: Mode::Logical,
         slot_name: "pg2iceberg".into(),
+        ..Default::default()
     }
 }
 
@@ -81,6 +82,7 @@ fn orphaned_tables_violation() {
         iceberg_name: "orders".into(),
         existed: true,
         current_snapshot_id: Some(1),
+        ..Default::default()
     });
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
@@ -122,6 +124,7 @@ fn missing_tables_violation() {
         iceberg_name: "orders".into(),
         existed: false, // user dropped the Iceberg table
         current_snapshot_id: None,
+        ..Default::default()
     });
     v.slot = Some(SlotState {
         exists: true,
@@ -228,6 +231,7 @@ fn snapshot_complete_but_table_has_no_snapshot_violation() {
         iceberg_name: "orders".into(),
         existed: true,
         current_snapshot_id: None, // table exists but has no snapshot
+        ..Default::default()
     });
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
@@ -310,6 +314,7 @@ fn multiple_violations_all_reported() {
         iceberg_name: "orders".into(),
         existed: true,
         current_snapshot_id: Some(1),
+        ..Default::default()
     });
     v.slot = Some(SlotState {
         exists: true,

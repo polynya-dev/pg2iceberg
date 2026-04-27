@@ -565,11 +565,13 @@ pub enum SnapshotPhaseOutcome {
 /// On restart, the next call re-loads progress and resumes — no
 /// re-staging of completed chunks. The fault-DST proves this:
 /// `binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_snapshot_phase<S, C>(
     source: &S,
     coord: Arc<dyn Coordinator>,
     schemas: &[TableSchema],
     skip_idents: &std::collections::BTreeSet<TableIdent>,
+    table_oids: &std::collections::BTreeMap<TableIdent, u32>,
     pipeline: &mut Pipeline<C>,
     chunk_size: usize,
 ) -> Result<SnapshotPhaseOutcome>
@@ -622,7 +624,16 @@ where
     cp_save.snapshot_complete = true;
     cp_save.flushed_lsn = snap_lsn;
     for s in &to_snapshot {
-        cp_save.snapshoted_tables.insert(key_for(&s.ident), true);
+        let key = key_for(&s.ident);
+        cp_save.snapshoted_tables.insert(key.clone(), true);
+        // Stamp `pg_class.oid` alongside the snapshot-done flag.
+        // Startup invariant 11 compares this against the current oid
+        // on subsequent runs to detect `DROP TABLE` + recreate.
+        if let Some(oid) = table_oids.get(&s.ident).copied() {
+            if oid != 0 {
+                cp_save.snapshoted_table_oids.insert(key, oid);
+            }
+        }
     }
     cp_save.snapshot_progress.clear();
     coord
