@@ -90,8 +90,13 @@ pub trait PgClient: Send + Sync {
     /// `confirmed_flush_lsn` is the LSN downstream has acked. The watcher
     /// uses it to enforce invariant 1 (`pipeline.flushed_lsn ≤
     /// slot.confirmed_flush_lsn`). Returns `None` when the slot doesn't
-    /// exist; returns `Some(Lsn::ZERO)` when the slot exists but no
-    /// confirmed_flush has been reported yet.
+    /// exist; returns `Some(Lsn(_))` when the slot exists. PG itself
+    /// initializes the column to the slot's consistent_point at
+    /// creation time, so a freshly-created slot returns
+    /// `Some(consistent_point)`, not `Some(Lsn::ZERO)`. The latter
+    /// is reserved as the mapping for SQL-NULL — a state PG doesn't
+    /// surface for live slots in current versions, but the impl
+    /// preserves it as a graceful fallback.
     async fn slot_confirmed_flush_lsn(&self, slot: &str) -> Result<Option<Lsn>>;
 
     async fn export_snapshot(&self) -> Result<SnapshotId>;

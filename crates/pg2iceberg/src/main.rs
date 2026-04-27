@@ -12,15 +12,10 @@
 //! - `run` — assemble the full pipeline (PG client + coord + catalog +
 //!   blob store) and run it until SIGINT.
 
-mod config;
-mod realio;
-mod run;
-mod setup;
-mod snapshot_src;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::Config;
+use pg2iceberg::config::{self, Config};
+use pg2iceberg::run;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]

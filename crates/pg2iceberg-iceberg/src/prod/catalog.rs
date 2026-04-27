@@ -93,6 +93,20 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             {
                 Ok(None)
             }
+            // iceberg-rust 0.9 REST catalog returns
+            // `ErrorKind::Unexpected` with this exact message on a
+            // 404 from the REST server (instead of the expected
+            // `TableNotFound`). Caught by the testcontainers
+            // integration test against `apache/iceberg-rest-fixture`.
+            // Treat it as "no such table" — startup validation
+            // depends on this returning `None` for first-run
+            // greenfield deployments.
+            Err(e)
+                if e.kind() == ErrorKind::Unexpected
+                    && e.message().contains("Tried to load a table that does not exist") =>
+            {
+                Ok(None)
+            }
             Err(e) => Err(map_iceberg_err(e)),
         }
     }

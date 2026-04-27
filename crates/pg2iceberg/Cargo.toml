@@ -31,6 +31,12 @@ pg2iceberg-validate.workspace = true
 # workspace, applied via [patch.crates-io] in the workspace Cargo.toml.
 iceberg = { version = "0.9", features = [] }
 iceberg-catalog-rest = { version = "0.9", default-features = false }
+# StorageFactory for the REST catalog. iceberg-rust 0.9's REST catalog
+# requires a StorageFactory be provided up front (otherwise table ops
+# fail at runtime with "StorageFactory must be provided"). We use
+# OpenDAL's S3 backend which the upstream integration tests also use.
+# Surfaced by the testcontainers integration test.
+iceberg-storage-opendal = { version = "0.9", features = ["opendal-s3"] }
 # `aws` enables the S3 backend; `gcp`/`azure` are deferred follow-ons.
 object_store = { version = "0.11", default-features = false, features = ["aws"] }
 

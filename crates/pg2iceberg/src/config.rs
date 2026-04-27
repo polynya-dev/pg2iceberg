@@ -430,8 +430,13 @@ impl Config {
     }
 
     /// Bag of REST catalog props derived from sink config. Keys we
-    /// pass: `uri`, `warehouse`, plus auth-flavor-specific bits.
-    /// `catalog_props` from YAML is layered on top.
+    /// pass: `uri`, `warehouse`, plus auth-flavor-specific bits, plus
+    /// S3 storage-factory props (`s3.*`) so iceberg-rust's REST
+    /// catalog can sign + send catalog-side IO. The catalog server's
+    /// `/v1/config` response can also carry these, but only the
+    /// endpoint/region/path-style/region — credentials almost always
+    /// have to come from the client side. `catalog_props` from YAML
+    /// is layered on top.
     pub fn rest_catalog_props(&self) -> BTreeMap<String, String> {
         let mut props: BTreeMap<String, String> = BTreeMap::new();
         props.insert("uri".into(), self.sink.catalog_uri.clone());
@@ -461,6 +466,40 @@ impl Config {
                 }
             }
             _ => {}
+        }
+        // S3 props for iceberg-rust's StorageFactory. Only set
+        // credentials when credential_mode=static — for `iam` we let
+        // OpenDAL pick them up from env/IMDS/EC2 metadata. Endpoint
+        // + region + path-style are always set when configured.
+        if !self.sink.s3_endpoint.is_empty() {
+            props.insert("s3.endpoint".into(), self.sink.s3_endpoint.clone());
+        }
+        if !self.sink.s3_region.is_empty() {
+            props.insert("s3.region".into(), self.sink.s3_region.clone());
+        }
+        if self.sink.credential_mode == "static" {
+            if !self.sink.s3_access_key.is_empty() {
+                props.insert(
+                    "s3.access-key-id".into(),
+                    self.sink.s3_access_key.clone(),
+                );
+            }
+            if !self.sink.s3_secret_key.is_empty() {
+                props.insert(
+                    "s3.secret-access-key".into(),
+                    self.sink.s3_secret_key.clone(),
+                );
+            }
+            // Path-style access is the safe default for non-AWS S3
+            // (MinIO, LocalStack). Mirrors what `build_s3_static`
+            // does for the client-side blob store.
+            props.insert("s3.path-style-access".into(), "true".into());
+            // Skip EC2 IMDS so unrelated AWS credential lookups don't
+            // surface as cryptic "169.254.169.254 unreachable" errors
+            // in non-AWS environments. Surfaced by the testcontainers
+            // integration test against MinIO + apache/iceberg-rest.
+            props.insert("s3.disable-ec2-metadata".into(), "true".into());
+            props.insert("s3.disable-config-load".into(), "true".into());
         }
         for (k, v) in &self.sink.catalog_props {
             props.insert(k.clone(), v.clone());

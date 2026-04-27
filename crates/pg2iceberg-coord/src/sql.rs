@@ -241,10 +241,16 @@ pub fn set_cursor(schema: &CoordSchema) -> String {
 }
 
 pub fn register_consumer(schema: &CoordSchema) -> String {
+    // `$3::text::interval` forces PG to infer `$3` as text (via the
+    // inner cast) rather than interval. tokio-postgres can serialize
+    // `String` for a text parameter; serializing for an interval
+    // parameter has no built-in impl and panics at runtime. Mirror
+    // the same idiom in `try_lock` / `renew_lock`.
     format!(
         "INSERT INTO {} (group_name, worker_id, expires_at) \
-         VALUES ($1, $2, now() + $3::interval) \
-         ON CONFLICT (group_name, worker_id) DO UPDATE SET expires_at = now() + $3::interval",
+         VALUES ($1, $2, now() + $3::text::interval) \
+         ON CONFLICT (group_name, worker_id) DO UPDATE \
+         SET expires_at = now() + $3::text::interval",
         schema.qualify("consumer")
     )
 }
@@ -280,14 +286,14 @@ pub fn expire_locks(schema: &CoordSchema) -> String {
 pub fn try_lock(schema: &CoordSchema) -> String {
     format!(
         "INSERT INTO {} (table_name, worker_id, expires_at) \
-         VALUES ($1, $2, now() + $3::interval) ON CONFLICT DO NOTHING",
+         VALUES ($1, $2, now() + $3::text::interval) ON CONFLICT DO NOTHING",
         schema.qualify("lock")
     )
 }
 
 pub fn renew_lock(schema: &CoordSchema) -> String {
     format!(
-        "UPDATE {} SET expires_at = now() + $3::interval \
+        "UPDATE {} SET expires_at = now() + $3::text::interval \
          WHERE table_name = $1 AND worker_id = $2",
         schema.qualify("lock")
     )
