@@ -111,23 +111,20 @@ state:
   coordinator_schema: _pg2iceberg
   group: default                 # consumer group name (distributed mode)
 
-metrics_addr: ":9090"            # tracked-but-not-yet-wired in the Rust port
+metrics_addr: ":9090"            # parsed but not yet wired (Prometheus endpoint TODO)
 snapshot_only: false             # legacy field; prefer the `snapshot` subcommand
 ```
 
-## Differences vs the Go reference
+## Notes on individual fields
 
-| Field present in Go YAML | Rust port behavior |
-|---|---|
-| `source.logical.snapshot_concurrency` / `snapshot_chunk_pages` / `snapshot_target_file_size` | Not yet exposed; snapshot uses fixed defaults. Tracked as a follow-on. |
-| `sink.flush_bytes` | Not yet exposed; flush threshold is `flush_rows` + `flush_interval` only. |
-| `sink.materializer_target_file_size` / `materializer_concurrency` | Not yet exposed; uses `target_file_size` + a fixed concurrency. |
-| `sink.materializer_worker_id` | Replaced by the `--worker-id` flag on `pg2iceberg materializer-only`. |
-| `sink.events_partition` | The Go "events" table doesn't exist in the Rust port; staged WAL has its own format. |
-| `sink.meta_enabled` | Inferred from `meta_namespace`: setting it enables meta-table writes. |
-| `metrics_addr` | Parsed but not yet wired (Prometheus endpoint TODO). |
-| `state.path` | File-based checkpoint store. Not implemented; coord is always PG-backed in Rust. |
-| `snapshot_only` | Use the `pg2iceberg snapshot` subcommand instead. The field still parses for backward compat. |
+- **`source.logical.snapshot_concurrency` / `snapshot_chunk_pages` / `snapshot_target_file_size`** — not yet exposed; snapshot uses fixed defaults.
+- **`sink.flush_bytes`** — not yet exposed; flush threshold is `flush_rows` + `flush_interval` only.
+- **`sink.materializer_target_file_size` / `materializer_concurrency`** — not yet exposed; uses `target_file_size` + a fixed concurrency.
+- **`sink.materializer_worker_id`** — replaced by the `--worker-id` flag on `pg2iceberg materializer-only`.
+- **`sink.meta_enabled`** — inferred from `meta_namespace`: setting it enables meta-table writes.
+- **`metrics_addr`** — parsed but not yet wired (Prometheus endpoint TODO).
+- **`state.path`** — file-based checkpoint store. Not implemented; coord is always Postgres-backed.
+- **`snapshot_only`** — use the `pg2iceberg snapshot` subcommand instead. The field still parses for backward compat.
 
 ## Override precedence
 

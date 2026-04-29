@@ -4,11 +4,11 @@ icon: lucide/activity
 
 # Observability
 
-The Rust port's observability surface is intentionally narrower than the Go reference's today. Three layers exist:
+pg2iceberg's observability surface today is intentionally narrow. Three layers exist:
 
 1. **Structured logs** via `tracing` + `tracing-subscriber` — wired and on by default.
 2. **Iceberg control-plane meta tables** — wired (4 of 5; see [metadata-tables.md](metadata-tables.md)) when `sink.meta_namespace` is set.
-3. **Prometheus metrics endpoint and OTLP trace export** — **not yet wired**. Tracked as remaining gaps vs the Go reference.
+3. **Prometheus metrics endpoint and OTLP trace export** — **not yet wired**.
 
 ## Structured logs
 
@@ -53,9 +53,9 @@ This is the recommended mechanism for **historical observability** (per-commit a
 
 ## Prometheus metrics — not yet wired
 
-The Go reference exposes a Prometheus endpoint on `:9090/metrics` and a configurable `metrics_addr`. The Rust port has a `Metrics` trait wired through every hot path (counters + histograms in `pg2iceberg-core::metrics`), but the operational HTTP endpoint that exports them is **not yet implemented**. The `metrics_addr` YAML field is parsed and ignored.
+pg2iceberg has a `Metrics` trait wired through every hot path (counters + histograms in `pg2iceberg-core::metrics`), but the operational HTTP endpoint that exports them is **not yet implemented**. The `metrics_addr` YAML field is parsed and ignored.
 
-When wired, the planned metric set mirrors Go's surface:
+When wired, the planned metric set will be exposed on `:9090/metrics` (configurable via `metrics_addr`):
 
 | Domain | Examples |
 |---|---|
@@ -68,21 +68,21 @@ Until the endpoint lands, the Iceberg meta tables and structured logs cover the 
 
 ## OpenTelemetry / OTLP — not yet wired
 
-The Go reference exports distributed traces via OTLP/gRPC when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The Rust port instruments the same code paths via `tracing` spans but **does not export them**; output is stdout-only.
+pg2iceberg instruments every hot path via `tracing` spans, but **does not export them**; output is stdout-only.
 
-Wiring an OTLP exporter is straightforward (the `tracing-opentelemetry` crate bridges directly) but hasn't been done yet. If you need centralized trace collection today, parse the structured logs into your trace store, or wait for this to be wired.
+Wiring an OTLP exporter is straightforward (the `tracing-opentelemetry` crate bridges directly) but hasn't been done yet. The plan is to honor `OTEL_EXPORTER_OTLP_ENDPOINT` once wired. Until then, if you need centralized trace collection, parse the structured logs into your trace store.
 
 ## Health checks (k8s probes)
 
-Not yet wired. The Go reference exposes `/healthz` and `/ready` endpoints on the metrics server; the Rust port has no equivalent. For k8s deployments today, use the `connect-pg` and `connect-iceberg` subcommands as `initContainer` probes:
+Dedicated `/healthz` / `/ready` endpoints are **not yet wired**. For k8s deployments today, use the `connect-pg` and `connect-iceberg` subcommands as `initContainer` probes:
 
 ```yaml
 initContainers:
   - name: connect-pg
-    image: ghcr.io/polynya-dev/pg2iceberg-rust:latest
+    image: ghcr.io/polynya-dev/pg2iceberg:latest
     command: ["pg2iceberg", "connect-pg", "--config", "/etc/pg2iceberg/config.yaml"]
   - name: connect-iceberg
-    image: ghcr.io/polynya-dev/pg2iceberg-rust:latest
+    image: ghcr.io/polynya-dev/pg2iceberg:latest
     command: ["pg2iceberg", "connect-iceberg", "--config", "/etc/pg2iceberg/config.yaml"]
 ```
 

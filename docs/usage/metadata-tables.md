@@ -4,13 +4,13 @@ icon: lucide/table-2
 
 # Metadata Tables
 
-When `sink.meta_namespace` is set, pg2iceberg writes operational metadata into a set of Iceberg tables in that namespace. This gives you a queryable audit log of every commit, compaction, maintenance run, and (in Go) checkpoint save — directly accessible from any Iceberg-compatible query engine.
+When `sink.meta_namespace` is set, pg2iceberg writes operational metadata into a set of Iceberg tables in that namespace. This gives you a queryable audit log of every commit, compaction, and maintenance run — directly accessible from any Iceberg-compatible query engine.
 
-In the Rust port, four of the five tables are wired and auto-written; `checkpoints` is exposed via API but not yet auto-emitted (the Go reference writes one per CDC checkpoint save; the Rust port doesn't do periodic CDC checkpoint saves today, by design).
+Four of the five tables are wired and auto-written; `checkpoints` is exposed via API but not auto-emitted by design (recovery doesn't depend on periodic CDC checkpoint saves — the slot's `confirmed_flush_lsn` plus per-table state is sufficient).
 
 ## Namespace
 
-Metadata tables are off by default in the Rust port. Set the namespace to enable:
+Metadata tables are off by default. Set the namespace to enable:
 
 ```yaml
 sink:
@@ -96,11 +96,11 @@ One row per `(marker_uuid, table)` pair, written when blue-green marker mode is 
 
 The blue-green tooling joins this table across two pg2iceberg replicas on `marker_uuid` to verify replica equivalence at known WAL points. See [`example/blue-green/`](https://github.com/polynya-dev/pg2iceberg/tree/main/pg2iceberg-rust/example/blue-green) for the full setup.
 
-### `checkpoints` (not auto-written in Rust)
+### `checkpoints` (not auto-written)
 
-The Go reference writes one row per CDC checkpoint save. The Rust port doesn't do periodic CDC checkpoint saves (recovery doesn't depend on them — the slot's `confirmed_flush_lsn` plus per-table state is sufficient), so this table doesn't get auto-emitted today. The `Materializer::record_checkpoint` API is exposed for callers who want to emit one manually.
+pg2iceberg doesn't do periodic CDC checkpoint saves (recovery doesn't depend on them — the slot's `confirmed_flush_lsn` plus per-table state is sufficient), so this table doesn't get auto-emitted today. The `Materializer::record_checkpoint` API is exposed for callers who want to emit one manually.
 
-When wired, the schema matches Go:
+The schema:
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -130,7 +130,7 @@ ORDER BY lag_seconds DESC
 
 ### Is pg2iceberg running?
 
-The Rust port doesn't auto-write `checkpoints` rows yet (see above), so the Go-style "checkpoint heartbeat" query doesn't apply. Use the `commits` table as a heartbeat instead:
+pg2iceberg doesn't auto-write `checkpoints` rows (see above), so a "checkpoint heartbeat" query doesn't apply. Use the `commits` table as a heartbeat instead:
 
 ```sql
 SELECT

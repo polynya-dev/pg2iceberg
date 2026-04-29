@@ -21,7 +21,7 @@ PostgreSQL  ──WAL──►│  Flusher  ──staged Parquet──►  Mater
 
 The two components communicate through a **staged log** — append-only, offset-indexed Parquet files in S3 with a lightweight index in PostgreSQL (`_pg2iceberg.log_index`). Same offset-claim primitive (`Coordinator::claim_offsets`) is the durability gate for both single-process and distributed deployments.
 
-In single-process mode (`pg2iceberg run`), the WAL writer and materializer share the same process and coord — staged files still upload to S3 but the materializer reads them via the coord cursor as in distributed mode. (The Go reference's "combined mode in-memory cache" optimization is not implemented in the Rust port; profiling didn't justify it.)
+In single-process mode (`pg2iceberg run`), the WAL writer and materializer share the same process and coord — staged files still upload to S3 but the materializer reads them via the coord cursor as in distributed mode. There is no in-memory hand-off shortcut; profiling didn't justify the added complexity.
 
 ## End-to-end flow
 

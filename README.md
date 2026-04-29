@@ -4,8 +4,6 @@ pg2iceberg replicates data from Postgres directly to Iceberg, no Kafka needed. O
 - Specifically replicates Postgres → Iceberg, nothing else.
 - Assumes pg2iceberg is the sole writer of the Iceberg tables it manages, including compaction.
 
-This repository is the Rust port of pg2iceberg. The original Go implementation is referenced under `pg2iceberg/` at the workspace root; this Rust version supersedes it for new deployments.
-
 ```mermaid
 graph LR
   App[Application] <-->|Read/Write| PG
@@ -167,11 +165,10 @@ pg2iceberg-rust/
 ├── example/
 │   ├── single/                # Docker Compose stack: PG + iceberg-rest + MinIO + Grafana
 │   └── blue-green/            # Two-side replica-alignment example with marker UUIDs
-├── Dockerfile                 # multi-stage release build
-└── pg2iceberg-rust-port-plan.md  # phase-by-phase port plan
+└── Dockerfile                 # multi-stage release build
 ```
 
-The architecture mirrors the Go reference, but every IO-touching crate is gated behind a `prod` feature; the default build is sim-only and feeds the deterministic-simulation testing harness in `pg2iceberg-tests`.
+Every IO-touching crate is gated behind a `prod` feature; the default build is sim-only and feeds the deterministic-simulation testing harness in `pg2iceberg-tests`.
 
 ## Type mapping
 
@@ -220,8 +217,8 @@ Any catalog implementing the [Iceberg REST Catalog spec](https://iceberg.apache.
 |---|---|---|
 | Apache Polaris | OAuth2 / Bearer | Yes (`credential_mode: vended`) |
 | Apache REST reference (testcontainers) | None | No |
-| Cloudflare R2 Data Catalog | Bearer | Yes (carried over from the Go port; not yet re-verified end-to-end on Rust) |
-| AWS Glue | SigV4 with IAM | No (carried over from Go; not yet re-verified) |
+| Cloudflare R2 Data Catalog | Bearer | Yes (not yet re-verified end-to-end) |
+| AWS Glue | SigV4 with IAM | No (not yet re-verified end-to-end) |
 
 ## Quickstart
 
@@ -310,7 +307,7 @@ The integration suite covers the prod Coordinator (PG-replication path), the pro
 
 ### Prometheus metrics
 
-A future maintenance pass will expose Prometheus metrics on a configurable address. The `Metrics` trait is wired through every hot path; the operational endpoint is **not yet wired in the Rust port** (tracked as a remaining gap vs the Go reference).
+A future maintenance pass will expose Prometheus metrics on a configurable address. The `Metrics` trait is wired through every hot path; the operational HTTP endpoint that exports them is **not yet wired**.
 
 ### Structured logs
 
@@ -318,7 +315,7 @@ The binary uses [`tracing`](https://docs.rs/tracing) with `tracing-subscriber` f
 
 ### Distributed tracing
 
-Distributed-tracing export via OTLP is **not yet wired in the Rust port** (tracked as a remaining gap vs the Go reference). The `tracing` instrumentation that exists is stdout-only today.
+Distributed-tracing export via OTLP is **not yet wired**. The `tracing` instrumentation that exists is stdout-only today.
 
 ### Control-plane meta tables
 
@@ -331,6 +328,6 @@ When `sink.meta_namespace` is set, pg2iceberg writes operational telemetry to fo
 | `<meta_ns>.maintenance` | Each `expire_snapshots` / `clean_orphans` op (per-table) |
 | `<meta_ns>.markers` | Blue-green marker alignment (when marker mode is enabled) |
 
-Schemas mirror the Go reference exactly (field IDs match), so dashboards built against either side read the other. See [`docs/usage/metadata-tables.md`](docs/usage/metadata-tables.md) for the full schemas.
+See [`docs/usage/metadata-tables.md`](docs/usage/metadata-tables.md) for the full schemas.
 
-A fifth, `<meta_ns>.checkpoints`, is included in Go but not auto-written in Rust today (the periodic CDC checkpoint save that Go does isn't wired here yet — by design; recovery doesn't depend on it). The `record_checkpoint` API is exposed for callers who want to emit one manually.
+A fifth, `<meta_ns>.checkpoints`, is exposed via the `record_checkpoint` API for callers who want to emit one manually but is not auto-written — recovery doesn't depend on periodic checkpoint saves (the slot's `confirmed_flush_lsn` plus per-table state is sufficient).

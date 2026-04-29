@@ -6,7 +6,7 @@ icon: lucide/package
 
 ## Docker
 
-The repository ships a multi-stage Dockerfile that builds the Rust binary and publishes a slim runtime image. To build locally:
+The repository ships a multi-stage Dockerfile that builds the binary and publishes a slim runtime image. To build locally:
 
 ```bash
 docker build -t pg2iceberg-rust:dev .
@@ -15,7 +15,7 @@ docker build -t pg2iceberg-rust:dev .
 Pre-built images are not yet published. Once a release pipeline is in place, the image will be available as:
 
 ```bash
-docker pull ghcr.io/polynya-dev/pg2iceberg-rust:latest
+docker pull ghcr.io/polynya-dev/pg2iceberg:latest
 ```
 
 The image's entrypoint is the `pg2iceberg` binary; pass a subcommand:
@@ -40,7 +40,7 @@ The default build is sim-only (no S3, no real PG client). The `prod` feature wir
 
 ## Helm
 
-Not yet published for the Rust port. Tracked as a remaining gap vs the Go reference.
+Not yet published.
 
 ## Prerequisites
 

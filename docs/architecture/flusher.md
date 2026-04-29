@@ -58,7 +58,7 @@ Step 2 is atomic — a flush is either fully registered or not registered at all
 
 **Read** (materializer ← log):
 
-The materializer reads `log_index` entries with offsets greater than its cursor, downloads the referenced files, decodes them via the staging codec, and processes events in offset order. The Rust port doesn't yet have an in-memory cache optimization; profiling showed the S3-fetch overhead is amortized well below the materializer cycle interval.
+The materializer reads `log_index` entries with offsets greater than its cursor, downloads the referenced files, decodes them via the staging codec, and processes events in offset order. There is no in-memory cache optimization for the single-process case; profiling showed the S3-fetch overhead is amortized well below the materializer cycle interval.
 
 ## Restart record
 
@@ -72,4 +72,4 @@ Replication state is split across several narrow tables (no single "checkpoint" 
 On startup, pg2iceberg cross-references all four against PG and the slot, and refuses to start on any mismatch. See [validate_startup](https://github.com/polynya-dev/pg2iceberg/blob/main/pg2iceberg-rust/crates/pg2iceberg-validate/src/lib.rs) for the full invariant list.
 
 !!! note "Separate coord storage"
-    By default coord state is stored in the source PostgreSQL database. If you want to keep them separate — for example, to avoid writes on a read replica or to share state across pipelines — point `state.postgres_url` at a different database. The Go port's file-based store (`state.path`) is not implemented in Rust.
+    By default coord state is stored in the source PostgreSQL database. If you want to keep them separate — for example, to avoid writes on a read replica or to share state across pipelines — point `state.postgres_url` at a different database. Coord state is always Postgres-backed; there is no file-based store option.

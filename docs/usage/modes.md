@@ -73,8 +73,6 @@ pg2iceberg snapshot --config config.yaml
 
 If every configured table is already marked complete in `_pg2iceberg.tables`, the command prints `OK: snapshot already complete` and exits without touching PG or the catalog.
 
-This is more conservative than the Go reference's `--snapshot-only`, which doesn't create the slot in advance.
-
 ## `compact` — one-shot compaction pass
 
 Runs a single compaction pass across every configured table, then exits. Designed for cron / Kubernetes `CronJob` deployments that want compaction on a slower cadence than the materializer.
@@ -107,8 +105,6 @@ Reads PG ground truth (REPEATABLE READ snapshot) and Iceberg materialized state 
 pg2iceberg verify --config config.yaml
 pg2iceberg verify --config config.yaml --chunk-size 4096
 ```
-
-Useful as a Day-2 confidence check or as the first step of a Go → Rust migration validation.
 
 ## `cleanup` — drop PG-side state
 
