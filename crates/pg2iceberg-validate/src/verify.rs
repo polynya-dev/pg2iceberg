@@ -259,7 +259,13 @@ mod tests {
         block_on(materializer.register_table(schema())).unwrap();
         let mut stream = db.start_replication("slot").unwrap();
 
-        let snap_lsn = block_on(run_snapshot(&db, &[schema()], &mut pipeline)).unwrap();
+        let snap_lsn = block_on(run_snapshot(
+            &db,
+            coord.clone() as Arc<dyn pg2iceberg_coord::Coordinator>,
+            &[schema()],
+            &mut pipeline,
+        ))
+        .unwrap();
         stream.send_standby(snap_lsn);
         block_on(materializer.cycle()).unwrap();
 

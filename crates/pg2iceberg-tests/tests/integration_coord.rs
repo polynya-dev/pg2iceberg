@@ -30,7 +30,7 @@ use pg2iceberg_coord::{
     schema::CoordSchema,
     CommitBatch, Coordinator, MarkerInfo, OffsetClaim,
 };
-use pg2iceberg_core::{Checkpoint, Lsn, Mode, Namespace, TableIdent, WorkerId};
+use pg2iceberg_core::{Lsn, Namespace, PgValue, TableIdent, WorkerId};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
@@ -299,44 +299,92 @@ async fn lock_try_renew_release_round_trip() {
 }
 
 #[tokio::test]
-async fn checkpoint_round_trip() {
+async fn pipeline_meta_round_trip() {
     let coord = fresh_coord().await;
-    // Pass `0` for connected_system_id so the cluster fingerprint
-    // check is skipped (see Checkpoint::verify contract).
-    assert!(coord.load_checkpoint(0).await.unwrap().is_none());
+    // Fresh: no row → returns 0.
+    assert_eq!(coord.pipeline_system_identifier().await.unwrap(), 0);
 
-    let mut cp = Checkpoint::fresh(Mode::Logical);
-    cp.flushed_lsn = Lsn(0xDEAD_BEEF);
-    coord.save_checkpoint(&mut cp).await.unwrap();
-    let loaded = coord.load_checkpoint(0).await.unwrap().expect("checkpoint");
-    assert_eq!(loaded.flushed_lsn, Lsn(0xDEAD_BEEF));
-    assert!(matches!(loaded.mode, Mode::Logical));
-    // First save bumps revision 0 → 1.
-    assert_eq!(loaded.revision, 1);
-    assert!(loaded.checksum.is_some());
+    // Stamp idempotently.
+    coord.set_pipeline_system_identifier(7777).await.unwrap();
+    assert_eq!(coord.pipeline_system_identifier().await.unwrap(), 7777);
+    coord.set_pipeline_system_identifier(7777).await.unwrap();
+    assert_eq!(coord.pipeline_system_identifier().await.unwrap(), 7777);
 
-    // Subsequent save with the loaded cp's revision succeeds; OCC
-    // predicate matches.
-    cp.flushed_lsn = Lsn(0xCAFE);
-    coord.save_checkpoint(&mut cp).await.unwrap();
-    let loaded = coord.load_checkpoint(0).await.unwrap().unwrap();
-    assert_eq!(loaded.flushed_lsn, Lsn(0xCAFE));
-    assert_eq!(loaded.revision, 2);
+    // Mismatched stamp returns SystemIdMismatch and doesn't overwrite.
+    let err = coord
+        .set_pipeline_system_identifier(8888)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        pg2iceberg_coord::CoordError::SystemIdMismatch { stored: 7777, connected: 8888 }
+    ));
+    assert_eq!(coord.pipeline_system_identifier().await.unwrap(), 7777);
 }
 
 #[tokio::test]
-async fn checkpoint_concurrent_update_returns_error() {
-    // Two writers, both with stale revision = 0, race on the first
-    // save. One wins; the other gets ConcurrentUpdate.
+async fn table_state_round_trip() {
     let coord = fresh_coord().await;
-    let mut cp_a = Checkpoint::fresh(Mode::Logical);
-    cp_a.flushed_lsn = Lsn(1);
-    let mut cp_b = Checkpoint::fresh(Mode::Logical);
-    cp_b.flushed_lsn = Lsn(2);
+    let t = ident("public", "orders");
+    assert!(coord.table_state(&t).await.unwrap().is_none());
 
-    coord.save_checkpoint(&mut cp_a).await.unwrap();
-    let err = coord.save_checkpoint(&mut cp_b).await.unwrap_err();
-    assert!(matches!(err, pg2iceberg_coord::CoordError::ConcurrentUpdate));
+    coord
+        .mark_table_snapshot_complete(&t, 12345, Lsn(0xDEAD_BEEF))
+        .await
+        .unwrap();
+    let state = coord.table_state(&t).await.unwrap().unwrap();
+    assert!(state.snapshot_complete);
+    assert_eq!(state.pg_oid, 12345);
+    assert_eq!(state.snapshot_lsn, Lsn(0xDEAD_BEEF));
+    assert!(state.completed_at_micros.is_some());
+}
+
+#[tokio::test]
+async fn snapshot_progress_round_trip() {
+    let coord = fresh_coord().await;
+    let t = ident("public", "orders");
+    assert!(coord.snapshot_progress(&t).await.unwrap().is_none());
+
+    coord.set_snapshot_progress(&t, "[123]").await.unwrap();
+    assert_eq!(
+        coord.snapshot_progress(&t).await.unwrap().as_deref(),
+        Some("[123]")
+    );
+
+    coord.set_snapshot_progress(&t, "[456]").await.unwrap();
+    assert_eq!(
+        coord.snapshot_progress(&t).await.unwrap().as_deref(),
+        Some("[456]")
+    );
+
+    coord.clear_snapshot_progress(&t).await.unwrap();
+    assert!(coord.snapshot_progress(&t).await.unwrap().is_none());
+    // Idempotent.
+    coord.clear_snapshot_progress(&t).await.unwrap();
+}
+
+#[tokio::test]
+async fn query_watermark_round_trip() {
+    let coord = fresh_coord().await;
+    let t = ident("public", "orders");
+    assert!(coord.query_watermark(&t).await.unwrap().is_none());
+
+    coord
+        .set_query_watermark(&t, &PgValue::Int8(42))
+        .await
+        .unwrap();
+    assert_eq!(
+        coord.query_watermark(&t).await.unwrap(),
+        Some(PgValue::Int8(42))
+    );
+    coord
+        .set_query_watermark(&t, &PgValue::Int8(99))
+        .await
+        .unwrap();
+    assert_eq!(
+        coord.query_watermark(&t).await.unwrap(),
+        Some(PgValue::Int8(99))
+    );
 }
 
 #[tokio::test]

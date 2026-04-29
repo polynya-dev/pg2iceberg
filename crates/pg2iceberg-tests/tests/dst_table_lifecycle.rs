@@ -25,8 +25,9 @@
 
 use std::sync::Arc;
 
+use pg2iceberg_coord::TableSnapshotState;
 use pg2iceberg_core::{
-    Checkpoint, ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema,
+    ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema,
 };
 use pg2iceberg_sim::postgres::{SimPgClient, SimPostgres};
 use pg2iceberg_validate::{
@@ -58,12 +59,12 @@ fn schema() -> TableSchema {
     }
 }
 
-/// Build a healthy `StartupValidation` from sim state, then let
-/// caller mutate `cp.snapshoted_table_oids` / `snapshoted_tables` to
-/// model "previously snapshotted at oid X."
+/// Build a healthy `StartupValidation` from sim state with the
+/// caller-supplied per-table state stamped on the table row.
+/// Replaces the old "build a Checkpoint blob and pass it in" shape.
 async fn build_startup(
     db: &SimPostgres,
-    cp: Checkpoint,
+    stored_state: Option<TableSnapshotState>,
 ) -> StartupValidation {
     let pg: Arc<dyn pg2iceberg_pg::PgClient> = Arc::new(SimPgClient::new(db.clone()));
 
@@ -98,7 +99,6 @@ async fn build_startup(
     };
 
     StartupValidation {
-        checkpoint: Some(cp),
         tables: vec![TableExistence {
             pg_table: ident(),
             iceberg_name: "public.orders".into(),
@@ -106,11 +106,29 @@ async fn build_startup(
             current_snapshot_id: Some(1),
             current_pg_oid: pg_oid,
             in_publication: pub_members.contains(&ident()),
+            stored_state,
         }],
         slot,
         config_mode: Mode::Logical,
         slot_name: SLOT.into(),
         publication_name: PUB.into(),
+        // Match the slot's confirmed_flush_lsn so tamper detection
+        // doesn't fire — these tests isolate identity / publication
+        // membership, not external advancement.
+        coord_flushed_lsn: db
+            .slot_state(SLOT)
+            .map(|s| s.confirmed_flush_lsn)
+            .unwrap_or(Lsn::ZERO),
+    }
+}
+
+/// Common shape: a complete snapshot at LSN 100 with a given oid.
+fn complete_state(pg_oid: u32) -> TableSnapshotState {
+    TableSnapshotState {
+        pg_oid,
+        snapshot_complete: true,
+        snapshot_lsn: Lsn(100),
+        completed_at_micros: Some(1_000_000),
     }
 }
 
@@ -130,15 +148,8 @@ fn drop_recreate_table_fires_table_identity_changed() {
     let new_oid = db.table_oid(&ident()).expect("table exists");
     assert_ne!(original_oid, new_oid, "recreate must yield fresh oid");
 
-    // Stage a checkpoint that says "we snapshotted at original_oid."
-    let mut cp = Checkpoint::fresh(Mode::Logical);
-    cp.snapshot_complete = true;
-    cp.flushed_lsn = Lsn(100);
-    cp.snapshoted_tables.insert(ident().to_string(), true);
-    cp.snapshoted_table_oids
-        .insert(ident().to_string(), original_oid);
-
-    let v = block_on(build_startup(&db, cp));
+    // Stage per-table state that says "we snapshotted at original_oid."
+    let v = block_on(build_startup(&db, Some(complete_state(original_oid))));
     let err =
         validate_startup(&v).expect_err("identity change must fail validation");
 
@@ -162,17 +173,10 @@ fn drop_table_from_publication_fires_table_missing_from_publication() {
 
     let oid = db.table_oid(&ident()).unwrap();
 
-    // Stage a checkpoint that says "we snapshotted this table."
-    let mut cp = Checkpoint::fresh(Mode::Logical);
-    cp.snapshot_complete = true;
-    cp.flushed_lsn = Lsn(100);
-    cp.snapshoted_tables.insert(ident().to_string(), true);
-    cp.snapshoted_table_oids.insert(ident().to_string(), oid);
-
     // Operator runs `ALTER PUBLICATION DROP TABLE`.
     db.drop_table_from_publication(PUB, &ident()).unwrap();
 
-    let v = block_on(build_startup(&db, cp));
+    let v = block_on(build_startup(&db, Some(complete_state(oid))));
     let err = validate_startup(&v)
         .expect_err("publication membership drift must fail validation");
 
@@ -197,13 +201,7 @@ fn untouched_table_passes_both_invariants() {
     db.create_slot(SLOT, PUB).unwrap();
 
     let oid = db.table_oid(&ident()).unwrap();
-    let mut cp = Checkpoint::fresh(Mode::Logical);
-    cp.snapshot_complete = true;
-    cp.flushed_lsn = Lsn(100);
-    cp.snapshoted_tables.insert(ident().to_string(), true);
-    cp.snapshoted_table_oids.insert(ident().to_string(), oid);
-
-    let v = block_on(build_startup(&db, cp));
+    let v = block_on(build_startup(&db, Some(complete_state(oid))));
     assert!(validate_startup(&v).is_ok());
 }
 
@@ -218,13 +216,9 @@ fn legacy_checkpoint_without_oid_skips_invariant_11() {
     db.create_publication(PUB, &[ident()]).unwrap();
     db.create_slot(SLOT, PUB).unwrap();
 
-    let mut cp = Checkpoint::fresh(Mode::Logical);
-    cp.snapshot_complete = true;
-    cp.flushed_lsn = Lsn(100);
-    cp.snapshoted_tables.insert(ident().to_string(), true);
-    // Note: snapshoted_table_oids deliberately NOT populated.
-
-    let v = block_on(build_startup(&db, cp));
+    // Per-table state with pg_oid = 0 (the legacy / unknown sentinel).
+    // Invariant 10 (oid mismatch) skips when stored_oid is 0.
+    let v = block_on(build_startup(&db, Some(complete_state(0))));
     assert!(validate_startup(&v).is_ok());
 }
 
@@ -241,20 +235,10 @@ fn stale_yaml_removal_passes_startup_with_no_violation() {
     db.create_slot(SLOT, PUB).unwrap();
 
     let oid = db.table_oid(&ident()).unwrap();
-    let mut cp = Checkpoint::fresh(Mode::Logical);
-    cp.snapshot_complete = true;
-    cp.flushed_lsn = Lsn(100);
-    cp.snapshoted_tables.insert(ident().to_string(), true);
-    cp.snapshoted_table_oids.insert(ident().to_string(), oid);
-    // Pretend YAML now has a different table that was never snapshotted.
-    cp.snapshoted_tables
-        .insert("public.removed_table".into(), true);
-    cp.snapshoted_table_oids
-        .insert("public.removed_table".into(), 99999);
-
-    let v = block_on(build_startup(&db, cp));
-    // The healthy table (in YAML) is in the validation. The stale
-    // one is in cp but not in `v.tables` — i.e. not in YAML. No
-    // invariant fires for that case.
+    // The healthy table (in YAML) gets stored state; tables that
+    // operator removed from YAML aren't represented in `v.tables`,
+    // so they can't trip any invariant — that "stale state in coord
+    // we don't track" hygiene case is out-of-band of validation now.
+    let v = block_on(build_startup(&db, Some(complete_state(oid))));
     assert!(validate_startup(&v).is_ok());
 }

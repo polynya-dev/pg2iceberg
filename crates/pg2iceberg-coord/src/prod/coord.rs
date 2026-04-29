@@ -20,7 +20,8 @@ use crate::{
     OffsetGrant, Result,
 };
 use async_trait::async_trait;
-use pg2iceberg_core::{Checkpoint, Lsn, TableIdent, WorkerId};
+use crate::TableSnapshotState;
+use pg2iceberg_core::{Lsn, TableIdent, WorkerId};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -417,63 +418,199 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
-    async fn load_checkpoint(
-        &self,
-        connected_system_id: u64,
-    ) -> Result<Option<Checkpoint>> {
+    async fn pipeline_system_identifier(&self) -> Result<u64> {
         let client = self.client.lock().await;
         let rows = client
-            .query(&sql::load_checkpoint(&self.schema), &[])
+            .query(&sql::select_pipeline_meta(&self.schema), &[])
             .await
             .map_err(pg)?;
         match rows.first() {
             Some(r) => {
-                let payload: serde_json::Value = r.get("payload");
-                let stored_revision: i64 = r.get("revision");
-                let mut cp: Checkpoint = serde_json::from_value(payload)
-                    .map_err(|e| CoordError::Other(format!("checkpoint deserialize: {e}")))?;
-                // The on-disk `revision` is authoritative — it
-                // increments under the OCC predicate even when the
-                // JSONB payload's `revision` agrees, but if the
-                // JSONB ever drifts (e.g. someone hand-edited it)
-                // we still trust the column.
-                cp.revision = stored_revision;
-                cp.verify(connected_system_id)?;
-                Ok(Some(cp))
+                let v: i64 = r.get(0);
+                Ok(v as u64)
+            }
+            None => Ok(0),
+        }
+    }
+
+    async fn set_pipeline_system_identifier(&self, sysid: u64) -> Result<()> {
+        // Read-modify-write the row inside one transaction so a
+        // concurrent stamper can't race us into a silent overwrite.
+        // The CHECK (id = 1) constraint plus the SELECT-then-UPSERT
+        // means there's at most one writer that wins; everyone else
+        // either matches the stored value (no-op) or returns
+        // SystemIdMismatch.
+        let mut client = self.client.lock().await;
+        let tx = client.transaction().await.map_err(pg)?;
+        let stored: u64 = match tx
+            .query(&sql::select_pipeline_meta(&self.schema), &[])
+            .await
+            .map_err(pg)?
+            .first()
+        {
+            Some(r) => {
+                let v: i64 = r.get(0);
+                v as u64
+            }
+            None => 0,
+        };
+        if stored != 0 && stored != sysid {
+            // Don't write the conflicting value. Surface the
+            // mismatch and let the caller decide (typically: exit
+            // with a clear error pointing at the DSN).
+            return Err(CoordError::SystemIdMismatch {
+                stored,
+                connected: sysid,
+            });
+        }
+        let v: i64 = sysid as i64;
+        tx.execute(&sql::upsert_pipeline_meta(&self.schema), &[&v])
+            .await
+            .map_err(pg)?;
+        tx.commit().await.map_err(pg)?;
+        Ok(())
+    }
+
+    async fn flushed_lsn(&self) -> Result<Lsn> {
+        let client = self.client.lock().await;
+        let rows = client
+            .query(&sql::select_flushed_lsn(&self.schema), &[])
+            .await
+            .map_err(pg)?;
+        match rows.first() {
+            Some(r) => {
+                let v: i64 = r.get(0);
+                Ok(i64_to_lsn(v))
+            }
+            None => Ok(Lsn::ZERO),
+        }
+    }
+
+    async fn set_flushed_lsn(&self, lsn: Lsn) -> Result<()> {
+        let v = lsn_to_i64(lsn);
+        let client = self.client.lock().await;
+        client
+            .execute(&sql::upsert_flushed_lsn(&self.schema), &[&v])
+            .await
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    async fn table_state(&self, ident: &TableIdent) -> Result<Option<TableSnapshotState>> {
+        let key = table_key(ident);
+        let client = self.client.lock().await;
+        let rows = client
+            .query(&sql::select_table_state(&self.schema), &[&key])
+            .await
+            .map_err(pg)?;
+        match rows.first() {
+            Some(r) => {
+                let pg_oid: i64 = r.get(0);
+                let snapshot_complete: bool = r.get(1);
+                let snapshot_lsn: i64 = r.get(2);
+                let completed_micros: Option<f64> = r.try_get(3).ok();
+                Ok(Some(TableSnapshotState {
+                    pg_oid: pg_oid as u32,
+                    snapshot_complete,
+                    snapshot_lsn: i64_to_lsn(snapshot_lsn),
+                    completed_at_micros: completed_micros.map(|f| f as i64),
+                }))
             }
             None => Ok(None),
         }
     }
 
-    async fn save_checkpoint(&self, cp: &mut Checkpoint) -> Result<()> {
-        let expected_revision = cp.revision;
-        let now_micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
-            .unwrap_or(0);
-        cp.seal(now_micros);
-
-        let payload = serde_json::to_value(&*cp)
-            .map_err(|e| CoordError::Other(format!("checkpoint serialize: {e}")))?;
-        let new_revision = cp.revision;
-
+    async fn mark_table_snapshot_complete(
+        &self,
+        ident: &TableIdent,
+        pg_oid: u32,
+        snapshot_lsn: Lsn,
+    ) -> Result<()> {
+        let key = table_key(ident);
+        let oid_i64: i64 = pg_oid as i64;
+        let lsn_i64 = lsn_to_i64(snapshot_lsn);
         let client = self.client.lock().await;
-        let q = if expected_revision == 0 {
-            sql::insert_checkpoint_first(&self.schema)
-        } else {
-            sql::update_checkpoint_with_occ(&self.schema)
-        };
-        let n = client
-            .execute(&q, &[&payload, &new_revision, &expected_revision])
+        client
+            .execute(
+                &sql::mark_table_complete(&self.schema),
+                &[&key, &oid_i64, &lsn_i64],
+            )
             .await
             .map_err(pg)?;
-        if n == 0 {
-            // Roll back the in-memory bump so the caller can
-            // reload + retry without inheriting our skipped
-            // revision number.
-            cp.revision = expected_revision;
-            return Err(CoordError::ConcurrentUpdate);
+        Ok(())
+    }
+
+    async fn snapshot_progress(&self, ident: &TableIdent) -> Result<Option<String>> {
+        let key = table_key(ident);
+        let client = self.client.lock().await;
+        let rows = client
+            .query(&sql::select_snapshot_progress(&self.schema), &[&key])
+            .await
+            .map_err(pg)?;
+        Ok(rows.first().map(|r| r.get::<_, String>(0)))
+    }
+
+    async fn set_snapshot_progress(
+        &self,
+        ident: &TableIdent,
+        last_pk_key: &str,
+    ) -> Result<()> {
+        let key = table_key(ident);
+        let client = self.client.lock().await;
+        client
+            .execute(
+                &sql::upsert_snapshot_progress(&self.schema),
+                &[&key, &last_pk_key],
+            )
+            .await
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    async fn clear_snapshot_progress(&self, ident: &TableIdent) -> Result<()> {
+        let key = table_key(ident);
+        let client = self.client.lock().await;
+        client
+            .execute(&sql::delete_snapshot_progress(&self.schema), &[&key])
+            .await
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    async fn query_watermark(&self, ident: &TableIdent) -> Result<Option<pg2iceberg_core::PgValue>> {
+        let key = table_key(ident);
+        let client = self.client.lock().await;
+        let rows = client
+            .query(&sql::select_query_watermark(&self.schema), &[&key])
+            .await
+            .map_err(pg)?;
+        match rows.first() {
+            Some(r) => {
+                let payload: serde_json::Value = r.get(0);
+                let v: pg2iceberg_core::PgValue = serde_json::from_value(payload)
+                    .map_err(|e| CoordError::Other(format!("query_watermark deserialize: {e}")))?;
+                Ok(Some(v))
+            }
+            None => Ok(None),
         }
+    }
+
+    async fn set_query_watermark(
+        &self,
+        ident: &TableIdent,
+        watermark: &pg2iceberg_core::PgValue,
+    ) -> Result<()> {
+        let key = table_key(ident);
+        let payload = serde_json::to_value(watermark)
+            .map_err(|e| CoordError::Other(format!("query_watermark serialize: {e}")))?;
+        let client = self.client.lock().await;
+        client
+            .execute(
+                &sql::upsert_query_watermark(&self.schema),
+                &[&key, &payload],
+            )
+            .await
+            .map_err(pg)?;
         Ok(())
     }
 

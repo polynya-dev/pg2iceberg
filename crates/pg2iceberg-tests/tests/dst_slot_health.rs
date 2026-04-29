@@ -29,9 +29,9 @@
 
 use std::sync::Arc;
 
+use pg2iceberg_coord::TableSnapshotState;
 use pg2iceberg_core::{
-    Checkpoint, ColumnName, ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent,
-    TableSchema,
+    ColumnName, ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema,
 };
 use pg2iceberg_pg::WalStatus;
 use pg2iceberg_sim::clock::TestClock;
@@ -97,15 +97,17 @@ async fn build_startup_validation(
         }),
     };
 
-    // Stage a Complete checkpoint so the irrelevant invariants don't
-    // also fire. We're isolating the slot-health path.
-    let mut cp = Checkpoint::fresh(Mode::Logical);
-    cp.snapshot_complete = true;
-    cp.flushed_lsn = Lsn(100);
-    cp.snapshoted_tables.insert(ident().to_string(), true);
+    // Stage per-table snapshot state so the irrelevant invariants
+    // don't also fire. We're isolating the slot-health path.
+    let pg_oid = db.table_oid(&ident()).unwrap_or(42);
+    let stored = Some(TableSnapshotState {
+        pg_oid,
+        snapshot_complete: true,
+        snapshot_lsn: Lsn(100),
+        completed_at_micros: Some(1_000_000),
+    });
 
     StartupValidation {
-        checkpoint: Some(cp),
         tables: vec![TableExistence {
             pg_table: ident(),
             iceberg_name: "public.orders".into(),
@@ -116,11 +118,19 @@ async fn build_startup_validation(
                 .publication_tables(PUB)
                 .into_iter()
                 .any(|t| t == ident()),
+            stored_state: stored,
         }],
         slot,
         config_mode: Mode::Logical,
         slot_name: slot_name.into(),
         publication_name: PUB.into(),
+        // Match the slot's confirmed_flush_lsn so the tamper-detection
+        // invariant doesn't fire — these tests isolate slot-health
+        // (wal_status, conflicting), not external advancement.
+        coord_flushed_lsn: db
+            .slot_state(slot_name)
+            .map(|s| s.confirmed_flush_lsn)
+            .unwrap_or(Lsn::ZERO),
     }
 }
 

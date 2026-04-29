@@ -385,19 +385,16 @@ fn save_checkpoint_without_flush_still_persists() {
     // Watermark is in memory but not yet committed because flush wasn't called.
     block_on(h.qp.save_checkpoint()).unwrap();
 
-    let cp = block_on(h.coord.load_checkpoint(0)).unwrap().unwrap();
-    assert_eq!(
-        cp.query_watermarks.get(&ident().to_string()),
-        Some(&PgValue::Int8(5))
-    );
+    let wm = block_on(h.coord.query_watermark(&ident())).unwrap();
+    assert_eq!(wm, Some(PgValue::Int8(5)));
 }
 
 #[test]
 fn empty_pipeline_save_yields_empty_watermark_map() {
     let h = boot();
     block_on(h.qp.save_checkpoint()).unwrap();
-    let cp = block_on(h.coord.load_checkpoint(0)).unwrap().unwrap();
-    assert!(cp.query_watermarks.is_empty());
+    let wm = block_on(h.coord.query_watermark(&ident())).unwrap();
+    assert!(wm.is_none(), "no tables registered → no watermark stored");
 }
 
 // ---------- chunked polling (Phase 10 finish) ----------

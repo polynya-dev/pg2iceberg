@@ -16,10 +16,6 @@ thiserror.workspace = true
 # murmur3_x86_32 — required by Iceberg's bucket[N] transform spec.
 # Same crate iceberg-rust uses; tiny pure-compute, no IO.
 murmur3 = "0.5"
-# SHA-256 for Checkpoint::seal()/verify(). Pure-compute, no IO. Same
-# digest the Go reference uses so checksums are wire-comparable when
-# differential-testing against a Go-written checkpoint.
-sha2 = "0.10"
 
 [dev-dependencies]
 proptest.workspace = true

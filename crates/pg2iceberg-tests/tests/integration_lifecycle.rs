@@ -236,6 +236,7 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             // asserts `flush_threshold > 0`, so 0 would crash the
             // pipeline on startup.
             flush_rows: 1000,
+            materializer_interval: String::new(),
             compaction_data_files: 8,
             compaction_delete_files: 4,
             target_file_size: 0, // disable compaction for this test

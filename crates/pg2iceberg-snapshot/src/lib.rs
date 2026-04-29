@@ -33,7 +33,7 @@
 use async_trait::async_trait;
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::{
-    ChangeEvent, Checkpoint, ColumnName, Lsn, Mode, Op, Row, TableIdent,
+    ChangeEvent, ColumnName, Lsn, Op, Row, TableIdent,
     TableSchema, Timestamp,
 };
 use pg2iceberg_iceberg::{pk_key, Catalog};
@@ -155,6 +155,7 @@ pub const DEFAULT_CHUNK_SIZE: usize = 1024;
 /// snapshot rows out to Iceberg.
 pub async fn run_snapshot<S, C>(
     source: &S,
+    coord: Arc<dyn Coordinator>,
     schemas: &[TableSchema],
     pipeline: &mut Pipeline<C>,
 ) -> Result<Lsn>
@@ -162,22 +163,22 @@ where
     S: SnapshotSource + ?Sized,
     C: Coordinator + ?Sized,
 {
-    run_snapshot_chunked(source, schemas, pipeline, DEFAULT_CHUNK_SIZE).await
+    run_snapshot_chunked(source, coord, schemas, pipeline, DEFAULT_CHUNK_SIZE).await
 }
 
-/// Like [`run_snapshot`] but with an explicit `chunk_size`. Each chunk is
-/// staged + coord-committed independently; peak memory is bounded by
-/// `chunk_size` rows. The materializer later coalesces all chunks into one
-/// Iceberg snapshot.
+/// Like [`run_snapshot`] but with an explicit `chunk_size`. Each chunk
+/// is staged + coord-committed independently; peak memory is bounded
+/// by `chunk_size` rows. The materializer later coalesces all chunks
+/// into one Iceberg snapshot per table.
 ///
-/// Crash recovery: if the process dies mid-snapshot, the pipeline restarts
-/// from the slot's `restart_lsn` (still at the pre-snapshot point) and the
-/// snapshot replays from chunk 0. Idempotent because chunked replay
-/// produces the same staged Parquet for the same source rows. (Resumability
-/// — skipping already-completed chunks — is a Phase 11.5 task that needs
-/// per-table progress tracked in the checkpoint.)
+/// Resumability: each chunk persists a per-table cursor in
+/// `_pg2iceberg.snapshot_progress`, and a completed table writes a
+/// row to `_pg2iceberg.tables`. A subsequent call against the same
+/// coord will skip already-complete tables and resume mid-table from
+/// the last saved cursor.
 pub async fn run_snapshot_chunked<S, C>(
     source: &S,
+    coord: Arc<dyn Coordinator>,
     schemas: &[TableSchema],
     pipeline: &mut Pipeline<C>,
     chunk_size: usize,
@@ -186,43 +187,33 @@ where
     S: SnapshotSource + ?Sized,
     C: Coordinator + ?Sized,
 {
-    // Non-resumable variant: just runs a single pass with empty
-    // progress and no incremental saving.
-    let snap_lsn = source.snapshot_lsn().await?;
-    let progress = SnapshotProgressMap::default();
-    let (_chunks, _end) = snapshot_one_pass(
-        source, schemas, pipeline, chunk_size, snap_lsn, progress, None, None,
-    )
-    .await?;
-    Ok(snap_lsn)
-}
-
-/// Per-table progress map (canonical PK key of the last staged row).
-/// Progress map keyed by `"<namespace>.<name>"` (matches the
-/// `Checkpoint::snapshot_progress` wire format). Centralized helper
-/// `key_for(ident)` builds the lookup key.
-type SnapshotProgressMap = BTreeMap<String, String>;
-
-/// Build the canonical "namespace.name" key used in `snapshot_progress`
-/// + `snapshoted_tables` maps. Mirrors `TableIdent::Display`.
-fn key_for(ident: &TableIdent) -> String {
-    ident.to_string()
+    Snapshotter::new(coord)
+        .with_chunk_size(chunk_size)
+        .run(source, schemas, pipeline)
+        .await
 }
 
 /// Resumable snapshot driver.
 ///
-/// On `run`, loads `Checkpoint::snapshot_progress` from the coord; for each
-/// table, resumes reading at PKs strictly greater than the saved key. After
-/// each chunk, persists updated progress so a crash mid-snapshot resumes
-/// from the right place. When all tables complete, clears their progress
-/// entries.
+/// On `run`, loads each table's per-row resume cursor from
+/// `_pg2iceberg.snapshot_progress`; for each table, resumes reading
+/// at PKs strictly greater than the saved key. After every chunk,
+/// stamps the new cursor so a crash mid-snapshot resumes from the
+/// right place. When a table finishes, the cursor row is dropped
+/// and `mark_table_snapshot_complete` upserts the per-table flag in
+/// `_pg2iceberg.tables`.
 ///
-/// Phase 11 finish surface — the existing `run_snapshot` /
-/// `run_snapshot_chunked` free functions stay for tests and uses that
-/// don't care about resumability.
+/// Replaces the old `Checkpoint`-driven design — see the module-level
+/// docs for the rationale.
 pub struct Snapshotter {
     coord: Arc<dyn Coordinator>,
     chunk_size: usize,
+    /// Optional per-table `pg_class.oid`s captured at snapshot time.
+    /// Stamped onto the `_pg2iceberg.tables` row when a table
+    /// completes; used downstream by the `TableIdentityChanged`
+    /// startup invariant. Empty in sim runs (oid 0 means "unknown";
+    /// the invariant skips on 0).
+    table_oids: BTreeMap<TableIdent, u32>,
 }
 
 impl Snapshotter {
@@ -230,12 +221,23 @@ impl Snapshotter {
         Self {
             coord,
             chunk_size: DEFAULT_CHUNK_SIZE,
+            table_oids: BTreeMap::new(),
         }
     }
 
     pub fn with_chunk_size(mut self, n: usize) -> Self {
         assert!(n > 0, "chunk_size must be > 0");
         self.chunk_size = n;
+        self
+    }
+
+    /// Stamp per-table `pg_class.oid`s. Callers that have access to
+    /// PG (the lifecycle, `run_snapshot_phase`) supply this so each
+    /// table's `_pg2iceberg.tables` row carries the oid for the
+    /// `TableIdentityChanged` invariant. Tests that don't care can
+    /// skip — defaults to empty.
+    pub fn with_table_oids(mut self, oids: BTreeMap<TableIdent, u32>) -> Self {
+        self.table_oids = oids;
         self
     }
 
@@ -254,10 +256,10 @@ impl Snapshotter {
     }
 
     /// Run at most `max_chunks` chunks across all tables, then return.
-    /// `None` = unlimited. Used by tests to simulate a mid-snapshot crash:
-    /// after `run_chunks(.., Some(N))`, drop the pipeline + Snapshotter,
-    /// recreate them, and call `run` to finish — checkpoint progress
-    /// drives correct resumption.
+    /// `None` = unlimited. Used by tests to simulate a mid-snapshot
+    /// crash: after `run_chunks(.., Some(N))`, drop the pipeline +
+    /// Snapshotter, recreate them, and call `run` to finish — the
+    /// per-table progress rows drive correct resumption.
     pub async fn run_chunks<S, C>(
         &self,
         source: &S,
@@ -271,261 +273,136 @@ impl Snapshotter {
     {
         let snap_lsn = source.snapshot_lsn().await?;
 
-        // Load existing checkpoint progress. Pass `0` for
-        // connected_system_id — the snapshotter doesn't have a PG
-        // client handle here; the lifecycle's startup validation is
-        // what verifies cluster fingerprint before we get here.
-        let cp = self
-            .coord
-            .load_checkpoint(0)
-            .await
-            .map_err(|e| SnapshotError::Source(format!("load_checkpoint: {e}")))?;
-        let progress = cp
-            .as_ref()
-            .map(|c| c.snapshot_progress.clone())
-            .unwrap_or_default();
+        // Per-table snapshot loop. For each schema, read its progress
+        // cursor from coord, drive chunks until empty, stamp progress
+        // after each, mark the table complete on finish. A
+        // mid-snapshot fault leaves only the in-progress table's row
+        // in `snapshot_progress`; on resume the inner loop picks up
+        // at the saved PK.
+        let mut total_chunks = 0usize;
+        'tables: for (i, schema) in schemas.iter().enumerate() {
+            let xid = SNAPSHOT_XID_BASE.wrapping_add(i as u32);
+            let pk_cols: Vec<ColumnName> = schema
+                .primary_key_columns()
+                .map(|c| ColumnName(c.name.clone()))
+                .collect();
+            if pk_cols.is_empty() {
+                return Err(SnapshotError::Source(format!(
+                    "table {} has no primary key; pg2iceberg requires one",
+                    schema.ident
+                )));
+            }
 
-        // The single mutable Checkpoint we thread through every save
-        // in this pass. After each successful save, `seal` has bumped
-        // its `revision` to match the on-disk row, so the next save's
-        // OCC predicate matches. Cloning `base_cp` per-save (the
-        // earlier shape) loses that revision and the second save
-        // returns ConcurrentUpdate.
-        let mut cp_state = cp.unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
+            // Skip tables already complete from a prior pass. Cheap
+            // single-row read; avoids re-reading the source for
+            // already-snapshotted data.
+            if let Some(state) = self.coord.table_state(&schema.ident).await.map_err(
+                |e| SnapshotError::Source(format!("table_state: {e}")),
+            )? {
+                if state.snapshot_complete {
+                    continue;
+                }
+            }
 
-        // Pass the coord through to snapshot_one_pass so progress is
-        // persisted *after every successful chunk*, not just at
-        // end-of-pass. Without this, a fault mid-chunk loses every
-        // chunk's progress and the resume restarts from chunk 0 —
-        // which is exactly the bug fault-DST surfaced.
-        let pass = snapshot_one_pass(
-            source,
-            schemas,
-            pipeline,
-            self.chunk_size,
-            snap_lsn,
-            progress,
-            max_chunks,
-            Some((self.coord.as_ref(), &mut cp_state)),
-        )
-        .await;
+            let mut last_pk_key: Option<String> = self
+                .coord
+                .snapshot_progress(&schema.ident)
+                .await
+                .map_err(|e| SnapshotError::Source(format!("snapshot_progress: {e}")))?;
 
-        // The pass may have errored mid-chunk; in that case
-        // snapshot_one_pass has already persisted progress through
-        // the last successful chunk before propagating the error.
-        // Just propagate.
-        let (_chunks, end_progress) = pass?;
+            loop {
+                if let Some(cap) = max_chunks {
+                    if total_chunks >= cap {
+                        break 'tables;
+                    }
+                }
 
-        // End-of-pass save: marks Complete iff every table this pass
-        // had finished. Per-table tracking lets a future "add another
-        // table" pass snapshot only the new one without losing
-        // existing per-table state.
-        cp_state.snapshot_progress = end_progress;
-        for s in schemas {
-            if !cp_state.snapshot_progress.contains_key(&key_for(&s.ident)) {
-                cp_state
-                    .snapshoted_tables
-                    .insert(key_for(&s.ident), true);
+                let chunk = source
+                    .read_chunk(&schema.ident, self.chunk_size, last_pk_key.as_deref())
+                    .await?;
+                if chunk.is_empty() {
+                    // Table done — drop the resume cursor and stamp
+                    // the per-table completion row. Order matters: we
+                    // clear progress *first* so a crash between the
+                    // two writes leaves the table marked
+                    // not-yet-complete (snapshotter retries cleanly)
+                    // rather than complete-without-cursor (no-op
+                    // resume; correct).
+                    self.coord
+                        .clear_snapshot_progress(&schema.ident)
+                        .await
+                        .map_err(|e| {
+                            SnapshotError::Source(format!("clear_snapshot_progress: {e}"))
+                        })?;
+                    let oid = self.table_oids.get(&schema.ident).copied().unwrap_or(0);
+                    self.coord
+                        .mark_table_snapshot_complete(&schema.ident, oid, snap_lsn)
+                        .await
+                        .map_err(|e| {
+                            SnapshotError::Source(format!(
+                                "mark_table_snapshot_complete: {e}"
+                            ))
+                        })?;
+                    break;
+                }
+
+                let last_in_chunk = chunk.last().unwrap();
+                let new_key = pk_key(last_in_chunk, &pk_cols);
+
+                if let Some(prev) = last_pk_key.as_deref() {
+                    if new_key.as_str() <= prev {
+                        return Err(SnapshotError::Source(format!(
+                            "snapshot source did not advance past PK {prev} for table {}; got {new_key}",
+                            schema.ident
+                        )));
+                    }
+                }
+
+                pipeline
+                    .process(DecodedMessage::Begin {
+                        final_lsn: snap_lsn,
+                        xid,
+                    })
+                    .await?;
+                for row in chunk {
+                    pipeline
+                        .process(DecodedMessage::Change(ChangeEvent {
+                            table: schema.ident.clone(),
+                            op: Op::Insert,
+                            lsn: snap_lsn,
+                            commit_ts: Timestamp(0),
+                            xid: Some(xid),
+                            before: None,
+                            after: Some(row),
+                            unchanged_cols: vec![],
+                        }))
+                        .await?;
+                }
+                pipeline
+                    .process(DecodedMessage::Commit {
+                        commit_lsn: snap_lsn,
+                        xid,
+                    })
+                    .await?;
+                pipeline.flush().await?;
+
+                // Chunk fully durable in coord. Stamp the resume
+                // cursor *after* the flush — if we crash before this
+                // write, resume re-reads the chunk (idempotent: the
+                // materializer's fold-by-PK absorbs the duplicate
+                // staged events).
+                last_pk_key = Some(new_key.clone());
+                self.coord
+                    .set_snapshot_progress(&schema.ident, &new_key)
+                    .await
+                    .map_err(|e| SnapshotError::Source(format!("set_snapshot_progress: {e}")))?;
+                total_chunks += 1;
             }
         }
-        cp_state.snapshot_complete = cp_state.snapshot_progress.is_empty();
-        self.coord
-            .save_checkpoint(&mut cp_state)
-            .await
-            .map_err(|e| SnapshotError::Source(format!("save_checkpoint: {e}")))?;
-
         Ok(snap_lsn)
     }
 }
 
-/// Drive the actual snapshot loop. Shared by both the free-function
-/// entry point and `Snapshotter`. When `incremental_saver` is `Some`,
-/// the loop persists progress to the coord *after every successful
-/// chunk*, so a fault between chunks doesn't lose previous progress.
-/// The free `run_snapshot` passes `None` (non-resumable, single-pass).
-///
-/// On error, this function persists whatever progress was made before
-/// the error (when an `incremental_saver` is provided) and *then*
-/// propagates the error. The caller's resume picks up at the next
-/// chunk.
-async fn snapshot_one_pass<'a, S, C>(
-    source: &S,
-    schemas: &[TableSchema],
-    pipeline: &mut Pipeline<C>,
-    chunk_size: usize,
-    snap_lsn: Lsn,
-    progress: SnapshotProgressMap,
-    max_chunks: Option<usize>,
-    incremental_saver: Option<(&'a dyn Coordinator, &'a mut Checkpoint)>,
-) -> Result<(usize, SnapshotProgressMap)>
-where
-    S: SnapshotSource + ?Sized,
-    C: Coordinator + ?Sized,
-{
-    assert!(chunk_size > 0, "chunk_size must be > 0");
-
-    let mut total_chunks = 0usize;
-    let mut state = progress;
-    // Split the saver up-front: `run_chunk_loop` needs a mutable
-    // borrow of the Checkpoint, but the error-path save below also
-    // needs one. We re-borrow through an Option that we replace each
-    // pass.
-    let (saver_coord, mut saver_cp): (Option<&dyn Coordinator>, Option<&mut Checkpoint>) =
-        match incremental_saver {
-            Some((c, cp)) => (Some(c), Some(cp)),
-            None => (None, None),
-        };
-
-    let res = run_chunk_loop(
-        source,
-        schemas,
-        pipeline,
-        chunk_size,
-        snap_lsn,
-        &mut state,
-        &mut total_chunks,
-        max_chunks,
-        saver_coord,
-        saver_cp.as_deref_mut(),
-    )
-    .await;
-
-    // On any error, save partial progress before propagating so the
-    // next call resumes at the next chunk. Best-effort: a save failure
-    // here gets swallowed (the original error is more interesting).
-    if res.is_err() {
-        if let (Some(coord), Some(cp)) = (saver_coord, saver_cp.as_deref_mut()) {
-            cp.snapshot_progress = state.clone();
-            cp.snapshot_complete = state.is_empty();
-            let _ = coord.save_checkpoint(cp).await;
-        }
-    }
-
-    res?;
-    Ok((total_chunks, state))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_chunk_loop<S, C>(
-    source: &S,
-    schemas: &[TableSchema],
-    pipeline: &mut Pipeline<C>,
-    chunk_size: usize,
-    snap_lsn: Lsn,
-    state: &mut SnapshotProgressMap,
-    total_chunks: &mut usize,
-    max_chunks: Option<usize>,
-    saver_coord: Option<&dyn Coordinator>,
-    mut saver_cp: Option<&mut Checkpoint>,
-) -> Result<()>
-where
-    S: SnapshotSource + ?Sized,
-    C: Coordinator + ?Sized,
-{
-    'tables: for (i, schema) in schemas.iter().enumerate() {
-        let xid = SNAPSHOT_XID_BASE.wrapping_add(i as u32);
-        let pk_cols: Vec<ColumnName> = schema
-            .primary_key_columns()
-            .map(|c| ColumnName(c.name.clone()))
-            .collect();
-
-        if pk_cols.is_empty() {
-            return Err(SnapshotError::Source(format!(
-                "table {} has no primary key; pg2iceberg requires one",
-                schema.ident
-            )));
-        }
-
-        let key = key_for(&schema.ident);
-        let mut last_pk_key: Option<String> = state.get(&key).cloned();
-
-        loop {
-            if let Some(cap) = max_chunks {
-                if *total_chunks >= cap {
-                    break 'tables;
-                }
-            }
-
-            let chunk = source
-                .read_chunk(&schema.ident, chunk_size, last_pk_key.as_deref())
-                .await?;
-            if chunk.is_empty() {
-                state.remove(&key);
-                // Persist the table-done state so a subsequent call
-                // doesn't try to re-read this table from scratch.
-                if let (Some(coord), Some(cp)) =
-                    (saver_coord, saver_cp.as_deref_mut())
-                {
-                    cp.snapshot_progress = state.clone();
-                    cp.snapshoted_tables.insert(key.clone(), true);
-                    cp.snapshot_complete = state.is_empty();
-                    coord
-                        .save_checkpoint(cp)
-                        .await
-                        .map_err(|e| SnapshotError::Source(format!("save_checkpoint: {e}")))?;
-                }
-                break;
-            }
-
-            let last_in_chunk = chunk.last().unwrap();
-            let new_key = pk_key(last_in_chunk, &pk_cols);
-
-            if let Some(prev) = last_pk_key.as_deref() {
-                if new_key.as_str() <= prev {
-                    return Err(SnapshotError::Source(format!(
-                        "snapshot source did not advance past PK {prev} for table {}; got {new_key}",
-                        schema.ident
-                    )));
-                }
-            }
-
-            pipeline
-                .process(DecodedMessage::Begin {
-                    final_lsn: snap_lsn,
-                    xid,
-                })
-                .await?;
-            for row in chunk {
-                pipeline
-                    .process(DecodedMessage::Change(ChangeEvent {
-                        table: schema.ident.clone(),
-                        op: Op::Insert,
-                        lsn: snap_lsn,
-                        commit_ts: Timestamp(0),
-                        xid: Some(xid),
-                        before: None,
-                        after: Some(row),
-                        unchanged_cols: vec![],
-                    }))
-                    .await?;
-            }
-            pipeline
-                .process(DecodedMessage::Commit {
-                    commit_lsn: snap_lsn,
-                    xid,
-                })
-                .await?;
-            pipeline.flush().await?;
-
-            // Chunk fully durable in coord. Update state + persist.
-            last_pk_key = Some(new_key.clone());
-            state.insert(key.clone(), new_key);
-            *total_chunks += 1;
-
-            if let (Some(coord), Some(cp)) =
-                (saver_coord, saver_cp.as_deref_mut())
-            {
-                cp.snapshot_progress = state.clone();
-                cp.snapshot_complete = false;
-                coord
-                    .save_checkpoint(cp)
-                    .await
-                    .map_err(|e| SnapshotError::Source(format!("save_checkpoint: {e}")))?;
-            }
-        }
-    }
-    Ok(())
-}
 
 /// Outcome of [`run_snapshot_phase`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -579,14 +456,7 @@ where
     S: SnapshotSource + ?Sized,
     C: Coordinator + ?Sized,
 {
-    let cp_pre = coord
-        .load_checkpoint(0)
-        .await
-        .map_err(|e| SnapshotError::Source(format!("load_checkpoint: {e}")))?;
-    if cp_pre.as_ref().map(|c| c.snapshot_complete).unwrap_or(false) {
-        return Ok(SnapshotPhaseOutcome::Skipped);
-    }
-
+    // Filter out operator-supplied skip-list entries.
     let to_snapshot: Vec<TableSchema> = schemas
         .iter()
         .filter(|s| !skip_idents.contains(&s.ident))
@@ -596,50 +466,41 @@ where
         return Ok(SnapshotPhaseOutcome::Skipped);
     }
 
-    // Resumable snapshot. Persists progress per chunk in
-    // Checkpoint::snapshot_progress; a mid-snapshot fault + restart
-    // resumes at the next chunk.
-    let snapshotter = Snapshotter::new(coord.clone()).with_chunk_size(chunk_size);
-    let snap_lsn = snapshotter
-        .run(source, &to_snapshot, pipeline)
-        .await?;
-
-    // Defensive: ensure every staged chunk is durable in coord before
-    // we ack the slot. The Snapshotter::run loop already calls
-    // pipeline.flush() after each chunk, so this is usually a no-op,
-    // but a final flush is cheap insurance.
-    pipeline.flush().await?;
-
-    // Persist completion. The Snapshotter just saved the checkpoint
-    // multiple times during `run` so on-disk revision has advanced
-    // past `cp_pre`'s. Re-load to pick up the current revision; that
-    // way our OCC predicate matches and we don't bounce with
-    // ConcurrentUpdate. Re-loading is safe because the Snapshotter
-    // is the only other writer between `cp_pre` and here.
-    let mut cp_save = coord
-        .load_checkpoint(0)
-        .await
-        .map_err(|e| SnapshotError::Source(format!("load_checkpoint: {e}")))?
-        .unwrap_or_else(|| Checkpoint::fresh(Mode::Logical));
-    cp_save.snapshot_complete = true;
-    cp_save.flushed_lsn = snap_lsn;
+    // Skip the phase entirely when every relevant table is already
+    // marked complete in `_pg2iceberg.tables`. Per-table reads — one
+    // round-trip per table at startup, cheap.
+    let mut all_complete = true;
     for s in &to_snapshot {
-        let key = key_for(&s.ident);
-        cp_save.snapshoted_tables.insert(key.clone(), true);
-        // Stamp `pg_class.oid` alongside the snapshot-done flag.
-        // Startup invariant 11 compares this against the current oid
-        // on subsequent runs to detect `DROP TABLE` + recreate.
-        if let Some(oid) = table_oids.get(&s.ident).copied() {
-            if oid != 0 {
-                cp_save.snapshoted_table_oids.insert(key, oid);
-            }
+        let state = coord
+            .table_state(&s.ident)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("table_state: {e}")))?;
+        if !state.map(|t| t.snapshot_complete).unwrap_or(false) {
+            all_complete = false;
+            break;
         }
     }
-    cp_save.snapshot_progress.clear();
-    coord
-        .save_checkpoint(&mut cp_save)
-        .await
-        .map_err(|e| SnapshotError::Source(format!("save_checkpoint: {e}")))?;
+    if all_complete {
+        return Ok(SnapshotPhaseOutcome::Skipped);
+    }
+
+    // Resumable snapshot. The Snapshotter persists per-chunk progress
+    // (one row per in-flight table in `_pg2iceberg.snapshot_progress`)
+    // and stamps each table's completion row in `_pg2iceberg.tables`
+    // when it finishes — so this function doesn't have to do any
+    // post-pass coord writes itself. A mid-snapshot fault leaves the
+    // world in a state where the next call picks up exactly where the
+    // previous one left off.
+    let snapshotter = Snapshotter::new(coord.clone())
+        .with_chunk_size(chunk_size)
+        .with_table_oids(table_oids.clone());
+    let snap_lsn = snapshotter.run(source, &to_snapshot, pipeline).await?;
+
+    // Defensive final flush — the Snapshotter::run loop already
+    // flushes after each chunk, but a final pass is cheap insurance
+    // that every staged chunk is durable in coord before the caller
+    // acks the slot.
+    pipeline.flush().await?;
 
     Ok(SnapshotPhaseOutcome::Completed {
         snapshot_lsn: snap_lsn,

@@ -178,7 +178,7 @@ fn pk_int(r: &Row) -> i32 {
 #[test]
 fn empty_table_snapshot_produces_no_iceberg_data() {
     let mut h = boot(&[]);
-    let snap_lsn = block_on(run_snapshot(&h.db, &[schema()], &mut h.pipeline)).unwrap();
+    let snap_lsn = block_on(run_snapshot(&h.db, h.coord.clone() as Arc<dyn Coordinator>, &[schema()], &mut h.pipeline)).unwrap();
     h.stream.send_standby(snap_lsn);
     block_on(h.materializer.cycle()).unwrap();
     assert!(read_iceberg(&h).is_empty());
@@ -189,7 +189,7 @@ fn empty_table_snapshot_produces_no_iceberg_data() {
 fn snapshot_bootstraps_existing_pg_data() {
     let mut h = boot(&[(1, 10), (2, 20), (3, 30)]);
 
-    let snap_lsn = block_on(run_snapshot(&h.db, &[schema()], &mut h.pipeline)).unwrap();
+    let snap_lsn = block_on(run_snapshot(&h.db, h.coord.clone() as Arc<dyn Coordinator>, &[schema()], &mut h.pipeline)).unwrap();
     assert_eq!(h.pipeline.flushed_lsn(), snap_lsn);
     h.stream.send_standby(snap_lsn);
 
@@ -205,7 +205,7 @@ fn snapshot_then_live_replication_picks_up_seamlessly() {
     let mut h = boot(&[(1, 10), (2, 20)]);
 
     // Phase 1: snapshot.
-    let snap_lsn = block_on(run_snapshot(&h.db, &[schema()], &mut h.pipeline)).unwrap();
+    let snap_lsn = block_on(run_snapshot(&h.db, h.coord.clone() as Arc<dyn Coordinator>, &[schema()], &mut h.pipeline)).unwrap();
     h.stream.send_standby(snap_lsn);
     block_on(h.materializer.cycle()).unwrap();
     assert_eq!(read_iceberg(&h), read_pg(&h));
@@ -235,7 +235,7 @@ fn snapshot_then_more_writes_in_pg_before_replication_starts_no_data_lost() {
     // is: seed → snapshot → write → drive → materialize.
     let mut h = boot(&[(1, 10)]);
 
-    let snap_lsn = block_on(run_snapshot(&h.db, &[schema()], &mut h.pipeline)).unwrap();
+    let snap_lsn = block_on(run_snapshot(&h.db, h.coord.clone() as Arc<dyn Coordinator>, &[schema()], &mut h.pipeline)).unwrap();
 
     // After snapshot reads but before slot ack: a new insert. Its LSN is
     // strictly greater than snap_lsn, so the slot (still at restart_lsn) will
@@ -261,7 +261,7 @@ fn chunk_size_one_materializes_every_row_exactly_once() {
     let seeds: Vec<(i32, i32)> = (1..=25).map(|i| (i, i * 10)).collect();
     let mut h = boot(&seeds);
 
-    let snap_lsn = block_on(run_snapshot_chunked(&h.db, &[schema()], &mut h.pipeline, 1)).unwrap();
+    let snap_lsn = block_on(run_snapshot_chunked(&h.db, h.coord.clone() as Arc<dyn Coordinator>, &[schema()], &mut h.pipeline, 1)).unwrap();
     h.stream.send_standby(snap_lsn);
     block_on(h.materializer.cycle()).unwrap();
 
@@ -278,6 +278,7 @@ fn chunk_size_does_not_change_final_state() {
         let mut h = boot(&seeds);
         let snap_lsn = block_on(run_snapshot_chunked(
             &h.db,
+            h.coord.clone() as Arc<dyn Coordinator>,
             &[schema()],
             &mut h.pipeline,
             chunk_size,
@@ -305,7 +306,7 @@ fn chunked_snapshot_produces_one_log_index_entry_per_chunk() {
     let seeds: Vec<(i32, i32)> = (1..=10).map(|i| (i, i * 10)).collect();
     let mut h = boot(&seeds);
 
-    block_on(run_snapshot_chunked(&h.db, &[schema()], &mut h.pipeline, 3)).unwrap();
+    block_on(run_snapshot_chunked(&h.db, h.coord.clone() as Arc<dyn Coordinator>, &[schema()], &mut h.pipeline, 3)).unwrap();
 
     let entries = block_on(<MemoryCoordinator as Coordinator>::read_log(
         h.coord.as_ref(),
@@ -341,11 +342,10 @@ fn snapshotter_clears_progress_when_table_completes() {
     let s = Snapshotter::new(h.coord.clone() as Arc<dyn Coordinator>);
     block_on(s.run(&h.db, &[schema()], &mut h.pipeline)).unwrap();
 
-    let cp = block_on(h.coord.load_checkpoint(0)).unwrap().unwrap();
+    let progress = block_on(h.coord.snapshot_progress(&ident())).unwrap();
     assert!(
-        cp.snapshot_progress.is_empty(),
-        "completed snapshot must clear its progress entry; got {:?}",
-        cp.snapshot_progress
+        progress.is_none(),
+        "completed snapshot must clear its progress entry; got {progress:?}"
     );
 }
 
@@ -358,11 +358,10 @@ fn snapshotter_persists_progress_after_partial_run() {
     // Process only 2 chunks (10 rows) then return.
     block_on(s.run_chunks(&h.db, &[schema()], &mut h.pipeline, Some(2))).unwrap();
 
-    let cp = block_on(h.coord.load_checkpoint(0)).unwrap().unwrap();
+    let progress = block_on(h.coord.snapshot_progress(&ident())).unwrap();
     assert!(
-        cp.snapshot_progress.contains_key(&ident().to_string()),
-        "partial run must record progress; got {:?}",
-        cp.snapshot_progress
+        progress.is_some(),
+        "partial run must record progress; got None"
     );
 }
 
@@ -435,9 +434,9 @@ fn crash_mid_snapshot_then_resume_completes_correctly() {
     };
     let _ = snap_lsn;
 
-    let cp = block_on(coord.load_checkpoint(0)).unwrap().unwrap();
+    let progress = block_on(coord.snapshot_progress(&ident())).unwrap();
     assert!(
-        cp.snapshot_progress.contains_key(&ident().to_string()),
+        progress.is_some(),
         "after partial run, progress must be persisted"
     );
 
@@ -465,11 +464,11 @@ fn crash_mid_snapshot_then_resume_completes_correctly() {
     pg.sort_by_key(pk_int);
     assert_eq!(iceberg, pg);
 
-    // Final checkpoint progress should be cleared (snapshot complete).
-    let cp = block_on(coord.load_checkpoint(0)).unwrap().unwrap();
+    // Per-table progress row should be cleared (snapshot complete).
+    let progress = block_on(coord.snapshot_progress(&ident())).unwrap();
     assert!(
-        cp.snapshot_progress.is_empty(),
-        "completed resume must clear progress"
+        progress.is_none(),
+        "completed resume must clear progress; got {progress:?}"
     );
 }
 
@@ -477,7 +476,7 @@ fn crash_mid_snapshot_then_resume_completes_correctly() {
 fn chunked_snapshot_with_zero_chunk_size_panics() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut h = boot(&[(1, 10)]);
-        block_on(run_snapshot_chunked(&h.db, &[schema()], &mut h.pipeline, 0)).unwrap();
+        block_on(run_snapshot_chunked(&h.db, h.coord.clone() as Arc<dyn Coordinator>, &[schema()], &mut h.pipeline, 0)).unwrap();
     }));
     assert!(result.is_err(), "chunk_size=0 must panic");
 }
@@ -489,7 +488,7 @@ fn snapshot_xid_does_not_collide_with_real_pg_xids() {
     // at 1 and increment. This test isn't a tight bound (we can't realistically
     // exhaust 0xFFFF_FF00 xids) but proves the design isn't visibly broken.
     let mut h = boot(&[(1, 10)]);
-    let snap_lsn = block_on(run_snapshot(&h.db, &[schema()], &mut h.pipeline)).unwrap();
+    let snap_lsn = block_on(run_snapshot(&h.db, h.coord.clone() as Arc<dyn Coordinator>, &[schema()], &mut h.pipeline)).unwrap();
     h.stream.send_standby(snap_lsn);
     block_on(h.materializer.cycle()).unwrap();
 

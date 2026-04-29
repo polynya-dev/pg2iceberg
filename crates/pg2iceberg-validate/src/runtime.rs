@@ -258,7 +258,7 @@ pub type SnapshotSourceFactoryFut = std::pin::Pin<
 /// publication, advancing the slot before the snapshot is durable)
 /// surface in fault tests automatically.
 pub async fn run_logical_lifecycle<Cat, F>(
-    mut lc: LogicalLifecycle<Cat>,
+    lc: LogicalLifecycle<Cat>,
     shutdown: F,
 ) -> Result<(), LifecycleError>
 where
@@ -267,28 +267,28 @@ where
 {
     // 1. Fingerprint the source cluster. `IDENTIFY_SYSTEM`'s systemid
     //    is unique per `initdb` and survives clone/replication, so a
-    //    stale checkpoint pointed at the wrong cluster (accidental
-    //    DSN swap, or blue/green mid-cutover) gets caught by
-    //    `Checkpoint::verify` instead of silently re-using a
-    //    cluster's LSN against a different cluster's WAL. Sim's
-    //    `identify_system_id` returns 0, which makes
-    //    `verify`/load_checkpoint skip the cluster check.
+    //    stale resume against the wrong cluster (accidental DSN swap,
+    //    or blue/green mid-cutover) gets caught here instead of
+    //    silently re-using one cluster's LSN against another
+    //    cluster's WAL. Sim's `identify_system_id` returns 0, in
+    //    which case the stamp + check both no-op.
     let connected_system_id = lc.pg.identify_system_id().await?;
     if connected_system_id != 0 {
         tracing::info!(system_id = connected_system_id, "source cluster fingerprinted");
-        // Wrap the coord so every subsequent `save_checkpoint` stamps
-        // the connected cluster's fingerprint into the payload.
-        // Mirrors Go's `pipeline.WithSystemIdentifier`.
-        lc.coord = Arc::new(pg2iceberg_coord::StampingCoordinator::new(
-            Arc::clone(&lc.coord),
-            connected_system_id,
-        ));
+        // Stamp once at startup. Idempotent: matching value is a
+        // no-op; mismatch returns SystemIdMismatch and we fail fast
+        // before any data writes happen.
+        lc.coord
+            .set_pipeline_system_identifier(connected_system_id)
+            .await
+            .map_err(|e| LifecycleError::Coord(e.to_string()))?;
     }
 
-    // 2. Startup validation. Refuses to start on any of the 8
-    //    invariants Go's `pipeline/validate.go` enforces. Loads the
-    //    checkpoint with the connected systemid so a cluster
-    //    fingerprint mismatch fails fast here.
+    // 2. Startup validation. Refuses to start on any of the
+    //    invariants `pipeline/validate.go` enforces. Cluster
+    //    fingerprint mismatch is now caught above by
+    //    `set_pipeline_system_identifier`, so this only runs the
+    //    other invariants.
     run_startup_validation(
         lc.pg.as_ref(),
         lc.coord.as_ref(),
@@ -336,6 +336,16 @@ where
         }
         let cp = lc.pg.create_slot(&lc.slot_name).await?;
         tracing::info!(slot = %lc.slot_name, ?cp, "replication slot created");
+        // Bootstrap the tamper-detection baseline. PG sets the new
+        // slot's `confirmed_flush_lsn` to its `consistent_point`;
+        // stamping that value into our record means subsequent
+        // startup checks have a real baseline (zero would skip the
+        // check). Failing here is fatal — a fresh slot without a
+        // stamped baseline is a tamper-detection blind spot.
+        lc.coord
+            .set_flushed_lsn(cp)
+            .await
+            .map_err(|e| LifecycleError::Coord(e.to_string()))?;
     } else {
         tracing::info!(slot = %lc.slot_name, "replication slot exists, resuming");
     }
@@ -492,7 +502,14 @@ where
         .await?;
     // 7. Initial standby ack so the slot's confirmed_flush_lsn
     //    advances to start_lsn — server can recycle WAL behind it.
+    //    Stamp our durable record *before* the ack so on a crash
+    //    between the two writes the slot lags us (safe replay) not
+    //    the other way around (tamper false positive).
     if let Some(snapshot_lsn) = snap_lsn {
+        lc.coord
+            .set_flushed_lsn(snapshot_lsn)
+            .await
+            .map_err(|e| LifecycleError::Coord(e.to_string()))?;
         stream.send_standby(snapshot_lsn, snapshot_lsn).await?;
     }
 
@@ -520,8 +537,8 @@ where
 }
 
 /// Bridge between [`crate::validate_startup`] (sync) and the lifecycle
-/// helper. Loads coord checkpoint, queries each table's catalog state
-/// + slot state, runs the 8 invariants. Errors with
+/// helper. Reads each registered table's per-row state from coord,
+/// queries catalog + slot state, runs the invariants. Errors with
 /// [`LifecycleError::Validation`] on any violation.
 #[allow(clippy::too_many_arguments)]
 async fn run_startup_validation<Cat: Catalog + ?Sized>(
@@ -532,12 +549,8 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
     slot_name: &str,
     publication_name: &str,
     mode: Mode,
-    connected_system_id: u64,
+    _connected_system_id: u64,
 ) -> Result<(), LifecycleError> {
-    let checkpoint = coord
-        .load_checkpoint(connected_system_id)
-        .await
-        .map_err(|e| LifecycleError::Coord(e.to_string()))?;
     // One round-trip lookup of the publication's current tables;
     // we'll cross-reference each schema below. Empty list when the
     // publication doesn't exist (covered by the OrphanedSlot /
@@ -560,6 +573,12 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
                 &schema.ident.name,
             )
             .await?;
+        // Per-table snapshot state from `_pg2iceberg.tables`. Cheap
+        // single-row reads — one per registered table at startup.
+        let stored_state = coord
+            .table_state(&schema.ident)
+            .await
+            .map_err(|e| LifecycleError::Coord(e.to_string()))?;
         tables.push(TableExistence {
             pg_table: schema.ident.clone(),
             iceberg_name,
@@ -567,33 +586,12 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
             current_snapshot_id: meta.and_then(|m| m.current_snapshot_id),
             current_pg_oid: pg_oid,
             in_publication: pub_members.contains(&schema.ident),
+            stored_state,
         });
-    }
-
-    // (3) Hygiene warning — surface tables previously snapshotted
-    // but no longer in YAML. log_index for these still accumulates;
-    // operator should clean up. Doesn't block startup.
-    if let Some(cp) = &checkpoint {
-        let yaml_keys: std::collections::BTreeSet<String> =
-            schemas.iter().map(|s| s.ident.to_string()).collect();
-        for stale in cp
-            .snapshoted_tables
-            .keys()
-            .filter(|k| !yaml_keys.contains(k.as_str()))
-        {
-            tracing::warn!(
-                table = %stale,
-                "table previously snapshotted but no longer in YAML config; \
-                 its log_index entries will accumulate. drop the table from \
-                 the publication and clear its `snapshoted_tables` entry to \
-                 stop tracking it."
-            );
-        }
     }
     // One round-trip combined slot probe — covers exists,
     // restart_lsn, confirmed_flush_lsn, wal_status, conflicting,
-    // safe_wal_size. The two new health fields drive invariants 9
-    // and 10 in `validate_startup`.
+    // safe_wal_size.
     let slot = match pg.slot_health(slot_name).await? {
         Some(h) => Some(SlotState {
             exists: true,
@@ -610,13 +608,21 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
             conflicting: false,
         }),
     };
+    // Our durable record of the highest LSN we've ever told the slot
+    // to flush past. `Lsn::ZERO` means no record yet (fresh install
+    // / no slot baseline) — the validator skips the tamper check
+    // in that case.
+    let coord_flushed_lsn = coord
+        .flushed_lsn()
+        .await
+        .map_err(|e| LifecycleError::Coord(e.to_string()))?;
     let v = StartupValidation {
-        checkpoint,
         tables,
         slot,
         config_mode: mode,
         slot_name: slot_name.to_string(),
         publication_name: publication_name.to_string(),
+        coord_flushed_lsn,
     };
     validate_startup(&v).map_err(|e| LifecycleError::Validation(e.to_string()))
 }
@@ -756,6 +762,21 @@ where
         }
         Handler::Standby => {
             let lsn = loop_state.pipeline.flushed_lsn();
+            // Stamp the durable record *before* acking the slot.
+            // Crash between the two: slot lags our record, slot
+            // replays, fold absorbs duplicates — safe. Reverse
+            // order would let a successful slot ack lose its
+            // record on crash, then look like external advancement
+            // on next startup.
+            //
+            // Failures here are logged but not fatal: a transient
+            // coord blip shouldn't stop the standby ack (which is
+            // what advances the slot and lets PG recycle WAL). The
+            // next tick will retry the stamp; a persistent failure
+            // shows up in metrics.
+            if let Err(e) = loop_state.coord.set_flushed_lsn(lsn).await {
+                tracing::warn!(error = %e, "set_flushed_lsn failed; will retry next tick");
+            }
             let _ = loop_state.stream.send_standby(lsn, lsn).await;
         }
         Handler::Materialize => {
@@ -837,6 +858,11 @@ where
         tracing::warn!(error = %e, "final flush failed");
     }
     let final_lsn = loop_state.pipeline.flushed_lsn();
+    // Stamp the final acked LSN before the standby ack — same write-
+    // before-ack discipline as the periodic Standby handler.
+    if let Err(e) = loop_state.coord.set_flushed_lsn(final_lsn).await {
+        tracing::warn!(error = %e, "final set_flushed_lsn failed");
+    }
     if let Err(e) = loop_state.stream.send_standby(final_lsn, final_lsn).await {
         tracing::warn!(error = %e, "final send_standby failed");
     }

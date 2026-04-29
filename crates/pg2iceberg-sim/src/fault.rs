@@ -50,7 +50,8 @@ use pg2iceberg_coord::{
     CommitBatch, CoordCommitReceipt, CoordError, Coordinator, LogEntry,
     Result as CoordResult,
 };
-use pg2iceberg_core::{Checkpoint, TableIdent, WorkerId};
+use pg2iceberg_coord::TableSnapshotState;
+use pg2iceberg_core::{Lsn, TableIdent, WorkerId};
 use pg2iceberg_iceberg::{
     Catalog, IcebergError, PreparedCommit, PreparedCompaction, Result as IcebergResult,
     SchemaChange, Snapshot, TableMetadata,
@@ -78,7 +79,11 @@ pub mod ops {
     pub const COORD_READ_LOG: &str = "coord.read_log";
     pub const COORD_TRUNCATE: &str = "coord.truncate_log";
     pub const COORD_SET_CURSOR: &str = "coord.set_cursor";
-    pub const COORD_SAVE_CP: &str = "coord.save_checkpoint";
+    /// Fault key for `Coordinator::set_snapshot_progress`. The
+    /// snapshot phase calls this after every chunk; injecting here
+    /// drives the resumability fault DSTs (mid-chunk crash → resume
+    /// at next PK).
+    pub const COORD_SAVE_CP: &str = "coord.set_snapshot_progress";
 
     // Catalog.
     pub const CAT_LOAD_TABLE: &str = "cat.load_table";
@@ -326,18 +331,69 @@ impl Coordinator for FaultyCoordinator {
         self.inner.release_lock(table, worker).await
     }
 
-    async fn load_checkpoint(
-        &self,
-        connected_system_id: u64,
-    ) -> CoordResult<Option<Checkpoint>> {
-        self.inner.load_checkpoint(connected_system_id).await
+    async fn pipeline_system_identifier(&self) -> CoordResult<u64> {
+        self.inner.pipeline_system_identifier().await
     }
 
-    async fn save_checkpoint(&self, cp: &mut Checkpoint) -> CoordResult<()> {
+    async fn set_pipeline_system_identifier(&self, sysid: u64) -> CoordResult<()> {
+        self.inner.set_pipeline_system_identifier(sysid).await
+    }
+
+    async fn flushed_lsn(&self) -> CoordResult<Lsn> {
+        self.inner.flushed_lsn().await
+    }
+
+    async fn set_flushed_lsn(&self, lsn: Lsn) -> CoordResult<()> {
+        self.inner.set_flushed_lsn(lsn).await
+    }
+
+    async fn table_state(&self, ident: &TableIdent) -> CoordResult<Option<TableSnapshotState>> {
+        self.inner.table_state(ident).await
+    }
+
+    async fn mark_table_snapshot_complete(
+        &self,
+        ident: &TableIdent,
+        pg_oid: u32,
+        snapshot_lsn: Lsn,
+    ) -> CoordResult<()> {
+        self.inner
+            .mark_table_snapshot_complete(ident, pg_oid, snapshot_lsn)
+            .await
+    }
+
+    async fn snapshot_progress(&self, ident: &TableIdent) -> CoordResult<Option<String>> {
+        self.inner.snapshot_progress(ident).await
+    }
+
+    async fn set_snapshot_progress(
+        &self,
+        ident: &TableIdent,
+        last_pk_key: &str,
+    ) -> CoordResult<()> {
         if self.plan.tick(ops::COORD_SAVE_CP) {
-            return Err(CoordError::Pg("injected fault: save_checkpoint".into()));
+            return Err(CoordError::Pg("injected fault: set_snapshot_progress".into()));
         }
-        self.inner.save_checkpoint(cp).await
+        self.inner.set_snapshot_progress(ident, last_pk_key).await
+    }
+
+    async fn clear_snapshot_progress(&self, ident: &TableIdent) -> CoordResult<()> {
+        self.inner.clear_snapshot_progress(ident).await
+    }
+
+    async fn query_watermark(
+        &self,
+        ident: &TableIdent,
+    ) -> CoordResult<Option<pg2iceberg_core::PgValue>> {
+        self.inner.query_watermark(ident).await
+    }
+
+    async fn set_query_watermark(
+        &self,
+        ident: &TableIdent,
+        watermark: &pg2iceberg_core::PgValue,
+    ) -> CoordResult<()> {
+        self.inner.set_query_watermark(ident, watermark).await
     }
 }
 

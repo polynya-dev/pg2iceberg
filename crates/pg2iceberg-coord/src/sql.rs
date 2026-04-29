@@ -22,9 +22,21 @@ pub fn drop_schema(schema: &CoordSchema) -> String {
     format!("DROP SCHEMA IF EXISTS {} CASCADE", schema)
 }
 
-/// DDL for the six coord tables. Each statement is idempotent
-/// (`CREATE TABLE IF NOT EXISTS`). Mirrors `stream/coordinator_pg.go:73-104`
-/// plus a single-row `checkpoints` table for [`crate::Coordinator::save_checkpoint`].
+/// DDL for the coord tables. Each statement is idempotent
+/// (`CREATE TABLE IF NOT EXISTS`).
+///
+/// Mirrors `stream/coordinator_pg.go:73-104` for the WAL/cursor
+/// tables, and replaces Go's single-row `_pg2iceberg.checkpoints`
+/// blob with four narrower per-concern tables:
+///
+/// - `pipeline_meta` — single-row cluster fingerprint
+/// - `tables` — per-table snapshot status
+/// - `snapshot_progress` — per-table mid-snapshot resume cursor
+/// - `query_watermarks` — per-table watermark for query mode
+///
+/// Each is an idempotent UPSERT in its hot path; no OCC, no
+/// SHA-256 sealing, no schema versioning. Multi-writer becomes
+/// natural (different writers touch different rows).
 pub fn migrate(schema: &CoordSchema) -> Vec<String> {
     vec![
         format!(
@@ -49,10 +61,9 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
             schema.qualify("log_index")
         ),
         // Idempotent column add for older deployments that
-        // pre-date the `flushable_lsn` column. `IF NOT EXISTS`
-        // makes this safe to run on fresh + upgraded databases.
-        // Required for blue-green markers: the materializer's
-        // marker-eligibility check joins on this column.
+        // pre-date the `flushable_lsn` column. Required for
+        // blue-green markers: the materializer's marker-eligibility
+        // check joins on this column.
         format!(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS flushable_lsn BIGINT NOT NULL DEFAULT 0",
             schema.qualify("log_index")
@@ -84,26 +95,71 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
             )",
             schema.qualify("consumer")
         ),
-        // Single-row table holding the serialized `Checkpoint` blob.
-        // `id` is hardcoded to 1 so the upsert is unambiguous.
-        // `revision` is broken out of the JSONB so the OCC UPDATE
-        // can bind it as a WHERE clause without a JSON cast — that
-        // way two concurrent pg2iceberg instances racing to save
-        // see one win and the other return ConcurrentUpdate.
+        // Pipeline-level singleton: cluster fingerprint, last update
+        // timestamp. Always exactly one row (`id = 1`). The CHECK
+        // constraint makes a stray INSERT impossible.
         format!(
             "CREATE TABLE IF NOT EXISTS {} (
-                id         INT  PRIMARY KEY,
-                revision   BIGINT NOT NULL DEFAULT 0,
-                payload    JSONB NOT NULL,
+                id                INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                system_identifier BIGINT NOT NULL DEFAULT 0,
+                updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+            schema.qualify("pipeline_meta")
+        ),
+        // Single-row record of the highest LSN we've ever told the
+        // replication slot to flush past. Updated *before* every
+        // `send_standby`, so on a crash between the two writes the
+        // slot lags behind our record (slot replays, fold absorbs
+        // duplicates) instead of leading it (which would be either
+        // our own ack we missed recording, or external tampering).
+        // Read at startup and compared to `slot.confirmed_flush_lsn`
+        // to catch `pg_replication_slot_advance` / drop+recreate /
+        // a stray `pg_recvlogical` debug session that advanced the
+        // slot while we were down.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id         INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                lsn        BIGINT NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )",
-            schema.qualify("checkpoints")
+            schema.qualify("flushed_lsn")
         ),
-        // Idempotent `revision` column add for older deployments
-        // (pre-OCC). `IF NOT EXISTS` makes this safe to re-run.
+        // Per-table snapshot status. `pg_oid` drives the
+        // TableIdentityChanged invariant (DROP+recreate detection);
+        // `snapshot_complete` gates the snapshot phase on restart;
+        // `snapshot_lsn` records the LSN at completion (sanity).
         format!(
-            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0",
-            schema.qualify("checkpoints")
+            "CREATE TABLE IF NOT EXISTS {} (
+                table_name        TEXT PRIMARY KEY,
+                pg_oid            BIGINT NOT NULL DEFAULT 0,
+                snapshot_complete BOOLEAN NOT NULL DEFAULT false,
+                snapshot_lsn      BIGINT NOT NULL DEFAULT 0,
+                completed_at      TIMESTAMPTZ
+            )",
+            schema.qualify("tables")
+        ),
+        // Per-table mid-snapshot resume cursor. `last_pk_key` is the
+        // canonical-PK JSON of the last successfully staged row.
+        // Snapshotter resumes from the next PK after restart; rows
+        // are deleted once the table's snapshot completes.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                table_name  TEXT PRIMARY KEY,
+                last_pk_key TEXT NOT NULL,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+            schema.qualify("snapshot_progress")
+        ),
+        // Per-table watermark for query mode. JSONB so any PgValue
+        // (timestamp, bigint, uuid, text) round-trips without a
+        // wire-format change.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                table_name TEXT PRIMARY KEY,
+                watermark  JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+            schema.qualify("query_watermarks")
         ),
         // Blue-green marker bookkeeping. Populated by
         // `claim_offsets` when the pipeline observed a
@@ -324,44 +380,120 @@ pub fn release_lock(schema: &CoordSchema) -> String {
     )
 }
 
-/// Insert the very first checkpoint row (`id = 1`). Uses
-/// ON CONFLICT … WHERE revision = 0 so a real concurrent writer
-/// who's already past their first save can't be silently overwritten
-/// by a fresh process — its UPDATE leaves zero rows touched and the
-/// caller falls through to ConcurrentUpdate.
-///
-/// Three positional args: `(payload, new_revision, expected_revision)`.
-/// `expected_revision` is `0` for the first save.
-pub fn insert_checkpoint_first(schema: &CoordSchema) -> String {
+// ── Pipeline meta ─────────────────────────────────────────────────────
+
+/// Read the singleton pipeline-meta row. Returns 0 or 1 row; the
+/// new-deployment case (no row) is reported via the row count, not
+/// a NULL system_identifier (which would conflate "fresh" with
+/// "stamped to zero").
+pub fn select_pipeline_meta(schema: &CoordSchema) -> String {
     format!(
-        "INSERT INTO {} (id, revision, payload, updated_at) \
-         VALUES (1, $2, $1, now()) \
+        "SELECT system_identifier FROM {} WHERE id = 1",
+        schema.qualify("pipeline_meta")
+    )
+}
+
+/// Idempotent UPSERT for the singleton pipeline-meta row.
+/// One positional arg: `system_identifier`.
+pub fn upsert_pipeline_meta(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {} (id, system_identifier, updated_at) \
+         VALUES (1, $1, now()) \
          ON CONFLICT (id) DO UPDATE \
-            SET revision = $2, payload = $1, updated_at = now() \
-            WHERE {tbl}.revision = $3",
-        schema.qualify("checkpoints"),
-        tbl = schema.qualify("checkpoints"),
+         SET system_identifier = $1, updated_at = now()",
+        schema.qualify("pipeline_meta")
     )
 }
 
-/// OCC update for subsequent saves. Three positional args:
-/// `(payload, new_revision, expected_revision)`. The UPDATE only
-/// touches the row when stored `revision = expected_revision`; if
-/// not, RowsAffected = 0 and the caller returns ConcurrentUpdate.
-pub fn update_checkpoint_with_occ(schema: &CoordSchema) -> String {
+// ── Last-acked LSN (single-row tamper detection) ──────────────────────
+
+pub fn select_flushed_lsn(schema: &CoordSchema) -> String {
     format!(
-        "UPDATE {} SET revision = $2, payload = $1, updated_at = now() \
-         WHERE id = 1 AND revision = $3",
-        schema.qualify("checkpoints")
+        "SELECT lsn FROM {} WHERE id = 1",
+        schema.qualify("flushed_lsn")
     )
 }
 
-/// Read the single-row checkpoint blob. Returns 0 or 1 row,
-/// payload + revision.
-pub fn load_checkpoint(schema: &CoordSchema) -> String {
+pub fn upsert_flushed_lsn(schema: &CoordSchema) -> String {
     format!(
-        "SELECT payload, revision FROM {} WHERE id = 1",
-        schema.qualify("checkpoints")
+        "INSERT INTO {} (id, lsn, updated_at) \
+         VALUES (1, $1, now()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET lsn = $1, updated_at = now()",
+        schema.qualify("flushed_lsn")
+    )
+}
+
+// ── Per-table snapshot status ─────────────────────────────────────────
+
+pub fn select_table_state(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT pg_oid, snapshot_complete, snapshot_lsn, \
+         EXTRACT(EPOCH FROM completed_at) * 1000000 \
+         FROM {} WHERE table_name = $1",
+        schema.qualify("tables")
+    )
+}
+
+/// UPSERT a table's `snapshot_complete = true` with `pg_oid` and
+/// `snapshot_lsn`. Three positional args: `(table_name, pg_oid,
+/// snapshot_lsn)`. Idempotent — repeated marks of the same table
+/// just refresh `completed_at`.
+pub fn mark_table_complete(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {} (table_name, pg_oid, snapshot_complete, snapshot_lsn, completed_at) \
+         VALUES ($1, $2, true, $3, now()) \
+         ON CONFLICT (table_name) DO UPDATE \
+         SET pg_oid = $2, \
+             snapshot_complete = true, \
+             snapshot_lsn = $3, \
+             completed_at = now()",
+        schema.qualify("tables")
+    )
+}
+
+// ── Per-table mid-snapshot resume ─────────────────────────────────────
+
+pub fn select_snapshot_progress(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT last_pk_key FROM {} WHERE table_name = $1",
+        schema.qualify("snapshot_progress")
+    )
+}
+
+pub fn upsert_snapshot_progress(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {} (table_name, last_pk_key, updated_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (table_name) DO UPDATE \
+         SET last_pk_key = $2, updated_at = now()",
+        schema.qualify("snapshot_progress")
+    )
+}
+
+pub fn delete_snapshot_progress(schema: &CoordSchema) -> String {
+    format!(
+        "DELETE FROM {} WHERE table_name = $1",
+        schema.qualify("snapshot_progress")
+    )
+}
+
+// ── Per-table query-mode watermark ────────────────────────────────────
+
+pub fn select_query_watermark(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT watermark FROM {} WHERE table_name = $1",
+        schema.qualify("query_watermarks")
+    )
+}
+
+pub fn upsert_query_watermark(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {} (table_name, watermark, updated_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (table_name) DO UPDATE \
+         SET watermark = $2, updated_at = now()",
+        schema.qualify("query_watermarks")
     )
 }
 
@@ -373,11 +505,14 @@ mod tests {
     fn migrate_returns_idempotent_statements() {
         let s = CoordSchema::default_name();
         let stmts = migrate(&s);
-        // 6 base CREATE TABLEs + 1 ALTER TABLE (log_index.flushable_lsn)
-        // + 1 ALTER TABLE (checkpoints.revision) + 2 marker tables
-        // (pending_markers, marker_emissions) = 10. Each statement is
-        // idempotent: CREATE TABLE IF NOT EXISTS or ADD COLUMN IF NOT EXISTS.
-        assert_eq!(stmts.len(), 10);
+        // 6 base CREATE TABLEs (log_seq, log_index, mat_cursor, lock,
+        // consumer, pending_markers, marker_emissions)
+        // + 1 ALTER TABLE (log_index.flushable_lsn)
+        // + 5 new per-concern tables (pipeline_meta, flushed_lsn,
+        //   tables, snapshot_progress, query_watermarks)
+        // = 13. Each statement is idempotent (CREATE TABLE IF NOT
+        // EXISTS or ADD COLUMN IF NOT EXISTS).
+        assert_eq!(stmts.len(), 13);
         for stmt in &stmts {
             assert!(
                 stmt.contains("IF NOT EXISTS"),
@@ -385,42 +520,61 @@ mod tests {
             );
             assert!(stmt.contains("_pg2iceberg."));
         }
-        // The `checkpoints` table uses JSONB for the payload.
-        let cp_stmt = stmts
-            .iter()
-            .find(|s| s.contains("checkpoints") && s.contains("JSONB"))
-            .expect("checkpoints DDL present");
-        assert!(cp_stmt.contains("JSONB"));
+        // Check that the five new per-concern tables are present.
+        for name in [
+            "pipeline_meta",
+            "flushed_lsn",
+            "tables",
+            "snapshot_progress",
+            "query_watermarks",
+        ] {
+            assert!(
+                stmts.iter().any(|s| s.contains(&format!("_pg2iceberg.{name}"))),
+                "missing migrate for {name}"
+            );
+        }
         // Marker tables present.
         assert!(stmts.iter().any(|s| s.contains("pending_markers")));
         assert!(stmts.iter().any(|s| s.contains("marker_emissions")));
         // log_index has flushable_lsn either in the CREATE TABLE
         // body or via the idempotent ALTER TABLE.
         assert!(stmts.iter().any(|s| s.contains("flushable_lsn")));
-        // checkpoints has the revision column either in the CREATE
-        // TABLE body or via the idempotent ALTER TABLE.
-        assert!(stmts
+        // Old `checkpoints` table is gone — its concerns moved to
+        // the four new tables.
+        assert!(
+            !stmts.iter().any(|s| s.contains("_pg2iceberg.checkpoints")),
+            "checkpoints table should no longer be migrated"
+        );
+    }
+
+    #[test]
+    fn pipeline_meta_singleton_has_check_constraint() {
+        let s = CoordSchema::default_name();
+        let stmts = migrate(&s);
+        let pm = stmts
             .iter()
-            .any(|s| s.contains("checkpoints") && s.contains("revision")));
+            .find(|s| s.contains("pipeline_meta"))
+            .expect("pipeline_meta migrate");
+        assert!(
+            pm.contains("CHECK (id = 1)"),
+            "pipeline_meta must enforce singleton via CHECK"
+        );
     }
 
     #[test]
-    fn checkpoint_save_sql_carries_occ_predicate() {
+    fn upsert_sql_uses_on_conflict() {
         let s = CoordSchema::default_name();
-        let q = update_checkpoint_with_occ(&s);
-        assert!(q.contains("WHERE id = 1 AND revision = $3"));
-
-        let q = insert_checkpoint_first(&s);
-        assert!(q.contains("ON CONFLICT (id) DO UPDATE"));
-        assert!(q.contains("revision = $3"));
-    }
-
-    #[test]
-    fn claim_log_seq_uses_returning_clause() {
-        let s = CoordSchema::default_name();
-        let q = claim_log_seq(&s);
-        assert!(q.contains("RETURNING next_offset"));
-        assert!(q.contains("WHERE table_name = $1"));
+        for q in [
+            upsert_pipeline_meta(&s),
+            mark_table_complete(&s),
+            upsert_snapshot_progress(&s),
+            upsert_query_watermark(&s),
+        ] {
+            assert!(
+                q.contains("ON CONFLICT"),
+                "upsert SQL must use ON CONFLICT: {q}"
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,8 @@ use pg2iceberg_coord::{
     receipt, schema::CoordSchema, CommitBatch, CoordCommitReceipt, CoordError, Coordinator,
     LogEntry, MarkerInfo, OffsetGrant, Result,
 };
-use pg2iceberg_core::{Checkpoint, Clock, Lsn, TableIdent, Timestamp, WorkerId};
+use pg2iceberg_coord::TableSnapshotState;
+use pg2iceberg_core::{Clock, Lsn, TableIdent, Timestamp, WorkerId};
 use std::collections::BTreeSet;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -38,8 +39,18 @@ struct State {
     consumers: BTreeMap<(String, WorkerId), Timestamp>,
     /// `lock` per table: holder + expiry.
     locks: BTreeMap<TableIdent, (WorkerId, Timestamp)>,
-    /// `checkpoints` (one row in this design).
-    checkpoint: Option<Checkpoint>,
+    /// `pipeline_meta.system_identifier` (zero = unset).
+    system_identifier: u64,
+    /// `flushed_lsn.lsn` — highest LSN we've ever acked. Compared to
+    /// `slot.confirmed_flush_lsn` at startup to catch external slot
+    /// advancement.
+    flushed_lsn: Lsn,
+    /// Per-table snapshot status (`tables` table in the new schema).
+    table_states: BTreeMap<TableIdent, TableSnapshotState>,
+    /// Per-table mid-snapshot resume cursor (`snapshot_progress`).
+    snapshot_progress: BTreeMap<TableIdent, String>,
+    /// Per-table query-mode watermark (`query_watermarks`).
+    query_watermarks: BTreeMap<TableIdent, pg2iceberg_core::PgValue>,
     /// Pending marker UUIDs observed by `claim_offsets`. Persisted
     /// alongside the log_index rows so the materializer can read
     /// them post-cycle (see [`Coordinator::pending_markers_for_table`]).
@@ -317,30 +328,107 @@ impl Coordinator for MemoryCoordinator {
         Ok(())
     }
 
-    async fn load_checkpoint(
-        &self,
-        connected_system_id: u64,
-    ) -> Result<Option<Checkpoint>> {
-        let cp = self.state.lock().unwrap().checkpoint.clone();
-        if let Some(ref cp) = cp {
-            cp.verify(connected_system_id)?;
-        }
-        Ok(cp)
+    async fn pipeline_system_identifier(&self) -> Result<u64> {
+        Ok(self.state.lock().unwrap().system_identifier)
     }
 
-    async fn save_checkpoint(&self, cp: &mut Checkpoint) -> Result<()> {
-        let expected = cp.revision;
-        let now_micros = self.clock.now().0;
-        cp.seal(now_micros);
-
+    async fn set_pipeline_system_identifier(&self, sysid: u64) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        let stored_revision = state.checkpoint.as_ref().map(|c| c.revision).unwrap_or(0);
-        if stored_revision != expected {
-            // OCC mismatch — roll back the in-memory bump.
-            cp.revision = expected;
-            return Err(CoordError::ConcurrentUpdate);
+        if state.system_identifier != 0 && state.system_identifier != sysid {
+            return Err(CoordError::SystemIdMismatch {
+                stored: state.system_identifier,
+                connected: sysid,
+            });
         }
-        state.checkpoint = Some(cp.clone());
+        state.system_identifier = sysid;
+        Ok(())
+    }
+
+    async fn flushed_lsn(&self) -> Result<Lsn> {
+        Ok(self.state.lock().unwrap().flushed_lsn)
+    }
+
+    async fn set_flushed_lsn(&self, lsn: Lsn) -> Result<()> {
+        self.state.lock().unwrap().flushed_lsn = lsn;
+        Ok(())
+    }
+
+    async fn table_state(&self, ident: &TableIdent) -> Result<Option<TableSnapshotState>> {
+        Ok(self.state.lock().unwrap().table_states.get(ident).cloned())
+    }
+
+    async fn mark_table_snapshot_complete(
+        &self,
+        ident: &TableIdent,
+        pg_oid: u32,
+        snapshot_lsn: Lsn,
+    ) -> Result<()> {
+        let now_micros = self.clock.now().0;
+        let mut state = self.state.lock().unwrap();
+        state.table_states.insert(
+            ident.clone(),
+            TableSnapshotState {
+                pg_oid,
+                snapshot_complete: true,
+                snapshot_lsn,
+                completed_at_micros: Some(now_micros),
+            },
+        );
+        Ok(())
+    }
+
+    async fn snapshot_progress(&self, ident: &TableIdent) -> Result<Option<String>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .snapshot_progress
+            .get(ident)
+            .cloned())
+    }
+
+    async fn set_snapshot_progress(
+        &self,
+        ident: &TableIdent,
+        last_pk_key: &str,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .snapshot_progress
+            .insert(ident.clone(), last_pk_key.to_string());
+        Ok(())
+    }
+
+    async fn clear_snapshot_progress(&self, ident: &TableIdent) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .snapshot_progress
+            .remove(ident);
+        Ok(())
+    }
+
+    async fn query_watermark(&self, ident: &TableIdent) -> Result<Option<pg2iceberg_core::PgValue>> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .query_watermarks
+            .get(ident)
+            .cloned())
+    }
+
+    async fn set_query_watermark(
+        &self,
+        ident: &TableIdent,
+        watermark: &pg2iceberg_core::PgValue,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .query_watermarks
+            .insert(ident.clone(), watermark.clone());
         Ok(())
     }
 

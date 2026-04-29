@@ -22,7 +22,7 @@ use crate::{watermark_compare, QueryError, WatermarkSource};
 use bytes::Bytes;
 use pg2iceberg_coord::{CoordError, Coordinator};
 use pg2iceberg_core::{
-    Checkpoint, ColumnName, Mode, PgValue, TableIdent, TableSchema,
+    ColumnName, PgValue, TableIdent, TableSchema,
 };
 use pg2iceberg_iceberg::{
     promote_re_inserts, rebuild_from_catalog, Catalog, DataFile, FileIndex, IcebergError,
@@ -126,13 +126,8 @@ impl<C: Catalog> QueryPipeline<C> {
         let writer = TableWriter::new(schema.clone());
         let buffer = Buffer::new(pk_cols.clone());
 
-        // Restore watermark from prior checkpoint if it exists.
-        let key = ident.to_string();
-        let restored_watermark = self
-            .coord
-            .load_checkpoint(0)
-            .await?
-            .and_then(|cp| cp.query_watermarks.get(&key).cloned());
+        // Restore per-table watermark from coord if it exists.
+        let restored_watermark = self.coord.query_watermark(&ident).await?;
 
         // Rebuild FileIndex from catalog so re-insert promotion works
         // across restarts. For a fresh catalog this is a no-op.
@@ -318,29 +313,17 @@ impl<C: Catalog> QueryPipeline<C> {
         self.tables.get(ident).and_then(|t| t.watermark.as_ref())
     }
 
-    /// Persist the current per-table watermarks into the coord's
-    /// checkpoint. Called after every successful flush; can also be
-    /// called by callers as a manual "checkpoint now" operation.
+    /// Persist the current per-table watermarks into the coord.
+    /// Called after every successful flush; can also be called by
+    /// callers as a manual "checkpoint now" operation. Each table's
+    /// watermark is stored in its own row in
+    /// `_pg2iceberg.query_watermarks` — no global blob, no OCC.
     pub async fn save_checkpoint(&self) -> Result<()> {
-        // Preserve any non-query-mode fields already present (e.g. an
-        // in-progress snapshot from a different controller). We're only
-        // authoritative over `query_watermarks`.
-        let existing = self.coord.load_checkpoint(0).await?;
-
-        let mut watermarks: BTreeMap<String, PgValue> = BTreeMap::new();
         for (ident, table) in &self.tables {
             if let Some(wm) = &table.watermark {
-                watermarks.insert(ident.to_string(), wm.clone());
+                self.coord.set_query_watermark(ident, wm).await?;
             }
         }
-
-        // Inherit the existing checkpoint's revision + snapshot
-        // bookkeeping; just stomp the query-mode authoritative
-        // fields.
-        let mut cp = existing.unwrap_or_else(|| Checkpoint::fresh(Mode::Query));
-        cp.mode = Mode::Query;
-        cp.query_watermarks = watermarks;
-        self.coord.save_checkpoint(&mut cp).await?;
         Ok(())
     }
 }

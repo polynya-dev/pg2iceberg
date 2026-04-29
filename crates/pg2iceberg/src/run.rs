@@ -897,25 +897,6 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     coord_concrete.migrate().await.context("coord migrate")?;
     let coord: Arc<dyn Coordinator> = coord_concrete;
 
-    // ── early exit: snapshot already done ──────────────────────────
-    // Use system_id=0 to skip the cluster fingerprint check — the
-    // first run hasn't stamped one yet and we don't want
-    // snapshot-only to fail loudly on a brand-new install. The full
-    // `Run` lifecycle re-validates on every start.
-    if let Some(cp) = coord
-        .load_checkpoint(0)
-        .await
-        .context("load checkpoint")?
-    {
-        if cp.snapshot_complete {
-            println!(
-                "OK: snapshot already complete (per checkpoint at LSN {:?}); nothing to do",
-                cp.flushed_lsn
-            );
-            return Ok(());
-        }
-    }
-
     // ── pg + slot ──────────────────────────────────────────────────
     let pg_tls = match cfg.source.postgres.tls_label() {
         "webpki" => PgTls::Webpki,
@@ -929,6 +910,39 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     let schemas = crate::setup::__discover_schemas_for_snapshot(&cfg.tables, pg.as_ref())
         .await
         .context("discover schemas")?;
+
+    // ── early exit: every configured table already snapshotted ─────
+    // Per-table state in `_pg2iceberg.tables` replaces the old
+    // single-blob `snapshot_complete` flag; a missing row means
+    // "fresh" (snapshot still needed).
+    let mut all_done = !schemas.is_empty();
+    let mut last_lsn = pg2iceberg_core::Lsn::ZERO;
+    for s in &schemas {
+        match coord
+            .table_state(&s.ident)
+            .await
+            .context("load table_state")?
+        {
+            Some(state) if state.snapshot_complete => {
+                if state.snapshot_lsn > last_lsn {
+                    last_lsn = state.snapshot_lsn;
+                }
+            }
+            _ => {
+                all_done = false;
+                break;
+            }
+        }
+    }
+    if all_done {
+        println!(
+            "OK: snapshot already complete for all {} configured table(s) \
+             (highest snapshot LSN {:?}); nothing to do",
+            schemas.len(),
+            last_lsn
+        );
+        return Ok(());
+    }
 
     // Auto-create slot + publication if missing. This pins the WAL
     // from `consistent_point` onward so a later `Run` doesn't lose

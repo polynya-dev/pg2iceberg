@@ -544,17 +544,19 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
     assert!(format!("{err:?}").contains("blob.put"), "got: {err:?}");
     assert_eq!(h.injected(), 1);
 
-    // Checkpoint must reflect partial progress: snapshot_complete
-    // is still false AND snapshot_progress is non-empty (the last
-    // successfully-staged chunk's last PK key is recorded).
-    let cp = block_on(h.coord_inner.load_checkpoint(0)).unwrap().unwrap();
+    // Per-table state must reflect partial progress:
+    // snapshot_complete is still false AND a snapshot_progress row
+    // exists (the last successfully-staged chunk's last PK key is
+    // recorded).
+    let state = block_on(h.coord_inner.table_state(&ident())).unwrap();
     assert!(
-        !cp.snapshot_complete,
-        "expected snapshot_complete=false mid-snapshot, got true"
+        state.as_ref().map(|s| !s.snapshot_complete).unwrap_or(true),
+        "expected snapshot_complete=false (or absent row) mid-snapshot, got {state:?}"
     );
+    let progress = block_on(h.coord_inner.snapshot_progress(&ident())).unwrap();
     assert!(
-        !cp.snapshot_progress.is_empty(),
-        "expected progress recorded for resume; got empty map"
+        progress.is_some(),
+        "expected progress recorded for resume; got None"
     );
 
     // Crash + clear faults; resume.
@@ -591,14 +593,15 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
     sort_by_pk(&mut pg);
     assert_eq!(iceberg, pg, "all 10 rows visible in Iceberg after resume");
 
-    let cp_done = block_on(h.coord_inner.load_checkpoint(0)).unwrap().unwrap();
+    let state = block_on(h.coord_inner.table_state(&ident())).unwrap().unwrap();
     assert!(
-        cp_done.snapshot_complete,
-        "checkpoint must have snapshot_complete=true after resume"
+        state.snapshot_complete,
+        "table state must have snapshot_complete=true after resume"
     );
+    let progress = block_on(h.coord_inner.snapshot_progress(&ident())).unwrap();
     assert!(
-        cp_done.snapshot_progress.is_empty(),
-        "progress map should be cleared on Complete"
+        progress.is_none(),
+        "progress row should be cleared on Complete; got {progress:?}"
     );
 }
 
@@ -1222,13 +1225,13 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
     assert!(outcome.is_ok(), "lifecycle should succeed: {outcome:?}");
 
     // After shutdown: the slot was created, the snapshot ran, and
-    // checkpoint says snapshot is complete.
+    // per-table state says snapshot is complete.
     assert!(
         db.slot_state("lifecycle-slot").is_ok(),
         "slot should exist after lifecycle creates it"
     );
-    let cp = block_on(coord_inner.load_checkpoint(0)).unwrap().unwrap();
-    assert!(cp.snapshot_complete);
+    let state = block_on(coord_inner.table_state(&ident())).unwrap().unwrap();
+    assert!(state.snapshot_complete);
 }
 
 #[test]
@@ -1275,11 +1278,12 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
         equality_deletes: vec![],
     }))
     .unwrap();
-    let mut cp = pg2iceberg_core::Checkpoint::fresh(Mode::Logical);
-    cp.snapshot_complete = true;
-    cp.snapshoted_tables.insert(ident().to_string(), true);
-    cp.flushed_lsn = pg2iceberg_core::Lsn(1);
-    block_on(coord_inner.save_checkpoint(&mut cp)).unwrap();
+    block_on(coord_inner.mark_table_snapshot_complete(
+        &ident(),
+        0,
+        pg2iceberg_core::Lsn(1),
+    ))
+    .unwrap();
 
     let pg_client = Arc::new(SimPgClient::new(db.clone()));
     let pg: Arc<dyn pg2iceberg_pg::PgClient> = pg_client.clone();

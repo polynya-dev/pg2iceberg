@@ -24,13 +24,13 @@ pub use watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
 use pg2iceberg_core::{Lsn, Mode, TableIdent};
 use thiserror::Error;
 
-/// State observed at pipeline startup. Built by the binary by querying the
-/// coord (for the persisted checkpoint), the source PG (for replication
-/// slot info), and the catalog (for which tables exist + their snapshot
-/// status).
+/// State observed at pipeline startup. Built by the binary by querying
+/// the coord (for per-table snapshot state), the source PG (for
+/// replication slot info), and the catalog (for which tables exist +
+/// their snapshot status). Replaces the old single-blob `Checkpoint`
+/// in favor of per-table state assembled into [`TableExistence`].
 #[derive(Clone, Debug, Default)]
 pub struct StartupValidation {
-    pub checkpoint: Option<pg2iceberg_core::Checkpoint>,
     pub tables: Vec<TableExistence>,
     /// `None` for query mode (no replication slot).
     pub slot: Option<SlotState>,
@@ -39,6 +39,24 @@ pub struct StartupValidation {
     /// Publication name — used in the `TableMissingFromPublication`
     /// violation message. Empty in query mode.
     pub publication_name: String,
+    /// Highest LSN we (pg2iceberg) have ever told the slot to flush
+    /// past, read from `_pg2iceberg.flushed_lsn`. Compared to
+    /// `slot.confirmed_flush_lsn` to detect external advancement
+    /// (see [`Violation::SlotAdvancedExternally`]). `Lsn::ZERO`
+    /// means "no record yet" — treated as the bootstrap case (fresh
+    /// install or first slot creation), where we trust the slot
+    /// unconditionally.
+    pub coord_flushed_lsn: Lsn,
+}
+
+impl StartupValidation {
+    /// `true` when no registered table has a stored snapshot state in
+    /// `_pg2iceberg.tables`. Replaces the old `checkpoint.is_none()`
+    /// check — same semantic ("first run after install / cleanup")
+    /// derived from per-table state.
+    pub fn fresh(&self) -> bool {
+        self.tables.iter().all(|t| t.stored_state.is_none())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,16 +68,20 @@ pub struct TableExistence {
     pub current_snapshot_id: Option<i64>,
     /// PG `pg_class.oid` of the source table at validation time.
     /// `None` if the table doesn't exist in PG. Compared against
-    /// `cp.snapshoted_table_oids` to detect identity changes
+    /// `stored_state.pg_oid` to detect identity changes
     /// (`DROP TABLE` + recreate).
     pub current_pg_oid: Option<u32>,
     /// `true` if the source table is currently a member of the
     /// configured publication. `false` (combined with
-    /// `cp.snapshoted_tables` containing this key) signals that the
-    /// operator removed the table from the publication mid-run —
-    /// any DML during the gap was filtered, and re-adding the
-    /// table requires a re-snapshot.
+    /// `stored_state.snapshot_complete`) signals that the operator
+    /// removed the table from the publication mid-run — any DML
+    /// during the gap was filtered, and re-adding the table requires
+    /// a re-snapshot.
     pub in_publication: bool,
+    /// Per-table snapshot status from `_pg2iceberg.tables`. `None`
+    /// means we've never recorded a row for this table — treat as
+    /// "fresh."
+    pub stored_state: Option<pg2iceberg_coord::TableSnapshotState>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,63 +104,54 @@ pub struct SlotState {
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum Violation {
     #[error(
-        "checkpoint was created by {checkpoint_mode:?} mode but config specifies {config_mode:?} \
-         mode; change source.mode back to {checkpoint_mode:?}, or delete the checkpoint to start fresh"
-    )]
-    ModeMismatch {
-        checkpoint_mode: Mode,
-        config_mode: Mode,
-    },
-
-    #[error(
-        "no checkpoint found but Iceberg table(s) already exist: {tables:?}; delete the tables \
-         to start fresh, or restore the checkpoint"
+        "no per-table snapshot state recorded but Iceberg table(s) already exist: {tables:?}; \
+         delete the tables to start fresh, or `pg2iceberg cleanup` to wipe coord state"
     )]
     OrphanedTables { tables: Vec<String> },
 
     #[error(
-        "no checkpoint found but replication slot {slot_name:?} already exists; drop the slot \
-         with `SELECT pg_drop_replication_slot('{slot_name}')`, or restore the checkpoint"
+        "no per-table snapshot state recorded but replication slot {slot_name:?} already exists; \
+         drop the slot with `SELECT pg_drop_replication_slot('{slot_name}')`, or run `pg2iceberg cleanup`"
     )]
     OrphanedSlot { slot_name: String },
 
     #[error(
-        "checkpoint exists but Iceberg table(s) missing: {tables:?}; delete the checkpoint to \
-         re-snapshot, or recreate the tables"
+        "table state recorded but Iceberg table(s) missing: {tables:?}; \
+         run `pg2iceberg cleanup` to re-snapshot, or recreate the Iceberg tables"
     )]
     MissingTables { tables: Vec<String> },
 
     #[error(
-        "checkpoint has LSN {checkpoint_lsn} but replication slot {slot_name:?} does not exist; \
-         WAL data since that position is lost; delete the checkpoint and Iceberg tables to \
+        "table state has snapshot_lsn {snapshot_lsn} but replication slot {slot_name:?} does \
+         not exist; WAL data since that position is lost; run `pg2iceberg cleanup` and \
          re-snapshot"
     )]
     SlotGoneButLsnExists {
-        checkpoint_lsn: Lsn,
+        snapshot_lsn: Lsn,
         slot_name: String,
     },
 
     #[error(
-        "replication slot {slot_name:?} restart_lsn ({restart_lsn}) is ahead of checkpoint LSN \
-         ({checkpoint_lsn}); WAL has been recycled and data is lost; delete the checkpoint and \
-         Iceberg tables to re-snapshot"
+        "replication slot {slot_name:?} restart_lsn ({restart_lsn}) is ahead of recorded \
+         snapshot_lsn ({snapshot_lsn}); WAL has been recycled and data is lost; \
+         run `pg2iceberg cleanup` and re-snapshot"
     )]
     SlotAheadOfCheckpoint {
         restart_lsn: Lsn,
-        checkpoint_lsn: Lsn,
+        snapshot_lsn: Lsn,
         slot_name: String,
     },
 
     #[error(
-        "checkpoint says snapshot is complete but LSN is 0; the pipeline crashed after the \
-         snapshot but before the first CDC flush; delete the checkpoint and Iceberg tables to \
-         re-snapshot"
+        "table {table:?} is marked snapshot_complete but its snapshot_lsn is 0; the pipeline \
+         crashed after the snapshot but before the first CDC flush; \
+         run `pg2iceberg cleanup` to re-snapshot"
     )]
-    SnapshotCompleteButLsnZero,
+    SnapshotCompleteButLsnZero { table: String },
 
     #[error(
-        "checkpoint says snapshot is complete but table {table:?} has no snapshots; table may \
-         have been recreated externally; delete the checkpoint to re-snapshot"
+        "table {table:?} is marked snapshot_complete but has no snapshots in the catalog; \
+         the table may have been recreated externally; run `pg2iceberg cleanup` to re-snapshot"
     )]
     SnapshotCompleteButTableNoSnapshot { table: String },
 
@@ -164,9 +177,8 @@ pub enum Violation {
         "table {table:?} pg_class.oid changed from {stored_oid} to {current_oid}; \
          the table was dropped + recreated, so the pre-drop Iceberg data is now \
          stale (rows no longer in PG, and CDC won't re-emit them). drop the \
-         Iceberg table and the corresponding `_pg2iceberg.checkpoints` row's \
-         `snapshoted_tables`/`snapshoted_table_oids` entry to trigger a fresh \
-         snapshot"
+         Iceberg table and clear the corresponding `_pg2iceberg.tables` row to \
+         trigger a fresh snapshot, or run `pg2iceberg cleanup`"
     )]
     TableIdentityChanged {
         table: String,
@@ -178,12 +190,29 @@ pub enum Violation {
         "table {table:?} is in YAML and was previously snapshotted but is no longer \
          a member of publication {publication_name:?}; any DML that occurred while \
          the table was outside the publication was filtered by the slot. \
-         drop the Iceberg table and the corresponding `snapshoted_tables` entry \
-         to trigger a re-snapshot, then re-add to the publication"
+         drop the Iceberg table and clear its row in `_pg2iceberg.tables` to \
+         trigger a re-snapshot, then re-add to the publication"
     )]
     TableMissingFromPublication {
         table: String,
         publication_name: String,
+    },
+
+    #[error(
+        "replication slot {slot_name:?} has been advanced externally: \
+         our recorded flushed_lsn is {coord_lsn} but the slot's \
+         confirmed_flush_lsn is {slot_lsn}. Possible causes: \
+         `pg_replication_slot_advance` was called from outside pg2iceberg, \
+         the slot was dropped + recreated, or a separate consumer \
+         (e.g. `pg_recvlogical`) acked the slot during a downtime. WAL \
+         between our record and the slot's position has been skipped — \
+         data written to PG in that window will not appear in Iceberg. \
+         Run `pg2iceberg cleanup` and re-snapshot to recover."
+    )]
+    SlotAdvancedExternally {
+        slot_name: String,
+        coord_lsn: Lsn,
+        slot_lsn: Lsn,
     },
 }
 
@@ -196,19 +225,10 @@ pub struct ValidationError {
 
 pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), ValidationError> {
     let mut violations = Vec::new();
-    let fresh = v.checkpoint.is_none();
+    let fresh = v.fresh();
+    let _ = v.config_mode; // retained for future query-mode-specific invariants
 
-    // 1. Mode mismatch.
-    if let Some(cp) = &v.checkpoint {
-        if cp.mode != v.config_mode {
-            violations.push(Violation::ModeMismatch {
-                checkpoint_mode: cp.mode,
-                config_mode: v.config_mode,
-            });
-        }
-    }
-
-    // 2. Fresh checkpoint but Iceberg tables exist (orphans).
+    // 1. Fresh install but Iceberg tables exist (orphans).
     if fresh {
         let orphaned: Vec<String> = v
             .tables
@@ -221,7 +241,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
         }
     }
 
-    // 3. Fresh checkpoint but replication slot exists.
+    // 2. Fresh install but replication slot exists.
     if fresh {
         if let Some(slot) = &v.slot {
             if slot.exists {
@@ -232,69 +252,67 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
         }
     }
 
-    // 4. Checkpoint exists but previously-tracked tables missing.
-    //    "Tracked" is derived from `snapshoted_tables` keys — anything
-    //    we've ever snapshotted is a table we expect to find again.
-    if let Some(cp) = &v.checkpoint {
-        let tracked: std::collections::BTreeSet<String> =
-            cp.snapshoted_tables.keys().cloned().collect();
-        let missing: Vec<String> = v
-            .tables
-            .iter()
-            .filter(|t| !t.existed && tracked.contains(&t.pg_table.to_string()))
-            .map(|t| t.iceberg_name.clone())
-            .collect();
-        if !missing.is_empty() {
-            violations.push(Violation::MissingTables { tables: missing });
-        }
+    // 3. Previously-tracked table missing in catalog. "Tracked"
+    //    means a row in `_pg2iceberg.tables` exists for it
+    //    (regardless of snapshot_complete).
+    let missing: Vec<String> = v
+        .tables
+        .iter()
+        .filter(|t| !t.existed && t.stored_state.is_some())
+        .map(|t| t.iceberg_name.clone())
+        .collect();
+    if !missing.is_empty() {
+        violations.push(Violation::MissingTables { tables: missing });
     }
 
-    // 5. Checkpoint has LSN > 0 but slot is gone.
-    if let Some(cp) = &v.checkpoint {
-        if cp.flushed_lsn > Lsn::ZERO {
-            if let Some(slot) = &v.slot {
-                if !slot.exists {
-                    violations.push(Violation::SlotGoneButLsnExists {
-                        checkpoint_lsn: cp.flushed_lsn,
-                        slot_name: v.slot_name.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    // 6. Slot's restart_lsn is ahead of checkpoint LSN (WAL recycled).
-    if let Some(cp) = &v.checkpoint {
-        if cp.flushed_lsn > Lsn::ZERO {
-            if let Some(slot) = &v.slot {
-                if slot.exists && slot.restart_lsn > cp.flushed_lsn {
-                    violations.push(Violation::SlotAheadOfCheckpoint {
-                        restart_lsn: slot.restart_lsn,
-                        checkpoint_lsn: cp.flushed_lsn,
-                        slot_name: v.slot_name.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    // 7. Snapshot complete but LSN = 0 (crashed after snapshot, before first CDC flush).
-    //    Only applies to logical mode. Query mode doesn't track LSN.
-    if let Some(cp) = &v.checkpoint {
-        if cp.snapshot_complete
-            && cp.flushed_lsn == Lsn::ZERO
-            && v.config_mode == Mode::Logical
-        {
-            violations.push(Violation::SnapshotCompleteButLsnZero);
-        }
-    }
-
-    // 8. Snapshot complete but a tracked table has no snapshots in the catalog.
-    if let Some(cp) = &v.checkpoint {
-        if cp.snapshot_complete {
+    // 4. Some table has snapshot_lsn > 0 but slot is gone. WAL
+    //    behind that LSN is lost; can't resume CDC safely.
+    if let Some(slot) = &v.slot {
+        if !slot.exists {
             for t in &v.tables {
-                if t.existed && t.current_snapshot_id.is_none() {
-                    violations.push(Violation::SnapshotCompleteButTableNoSnapshot {
+                if let Some(state) = &t.stored_state {
+                    if state.snapshot_lsn > Lsn::ZERO {
+                        violations.push(Violation::SlotGoneButLsnExists {
+                            snapshot_lsn: state.snapshot_lsn,
+                            slot_name: v.slot_name.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Slot's restart_lsn is ahead of every recorded snapshot_lsn
+    //    (WAL recycled past where we last said we were caught up).
+    //    Use the *max* recorded snapshot_lsn — if the slot is past
+    //    even our furthest-ahead table, the gap is real.
+    if let Some(slot) = &v.slot {
+        if slot.exists {
+            let max_snapshot_lsn = v
+                .tables
+                .iter()
+                .filter_map(|t| t.stored_state.as_ref().map(|s| s.snapshot_lsn))
+                .max()
+                .unwrap_or(Lsn::ZERO);
+            if max_snapshot_lsn > Lsn::ZERO && slot.restart_lsn > max_snapshot_lsn {
+                violations.push(Violation::SlotAheadOfCheckpoint {
+                    restart_lsn: slot.restart_lsn,
+                    snapshot_lsn: max_snapshot_lsn,
+                    slot_name: v.slot_name.clone(),
+                });
+            }
+        }
+    }
+
+    // 6. Per-table snapshot_complete but snapshot_lsn = 0 (crashed
+    //    after marking complete but before the LSN was stamped, or
+    //    legacy bug). Only applies to logical mode.
+    if v.config_mode == Mode::Logical {
+        for t in &v.tables {
+            if let Some(state) = &t.stored_state {
+                if state.snapshot_complete && state.snapshot_lsn == Lsn::ZERO {
+                    violations.push(Violation::SnapshotCompleteButLsnZero {
                         table: t.iceberg_name.clone(),
                     });
                 }
@@ -302,10 +320,21 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
         }
     }
 
-    // 9. Slot is `lost` — WAL recycled past `max_slot_wal_keep_size`.
-    //    `wal_status = None` (pre-PG-13) skips this check; `Reserved`
-    //    / `Extended` / `Unreserved` are non-fatal at startup
-    //    (`Unreserved` is a *warning* surfaced by the watcher).
+    // 7. Per-table snapshot_complete but the catalog table has no
+    //    snapshots — the iceberg table was likely recreated
+    //    externally.
+    for t in &v.tables {
+        if let Some(state) = &t.stored_state {
+            if state.snapshot_complete && t.existed && t.current_snapshot_id.is_none() {
+                violations.push(Violation::SnapshotCompleteButTableNoSnapshot {
+                    table: t.iceberg_name.clone(),
+                });
+            }
+        }
+    }
+
+    // 8. Slot is `lost` — WAL recycled past `max_slot_wal_keep_size`.
+    //    `wal_status = None` (pre-PG-13) skips this check.
     if let Some(slot) = &v.slot {
         if slot.exists
             && matches!(slot.wal_status, Some(pg2iceberg_pg::WalStatus::Lost))
@@ -317,7 +346,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
         }
     }
 
-    // 10. Slot is `conflicting` (PG 14+) — killed by physical-rep conflict.
+    // 9. Slot is `conflicting` (PG 14+) — killed by physical-rep conflict.
     if let Some(slot) = &v.slot {
         if slot.exists && slot.conflicting {
             violations.push(Violation::SlotConflicting {
@@ -326,49 +355,74 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
         }
     }
 
-    // 11. Tracked table's `pg_class.oid` changed → `DROP TABLE` +
-    //     recreate. Old Iceberg rows are stale; CDC won't replay
-    //     them. `stored_oid == 0` is treated as "not yet recorded"
-    //     and skipped (legacy / first run).
-    if let Some(cp) = &v.checkpoint {
-        for t in &v.tables {
-            let key = t.pg_table.to_string();
-            let stored_oid = cp.snapshoted_table_oids.get(&key).copied().unwrap_or(0);
-            if stored_oid == 0 {
-                continue;
-            }
-            let current_oid = match t.current_pg_oid {
-                Some(o) => o,
-                None => continue, // table missing — caught by invariant 4
-            };
-            if stored_oid != current_oid {
-                violations.push(Violation::TableIdentityChanged {
-                    table: t.iceberg_name.clone(),
-                    stored_oid,
-                    current_oid,
-                });
-            }
+    // 10. Per-table `pg_class.oid` changed → `DROP TABLE` + recreate.
+    //     `stored_oid == 0` is treated as "not yet recorded" and
+    //     skipped (legacy / first run). Identical to the old
+    //     invariant 11; just sourced from per-table state now.
+    for t in &v.tables {
+        let stored_oid = t
+            .stored_state
+            .as_ref()
+            .map(|s| s.pg_oid)
+            .unwrap_or(0);
+        if stored_oid == 0 {
+            continue;
+        }
+        let current_oid = match t.current_pg_oid {
+            Some(o) => o,
+            None => continue, // table missing — caught by invariant 3
+        };
+        if stored_oid != current_oid {
+            violations.push(Violation::TableIdentityChanged {
+                table: t.iceberg_name.clone(),
+                stored_oid,
+                current_oid,
+            });
         }
     }
 
-    // 12. Tracked table missing from current publication. If we
-    //     previously snapshotted it (it's in `snapshoted_tables`)
-    //     but it's not in the publication right now, then any DML
-    //     during the gap was filtered — re-snapshot is required.
-    if let Some(cp) = &v.checkpoint {
-        for t in &v.tables {
-            let key = t.pg_table.to_string();
-            let was_snapshotted = cp
-                .snapshoted_tables
-                .get(&key)
-                .copied()
-                .unwrap_or(false);
-            if was_snapshotted && !t.in_publication {
-                violations.push(Violation::TableMissingFromPublication {
-                    table: t.iceberg_name.clone(),
-                    publication_name: v.publication_name.clone(),
-                });
-            }
+    // 11. Tracked table missing from current publication. If we
+    //     previously snapshotted it but it's not in the publication
+    //     right now, any DML during the gap was filtered — re-snapshot.
+    for t in &v.tables {
+        let was_snapshotted = t
+            .stored_state
+            .as_ref()
+            .map(|s| s.snapshot_complete)
+            .unwrap_or(false);
+        if was_snapshotted && !t.in_publication {
+            violations.push(Violation::TableMissingFromPublication {
+                table: t.iceberg_name.clone(),
+                publication_name: v.publication_name.clone(),
+            });
+        }
+    }
+
+    // 12. Slot was advanced externally during downtime. Compare our
+    //     durable record to the slot's reported `confirmed_flush_lsn`.
+    //     Skip when:
+    //     - our record is `Lsn::ZERO` (fresh install / no slot baseline yet —
+    //       the lifecycle stamps the bootstrap value at slot creation)
+    //     - slot doesn't exist (separate `OrphanedSlot` / `MissingTables`
+    //       paths handle that)
+    //     - slot ≤ our record (normal operation: the slot lags us
+    //       between the coord write and the standby ack, which we
+    //       intentionally allow — re-delivery is idempotent via fold).
+    //
+    //     Any positive gap means external advancement. We do not
+    //     apply a tolerance: the standby tick writes coord *before*
+    //     ack-ing the slot, so in normal operation the slot's value
+    //     never exceeds our recorded value.
+    if let Some(slot) = &v.slot {
+        if slot.exists
+            && v.coord_flushed_lsn > Lsn::ZERO
+            && slot.confirmed_flush_lsn > v.coord_flushed_lsn
+        {
+            violations.push(Violation::SlotAdvancedExternally {
+                slot_name: v.slot_name.clone(),
+                coord_lsn: v.coord_flushed_lsn,
+                slot_lsn: slot.confirmed_flush_lsn,
+            });
         }
     }
 

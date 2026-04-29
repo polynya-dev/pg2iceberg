@@ -22,7 +22,7 @@ pub mod sql;
 pub mod prod;
 
 use async_trait::async_trait;
-use pg2iceberg_core::{Checkpoint, Lsn, TableIdent, WorkerId};
+use pg2iceberg_core::{Lsn, PgValue, TableIdent, WorkerId};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -35,15 +35,17 @@ pub enum CoordError {
     Conflict { table: TableIdent, detail: String },
     #[error("not found: {0}")]
     NotFound(String),
-    /// Another writer beat us to the punch on a checkpoint save —
-    /// our `revision = expected_revision` predicate matched zero
-    /// rows. The caller should reload the checkpoint, redo whatever
-    /// in-memory state diverged, and retry. Surface verbatim so the
-    /// pipeline can decide between abort vs. backoff+reload.
-    #[error("concurrent checkpoint update detected; another pg2iceberg instance may be running with the same pipeline ID")]
-    ConcurrentUpdate,
-    #[error("checkpoint: {0}")]
-    Checkpoint(#[from] pg2iceberg_core::CheckpointError),
+    /// Source PG cluster fingerprint mismatch. Stored
+    /// `system_identifier` differs from what `IDENTIFY_SYSTEM` returns
+    /// at startup. Refusing to start is the only safe option — a stale
+    /// LSN from a different cluster can't be replayed correctly.
+    #[error(
+        "system_identifier mismatch: stored {stored}, connected {connected}; \
+         refusing to resume — a stale LSN from a different cluster cannot be \
+         replayed safely. If this is an intentional blue/green cutover, run \
+         `pg2iceberg cleanup` first; otherwise verify the source DSN."
+    )]
+    SystemIdMismatch { stored: u64, connected: u64 },
     #[error("other: {0}")]
     Other(String),
 }
@@ -159,6 +161,24 @@ where
     update(receipt.flushable_lsn)
 }
 
+/// Per-table snapshot status stored in `_pg2iceberg.tables`.
+/// Replaces the old `Checkpoint::snapshoted_tables` /
+/// `snapshoted_table_oids` / `snapshot_complete` blob.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableSnapshotState {
+    /// PostgreSQL `pg_class.oid` captured at snapshot completion.
+    /// Drives the `TableIdentityChanged` startup invariant — a
+    /// `DROP TABLE` + recreate gives a new oid even with identical
+    /// schema, and the Iceberg state pre-drop is now stale.
+    /// `0` = unknown (legacy / sim runs); the invariant skips on 0.
+    pub pg_oid: u32,
+    pub snapshot_complete: bool,
+    /// LSN at the moment the table's snapshot finished.
+    pub snapshot_lsn: Lsn,
+    /// Microseconds since unix epoch. `None` means "never completed."
+    pub completed_at_micros: Option<i64>,
+}
+
 /// One row in `log_index`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -220,28 +240,90 @@ pub trait Coordinator: Send + Sync {
     ) -> Result<bool>;
     async fn release_lock(&self, table: &TableIdent, worker: &WorkerId) -> Result<()>;
 
-    /// Load the persisted checkpoint. Returns `None` if no row
-    /// exists (fresh start). The implementation runs `verify` with
-    /// the supplied `connected_system_id`, so a returned `Some`
-    /// has already been validated for version / checksum / cluster
-    /// fingerprint. Pass `0` for `connected_system_id` to skip the
-    /// cluster fingerprint check (sim mode, or before the source
-    /// connection is known).
-    async fn load_checkpoint(
-        &self,
-        connected_system_id: u64,
-    ) -> Result<Option<Checkpoint>>;
-    /// Save the checkpoint. The implementation:
-    /// 1. Snapshots `cp.revision` as `expected`.
-    /// 2. Calls `cp.seal(now_micros)` (mutates: increments revision,
-    ///    sets version, recomputes checksum).
-    /// 3. Persists with the OCC predicate `revision = expected`.
+    // ── Pipeline meta (cluster fingerprint) ─────────────────
+    /// Get the stored source-cluster `system_identifier`. Returns
+    /// `Ok(0)` if no row has been written yet (fresh install).
+    async fn pipeline_system_identifier(&self) -> Result<u64>;
+
+    /// Stamp the pipeline meta with the connected cluster's
+    /// `system_identifier`. Idempotent: stamping the same value is a
+    /// no-op. **Refuses** to overwrite a non-zero stored value with a
+    /// different non-zero value — returns
+    /// [`CoordError::SystemIdMismatch`]. Caller stamps once at
+    /// startup right after `IDENTIFY_SYSTEM`.
+    async fn set_pipeline_system_identifier(&self, sysid: u64) -> Result<()>;
+
+    // ── Last-acked LSN (tamper detection) ───────────────────
+    /// Read the highest LSN we've ever told the replication slot to
+    /// flush past. Returns `Ok(Lsn::ZERO)` if no row exists yet
+    /// (fresh install — we have no baseline, so the lifecycle
+    /// bootstraps it on first slot creation).
+    async fn flushed_lsn(&self) -> Result<Lsn>;
+
+    /// Stamp the highest LSN we've acked. Called *before* every
+    /// `send_standby` so on a crash between the two writes, the slot
+    /// lags behind our record (slot replays, fold absorbs duplicates)
+    /// rather than leading it (which would either be our own ack we
+    /// failed to record, or external tampering).
     ///
-    /// If another writer already advanced the on-disk revision past
-    /// `expected`, the UPDATE matches zero rows and the implementation
-    /// returns [`CoordError::ConcurrentUpdate`]. The caller should
-    /// reload + retry (or abort, depending on policy).
-    async fn save_checkpoint(&self, cp: &mut Checkpoint) -> Result<()>;
+    /// Idempotent UPSERT. Stamping a smaller value than the stored
+    /// one is silently allowed — callers should ensure monotonicity
+    /// at the call site, but the trait doesn't enforce it (so a
+    /// drain after a partial-flush rollback can re-stamp lower
+    /// without erroring).
+    async fn set_flushed_lsn(&self, lsn: Lsn) -> Result<()>;
+
+    // ── Per-table snapshot status ───────────────────────────
+    /// Get a table's snapshot state. `None` = never recorded
+    /// (treat as "not snapshotted yet"). Used at startup to gate the
+    /// snapshot phase + drive the TableIdentityChanged invariant.
+    async fn table_state(&self, ident: &TableIdent) -> Result<Option<TableSnapshotState>>;
+
+    /// Mark a table's snapshot complete with its `pg_oid` and the LSN
+    /// at completion. Idempotent UPSERT. Called by the snapshotter
+    /// after each table finishes (or by the lifecycle after the
+    /// snapshot phase runs to completion).
+    async fn mark_table_snapshot_complete(
+        &self,
+        ident: &TableIdent,
+        pg_oid: u32,
+        snapshot_lsn: Lsn,
+    ) -> Result<()>;
+
+    // ── Per-table mid-snapshot resume cursor ────────────────
+    /// Read the per-chunk resume cursor for a table. Returns the
+    /// canonical-PK JSON of the last successfully staged row, or
+    /// `None` if no progress was recorded (snapshot starts from the
+    /// beginning, or the table is already complete).
+    async fn snapshot_progress(&self, ident: &TableIdent) -> Result<Option<String>>;
+
+    /// Stamp a per-chunk resume cursor. The Snapshotter calls this
+    /// after every chunk is durably staged so a mid-snapshot crash
+    /// resumes at the next PK rather than from chunk 0.
+    async fn set_snapshot_progress(
+        &self,
+        ident: &TableIdent,
+        last_pk_key: &str,
+    ) -> Result<()>;
+
+    /// Drop the resume cursor (called when a table's snapshot
+    /// completes — saves a row vs leaving stale state behind).
+    /// Idempotent — safe to call when no row exists.
+    async fn clear_snapshot_progress(&self, ident: &TableIdent) -> Result<()>;
+
+    // ── Per-table query-mode watermark ──────────────────────
+    /// Read the watermark for a query-mode table. `None` means no
+    /// watermark recorded yet — caller treats as "start from
+    /// beginning" or whatever the source-side default is.
+    async fn query_watermark(&self, ident: &TableIdent) -> Result<Option<PgValue>>;
+
+    /// Stamp the watermark for a query-mode table. Idempotent
+    /// UPSERT. Called after each query-flush cycle commits.
+    async fn set_query_watermark(
+        &self,
+        ident: &TableIdent,
+        watermark: &PgValue,
+    ) -> Result<()>;
 
     /// Read pending [`MarkerInfo`]s eligible for emission as
     /// meta-marker rows for `table`. A marker is *eligible* iff:
@@ -282,101 +364,3 @@ pub trait Coordinator: Send + Sync {
     }
 }
 
-/// Wrapper that stamps `cp.system_identifier` on every
-/// `save_checkpoint`, so a checkpoint always carries the cluster
-/// fingerprint it was written under. Mirrors Go's
-/// `pipeline.WithSystemIdentifier` stamping store.
-///
-/// Construct in the lifecycle, after `IDENTIFY_SYSTEM` returns a
-/// nonzero systemid. All other methods delegate to the inner coord;
-/// `load_checkpoint` is a pass-through (the inner coord's verify
-/// already fails on cluster mismatch).
-pub struct StampingCoordinator {
-    inner: std::sync::Arc<dyn Coordinator>,
-    system_identifier: u64,
-}
-
-impl StampingCoordinator {
-    pub fn new(inner: std::sync::Arc<dyn Coordinator>, system_identifier: u64) -> Self {
-        Self {
-            inner,
-            system_identifier,
-        }
-    }
-}
-
-#[async_trait]
-impl Coordinator for StampingCoordinator {
-    async fn claim_offsets(&self, batch: &CommitBatch) -> Result<CoordCommitReceipt> {
-        self.inner.claim_offsets(batch).await
-    }
-    async fn read_log(
-        &self,
-        table: &TableIdent,
-        after_offset: u64,
-        limit: usize,
-    ) -> Result<Vec<LogEntry>> {
-        self.inner.read_log(table, after_offset, limit).await
-    }
-    async fn truncate_log(&self, table: &TableIdent, before_offset: u64) -> Result<Vec<String>> {
-        self.inner.truncate_log(table, before_offset).await
-    }
-    async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> Result<()> {
-        self.inner.ensure_cursor(group, table).await
-    }
-    async fn get_cursor(&self, group: &str, table: &TableIdent) -> Result<Option<i64>> {
-        self.inner.get_cursor(group, table).await
-    }
-    async fn set_cursor(&self, group: &str, table: &TableIdent, to_offset: i64) -> Result<()> {
-        self.inner.set_cursor(group, table, to_offset).await
-    }
-    async fn register_consumer(&self, group: &str, worker: &WorkerId, ttl: Duration) -> Result<()> {
-        self.inner.register_consumer(group, worker, ttl).await
-    }
-    async fn unregister_consumer(&self, group: &str, worker: &WorkerId) -> Result<()> {
-        self.inner.unregister_consumer(group, worker).await
-    }
-    async fn active_consumers(&self, group: &str) -> Result<Vec<WorkerId>> {
-        self.inner.active_consumers(group).await
-    }
-    async fn try_lock(&self, table: &TableIdent, worker: &WorkerId, ttl: Duration) -> Result<bool> {
-        self.inner.try_lock(table, worker, ttl).await
-    }
-    async fn renew_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> Result<bool> {
-        self.inner.renew_lock(table, worker, ttl).await
-    }
-    async fn release_lock(&self, table: &TableIdent, worker: &WorkerId) -> Result<()> {
-        self.inner.release_lock(table, worker).await
-    }
-    async fn load_checkpoint(
-        &self,
-        connected_system_id: u64,
-    ) -> Result<Option<Checkpoint>> {
-        self.inner.load_checkpoint(connected_system_id).await
-    }
-    async fn save_checkpoint(&self, cp: &mut Checkpoint) -> Result<()> {
-        // Stamp BEFORE delegating: the inner coord's `seal` computes
-        // checksum over (among other things) `system_identifier`.
-        cp.system_identifier = self.system_identifier;
-        self.inner.save_checkpoint(cp).await
-    }
-    async fn pending_markers_for_table(
-        &self,
-        table: &TableIdent,
-        cursor: i64,
-    ) -> Result<Vec<MarkerInfo>> {
-        self.inner.pending_markers_for_table(table, cursor).await
-    }
-    async fn record_marker_emitted(
-        &self,
-        uuid: &str,
-        table: &TableIdent,
-    ) -> Result<()> {
-        self.inner.record_marker_emitted(uuid, table).await
-    }
-}
