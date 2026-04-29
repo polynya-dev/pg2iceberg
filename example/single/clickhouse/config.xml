@@ -1,0 +1,9 @@
+<clickhouse>
+    <s3>
+        <access_key_id>admin</access_key_id>
+        <secret_access_key>password</secret_access_key>
+        <endpoint>http://minio:9000</endpoint>
+        <region>us-east-1</region>
+        <use_path_style>true</use_path_style>
+    </s3>
+</clickhouse>

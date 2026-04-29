@@ -1,0 +1,34 @@
+tables:
+  - name: public.riders
+  - name: public.drivers
+  - name: public.rides
+  - name: public.payments
+  - name: public.ratings
+
+source:
+  mode: logical
+
+  postgres:
+    host: postgres
+    port: 5432
+    database: rideshare
+    user: postgres
+    password: postgres
+
+  logical:
+    publication_name: pg2iceberg_pub
+    slot_name: pg2iceberg_slot
+
+sink:
+  catalog_uri: http://iceberg-rest:8181
+  warehouse: s3://warehouse/
+  namespace: rideshare
+  s3_endpoint: http://minio:9000
+  s3_access_key: admin
+  s3_secret_key: password
+  s3_region: us-east-1
+  flush_interval: 10s
+  flush_rows: 1000
+  flush_bytes: 67108864
+
+state: {}

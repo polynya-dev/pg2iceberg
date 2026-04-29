@@ -1,0 +1,14 @@
+<clickhouse>
+    <profiles>
+        <default>
+            <allow_experimental_database_iceberg>1</allow_experimental_database_iceberg>
+        </default>
+    </profiles>
+    <users>
+        <default>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+        </default>
+    </users>
+</clickhouse>
