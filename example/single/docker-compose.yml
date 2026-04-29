@@ -88,6 +88,12 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
+    # Dockerfile's ENTRYPOINT is the binary; pass the subcommand here.
+    # Config is sourced from environment variables (see below); no
+    # `--config` file needed for this example.
+    command: ["run", "--config", "/etc/pg2iceberg/config.yaml"]
+    volumes:
+      - ./config.yaml:/etc/pg2iceberg/config.yaml:ro
     environment:
       POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/rideshare
       TABLES: public.riders,public.drivers,public.rides,public.payments,public.ratings

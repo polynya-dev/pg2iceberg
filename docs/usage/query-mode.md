@@ -42,7 +42,7 @@ source:
     password: ""
 
   query:
-    poll_interval: 5s      # how often to poll each table
+    poll_interval: 30s     # how often to poll each table (default: 30s)
 
 tables:
   - name: public.orders
@@ -53,17 +53,27 @@ tables:
 Each table requires:
 
 - **`primary_key`** — one or more columns that uniquely identify a row. Used to deduplicate upserts in merge-on-read.
-- **`watermark_column`** — a `timestamp` or `timestamptz` column that is set (or updated) whenever a row changes. pg2iceberg polls with `WHERE watermark_column > $last_watermark ORDER BY watermark_column ASC` and advances the watermark to the maximum value seen in each batch.
+- **`watermark_column`** — a column whose values are monotonically non-decreasing as rows change. pg2iceberg polls with `WHERE watermark_column > $last_watermark ORDER BY watermark_column ASC` and advances the watermark to the maximum value seen in each batch.
+
+### Supported watermark column types
+
+| PostgreSQL type | Notes |
+|---|---|
+| `smallint`, `integer`, `bigint` | Sequence columns work well |
+| `date` | |
+| `timestamp`, `timestamptz` | Microsecond precision |
+
+Anything else (text, uuid, numeric, etc.) is rejected at startup with `UnsupportedWatermark`.
 
 !!! warning "Watermark column requirements"
-    The watermark column must be `NOT NULL` and must be a timestamp type. Rows with a `NULL` watermark value are skipped and will be re-polled on every cycle. Integer watermarks are not currently supported.
+    The watermark column must be `NOT NULL` and the type must be one of the supported list above. Rows with `NULL` watermark values are skipped silently and will be re-polled on every cycle, which is wasteful — fix the source to enforce `NOT NULL`.
 
 ## Initial snapshot
 
 On first run, pg2iceberg performs an initial snapshot before polling begins:
 
 1. Records `MAX(watermark_column)` per table as a fence value.
-2. Performs a full CTID-chunked bulk copy of each table (same mechanism as logical mode).
+2. Performs a full chunked bulk copy of each table (same mechanism as logical mode, paginated by primary-key cursor).
 3. Sets the watermark to the fence value captured in step 1.
 
 This ensures rows inserted or updated *during* the snapshot are not missed — polling starts from the fence, catching any changes that arrived while the snapshot was in progress.
@@ -77,17 +87,16 @@ This ensures rows inserted or updated *during* the snapshot are not missed — p
 
 ## Flush thresholds
 
-Query mode shares the same flush configuration as logical mode. A flush is triggered when any threshold is reached:
+Query mode shares the same flush configuration as logical mode:
 
 ```yaml
 sink:
   flush_rows: 1000        # flush after this many buffered rows
   flush_interval: 10s     # flush at least this often
-  flush_bytes:            # flush after this many buffered bytes (default: 64MB)
 ```
 
-After each flush, compaction runs automatically if the configured file-count thresholds are exceeded.
+After each flush, compaction runs automatically if the configured file-count thresholds are exceeded (`compaction_data_files` / `compaction_delete_files`).
 
-## Checkpointing
+## Watermark persistence
 
-After each successful flush, the watermark for each table is saved to the checkpoint store. On restart, polling resumes from the saved watermark — no rows are re-polled.
+After each successful flush, the watermark for each table is upserted into `_pg2iceberg.query_watermarks` (one row per table). On restart, polling resumes from the saved watermark — no rows are re-polled. There's no global checkpoint blob; each table's watermark is independent.

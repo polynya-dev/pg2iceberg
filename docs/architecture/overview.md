@@ -19,9 +19,9 @@ PostgreSQL  ──WAL──►│  Flusher  ──staged Parquet──►  Mater
                     └─────────────────────────────────────────────────────┘
 ```
 
-The two components communicate through a **leaderless log** — an append-only, offset-indexed log stored as Parquet files in S3 with a lightweight index in PostgreSQL.
+The two components communicate through a **staged log** — append-only, offset-indexed Parquet files in S3 with a lightweight index in PostgreSQL (`_pg2iceberg.log_index`). Same offset-claim primitive (`Coordinator::claim_offsets`) is the durability gate for both single-process and distributed deployments.
 
-In combined (single-process) mode, the materializer reads staged events directly from an in-memory cache, avoiding S3 round-trips entirely on the hot path.
+In single-process mode (`pg2iceberg run`), the WAL writer and materializer share the same process and coord — staged files still upload to S3 but the materializer reads them via the coord cursor as in distributed mode. (The Go reference's "combined mode in-memory cache" optimization is not implemented in the Rust port; profiling didn't justify it.)
 
 ## End-to-end flow
 
@@ -45,7 +45,7 @@ sequenceDiagram
     Note over F: Serialize buffered events to Parquet
     F->>S3s: Upload staged.parquet
     F->>Coord: ClaimOffsets (log_seq++, insert log_index)
-    F->>Coord: UpdateCheckpoint (confirmed flush LSN)
+    F->>Coord: set_flushed_lsn (durable record for tamper detection)
     F->>PG: Standby status (WALFlushPosition = staged LSN)
 
     Note over PG: WAL before staged LSN can now be recycled
@@ -64,5 +64,5 @@ sequenceDiagram
     Mat->>Coord: SetCursor(offset 1042)
 ```
 
-!!! note "Combined mode"
-    In combined (single-process) mode the `S3s: Download staged.parquet` step is skipped — the materializer reads events from an in-memory cache populated by the flusher during `ClaimOffsets`.
+!!! note "Distributed mode"
+    The same flow describes both single-process and distributed deployments. In distributed mode (`pg2iceberg stream-only` + N `pg2iceberg materializer-only`), each materializer worker takes a deterministic round-robin slice of the table list — see [distributed.md](distributed.md) for the assignment rules and rebalancing semantics.

@@ -4,102 +4,138 @@ icon: lucide/layers
 
 # Operational Modes
 
-pg2iceberg can run in several modes depending on your scale and operational needs.
+pg2iceberg's CLI is organized as subcommands. Each one is a separate entry point that takes the same `--config` YAML.
 
-## Single mode (default)
+```sh
+pg2iceberg <SUBCOMMAND> --config /etc/pg2iceberg/config.yaml [flags...]
+```
 
-Both the WAL writer and materializer run in the same process. This is the right choice for the vast majority of deployments.
+## `run` — single-process default
+
+Both the WAL writer and materializer run in the same process. This is the right choice for most deployments.
 
 ```bash
-pg2iceberg --config config.yaml
+pg2iceberg run --config config.yaml
 ```
 
 ```
 ┌─────────────────────────────────────────┐
-│              pg2iceberg                 │
+│             pg2iceberg run              │
 │                                         │
 │  WAL writer ──► stream ──► materializer │
 └─────────────────────────────────────────┘
 ```
 
-The WAL writer captures row-level changes from PostgreSQL via logical replication and stages them to the stream (S3 + PostgreSQL coordinator). The materializer reads from the stream and writes Iceberg data files.
+The WAL writer captures row-level changes via PostgreSQL logical replication and stages them to S3 + the `_pg2iceberg.log_index` table. The materializer reads from that staging layer and writes Iceberg data files via the catalog.
 
-## Multi-worker mode
+`run` dispatches on `source.mode` in the YAML — `logical` (default) drives the CDC pipeline; `query` drives the watermark-poll pipeline.
 
-One pg2iceberg process acts as the WAL writer; N separate processes run materializers. This is useful for databases with very large tables or high write throughput, where materializer work can be parallelised across multiple workers.
+## `stream-only` + `materializer-only` — distributed
 
-**WAL writer** (one instance):
+One process owns the replication slot; N worker processes claim a deterministic round-robin slice of tables.
+
+**WAL writer** (one instance only — Postgres allows one consumer per slot):
 
 ```bash
-pg2iceberg --config config.yaml --stream-only
+pg2iceberg stream-only --config config.yaml
 ```
 
-**Materializer workers** (one or more instances, each with a unique ID):
+**Materializer workers** (one or more, each with a process-unique id):
 
 ```bash
-pg2iceberg --config config.yaml --materializer-only --materializer-worker-id worker-1
-pg2iceberg --config config.yaml --materializer-only --materializer-worker-id worker-2
+pg2iceberg materializer-only --config config.yaml --worker-id worker-a
+pg2iceberg materializer-only --config config.yaml --worker-id worker-b
 ```
 
 ```
 ┌──────────────────┐     ┌──────────────────────┐
-│  WAL writer      │     │  materializer worker-1│
-│  (stream-only)   │──►  ├──────────────────────┤
-│                  │     │  materializer worker-2│
+│  stream-only     │     │ materializer-only A  │
+│                  │──►  ├──────────────────────┤
+│                  │     │ materializer-only B  │
 └──────────────────┘     └──────────────────────┘
-         │                         │
-      stream                    Iceberg
+         │                          │
+   `_pg2iceberg`              Iceberg catalog
+   coordinator
 ```
 
-Each materializer worker independently reads from the shared stream and writes to Iceberg. Workers are differentiated by their `--materializer-worker-id` value, which is also used as the consumer group cursor in the coordinator.
+Each worker registers a heartbeat in `_pg2iceberg.consumer` keyed by `state.group` and `--worker-id`. On every cycle, every worker reads the active-worker list and computes the same deterministic assignment (sorted tables → sorted workers → `[i % N]`). Adding or removing a worker rebalances on the next cycle automatically; no leader election.
 
 !!! note
-    All materializer workers must share the same configuration (catalog, namespace, tables). The WAL writer does not need `--materializer-worker-id`.
+    All workers must share the same `state.group` (default `default`) and the same configured table list. Different `--worker-id` per process is mandatory — duplicates trample each other's heartbeat row and produce undefined assignment.
 
-## Snapshot-only mode
+## `snapshot` — one-shot initial snapshot
 
-Performs a one-shot initial snapshot of all configured tables and exits. The replication pipeline is not started — no slot, no WAL streaming.
+Runs the initial snapshot phase for every configured table and exits. Auto-creates the replication slot first so a later `run` doesn't lose WAL between snapshot completion and CDC start.
 
 ```bash
-pg2iceberg --config config.yaml --snapshot-only
+pg2iceberg snapshot --config config.yaml
 ```
 
-pg2iceberg writes the snapshot to Iceberg and records completion in the checkpoint store. If the snapshot was already completed on a previous run, it exits immediately without doing any work.
+If every configured table is already marked complete in `_pg2iceberg.tables`, the command prints `OK: snapshot already complete` and exits without touching PG or the catalog.
 
-## Compact mode
+This is more conservative than the Go reference's `--snapshot-only`, which doesn't create the slot in advance.
 
-Runs one compaction cycle across all configured tables and exits. Compaction merges small data and delete files into larger files, improving query performance.
+## `compact` — one-shot compaction pass
+
+Runs a single compaction pass across every configured table, then exits. Designed for cron / Kubernetes `CronJob` deployments that want compaction on a slower cadence than the materializer.
 
 ```bash
-pg2iceberg --config config.yaml --compact
+pg2iceberg compact --config config.yaml
 ```
 
-Compaction is skipped for any table that is below the configured `data_file_threshold` and `delete_file_threshold`.
+Skipped for tables below the configured `compaction_data_files` / `compaction_delete_files` thresholds. Set `target_file_size: 0` in YAML to disable compaction entirely.
 
-!!! warning "Known limitation"
-    Compaction currently writes unpartitioned output for partitioned tables. This is a known issue and will be addressed in a future release.
+## `maintain` — one-shot maintenance pass
 
-## Maintain mode
-
-Runs one maintenance cycle and exits. Maintenance covers two operations:
-
-- **Snapshot expiry** — removes old Iceberg snapshots beyond the configured retention period
-- **Orphan file cleanup** — deletes S3 files that are no longer referenced by any snapshot
+Runs snapshot expiry first, then orphan-file cleanup, across every configured table. Both phases can be turned off independently by leaving their config field blank.
 
 ```bash
-pg2iceberg --config config.yaml --maintain
+pg2iceberg maintain --config config.yaml
+pg2iceberg maintain --config config.yaml --retention 168h   # CLI override
 ```
 
-!!! note
-    Maintenance requires a `MetadataStore` catalog (Iceberg REST). It is not supported with plain S3 catalog backends.
+| Phase | Driven by | Behavior |
+|---|---|---|
+| Snapshot expiry | `sink.maintenance_retention` | Drops snapshots older than retention. Never drops the current snapshot. |
+| Orphan-file cleanup | `sink.maintenance_grace` | Deletes S3 files older than grace that no live snapshot references. |
 
-## Cleanup mode
+## `verify` — one-shot diff against PG
 
-Drops all pg2iceberg state from PostgreSQL and exits. This removes the replication slot, the publication, and the `_pg2iceberg` schema.
+Reads PG ground truth (REPEATABLE READ snapshot) and Iceberg materialized state for every configured table, compares row-by-row by primary key, prints per-table diff counts. Exits non-zero if any diff is non-empty.
 
 ```bash
-pg2iceberg --config config.yaml --cleanup
+pg2iceberg verify --config config.yaml
+pg2iceberg verify --config config.yaml --chunk-size 4096
+```
+
+Useful as a Day-2 confidence check or as the first step of a Go → Rust migration validation.
+
+## `cleanup` — drop PG-side state
+
+Drops the replication slot, drops the publication, and `DROP SCHEMA … CASCADE` on the coordinator. Does **not** delete the materialized Iceberg tables — drop those out-of-band via the catalog if you want a full reset.
+
+```bash
+pg2iceberg cleanup --config config.yaml
 ```
 
 !!! danger
-    This is irreversible. After cleanup, pg2iceberg must perform a fresh snapshot before streaming can resume. The Iceberg tables themselves are not modified.
+    This is irreversible. After cleanup, the next `pg2iceberg run` will create a fresh slot and re-snapshot every table.
+
+## `migrate-coord` — idempotent schema migration
+
+Runs the coordinator schema migration. Every statement is `CREATE TABLE IF NOT EXISTS` (or `ALTER TABLE … ADD COLUMN IF NOT EXISTS`), so it's safe to run repeatedly.
+
+```bash
+pg2iceberg migrate-coord --config config.yaml
+```
+
+`run` calls this automatically at startup, so explicit invocation is only needed if you want to inspect the schema before the long-running pipeline starts.
+
+## `connect-pg` / `connect-iceberg` — connectivity smoke tests
+
+Open a connection in the same prod path the lifecycle uses, run a trivial probe, and exit. Useful for k8s `initContainer` hooks and on-call sanity checks.
+
+```bash
+pg2iceberg connect-pg --config config.yaml
+pg2iceberg connect-iceberg --config config.yaml
+```

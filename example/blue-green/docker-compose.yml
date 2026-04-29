@@ -154,7 +154,7 @@ services:
       iceberg-rest:          { condition: service_healthy }
     volumes:
       - ./configs/pg2iceberg-blue.yaml:/etc/pg2iceberg/config.yaml:ro
-    command: ["--config", "/etc/pg2iceberg/config.yaml"]
+    command: ["run", "--config", "/etc/pg2iceberg/config.yaml"]
     environment:
       AWS_ACCESS_KEY_ID: admin
       AWS_SECRET_ACCESS_KEY: password
@@ -168,7 +168,7 @@ services:
       iceberg-rest:          { condition: service_healthy }
     volumes:
       - ./configs/pg2iceberg-green.yaml:/etc/pg2iceberg/config.yaml:ro
-    command: ["--config", "/etc/pg2iceberg/config.yaml"]
+    command: ["run", "--config", "/etc/pg2iceberg/config.yaml"]
     environment:
       AWS_ACCESS_KEY_ID: admin
       AWS_SECRET_ACCESS_KEY: password
