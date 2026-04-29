@@ -1,7 +1,6 @@
-bin/
-pg2iceberg-state.json
-.claude
+/target
+**/*.rs.bk
+Cargo.lock.bak
 .DS_Store
-pg2iceberg
-bench-verify
-bench-writer
+.claude
+site

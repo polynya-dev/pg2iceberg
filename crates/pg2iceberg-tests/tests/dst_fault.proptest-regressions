@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dc3a86964b2ef48044eb3a5eced32c103522b593786d05e1440f019fd5cc083d # shrinks to steps = [Insert { id: 1, qty: 0 }, InjectBlobPutFault, Flush]
+cc 208a06f6fad7fb17d373006e8265f4cf631fb7e60749bfe0d229ea45808ebc20 # shrinks to steps = [Insert { id: 1, qty: 0 }, InjectBlobPutFault, Flush, Insert { id: 2, qty: 0 }, Flush]

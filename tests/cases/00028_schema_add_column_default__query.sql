@@ -1,1 +1,0 @@
-SELECT id, name, status FROM iceberg.`default.e2e_schema_add_default` ORDER BY id

@@ -1,5 +1,0 @@
-1	10.65	alice	price_truncate=10.50
-2	25.3	bob	price_truncate=25.00
-3	99.99	charlie	price_truncate=99.50
-4	-10.65	dave	price_truncate=-11.00
-5	0	eve	price_truncate=0.00

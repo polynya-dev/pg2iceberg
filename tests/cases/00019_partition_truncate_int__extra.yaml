@@ -1,3 +1,0 @@
-    iceberg:
-      partition:
-        - truncate[10](id)

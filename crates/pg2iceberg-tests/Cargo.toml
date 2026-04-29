@@ -1,0 +1,76 @@
+[package]
+name = "pg2iceberg-tests"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pg2iceberg-core.workspace = true
+pg2iceberg-sim.workspace = true
+
+# ── Optional integration-test deps ─────────────────────────────────────
+# All gated behind the `integration` feature so default `cargo test`
+# doesn't pay the testcontainers + tokio-postgres + iceberg-rust
+# compile cost. Cargo unifies features for a crate across
+# [dependencies] and [dev-dependencies] within the same build, so
+# enabling `integration` flips the same crates listed below in
+# [dev-dependencies] to their `prod` configurations too.
+pg2iceberg-coord = { workspace = true, optional = true, features = ["prod"] }
+pg2iceberg-pg = { workspace = true, optional = true, features = ["prod"] }
+pg2iceberg-iceberg = { workspace = true, optional = true, features = ["prod"] }
+pg2iceberg-stream = { workspace = true, optional = true }
+pg2iceberg-logical = { workspace = true, optional = true }
+pg2iceberg-validate = { workspace = true, optional = true }
+pg2iceberg = { path = "../pg2iceberg", optional = true }
+testcontainers-modules = { version = "0.15", optional = true, features = ["postgres", "minio"] }
+testcontainers = { version = "0.27", optional = true }
+tokio-postgres = { version = "0.7", optional = true, default-features = false, features = ["runtime"] }
+object_store = { version = "0.11", optional = true, default-features = false, features = ["aws"] }
+async-trait = { workspace = true, optional = true }
+anyhow = { version = "1", optional = true }
+uuid = { version = "1", optional = true, features = ["v4"] }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
+
+[dev-dependencies]
+pg2iceberg-coord.workspace = true
+pg2iceberg-iceberg.workspace = true
+pg2iceberg-logical.workspace = true
+pg2iceberg-pg.workspace = true
+pg2iceberg-snapshot.workspace = true
+pg2iceberg-stream.workspace = true
+pg2iceberg-validate.workspace = true
+bytes = "1"
+pollster = "0.4"
+proptest.workspace = true
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[features]
+# Enables the testcontainers-driven integration tests
+# (`tests/integration_*.rs`). Run with:
+#   cargo test --features integration --test integration_coord
+# under the env vars in `reference_integration_tests.md` (Colima
+# socket override + Ryuk disabled).
+integration = [
+    "dep:pg2iceberg-coord",
+    "dep:pg2iceberg-pg",
+    "dep:pg2iceberg-iceberg",
+    "dep:pg2iceberg-stream",
+    "dep:pg2iceberg-logical",
+    "dep:pg2iceberg-validate",
+    "dep:pg2iceberg",
+    "dep:testcontainers-modules",
+    "dep:testcontainers",
+    "dep:tokio-postgres",
+    "dep:object_store",
+    "dep:async-trait",
+    "dep:anyhow",
+    "dep:uuid",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]

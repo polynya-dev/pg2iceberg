@@ -1,0 +1,75 @@
+[package]
+name = "pg2iceberg"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "pg2iceberg"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates with prod features turned on. The binary is the only
+# place where `prod` is mandatory — every library crate keeps `prod` as
+# an opt-in feature so test/sim builds stay light.
+pg2iceberg-core.workspace = true
+pg2iceberg-pg = { path = "../pg2iceberg-pg", features = ["prod"] }
+pg2iceberg-coord = { path = "../pg2iceberg-coord", features = ["prod"] }
+pg2iceberg-iceberg = { path = "../pg2iceberg-iceberg", features = ["prod"] }
+pg2iceberg-stream.workspace = true
+pg2iceberg-logical.workspace = true
+pg2iceberg-query.workspace = true
+pg2iceberg-snapshot.workspace = true
+pg2iceberg-validate.workspace = true
+
+# Real iceberg + object_store types — same fork pin as the rest of the
+# workspace, applied via [patch.crates-io] in the workspace Cargo.toml.
+iceberg = { version = "0.9", features = [] }
+iceberg-catalog-rest = { version = "0.9", default-features = false }
+# StorageFactory for the REST catalog. iceberg-rust 0.9's REST catalog
+# requires a StorageFactory be provided up front (otherwise table ops
+# fail at runtime with "StorageFactory must be provided"). We use
+# OpenDAL's S3 backend which the upstream integration tests also use.
+# Surfaced by the testcontainers integration test.
+iceberg-storage-opendal = { version = "0.9", features = ["opendal-s3"] }
+# `aws` enables the S3 backend; `gcp`/`azure` are deferred follow-ons.
+object_store = { version = "0.11", default-features = false, features = ["aws"] }
+
+# Async runtime + signals + CLI + config.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+    "sync",
+] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+# YAML to match the Go reference's config layout. Operators can drop
+# their existing pg2iceberg.yaml in unchanged (modulo TLS / gaps
+# documented in `config.rs`).
+serde_yaml = "0.9"
+anyhow = "1"
+# `pg2iceberg maintain --retention 168h` — same parser as Go's time.ParseDuration.
+humantime = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+# Snapshot/verify SnapshotSource impl needs to format dates/timestamps
+# back into SQL literals for keyset pagination cursors.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
+# Direct tokio-postgres dep so the snapshot source can run regular SQL
+# (the prod PgClient is replication-mode only).
+tokio-postgres = { version = "0.7", default-features = false, features = [
+    "runtime",
+    "with-chrono-0_4",
+    "with-uuid-1",
+    "with-serde_json-1",
+] }

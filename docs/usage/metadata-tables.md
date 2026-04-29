@@ -4,23 +4,22 @@ icon: lucide/table-2
 
 # Metadata Tables
 
-When `meta_enabled` is `true` (the default), pg2iceberg writes operational metadata into a set of Iceberg tables in a dedicated namespace. This gives you a queryable audit log of every commit, compaction, maintenance run, and checkpoint save — directly accessible from any Iceberg-compatible query engine.
+When `sink.meta_namespace` is set, pg2iceberg writes operational metadata into a set of Iceberg tables in that namespace. This gives you a queryable audit log of every commit, compaction, and maintenance run — directly accessible from any Iceberg-compatible query engine.
+
+Four of the five tables are wired and auto-written; `checkpoints` is exposed via API but not auto-emitted by design (recovery doesn't depend on periodic CDC checkpoint saves — the slot's `confirmed_flush_lsn` plus per-table state is sufficient).
 
 ## Namespace
 
-By default, metadata tables are written to the `_pg2iceberg` namespace in the same catalog as your data tables. This is configurable:
+Metadata tables are off by default. Set the namespace to enable:
 
 ```yaml
 sink:
-  meta_namespace: _pg2iceberg   # default
+  meta_namespace: _pg2iceberg_meta
 ```
 
-To disable metadata tables entirely:
+The namespace is created if missing. Each table is auto-created on first write.
 
-```yaml
-sink:
-  meta_enabled: false
-```
+To disable: leave `meta_namespace` empty.
 
 ## Tables
 
@@ -83,9 +82,25 @@ One row per maintenance operation (snapshot expiry or orphan cleanup) per table.
 | `duration_ms` | `bigint` | Operation duration |
 | `pg2iceberg_commit_sha` | `text` | Git SHA of the pg2iceberg binary |
 
-### `checkpoints`
+### `markers`
 
-One row per checkpoint save. Partitioned by `day(ts)`.
+One row per `(marker_uuid, table)` pair, written when blue-green marker mode is enabled. Partitioned by `day(ts)`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `ts` | `timestamptz` | Emission timestamp |
+| `worker_id` | `text` | Worker ID |
+| `marker_uuid` | `text` | Operator-supplied marker identity (PK component) |
+| `table_name` | `text` | User table this marker covers (PK component) |
+| `snapshot_id` | `bigint` | Iceberg snapshot id at the marker's WAL alignment point |
+
+The blue-green tooling joins this table across two pg2iceberg replicas on `marker_uuid` to verify replica equivalence at known WAL points. See [`example/blue-green/`](https://github.com/polynya-dev/pg2iceberg/tree/main/pg2iceberg-rust/example/blue-green) for the full setup.
+
+### `checkpoints` (not auto-written)
+
+pg2iceberg doesn't do periodic CDC checkpoint saves (recovery doesn't depend on them — the slot's `confirmed_flush_lsn` plus per-table state is sufficient), so this table doesn't get auto-emitted today. The `Materializer::record_checkpoint` API is exposed for callers who want to emit one manually.
+
+The schema:
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -115,16 +130,16 @@ ORDER BY lag_seconds DESC
 
 ### Is pg2iceberg running?
 
-pg2iceberg writes a checkpoint after every flush. If the most recent checkpoint is older than a few times the `standby_interval` (default 10 s), the process is likely down.
+pg2iceberg doesn't auto-write `checkpoints` rows (see above), so a "checkpoint heartbeat" query doesn't apply. Use the `commits` table as a heartbeat instead:
 
 ```sql
 SELECT
-    max(ts)                                       AS last_checkpoint_at,
-    dateDiff('second', max(ts), now())            AS seconds_since_checkpoint
-FROM _pg2iceberg.checkpoints
+    max(ts)                                       AS last_commit_at,
+    dateDiff('second', max(ts), now())            AS seconds_since_last_commit
+FROM _pg2iceberg.commits
 ```
 
-A `seconds_since_checkpoint` above ~60 warrants investigation.
+A `seconds_since_last_commit` significantly above your write rate warrants investigation. (For idle databases this can be misleading — a long-quiet table won't produce commits even when pg2iceberg is healthy. Pair with the slot's `confirmed_flush_lsn` advancement when in doubt.)
 
 ### Replication lag trend (last 24 hours)
 

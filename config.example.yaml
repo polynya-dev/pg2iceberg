@@ -1,84 +1,118 @@
-tables:
-  - name: public.orders
-  # - name: public.event_log
-  #   skip_snapshot: true    # logical mode: skip initial snapshot, only stream WAL changes
-  #   iceberg:
-  #     partition:
-  #       - day(created_at)       # partition by day on a timestamp column
-  #       - region                # partition by identity on a string column
-  #       # Also supported: year(), month(), hour(), bucket[N](), truncate[W]()
-  #       # - bucket[16](id)      # hash-based bucketing into 16 partitions
-  #       # - truncate[4](name)   # truncate string to first 4 characters
+# pg2iceberg config example. Mirrors the Go reference's YAML shape;
+# operators can drop their existing pg2iceberg.yaml in unchanged.
+# Fields that the Rust port doesn't yet consume (query mode,
+# control-plane metadata, materializer cycle knobs, etc.) are still
+# parsed cleanly and ignored.
 
-  # Query mode options (used when source.mode=query):
-  # - name: public.orders
-  #   primary_key: [id]
-  #   watermark_column: updated_at
+tables:
+  # Schema is discovered from `information_schema.columns` +
+  # `pg_index` at startup — same path the Go reference uses. PK
+  # columns are picked up automatically when the source has a
+  # PRIMARY KEY constraint. Fall through to explicit `columns:`
+  # below only when the source lacks a PK or you want to override
+  # the discovered shape.
+  - name: public.orders
+    # primary_key: [id]              # optional — overrides the
+                                      #            discovered PK
+    # columns:                       # optional — overrides discovery
+    #   - { name: id, pg_type: int4 }
+    #   - { name: qty, pg_type: int8, nullable: true }
+    # iceberg:
+    #   partition:                   # Iceberg partition spec
+    #     - day(created_at)          # day/month/year/hour
+    #     - bucket[16](id)           # murmur3_x86_32 % N
+    #     - region                   # identity
+    #     - truncate[4](name)        # first W code points (strings)
+    #                                #   or floor to multiple of W (ints)
+    #
+    # All six transforms work end-to-end (identity, year/month/day/hour,
+    # bucket[N], truncate[W] — including over Numeric columns).
+    #
+    # Operational note for `Delete`: when partition source columns
+    # are NOT in the primary key, configure `ALTER TABLE ... REPLICA
+    # IDENTITY FULL` on the Postgres source so logical replication
+    # carries old-row partition values. Otherwise deletes on
+    # partitioned tables error with `partition column missing`.
 
 source:
-  # "query" or "logical"
-  mode: logical
-
+  mode: logical                # "logical" or "query"
   postgres:
-    host: localhost
-    port: 5434
-    database: testdb
-    user: postgres
-    password: postgres
-
-  # Query mode settings (used when mode=query)
-  query:
-    poll_interval: 5s
-
-  # Logical replication settings (used when mode=logical)
+    host: db.example.com
+    port: 5432
+    database: src
+    user: pg2iceberg
+    password: REDACTED
+    sslmode: require           # "disable" | "require" | "verify-ca" | "verify-full"
+                                # — Rust port treats anything non-disable as
+                                #   webpki-roots verification (mTLS / custom
+                                #   CA / hostname-only flavors are follow-ons).
   logical:
     publication_name: pg2iceberg_pub
     slot_name: pg2iceberg_slot
-    # standby_interval: 10s          # how often to send standby status to PG (default: 10s)
-    # snapshot_chunk_pages: 2048      # CTID pages per chunk during initial snapshot (default: 2048, ~16MB)
-    # snapshot_target_file_size: 134217728  # target parquet file size for snapshot writes (default: 128MB)
+    # standby_interval: 10s
 
 sink:
-  catalog_uri: http://localhost:8181
+  catalog_uri: https://catalog.example.com
 
-  # Catalog authentication mode: "sigv4" (AWS Glue), "bearer" (R2, Databricks), or empty (none).
-  # catalog_auth: sigv4
-  #   catalog_uri: https://glue.us-east-1.amazonaws.com/iceberg
-  # catalog_auth: bearer
-  #   catalog_token: "your-api-token"
+  # Catalog auth flavor: "" (none) | "sigv4" (AWS Glue) | "bearer" |
+  # "oauth2". Only "bearer" and "" are currently exercised against
+  # Polaris/Tabular/Snowflake-managed-catalog and the Iceberg REST
+  # reference; "sigv4" + "oauth2" plumb through but aren't yet
+  # tested end-to-end.
+  catalog_auth: bearer
+  catalog_token: REDACTED-bearer-token
+  # catalog_client_id: ...
+  # catalog_client_secret: ...
 
-  # Credential mode: "static" (default) uses explicit S3 keys below.
-  # "vended" uses temporary credentials provided by the catalog (LoadTable response).
-  # When vended, s3_endpoint/s3_access_key/s3_secret_key/warehouse can be omitted.
-  # credential_mode: vended
-
-  warehouse: s3://warehouse/
+  # Credential mode for staging blobs:
+  # "static" (default) — explicit S3 keys below.
+  # "iam"             — instance profile / AWS SSO / env-var chain
+  #                      (object_store::aws::AmazonS3Builder::from_env).
+  # "vended"          — temporary creds from the catalog's LoadTable
+  #                      response. NOT YET WIRED in the Rust port; will
+  #                      error at startup (see plan §Phase 7).
+  credential_mode: static
+  warehouse: s3://my-warehouse/staged
   namespace: default
-  s3_endpoint: http://localhost:9000
-  s3_access_key: admin
-  s3_secret_key: password
+  s3_endpoint: https://s3.us-east-1.amazonaws.com
+  s3_access_key: REDACTED
+  s3_secret_key: REDACTED
   s3_region: us-east-1
   flush_interval: 10s
   flush_rows: 1000
-  flush_bytes: 67108864        # 64MB - flush when buffered bytes exceed this
-  target_file_size: 134217728  # 128MB - max parquet file size before rolling
 
-  # Materializer settings (merges change events into flattened tables)
-  # materializer_interval: 10s  # how often to run materialization (default: 10s)
+  # Compaction thresholds — names match Go. Compaction runs at the end
+  # of every materializer cycle, gated by these counts. Set
+  # `target_file_size: 0` to disable compaction entirely.
+  #
+  # Output files are partition-aware (each output file carries a single
+  # partition tuple). Equality deletes are applied inline at compaction
+  # time; surviving rows are deduped and folded into the new files.
+  compaction_data_files: 8
+  compaction_delete_files: 4
+  target_file_size: 134217728   # 128 MiB
 
-  # Compaction settings (used by materializer for target file size)
-  # compaction_target_size: 268435456  # 256MB - target merged file size
+  # `pg2iceberg maintain` knobs. The subcommand runs in two phases:
+  # snapshot expiry (drops snapshots older than retention; never the
+  # current one) followed by orphan-file cleanup (deletes blobs under
+  # `materialized_prefix` that no live snapshot references and that
+  # are older than grace). Operators typically run it via cron or a
+  # Kubernetes CronJob; both are one-shot, no in-process scheduler.
+  # Format matches Go's time.ParseDuration ("168h", "7d", "30m").
+  # maintenance_retention: 168h
+  # maintenance_grace: 30m
+  # materialized_prefix: materialized/   # must match the path scheme
+  #                                      # the materializer writes to
 
-  # Control-plane metadata tables (commits + checkpoints) written to a
-  # separate Iceberg namespace for customer-facing observability. Rows are
-  # piggybacked on the data commit so they're atomically consistent.
-  # meta_enabled: true          # default: true
-  # meta_namespace: _pg2iceberg # default: _pg2iceberg
+  # Free-form REST catalog props passthrough. Useful for
+  # vendor-specific settings the Go config doesn't have a dedicated
+  # field for.
+  # catalog_props:
+  #   "header.X-Custom-Header": "value"
 
-# State checkpoint storage.
-# By default, checkpoints are stored in the source postgres under the _pg2iceberg schema.
-# To use a separate postgres, set postgres_url. To use a local file (dev only), set path.
 state:
-  # postgres_url: postgresql://user:pass@host:5432/db?sslmode=disable
-  # path: ./pg2iceberg-state.json
-  # coordinator_schema: _pg2iceberg  # PG schema for coordination tables (default: _pg2iceberg)
+  # Optional dedicated PG for the _pg2iceberg.* coordinator schema.
+  # If absent, the source PG hosts it (matches Go).
+  # postgres_url: postgres://coord_user:secret@coord-db.example.com/coord?sslmode=require
+  coordinator_schema: _pg2iceberg
+  # group: default

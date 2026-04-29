@@ -1,0 +1,27 @@
+[package]
+name = "pg2iceberg-query"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes = "1"
+pg2iceberg-core.workspace = true
+pg2iceberg-pg.workspace = true
+pg2iceberg-coord.workspace = true
+pg2iceberg-iceberg.workspace = true
+pg2iceberg-stream.workspace = true
+pg2iceberg-logical.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+pg2iceberg-sim.workspace = true
+pollster = "0.4"

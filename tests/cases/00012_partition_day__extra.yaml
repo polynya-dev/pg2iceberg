@@ -1,3 +1,0 @@
-    iceberg:
-      partition:
-        - day(created_at)

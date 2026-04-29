@@ -1,0 +1,28 @@
+[package]
+name = "pg2iceberg-logical"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes = "1"
+pg2iceberg-core.workspace = true
+pg2iceberg-pg.workspace = true
+pg2iceberg-coord.workspace = true
+pg2iceberg-stream.workspace = true
+pg2iceberg-iceberg.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+tracing = "0.1"
+
+[dev-dependencies]
+object_store = { version = "0.11", default-features = false }
+pg2iceberg-sim.workspace = true
+pg2iceberg-validate.workspace = true
+pollster = "0.4"

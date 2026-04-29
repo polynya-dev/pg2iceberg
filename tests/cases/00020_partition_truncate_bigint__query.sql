@@ -1,1 +1,0 @@
-SELECT id, amount, name, replaceRegexpOne(_path, '.*/data/(.*)/.*', '\\1') AS partition FROM iceberg.`default.e2e_partition_truncate_bigint` ORDER BY id

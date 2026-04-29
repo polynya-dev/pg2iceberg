@@ -1,8 +1,8 @@
 # pg2iceberg
 
-pg2iceberg replicates data from Postgres directly to Iceberg, no Kafka needed. It has opinionated design:
-- It's specifically designed to replicate data from Postgres, to Iceberg, nothing else.
-- It assumes pg2iceberg is the sole writer of the Iceberg tables, which includes compaction.
+pg2iceberg replicates data from Postgres directly to Iceberg, no Kafka needed. Opinionated by design:
+- Specifically replicates Postgres → Iceberg, nothing else.
+- Assumes pg2iceberg is the sole writer of the Iceberg tables it manages, including compaction.
 
 ```mermaid
 graph LR
@@ -17,7 +17,7 @@ graph LR
 
 ## How it works
 
-pg2iceberg can operate on query mode or logical replication mode.
+pg2iceberg can operate in **logical replication** mode (recommended, full CDC) or **query** mode (watermark-based polling for Postgres replicas without `wal_level=logical`).
 
 ### Logical replication mode
 
@@ -47,51 +47,58 @@ graph LR
   StagedB -.->|offset index| Coord
 ```
 
-On logical replication mode (the recommended mode), it captures WAL change events and stages them as Parquet files in S3. A lightweight coordination layer in the source Postgres database (`_pg2iceberg` schema) tracks offsets and materializer progress. Since the write path only involves S3 uploads + a small PG transaction (no Iceberg catalog on the hot path), the replication slot LSN can be advanced quickly, minimizing WAL retention on the source database.
+pg2iceberg captures WAL change events via PostgreSQL logical replication and stages them as Parquet files in S3. A lightweight coordination layer in the source Postgres database (`_pg2iceberg` schema) tracks offsets and materializer progress. Since the write path only involves S3 uploads + a small PG transaction (no Iceberg catalog on the hot path), the replication slot LSN can be advanced quickly, minimizing WAL retention on the source.
 
-A materializer, which runs at a separate interval, reads the staged Parquet files and merges them into the corresponding Iceberg tables using merge-on-read (equality deletes for updates/deletes, data files for inserts/updates). In combined mode (single process), the materializer reads staged events directly from memory to avoid S3 download and Parquet parsing overhead.
+A materializer, which runs at a separate interval, reads the staged Parquet files and merges them into the corresponding Iceberg tables using merge-on-read (equality deletes for updates/deletes, data files for inserts).
 
-Staged files use a fixed Parquet schema regardless of source table changes: metadata columns (`_op`, `_lsn`, `_ts`, `_unchanged_cols`) plus a JSON `_data` column containing user data. Schema evolution (ALTER TABLE) only affects the Iceberg materialized table, not the staging layer.
+Staged files use a fixed Parquet schema regardless of source table changes: metadata columns (`_op`, `_lsn`, `_ts`, `_unchanged_cols`) plus a JSON `_data` column containing user data. Schema evolution (`ALTER TABLE`) only affects the Iceberg materialized table, not the staging layer.
 
 #### Deployment modes
 
-**Combined mode** (default): A single process runs the WAL writer and materializer together. Staged events are served from an in-memory cache, avoiding S3 round-trips. Best for simplicity.
+**Single-process** (default `pg2iceberg run`): one process runs the WAL writer and materializer together. Simplest to deploy.
 
 ```
 +------------------------------+
-|  pg2iceberg                  |
+|  pg2iceberg run              |
 |  +----------+  +------------+|
 |  |WAL Writer|->|Materializer||
 |  +----------+  +------------+|
-|  (in-memory cache + S3)      |
 +------------------------------+
 ```
 
-**Horizontal scaling**: One process runs the WAL writer (single replication slot), and N materializer workers each claim tables via heartbeat locks. Workers are added or removed dynamically — tables rebalance automatically.
+**Distributed**: one `pg2iceberg stream-only` process owns the replication slot; N `pg2iceberg materializer-only --worker-id <id>` workers each claim a deterministic slice of tables via heartbeat-based coordination. Workers can be added or removed dynamically — tables rebalance on the next cycle.
 
 ```
-+------------------+   +--------------+   +--------------+
-|  pg2iceberg      |   | materializer |   | materializer |
-|  +----------+    |   |  worker A    |   |  worker B    |
-|  |WAL Writer|    |   | (tables 1,3) |   | (tables 2,4) |
-|  +----------+    |   +--------------+   +--------------+
-|  (S3 only)       |         ^                   ^
-+------------------+         +-- heartbeat locks -+
++------------------+   +--------------------------+   +--------------------------+
+| stream-only      |   | materializer-only        |   | materializer-only        |
+| +------------+   |   |  --worker-id worker-a    |   |  --worker-id worker-b    |
+| | WAL Writer |   |   |  (tables 1, 3)           |   |  (tables 2, 4)           |
+| +------------+   |   +--------------------------+   +--------------------------+
++------------------+              ^                                ^
+                                  +-- _pg2iceberg.consumer ---------+
+                                       (heartbeat registry)
 ```
 
 #### Coordination
 
-All coordination state lives in the source Postgres database under the `_pg2iceberg` schema:
+All coordination state lives under the `_pg2iceberg` schema in the source (or a dedicated state) Postgres:
 
 | Table | Purpose |
 |-------|---------|
 | `log_seq` | Per-table offset counter (atomic increment) |
-| `log_index` | Sparse index of staged Parquet files with offset ranges |
+| `log_index` | Sparse index of staged Parquet files with offset ranges + LSN |
 | `mat_cursor` | Materializer progress (last committed offset per table) |
-| `lock` | Heartbeat-based locks for distributed materializer |
-| `checkpoints` | Replication checkpoint (LSN, snapshot state) |
+| `consumer` | Heartbeat registry for distributed materializer workers |
+| `lock` | Per-table locks (legacy; not load-bearing in current design) |
+| `pipeline_meta` | Singleton: source-cluster `system_identifier` (DSN-swap detection) |
+| `flushed_lsn` | Singleton: highest LSN we've acked the slot to (slot-tamper detection) |
+| `tables` | Per-table snapshot status + `pg_class.oid` (drop-recreate detection) |
+| `snapshot_progress` | Per-table mid-snapshot resume cursor |
+| `query_watermarks` | Per-table watermark for query mode |
+| `pending_markers` | Pending blue-green replica-alignment markers |
+| `marker_emissions` | Per-(uuid, table) marker emission record (idempotent dedup) |
 
-Coordinator write amplification is negligible: ~3 PG writes per flush regardless of batch size. At the default `flush_rows=1000`, overhead is <0.3% of source write throughput per table.
+Coordinator write amplification is negligible: a few small PG writes per flush regardless of batch size.
 
 ### Query mode
 
@@ -111,36 +118,59 @@ graph LR
   TableB -->|"SELECT WHERE watermark > $1"| TargetB
 ```
 
-On query mode, pg2iceberg polls Postgres using watermark-based SELECT queries and writes directly to the materialized Iceberg tables. Each row is an upsert (equality delete + insert) keyed by primary key.
+Query mode polls Postgres using watermark-based `SELECT` queries and writes directly to the materialized Iceberg tables. Each row is an upsert (equality delete + insert) keyed by primary key.
 
 Query mode is simpler but cannot detect hard deletes and has no transaction semantics. Use logical mode when you need full CDC fidelity.
+
+## CLI subcommands
+
+```sh
+pg2iceberg <SUBCOMMAND> --config /etc/pg2iceberg/config.yaml [flags...]
+```
+
+| Subcommand | Purpose |
+|---|---|
+| `run` | Long-running pipeline. Logical or query mode depending on `source.mode`. |
+| `snapshot` | One-shot: run the initial snapshot phase per configured table, then exit. Auto-creates the slot first so a later `run` doesn't lose WAL. |
+| `cleanup` | Drop the replication slot, drop the publication, and `DROP SCHEMA … CASCADE` on the coordinator. Resets PG-side state ahead of a re-bootstrap. **Doesn't drop Iceberg tables** — do that out-of-band. |
+| `compact` | One-shot: run a single compaction pass over every configured table, then exit. For cron / k8s `CronJob`. |
+| `maintain` | One-shot: snapshot expiry + orphan-file cleanup over every configured table. Reads `sink.maintenance_retention` / `sink.maintenance_grace`. |
+| `verify` | Diff PG ground truth against Iceberg materialized state for every configured table. Exits non-zero on any diff. Day-2 confidence check. |
+| `stream-only` | Distributed mode: WAL writer only; pair with one or more `materializer-only` workers. |
+| `materializer-only --worker-id <id>` | Distributed mode: materializer worker only. Joins the heartbeat group keyed by `state.group`; tables auto-rebalance on join/leave. |
+| `migrate-coord` | Run the coordinator's idempotent schema migration (every statement is `CREATE … IF NOT EXISTS`). |
+| `connect-pg` / `connect-iceberg` | Connectivity smoke tests for the PG / Iceberg-catalog prod paths. |
+
+Run `pg2iceberg --help` for the full list and per-subcommand flags.
 
 ## Code structure
 
 ```
-pg2iceberg/
-├── cmd/pg2iceberg/  # entry point, mode dispatch
-├── config/          # YAML config parsing & validation
-├── iceberg/         # shared Iceberg primitives (catalog, S3, Parquet, manifest, TableWriter)
-├── logical/         # logical replication mode (WAL capture, staging, materializer)
-├── pipeline/        # shared infrastructure (Pipeline interface, checkpoint, metrics)
-├── postgres/        # shared PG types (TableSchema, ChangeEvent, Op)
-├── query/           # query polling mode (watermark poller, PK buffer, pipeline)
-├── stream/          # leaderless log (Coordinator, Stream, CachedStream)
-├── snapshot/        # initial table snapshot (CTID-based chunked COPY)
-└── utils/           # retry helper, task pool
+pg2iceberg-rust/
+├── Cargo.toml                 # workspace root; pins polynya-dev/iceberg-rust fork
+├── crates/
+│   ├── pg2iceberg/            # binary: CLI dispatch, run.rs, setup.rs
+│   ├── pg2iceberg-core/       # types only (no IO): Lsn, ChangeEvent, TableSchema, Mode, …
+│   ├── pg2iceberg-pg/         # PG client: pgoutput stream, slot health, replication trait
+│   ├── pg2iceberg-coord/      # Coordinator trait + SQL + Postgres impl
+│   ├── pg2iceberg-stream/     # BlobStore trait + object_store-backed prod impl + codec
+│   ├── pg2iceberg-iceberg/    # Catalog trait, TableWriter, MoR fold, vended-S3 router, meta tables
+│   ├── pg2iceberg-logical/    # Pipeline + Materializer + ticker schedule
+│   ├── pg2iceberg-snapshot/   # Resumable snapshot phase
+│   ├── pg2iceberg-query/      # Query-mode pipeline
+│   ├── pg2iceberg-validate/   # Startup invariants + lifecycle helper + verify subcommand
+│   ├── pg2iceberg-sim/        # Memory-backed implementations of every prod trait (DST harness)
+│   └── pg2iceberg-tests/      # DST scenario tests + testcontainers integration tests
+├── docs/                      # mdbook-style reference (architecture, catalogs, usage, …)
+├── example/
+│   ├── single/                # Docker Compose stack: PG + iceberg-rest + MinIO + Grafana
+│   └── blue-green/            # Two-side replica-alignment example with marker UUIDs
+└── Dockerfile                 # multi-stage release build
 ```
 
-The `stream` package implements the [leaderless log protocol](https://github.com/lakestream-io/leaderless-log-protocol):
-- **Coordinator** interface — distributed coordination primitives (offset claiming, cursors, heartbeat locks) backed by PostgreSQL
-- **BaseStream** — S3 upload + PG coordination (for multi-process mode)
-- **CachedStream** — same, plus in-memory event cache (for combined mode — zero-copy from WAL writer to materializer)
-
-Both modes share `iceberg.TableWriter` for the final write path (partition bucketing, Parquet serialization, S3 upload, manifest assembly, catalog commit).
+Every IO-touching crate is gated behind a `prod` feature; the default build is sim-only and feeds the deterministic-simulation testing harness in `pg2iceberg-tests`.
 
 ## Type mapping
-
-pg2iceberg maps PostgreSQL column types to Iceberg types automatically during schema discovery. Aliases (e.g. `integer`, `serial`) are normalized to their canonical form.
 
 | PostgreSQL type | Iceberg type | Notes |
 |---|---|---|
@@ -149,8 +179,8 @@ pg2iceberg maps PostgreSQL column types to Iceberg types automatically during sc
 | `bigint`, `bigserial` | `long` | |
 | `real` | `float` | |
 | `double precision` | `double` | |
-| `numeric(p,s)` where p <= 38 | `decimal(p,s)` | Precision preserved exactly |
-| `numeric(p,s)` where p > 38 | -- | **Pipeline refuses to start** (see below) |
+| `numeric(p,s)` where p ≤ 38 | `decimal(p,s)` | Precision preserved exactly |
+| `numeric(p,s)` where p > 38 | — | **Pipeline refuses to start** (see below) |
 | `numeric` (unconstrained) | `decimal(38,18)` | Warning logged; values that overflow will error |
 | `boolean` | `boolean` | |
 | `text`, `varchar`, `char`, `name` | `string` | |
@@ -161,24 +191,34 @@ pg2iceberg maps PostgreSQL column types to Iceberg types automatically during sc
 | `timestamptz` | `timestamptz` | Microsecond precision |
 | `uuid` | `uuid` | |
 | `json`, `jsonb` | `string` | |
-| Other (`inet`, `interval`, `xml`, ...) | `string` | Stored as text |
-
-Support for `geometry` and `geography` types will be added soon!
 
 ### Decimal precision limit
 
-Iceberg supports a maximum decimal precision of 38. If a PostgreSQL table has a `numeric(p,s)` column where `p > 38`, pg2iceberg will fail on start, and also fail on schema evolution. This is intentional to avoid data corruption.
+Iceberg supports a maximum decimal precision of 38. If a PostgreSQL table has a `numeric(p,s)` column where `p > 38`, pg2iceberg fails on start, and also fails on schema evolution. This is intentional to avoid silent data corruption.
 
-Unconstrained `numeric` columns (no precision specified) use `decimal(38,18)` as default.
+Unconstrained `numeric` columns (no precision specified) default to `decimal(38,18)`.
 
-## Supported Iceberg Catalogs
+### Schema evolution
 
-Any catalogs that follows the Iceberg [REST Catalog spec](https://iceberg.apache.org/rest-catalog-spec/) should be supported by pg2iceberg. The following catalogs have been verified to work.
+| Change | Iceberg behavior |
+|---|---|
+| `ADD COLUMN` (nullable) | Appends a column with the next field id |
+| `DROP COLUMN` | Soft-drop: column stays in schema, becomes nullable; older data files keep resolving |
+| `ALTER COLUMN TYPE` (legal promotion: `int → long`, `float → double`, decimal precision increase) | Type-promote in place, field id preserved |
+| `ALTER COLUMN TYPE` (illegal: narrowing, cross-family) | Refuses with an actionable error; operator must re-snapshot |
+| `RENAME COLUMN` | Treated as drop + add (pgoutput doesn't carry attribute OIDs to detect renames) |
+| `SET / DROP NOT NULL` | Invisible: pgoutput Relation messages don't carry nullability |
+
+## Supported Iceberg catalogs
+
+Any catalog implementing the [Iceberg REST Catalog spec](https://iceberg.apache.org/rest-catalog-spec/) should work. The following have been verified end-to-end:
 
 | Catalog | Authentication | Vended Credentials? |
 |---|---|---|
-| Cloudflare R2 Data Catalog | Bearer | Yes |
-| AWS Glue | SigV4 with IAM | No |
+| Apache Polaris | OAuth2 / Bearer | Yes (`credential_mode: vended`) |
+| Apache REST reference (testcontainers) | None | No |
+| Cloudflare R2 Data Catalog | Bearer | Yes (not yet re-verified end-to-end) |
+| AWS Glue | SigV4 with IAM | No (not yet re-verified end-to-end) |
 
 ## Quickstart
 
@@ -187,245 +227,107 @@ cd example/single
 docker compose up -d --wait
 ```
 
-Then go to http://localhost:8123/play and run:
+Open `http://localhost:8123/play` and run:
 
 ```sql
-select * from rideshare.`rideshare.rides`
+SELECT * FROM rideshare.`rideshare.rides`
 ```
 
-You should see new rows added over time.
+You should see new rows appearing as the simulator drives PG.
 
-### Environment variables
+## Configuration
 
-| Env var | CLI flag | Description |
+Configuration is YAML-first; see [`config.example.yaml`](config.example.yaml) for the full surface. CLI flags and env vars override individual fields.
+
+| Env var | YAML field | Description |
 |---|---|---|
-| `POSTGRES_URL` | `--postgres-url` | PostgreSQL connection URL |
-| `POSTGRES_HOST` | | PostgreSQL host (overrides URL) |
-| `POSTGRES_PORT` | | PostgreSQL port (overrides URL) |
-| `POSTGRES_DATABASE` | | PostgreSQL database (overrides URL) |
-| `POSTGRES_USER` | | PostgreSQL user (overrides URL) |
-| `POSTGRES_PASSWORD` | | PostgreSQL password (overrides URL) |
-| `TABLES` | `--tables` | Comma-separated list of tables |
-| `MODE` | `--mode` | `logical` (default) or `query` |
-| `SLOT_NAME` | `--slot-name` | Replication slot (default: `pg2iceberg_slot`) |
-| `PUBLICATION_NAME` | `--publication-name` | Publication (default: `pg2iceberg_pub`) |
-| `ICEBERG_CATALOG_URL` | `--iceberg-catalog-url` | Iceberg REST catalog URL |
-| `WAREHOUSE` | `--warehouse` | Iceberg warehouse path |
-| `NAMESPACE` | `--namespace` | Iceberg namespace |
-| `S3_ENDPOINT` | `--s3-endpoint` | S3 endpoint URL |
-| `S3_ACCESS_KEY` | `--s3-access-key` | S3 access key |
-| `S3_SECRET_KEY` | `--s3-secret-key` | S3 secret key |
-| `S3_REGION` | `--s3-region` | S3 region (default: `us-east-1`) |
-| `SNAPSHOT_ONLY` | `--snapshot-only` | Exit after initial snapshot (default: `false`) |
-| `STATE_POSTGRES_URL` | `--state-postgres-url` | Separate Postgres for checkpoint storage |
-| `METRICS_ADDR` | `--metrics-addr` | Metrics server address (default: `:9090`) |
-| `MAINTENANCE_RETENTION` | | Snapshot retention duration (default: `168h` / 7 days) |
-| `MAINTENANCE_INTERVAL` | | Background maintenance interval (default: `1h`) |
-| `MAINTENANCE_GRACE` | | Orphan file grace period (default: `30m`) |
+| `POSTGRES_URL` | `source.postgres.dsn` | PostgreSQL connection URL |
+| `TABLES` | `tables` | List of source tables to replicate |
+| `MODE` | `source.mode` | `logical` (default) or `query` |
+| `SLOT_NAME` | `source.logical.slot_name` | Replication slot (default: `pg2iceberg_slot`) |
+| `PUBLICATION_NAME` | `source.logical.publication_name` | Publication (default: `pg2iceberg_pub`) |
+| `ICEBERG_CATALOG_URL` | `sink.catalog_uri` | Iceberg REST catalog URL |
+| `WAREHOUSE` | `sink.warehouse` | Iceberg warehouse path (`s3://bucket/prefix/`) |
+| `NAMESPACE` | `sink.namespace` | Iceberg namespace |
+| `S3_ENDPOINT` | `sink.s3_endpoint` | S3 endpoint URL |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_REGION` | `sink.s3_*` | S3 credentials and region |
+| `STATE_POSTGRES_URL` | `state.postgres_url` | Optional separate Postgres for coord state |
 
-See config.example.yaml for the full config YAML.
+### Credential modes (`sink.credential_mode`)
 
-## Checkpoint storage
+| Mode | Description |
+|---|---|
+| `static` (default) | Operator-supplied S3 keys in YAML / env |
+| `iam` | AWS SDK env / IMDS / EC2-metadata credential chain |
+| `vended` | Per-table credentials from the catalog (Polaris / Snowflake / Tabular). Requires `header.x-iceberg-access-delegation: vended-credentials` in the REST request, which pg2iceberg sets automatically when `credential_mode: vended`. |
 
-pg2iceberg tracks replication progress (LSN for logical replication, watermark for query mode) in a checkpoint. By default, checkpoints are stored in the source Postgres database under the `_pg2iceberg` schema:
+## Coordinator state and recovery
 
-```sql
-_pg2iceberg.checkpoints
+State persisted in `_pg2iceberg`:
+
+- **Cluster fingerprint** (`pipeline_meta.system_identifier`): stamped at first startup. A different `IDENTIFY_SYSTEM` value on subsequent runs (e.g. accidental DSN swap, blue-green cutover) returns `SystemIdMismatch` and refuses to start.
+- **Slot-tamper baseline** (`flushed_lsn`): the highest LSN we've ever acked. Compared against `slot.confirmed_flush_lsn` at startup to catch external advancement (`pg_replication_slot_advance`, drop-recreate, stray `pg_recvlogical`).
+- **Per-table snapshot state** (`tables`, `snapshot_progress`): `snapshot_complete` + `pg_oid` per table; mid-snapshot resume cursor cleared on completion.
+
+To resume from where the previous process left off, just restart with the same config — coord cursors + slot LSN are sufficient.
+
+To reset everything (cleanup PG-side state) without manually dropping tables:
+
+```sh
+pg2iceberg cleanup --config <path>
+# Iceberg tables remain — drop them via the catalog separately if you want a full reset.
 ```
 
-This means no extra infrastructure or persistent volumes are needed. If the container restarts, it resumes from where it left off.
-
-To use a separate Postgres instead of the source database, set `state.postgres_url` in the pipeline config:
+To use a separate Postgres for coord state (instead of the source DB):
 
 ```yaml
 state:
-  postgres_url: postgresql://user:pass@host:5432/db?sslmode=disable
-```
-
-For local development, a file-based store is also available:
-
-```yaml
-state:
-  path: ./pg2iceberg-state.json
+  postgres_url: postgresql://user:pass@host:5432/state-db
+  coordinator_schema: _pg2iceberg
 ```
 
 ## Running tests
 
-Start dependencies:
+The default test target is sim-based DST + unit tests; no Docker needed.
 
 ```sh
-docker compose up -d --wait
+cargo test --workspace
 ```
 
-To run all tests:
+Integration tests against testcontainers (PG 16-alpine + MinIO + Apache iceberg-rest) are gated behind the `integration` feature:
 
 ```sh
-./tests/run.sh
+# Colima users: see docs/getting-started/installation.md for the env vars
+cargo test --workspace --features integration -- --test-threads=1
 ```
 
-To run specific test:
-
-```sh
-./tests/run.sh 00001_basic_insert
-```
-
-To run tests in parallel:
-
-```sh
-PARALLEL=4 ./tests/run.sh
-```
-
-### Writing tests
-
-Test cases live in `tests/cases/` with three files per test:
-
-| File | Purpose |
-|------|---------|
-| `<name>__input.sql` | SQL executed against PostgreSQL |
-| `<name>__query.sql` | Query run on ClickHouse to verify results |
-| `<name>__reference.tsv` | Expected tab-separated output from ClickHouse |
-
-Input SQL is split into steps using markers:
-
-```sql
--- SETUP --     DDL phase: runs before pg2iceberg starts
--- DATA --      DML phase: runs after pg2iceberg connects to replication
--- SLEEP <N> -- pause for N seconds (useful between DDL and DML batches)
-```
-
-The table name, publication, and replication slot are auto-derived from the SQL.
+The integration suite covers the prod Coordinator (PG-replication path), the prod PgClient (pgoutput decoding against real PG), and a full end-to-end LogicalLifecycle against the docker stack. Roughly 17 tests.
 
 ## Observability
 
-### OpenTelemetry Tracing
+### Prometheus metrics
 
-pg2iceberg exports distributed traces via OTLP/gRPC. Set the `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable to enable:
+A future maintenance pass will expose Prometheus metrics on a configurable address. The `Metrics` trait is wired through every hot path; the operational HTTP endpoint that exports them is **not yet wired**.
 
-```sh
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 pg2iceberg
-```
+### Structured logs
 
-When unset, tracing is a no-op with zero overhead.
+The binary uses [`tracing`](https://docs.rs/tracing) with `tracing-subscriber` for stdout output. Set `RUST_LOG=info,pg2iceberg=debug` (or finer) to control verbosity.
 
-**Trace hierarchy (write path):**
+### Distributed tracing
 
-```
-pg2iceberg.flush {flush.rows=1000}
-  stream.Append {batch_count=1, cached=true}
-    s3.Upload staged/orders/xxx.parquet
-    coordinator.ClaimOffsets {batch_size=1}         # PG: atomic offset claim
-  checkpoint.Save
-    checkpoint.pg UPDATE                            # PG: checkpoint persistence
-```
+Distributed-tracing export via OTLP is **not yet wired**. The `tracing` instrumentation that exists is stdout-only today.
 
-The write hot path involves one S3 upload + one small PG transaction (ClaimOffsets). No Iceberg catalog operations.
+### Control-plane meta tables
 
-**Trace hierarchy (read path):**
+When `sink.meta_namespace` is set, pg2iceberg writes operational telemetry to four Iceberg tables under that namespace:
 
-```
-pg2iceberg.materialize
-  coordinator.GetCursor {table=public.orders}       # PG: read cursor
-  pg2iceberg.materialize.readEvents {entry_count=1, cache_hits=1, cache_misses=0}
-  pg2iceberg.materialize.table {table=public.orders}
-    s3.Upload orders data                           # data files
-    s3.Upload orders metadata                       # manifests
-  catalog.CommitTransaction                         # Iceberg REST catalog
-    http POST /v1/transactions/commit
-  coordinator.SetCursor {table, offset=1000}        # PG: advance cursor
-```
+| Table | Row written by |
+|---|---|
+| `<meta_ns>.commits` | Each successful materializer cycle (per-table) |
+| `<meta_ns>.compactions` | Each successful compaction commit |
+| `<meta_ns>.maintenance` | Each `expire_snapshots` / `clean_orphans` op (per-table) |
+| `<meta_ns>.markers` | Blue-green marker alignment (when marker mode is enabled) |
 
-In combined mode, `cache_hits > 0` confirms the materializer reads staged events from memory (zero S3 download, zero Parquet/JSON parsing). On recovery (cold start), `cache_misses > 0` indicates the S3 fallback path.
+See [`docs/usage/metadata-tables.md`](docs/usage/metadata-tables.md) for the full schemas.
 
-**Trace hierarchy (distributed mode):**
-
-```
-pg2iceberg.materialize
-  coordinator.TryLock {table=public.orders, worker_id=worker-a}   # acquired
-  coordinator.TryLock {table=public.payments, worker_id=worker-a}  # blocked (held by worker-b)
-  coordinator.GetCursor {table=public.orders}
-  ...
-  coordinator.SetCursor {table=public.orders, offset=5000}
-```
-
-**External services** identified via `peer.service` attribute:
-
-| Service | Spans |
-|---------|-------|
-| `iceberg-catalog` | `http GET/POST /v1/...` (REST catalog API calls) |
-| `s3` | `s3.Upload`, `s3.Download`, `s3.DownloadRange`, `s3.StatObject` |
-| `postgres` | `coordinator.*`, `checkpoint.pg SELECT/UPDATE/UPSERT` |
-
-**Measuring coordinator write amplification** from span metrics:
-
-```
-amplification = rate(coordinator_ClaimOffsets_count) / rate(flush_rows_sum)
-```
-
-At default settings (`flush_rows=1000`), expect <0.3% per table.
-
-**SigNoz setup:** The `example/single/` directory includes a complete docker-compose with SigNoz, an OTel collector, and ClickHouse as the trace backend. Run `docker compose up` and open `http://localhost:3301` to view traces.
-
-### Prometheus Metrics
-
-pg2iceberg exposes Prometheus metrics on `:9090/metrics` (configurable via `metrics_addr` in config). Key metrics include:
-
-- `pg2iceberg_flush_duration_seconds` - staged WAL flush latency
-- `pg2iceberg_materializer_duration_seconds` - materialization cycle latency
-- `pg2iceberg_catalog_operation_duration_seconds` - catalog API latency by operation
-- `pg2iceberg_replication_lag_bytes` - WAL lag from Postgres
-- `pg2iceberg_rows_processed_total` - rows replicated by table and operation
-- `pg2iceberg_maintenance_snapshots_expired_total` - snapshots expired by maintenance
-- `pg2iceberg_maintenance_orphans_deleted_total` - orphan files deleted by maintenance
-
-### HTTP Endpoints
-
-The metrics server (`:9090` by default) exposes the following endpoints:
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /metrics` | Prometheus metrics |
-| `GET /healthz` | Pipeline health check (503 if status is `error`) |
-| `GET /ready` | Readiness probe (503 if pipeline is not `running`) |
-| `GET /tables` | Per-table metadata, schema, and statistics |
-
-#### `GET /tables`
-
-Returns metadata and runtime statistics for every replicated table. Includes source and Iceberg schema information, partition specs, and per-table counters.
-
-```bash
-curl http://localhost:9090/tables | jq .
-```
-
-```json
-[
-  {
-    "source_table": "public.orders",
-    "namespace": "analytics",
-    "iceberg_table": "orders",
-    "columns": [
-      {"name": "id", "pg_type": "int4", "iceberg_type": "int", "nullable": false},
-      {"name": "amount", "pg_type": "numeric", "iceberg_type": "decimal(10,2)", "nullable": true},
-      {"name": "created_at", "pg_type": "timestamptz", "iceberg_type": "timestamptz", "nullable": false}
-    ],
-    "primary_key": ["id"],
-    "partition_spec": ["day(created_at)"],
-    "stats": {
-      "rows_processed": 152340,
-      "buffered_rows": 47,
-      "buffered_bytes": 6016
-    }
-  }
-]
-```
-
-| Field | Description |
-|-------|-------------|
-| `source_table` | Fully qualified PostgreSQL table name |
-| `namespace` | Iceberg namespace |
-| `iceberg_table` | Iceberg table name |
-| `columns` | Column list with PostgreSQL type, Iceberg type, and nullability |
-| `primary_key` | Primary key column names |
-| `partition_spec` | Partition expressions from config (e.g. `day(ts)`, `bucket[16](id)`) |
-| `stats.rows_processed` | Cumulative rows replicated for this table |
-| `stats.buffered_rows` | Rows currently buffered awaiting flush |
-| `stats.buffered_bytes` | Estimated bytes currently buffered |
+A fifth, `<meta_ns>.checkpoints`, is exposed via the `record_checkpoint` API for callers who want to emit one manually but is not auto-written — recovery doesn't depend on periodic checkpoint saves (the slot's `confirmed_flush_lsn` plus per-table state is sufficient).

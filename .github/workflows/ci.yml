@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build-test:
+    name: cargo check / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  ban-nondeterminism:
+    name: ban-nondeterminism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/ban-nondeterminism.sh
+
+  integration:
+    name: cargo test --features integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # ubuntu-latest's bundled Docker runs Ryuk fine; the disable
+      # is here so `docker ps` after a failed run is clean and
+      # reruns can't leak orphaned reaper containers.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep the integration cache separate from build-test:
+          # the `integration` feature unifies several `prod` deps
+          # (tokio-postgres, iceberg-rust, object_store) that the
+          # default test build doesn't compile.
+          key: integration
+
+      - name: Verify Docker is available
+        run: docker version
+
+      - name: cargo test --features integration
+        # `--test-threads=1` is required: integration tests share
+        # PG/MinIO/iceberg-rest containers and slot/publication
+        # names, and parallel runs trample each other.
+        run: cargo test --workspace --features integration -- --test-threads=1

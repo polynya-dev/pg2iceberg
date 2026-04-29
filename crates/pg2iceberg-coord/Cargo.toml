@@ -1,0 +1,47 @@
+[package]
+name = "pg2iceberg-coord"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+pg2iceberg-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+# Postgres-backed Coordinator impl. Pinned via the workspace
+# `[patch.crates-io]` to Supabase etl's rust-postgres fork; same dep
+# used by `pg2iceberg-pg/prod`.
+tokio-postgres = { version = "0.7", optional = true, default-features = false, features = [
+    "runtime",
+    "with-serde_json-1",
+] }
+postgres-types = { version = "0.2", optional = true, features = ["with-serde_json-1"] }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", optional = true, features = ["macros", "rt", "sync"] }
+# TLS support — see the symmetric block in `pg2iceberg-pg/Cargo.toml`
+# for the rationale on `ring`.
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = { version = "0.26", optional = true }
+
+[features]
+default = []
+prod = [
+    "dep:tokio-postgres",
+    "dep:postgres-types",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

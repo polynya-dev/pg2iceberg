@@ -28,41 +28,48 @@ For each transaction, the flusher:
 
 The replication slot's confirmed flush LSN is advanced immediately after staging — once events are durably registered in S3 + `log_index`, PostgreSQL can recycle WAL up to that point. On a crash between staging and materialization, pg2iceberg recovers by re-reading the staged Parquet files from the log; the WAL is no longer needed.
 
-## Leaderless log protocol
+## Staged log
 
-The leaderless log implements the [leaderless log protocol](https://github.com/lakestream-io/leaderless-log-protocol), providing offset-ordered, durable delivery of staged events to one or more materializer workers, without a dedicated leader process.
+The staged-log primitive provides offset-ordered, durable delivery of WAL events from the flusher to one or more materializer workers without a dedicated leader process.
 
-The protocol's coordinator role is filled by the **source PostgreSQL database** itself. This is a deliberate choice: the coordinator is technically a single point of failure, but if the source database goes down, replication cannot happen regardless — so there is no additional availability cost to colocating coordination there. It also means pg2iceberg needs no extra infrastructure beyond the database you are already replicating from.
+The coordinator role is filled by the **source PostgreSQL database** itself. This is a deliberate choice: the coordinator is technically a single point of failure, but if the source database goes down, replication cannot happen regardless — so there is no additional availability cost to colocating coordination there. It also means pg2iceberg needs no extra infrastructure beyond the database you are already replicating from. (Operators who want isolation can point `state.postgres_url` at a separate Postgres.)
 
-**Coordination tables** (in the `_pg2iceberg` schema):
+**Coordination tables** (in `_pg2iceberg`):
 
 | Table | Purpose |
 |-------|---------|
 | `log_seq` | Per-table atomic offset counter |
-| `log_index` | Sparse index: maps offset ranges to S3 file paths |
-| `mat_cursor` | Per-worker cursor tracking the last materialized offset |
-| `lock` | Heartbeat-based table locks for distributed workers |
-| `checkpoints` | Replication LSN and snapshot progress |
+| `log_index` | Sparse index: maps offset ranges to staged-Parquet S3 paths + LSNs |
+| `mat_cursor` | Per-`(group, table)` cursor tracking the last materialized offset |
+| `consumer` | Heartbeat registry for distributed materializer workers |
+| `pipeline_meta` | Singleton: source-cluster `system_identifier` |
+| `flushed_lsn` | Singleton: highest LSN we've acked the slot to |
+| `tables` | Per-table snapshot status + `pg_class.oid` |
+| `snapshot_progress` | Per-table mid-snapshot resume cursor |
+| `query_watermarks` | Per-table query-mode cursor |
+| `pending_markers` / `marker_emissions` | Blue-green marker bookkeeping |
 
 **Append** (flusher → log):
 
 1. Upload staged Parquet files to S3 in parallel
-2. In a single PostgreSQL transaction: increment `log_seq` by the batch size and insert a row into `log_index` with the assigned offset range and S3 path
+2. In a single PostgreSQL transaction: increment `log_seq` by the batch size, insert per-claim rows into `log_index` with the assigned offset range, S3 path, and `flushable_lsn`, and persist any blue-green markers
 
-Step 2 is atomic — a file is either fully registered or not registered at all. Orphaned S3 files from failed step 2s are collected by [table maintenance](maintenance.md).
+Step 2 is atomic — a flush is either fully registered or not registered at all. Orphaned S3 files from failed step 2s are collected by [table maintenance](maintenance.md).
 
 **Read** (materializer ← log):
 
-The materializer reads `log_index` entries with offsets greater than its cursor, downloads the referenced files, and processes events in offset order. In combined mode, events are served from an in-memory cache populated during the flush, bypassing S3 entirely.
+The materializer reads `log_index` entries with offsets greater than its cursor, downloads the referenced files, decodes them via the staging codec, and processes events in offset order. There is no in-memory cache optimization for the single-process case; profiling showed the S3-fetch overhead is amortized well below the materializer cycle interval.
 
-## Checkpointing
+## Restart record
 
-The checkpoint is pg2iceberg's durable restart record. It is stored in the `_pg2iceberg.checkpoints` table by default, and tracks:
+Replication state is split across several narrow tables — no single "checkpoint" blob. Each concern that needs durability gets its own row, so updates from different code paths don't contend on a shared OCC token:
 
-- **Confirmed flush LSN** — the WAL position confirmed staged to S3. PostgreSQL will not recycle WAL before this point. On restart, pg2iceberg resumes replication from this LSN; any staged-but-not-yet-materialized events are recovered from the leaderless log.
-- **Snapshot state** — whether the initial table snapshot has completed, and per-table chunk progress so an interrupted snapshot can be resumed rather than restarted.
+- **Confirmed flush LSN** — recorded in `_pg2iceberg.flushed_lsn` *before* every standby ack to the slot. This durable record is compared to the slot's `confirmed_flush_lsn` at startup to catch external slot tampering (`pg_replication_slot_advance`, drop+recreate, stray `pg_recvlogical`).
+- **Per-table snapshot status** — `_pg2iceberg.tables` rows store `snapshot_complete`, `pg_oid`, and `snapshot_lsn` per table. The `pg_oid` field drives the `TableIdentityChanged` invariant (DROP+recreate detection).
+- **Per-table mid-snapshot resume** — `_pg2iceberg.snapshot_progress` stores the canonical-PK cursor of the last successfully staged row. Cleared on completion.
+- **Cluster fingerprint** — singleton row in `_pg2iceberg.pipeline_meta` stores `IDENTIFY_SYSTEM`'s `system_identifier`. Stamped at first run; subsequent runs against a different cluster fail with `SystemIdMismatch`.
 
-On startup, pg2iceberg loads the checkpoint and resumes replication from the confirmed flush LSN. The replication slot ensures no WAL is lost between that LSN and the present.
+On startup, pg2iceberg cross-references all four against PG and the slot, and refuses to start on any mismatch. See [validate_startup](https://github.com/polynya-dev/pg2iceberg/blob/main/pg2iceberg-rust/crates/pg2iceberg-validate/src/lib.rs) for the full invariant list.
 
-!!! note "Separate checkpoint storage"
-    By default checkpoints are stored in the source PostgreSQL database. If you want to keep them separate — for example, to avoid writes on a read replica or to share state across pipelines — point `state.postgres_url` at a different database, or use a local file with `state.path`.
+!!! note "Separate coord storage"
+    By default coord state is stored in the source PostgreSQL database. If you want to keep them separate — for example, to avoid writes on a read replica or to share state across pipelines — point `state.postgres_url` at a different database. Coord state is always Postgres-backed; there is no file-based store option.

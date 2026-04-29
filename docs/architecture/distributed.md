@@ -11,18 +11,20 @@ See [Run Modes](../usage/modes.md) for the flags to enable this.
 ## Architecture
 
 ```
-┌──────────────────────┐
-│  pg2iceberg          │     ┌─────────────────────┐
-│  (--stream-only)     │────►│  materializer        │
-│                      │     │  worker-1            │
-│  WAL writer only     │     │  (tables: orders,    │
-│  No materializer     │     │           products)  │
-└──────────────────────┘     ├─────────────────────┤
-         │                   │  materializer        │
-      S3 + _pg2iceberg ──────│  worker-2            │
-                             │  (tables: users,     │
-                             │           payments)  │
-                             └─────────────────────┘
+┌────────────────────────┐
+│  pg2iceberg            │     ┌──────────────────────────┐
+│  stream-only           │────►│  pg2iceberg              │
+│                        │     │  materializer-only       │
+│  WAL writer only       │     │  --worker-id worker-1    │
+│  No materializer cycle │     │  (tables: orders,        │
+└────────────────────────┘     │           products)      │
+         │                     ├──────────────────────────┤
+   S3 + _pg2iceberg            │  pg2iceberg              │
+   coordination ───────────────│  materializer-only       │
+                               │  --worker-id worker-2    │
+                               │  (tables: users,         │
+                               │           payments)      │
+                               └──────────────────────────┘
 ```
 
 All workers share the same leaderless log (S3 + `_pg2iceberg` schema). There is no central coordinator process — workers coordinate entirely through PostgreSQL.
@@ -55,8 +57,13 @@ A worker leaving (crash or graceful shutdown) is detected within one heartbeat T
 
 ## Cursor isolation
 
-Each worker tracks its own progress via `mat_cursor`, keyed by `(group_name, worker_id, table_name)`. Workers never read or write each other's cursors — their progress is fully independent.
+`mat_cursor` is keyed by `(group_name, table_name)` — workers within the same group share cursors per table because the deterministic round-robin assignment guarantees only one worker materializes any given table per cycle. There's no `worker_id` in the cursor key; ownership is recomputed at each cycle's start, not persisted.
 
 ## Commit isolation
 
-Each worker commits its assigned tables independently. Because pg2iceberg uses Iceberg's `CommitTransaction` with an optimistic lock per table (`assert-ref-snapshot-id`), two workers accidentally processing the same table would produce a 409 conflict on commit. The losing worker's cursor is not advanced, so it retries safely on the next cycle. In practice this only happens transiently during rebalancing.
+Two workers shouldn't ever process the same table on the same cycle (the assignment is deterministic), but transient races during rebalance are possible if one worker hasn't yet noticed a peer dropped out. In that window:
+
+- The catalog's `assert-ref-snapshot-id` requirement on Iceberg's transaction commit makes the loser's commit return a conflict — the catalog rejects the second commit.
+- The losing worker's `set_cursor` doesn't run because the commit failed; it retries cleanly on the next cycle.
+
+In practice this only happens transiently during rebalancing.

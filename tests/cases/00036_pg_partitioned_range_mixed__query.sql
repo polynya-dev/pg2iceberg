@@ -1,1 +1,0 @@
-SELECT id, created_at, name, amount FROM iceberg.`default.e2e_pg_part_range_mixed` ORDER BY id

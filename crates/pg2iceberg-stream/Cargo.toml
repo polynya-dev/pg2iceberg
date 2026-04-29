@@ -1,0 +1,33 @@
+[package]
+name = "pg2iceberg-stream"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+# Stream extensions for `object_store::list`, used by the orphan-cleanup
+# path. Pure futures, no executor dep.
+futures = "0.3"
+pg2iceberg-core.workspace = true
+serde.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+arrow-array = "54"
+arrow-schema = "54"
+arrow-buffer = "54"
+parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+bytes = "1"
+# Production blob-store backend. Default-features-off keeps S3/GCS/Azure
+# off the dependency graph until the binary enables them explicitly via
+# its own object_store feature flags.
+object_store = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+proptest.workspace = true
+pollster = "0.4"
