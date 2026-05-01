@@ -78,10 +78,7 @@ pub enum InvariantViolation {
          cannot be resumed. drop the slot and the Iceberg tables, then \
          re-snapshot from scratch — there is no safe way to skip ahead"
     )]
-    SlotWalLost {
-        slot_name: String,
-        restart_lsn: Lsn,
-    },
+    SlotWalLost { slot_name: String, restart_lsn: Lsn },
 
     /// Slot's `conflicting` flipped to `true` mid-run. Same fatal
     /// classification as `SlotWalLost` — the slot is killed by a
@@ -302,7 +299,7 @@ mod tests {
             group: "default".into(),
             watched_tables: vec![],
             ..Default::default()
-};
+        };
         let v = block_on(watcher.check(&inputs));
         assert!(v.is_empty());
     }
@@ -316,7 +313,7 @@ mod tests {
             group: "default".into(),
             watched_tables: vec![],
             ..Default::default()
-};
+        };
         let v = block_on(watcher.check(&inputs));
         assert_eq!(v.len(), 1);
         assert!(matches!(
@@ -359,7 +356,7 @@ mod tests {
             group: "default".into(),
             watched_tables: vec![ident()],
             ..Default::default()
-};
+        };
         let v = block_on(watcher.check(&inputs));
         assert_eq!(v.len(), 1);
         assert!(matches!(
@@ -378,7 +375,7 @@ mod tests {
             group: "default".into(),
             watched_tables: vec![],
             ..Default::default()
-}));
+        }));
         assert!(v1.is_empty());
 
         // Second tick: LSN went backwards. Flag it.
@@ -388,7 +385,7 @@ mod tests {
             group: "default".into(),
             watched_tables: vec![],
             ..Default::default()
-}));
+        }));
         assert_eq!(v2.len(), 1);
         assert!(matches!(
             v2[0],
@@ -405,7 +402,7 @@ mod tests {
             group: "default".into(),
             watched_tables: vec![],
             ..Default::default()
-}));
+        }));
         assert!(v3.is_empty());
     }
 
@@ -420,7 +417,7 @@ mod tests {
             group: "default".into(),
             watched_tables: vec![ident()],
             ..Default::default()
-};
+        };
         let v = block_on(watcher.check(&inputs));
         assert!(v.is_empty(), "got: {v:?}");
     }

@@ -300,11 +300,7 @@ pub trait Coordinator: Send + Sync {
     /// Stamp a per-chunk resume cursor. The Snapshotter calls this
     /// after every chunk is durably staged so a mid-snapshot crash
     /// resumes at the next PK rather than from chunk 0.
-    async fn set_snapshot_progress(
-        &self,
-        ident: &TableIdent,
-        last_pk_key: &str,
-    ) -> Result<()>;
+    async fn set_snapshot_progress(&self, ident: &TableIdent, last_pk_key: &str) -> Result<()>;
 
     /// Drop the resume cursor (called when a table's snapshot
     /// completes — saves a row vs leaving stale state behind).
@@ -319,11 +315,7 @@ pub trait Coordinator: Send + Sync {
 
     /// Stamp the watermark for a query-mode table. Idempotent
     /// UPSERT. Called after each query-flush cycle commits.
-    async fn set_query_watermark(
-        &self,
-        ident: &TableIdent,
-        watermark: &PgValue,
-    ) -> Result<()>;
+    async fn set_query_watermark(&self, ident: &TableIdent, watermark: &PgValue) -> Result<()>;
 
     /// Read pending [`MarkerInfo`]s eligible for emission as
     /// meta-marker rows for `table`. A marker is *eligible* iff:
@@ -354,13 +346,8 @@ pub trait Coordinator: Send + Sync {
     /// Record that the meta-marker row `(uuid, table)` has been
     /// written to Iceberg. Idempotent. Used by the materializer to
     /// dedup emissions across crashes/replays. Default no-op.
-    async fn record_marker_emitted(
-        &self,
-        uuid: &str,
-        table: &TableIdent,
-    ) -> Result<()> {
+    async fn record_marker_emitted(&self, uuid: &str, table: &TableIdent) -> Result<()> {
         let _ = (uuid, table);
         Ok(())
     }
 }
-

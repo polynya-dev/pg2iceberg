@@ -529,7 +529,9 @@ mod tests {
             "query_watermarks",
         ] {
             assert!(
-                stmts.iter().any(|s| s.contains(&format!("_pg2iceberg.{name}"))),
+                stmts
+                    .iter()
+                    .any(|s| s.contains(&format!("_pg2iceberg.{name}"))),
                 "missing migrate for {name}"
             );
         }

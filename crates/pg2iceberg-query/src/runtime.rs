@@ -26,6 +26,7 @@ pub enum QueryLifecycleError {
 
 /// Inputs for [`run_query_lifecycle`]. Binary builds with prod types;
 /// fault-DST builds with sim types — same lifecycle function runs.
+#[allow(clippy::type_complexity)]
 pub struct QueryLifecycle<Cat: Catalog + 'static> {
     pub coord: Arc<dyn Coordinator>,
     pub catalog: Arc<Cat>,
@@ -42,12 +43,8 @@ pub struct QueryLifecycle<Cat: Catalog + 'static> {
                 &[(TableSchema, String)],
             ) -> std::pin::Pin<
                 Box<
-                    dyn Future<
-                            Output = Result<
-                                Box<dyn WatermarkSource>,
-                                QueryLifecycleError,
-                            >,
-                        > + Send,
+                    dyn Future<Output = Result<Box<dyn WatermarkSource>, QueryLifecycleError>>
+                        + Send,
                 >,
             > + Send,
     >,

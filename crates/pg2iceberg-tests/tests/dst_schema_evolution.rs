@@ -194,10 +194,9 @@ fn type_promotion_int_to_long_succeeds() {
     // hit the "old data file under new schema" downcast issue —
     // that's compaction's job to fix.
     let s = schema_with("orders", "qty", IcebergType::Int);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
 
-    h.db
-        .alter_column_type(&s.ident, "qty", IcebergType::Long)
+    h.db.alter_column_type(&s.ident, "qty", IcebergType::Long)
         .unwrap();
 
     let mut tx = h.db.begin_tx();
@@ -226,23 +225,25 @@ fn type_promotion_int_to_long_succeeds() {
     ))
     .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].get(&col("qty")), Some(&PgValue::Int8(9_000_000_000)));
+    assert_eq!(
+        rows[0].get(&col("qty")),
+        Some(&PgValue::Int8(9_000_000_000))
+    );
 }
 
 #[test]
 fn type_promotion_float_to_double_succeeds() {
     // ALTER TABLE … ALTER COLUMN price TYPE DOUBLE PRECISION.
     let s = schema_with("prices", "price", IcebergType::Float);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
 
-    h.db
-        .alter_column_type(&s.ident, "price", IcebergType::Double)
+    h.db.alter_column_type(&s.ident, "price", IcebergType::Double)
         .unwrap();
 
     let mut tx = h.db.begin_tx();
     let mut row = BTreeMap::new();
     row.insert(col("id"), PgValue::Int4(1));
-    row.insert(col("price"), PgValue::Float8(3.141_592_653_589_793));
+    row.insert(col("price"), PgValue::Float8(std::f64::consts::PI));
     tx.insert(&s.ident, row);
     tx.commit(Timestamp(0)).unwrap();
     h.drive_then_materialize();
@@ -262,10 +263,9 @@ fn type_narrowing_long_to_int_fails_loudly() {
     // be silently truncated. The materializer must reject the
     // Relation with a clear error rather than coerce.
     let s = schema_with("orders", "qty", IcebergType::Long);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
 
-    h.db
-        .alter_column_type(&s.ident, "qty", IcebergType::Int)
+    h.db.alter_column_type(&s.ident, "qty", IcebergType::Int)
         .unwrap();
 
     let err = h
@@ -282,7 +282,11 @@ fn type_narrowing_long_to_int_fails_loudly() {
     // Schema must remain unchanged on the Iceberg side.
     let still_long = h.iceberg_schema(&s.ident);
     let qty = still_long.columns.iter().find(|c| c.name == "qty").unwrap();
-    assert_eq!(qty.ty, IcebergType::Long, "schema unchanged after rejection");
+    assert_eq!(
+        qty.ty,
+        IcebergType::Long,
+        "schema unchanged after rejection"
+    );
 }
 
 #[test]
@@ -291,10 +295,9 @@ fn type_change_cross_family_text_to_int_fails_loudly() {
     // Cross-family conversions corrupt downstream readers if applied
     // silently — must reject.
     let s = schema_with("notes", "note", IcebergType::String);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
 
-    h.db
-        .alter_column_type(&s.ident, "note", IcebergType::Int)
+    h.db.alter_column_type(&s.ident, "note", IcebergType::Int)
         .unwrap();
 
     let err = h
@@ -311,10 +314,9 @@ fn pk_type_change_rejected_even_for_legal_promotion() {
     // Even an otherwise-legal int→long is rejected on the PK to
     // force operators to re-snapshot.
     let s = schema_with("orders", "qty", IcebergType::Int);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
 
-    h.db
-        .alter_column_type(&s.ident, "id", IcebergType::Long)
+    h.db.alter_column_type(&s.ident, "id", IcebergType::Long)
         .unwrap();
 
     let err = h
@@ -337,7 +339,7 @@ fn single_relation_with_multiple_new_columns_adds_all() {
     // AddColumn changes and apply them atomically (both succeed or
     // neither does).
     let s = schema_with("orders", "qty", IcebergType::Int);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
 
     // Drain the initial Relation (from create_table).
     h.drive_then_materialize();
@@ -346,30 +348,28 @@ fn single_relation_with_multiple_new_columns_adds_all() {
     // but the materializer's diff is the same shape as a real
     // multi-column-add Relation: multiple new names compared to
     // current schema. We verify both end up in the Iceberg schema.
-    h.db
-        .alter_add_column(
-            &s.ident,
-            ColumnSchema {
-                name: "note".into(),
-                field_id: 0,
-                ty: IcebergType::String,
-                nullable: true,
-                is_primary_key: false,
-            },
-        )
-        .unwrap();
-    h.db
-        .alter_add_column(
-            &s.ident,
-            ColumnSchema {
-                name: "tag".into(),
-                field_id: 0,
-                ty: IcebergType::String,
-                nullable: true,
-                is_primary_key: false,
-            },
-        )
-        .unwrap();
+    h.db.alter_add_column(
+        &s.ident,
+        ColumnSchema {
+            name: "note".into(),
+            field_id: 0,
+            ty: IcebergType::String,
+            nullable: true,
+            is_primary_key: false,
+        },
+    )
+    .unwrap();
+    h.db.alter_add_column(
+        &s.ident,
+        ColumnSchema {
+            name: "tag".into(),
+            field_id: 0,
+            ty: IcebergType::String,
+            nullable: true,
+            is_primary_key: false,
+        },
+    )
+    .unwrap();
 
     h.drive_then_materialize();
 
@@ -377,10 +377,23 @@ fn single_relation_with_multiple_new_columns_adds_all() {
     let names: Vec<&str> = evolved.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"note"));
     assert!(names.contains(&"tag"));
-    let note_id = evolved.columns.iter().find(|c| c.name == "note").unwrap().field_id;
-    let tag_id = evolved.columns.iter().find(|c| c.name == "tag").unwrap().field_id;
+    let note_id = evolved
+        .columns
+        .iter()
+        .find(|c| c.name == "note")
+        .unwrap()
+        .field_id;
+    let tag_id = evolved
+        .columns
+        .iter()
+        .find(|c| c.name == "tag")
+        .unwrap()
+        .field_id;
     assert_ne!(note_id, tag_id, "field ids must be unique");
-    assert!(note_id >= 3 && tag_id >= 3, "post-evolution field ids start above PK + qty");
+    assert!(
+        note_id >= 3 && tag_id >= 3,
+        "post-evolution field ids start above PK + qty"
+    );
 }
 
 #[test]
@@ -391,7 +404,7 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
     // original field id), b is present, c is present with the
     // highest field id.
     let s = schema_with("orders", "qty", IcebergType::Int);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
     h.drive_then_materialize();
 
     let add = |name: &str, ty: IcebergType| ColumnSchema {
@@ -402,13 +415,27 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
         is_primary_key: false,
     };
 
-    h.db.alter_add_column(&s.ident, add("a", IcebergType::Int)).unwrap();
+    h.db.alter_add_column(&s.ident, add("a", IcebergType::Int))
+        .unwrap();
     h.drive_then_materialize();
-    let a_id = h.iceberg_schema(&s.ident).columns.iter().find(|c| c.name == "a").unwrap().field_id;
+    let a_id = h
+        .iceberg_schema(&s.ident)
+        .columns
+        .iter()
+        .find(|c| c.name == "a")
+        .unwrap()
+        .field_id;
 
-    h.db.alter_add_column(&s.ident, add("b", IcebergType::String)).unwrap();
+    h.db.alter_add_column(&s.ident, add("b", IcebergType::String))
+        .unwrap();
     h.drive_then_materialize();
-    let b_id = h.iceberg_schema(&s.ident).columns.iter().find(|c| c.name == "b").unwrap().field_id;
+    let b_id = h
+        .iceberg_schema(&s.ident)
+        .columns
+        .iter()
+        .find(|c| c.name == "b")
+        .unwrap()
+        .field_id;
 
     h.db.alter_drop_column(&s.ident, "a").unwrap();
     h.drive_then_materialize();
@@ -417,10 +444,16 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
     assert!(a_after.nullable, "soft-dropped column becomes nullable");
     assert_eq!(a_after.field_id, a_id, "soft-drop preserves field id");
 
-    h.db.alter_add_column(&s.ident, add("c", IcebergType::Long)).unwrap();
+    h.db.alter_add_column(&s.ident, add("c", IcebergType::Long))
+        .unwrap();
     h.drive_then_materialize();
     let final_schema = h.iceberg_schema(&s.ident);
-    let c_id = final_schema.columns.iter().find(|c| c.name == "c").unwrap().field_id;
+    let c_id = final_schema
+        .columns
+        .iter()
+        .find(|c| c.name == "c")
+        .unwrap()
+        .field_id;
 
     // Strict monotonic ordering: a < b < c. (a survived as soft-drop
     // but still has its original id, which must be lower than b's
@@ -439,21 +472,20 @@ fn add_then_drop_without_data_leaves_soft_dropped_column() {
     // written for it. This mirrors what PG would do: the column
     // existed for a moment, then was removed with no writes.
     let s = schema_with("orders", "qty", IcebergType::Int);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
     h.drive_then_materialize();
 
-    h.db
-        .alter_add_column(
-            &s.ident,
-            ColumnSchema {
-                name: "tmp".into(),
-                field_id: 0,
-                ty: IcebergType::String,
-                nullable: true,
-                is_primary_key: false,
-            },
-        )
-        .unwrap();
+    h.db.alter_add_column(
+        &s.ident,
+        ColumnSchema {
+            name: "tmp".into(),
+            field_id: 0,
+            ty: IcebergType::String,
+            nullable: true,
+            is_primary_key: false,
+        },
+    )
+    .unwrap();
     h.db.alter_drop_column(&s.ident, "tmp").unwrap();
     h.drive_then_materialize();
 
@@ -476,25 +508,27 @@ fn schema_evolution_across_two_tables_is_independent() {
     let mut h = Harness::boot(&[s_a.clone(), s_b.clone()]);
     h.drive_then_materialize();
 
-    h.db
-        .alter_add_column(
-            &s_a.ident,
-            ColumnSchema {
-                name: "tax".into(),
-                field_id: 0,
-                ty: IcebergType::Int,
-                nullable: true,
-                is_primary_key: false,
-            },
-        )
-        .unwrap();
+    h.db.alter_add_column(
+        &s_a.ident,
+        ColumnSchema {
+            name: "tax".into(),
+            field_id: 0,
+            ty: IcebergType::Int,
+            nullable: true,
+            is_primary_key: false,
+        },
+    )
+    .unwrap();
     h.db.alter_drop_column(&s_b.ident, "email").unwrap();
     h.drive_then_materialize();
 
     let a = h.iceberg_schema(&s_a.ident);
     let b = h.iceberg_schema(&s_b.ident);
 
-    assert!(a.columns.iter().any(|c| c.name == "tax"), "A got the new column");
+    assert!(
+        a.columns.iter().any(|c| c.name == "tax"),
+        "A got the new column"
+    );
     assert!(
         !b.columns.iter().any(|c| c.name == "tax"),
         "B did not get A's new column"
@@ -515,7 +549,7 @@ fn repeated_relation_with_same_schema_is_no_op() {
     // case, so we don't churn snapshot history with empty schema
     // updates.
     let s = schema_with("orders", "qty", IcebergType::Int);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
     h.drive_then_materialize();
 
     let snapshots_before = block_on(h.catalog.snapshots(&s.ident)).unwrap().len();
@@ -525,8 +559,7 @@ fn repeated_relation_with_same_schema_is_no_op() {
     // alter_column_type with the *current* type — sim emits a
     // Relation but the columns are unchanged so apply_relation
     // produces zero changes.
-    h.db
-        .alter_column_type(&s.ident, "qty", IcebergType::Int)
+    h.db.alter_column_type(&s.ident, "qty", IcebergType::Int)
         .unwrap();
     h.drive_then_materialize();
 
@@ -547,21 +580,20 @@ fn add_column_then_insert_uses_new_column() {
     // PG), the Iceberg schema is updated in time for the staged
     // Insert to encode the new column.
     let s = schema_with("orders", "qty", IcebergType::Int);
-    let mut h = Harness::boot(&[s.clone()]);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
     h.drive_then_materialize();
 
-    h.db
-        .alter_add_column(
-            &s.ident,
-            ColumnSchema {
-                name: "note".into(),
-                field_id: 0,
-                ty: IcebergType::String,
-                nullable: true,
-                is_primary_key: false,
-            },
-        )
-        .unwrap();
+    h.db.alter_add_column(
+        &s.ident,
+        ColumnSchema {
+            name: "note".into(),
+            field_id: 0,
+            ty: IcebergType::String,
+            nullable: true,
+            is_primary_key: false,
+        },
+    )
+    .unwrap();
 
     let mut tx = h.db.begin_tx();
     let mut row: Row = BTreeMap::new();

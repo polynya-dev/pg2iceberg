@@ -28,7 +28,7 @@ use pg2iceberg_coord::{Coordinator, LogEntry};
 use pg2iceberg_core::metrics::{names, Labels};
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
-    ColumnName, ColumnSchema, Lsn, Metrics, Namespace, NoopMetrics, Op, PgValue, Row, TableIdent,
+    ColumnName, ColumnSchema, Metrics, Namespace, NoopMetrics, Op, PgValue, Row, TableIdent,
     TableSchema,
 };
 use pg2iceberg_iceberg::meta::{
@@ -179,6 +179,7 @@ pub struct Materializer<C: Catalog> {
     ///      workers, `table[i]` → `workers[i % N]`).
     ///   3. Skips `cycle_table` for tables not assigned to this
     ///      worker.
+    ///
     /// When `None`, every registered table runs every cycle —
     /// the single-process default. The `consumer_ttl` field
     /// controls how long a missed heartbeat survives before the
@@ -313,7 +314,9 @@ impl<C: Catalog> Materializer<C> {
     /// meta-marker table in the catalog (e.g. via
     /// `catalog.create_table(&schema)`).
     pub async fn enable_meta_markers(&mut self, schema: TableSchema) -> Result<()> {
-        self.catalog.ensure_namespace(&schema.ident.namespace).await?;
+        self.catalog
+            .ensure_namespace(&schema.ident.namespace)
+            .await?;
         if self.catalog.load_table(&schema.ident).await?.is_none() {
             self.catalog.create_table(&schema).await?;
         }
@@ -584,12 +587,14 @@ impl<C: Catalog> Materializer<C> {
             None => return Ok(()),
         };
 
-        let mut current_names: std::collections::BTreeSet<String> =
-            entry.schema.columns.iter().map(|c| c.name.clone()).collect();
-        let incoming_names: std::collections::BTreeSet<String> = incoming_columns
+        let mut current_names: std::collections::BTreeSet<String> = entry
+            .schema
+            .columns
             .iter()
             .map(|c| c.name.clone())
             .collect();
+        let incoming_names: std::collections::BTreeSet<String> =
+            incoming_columns.iter().map(|c| c.name.clone()).collect();
         let current_by_name: std::collections::BTreeMap<String, &ColumnSchema> = entry
             .schema
             .columns
@@ -1061,13 +1066,8 @@ impl<C: Catalog> Materializer<C> {
         //     full event stream to compute max LSN, max source-side
         //     ts, and the distinct-xid count for the meta `commits`
         //     row.
-        let max_lsn: i64 = all_events
-            .iter()
-            .map(|e| e.lsn.0 as i64)
-            .max()
-            .unwrap_or(0);
-        let max_source_ts_micros: i64 =
-            all_events.iter().map(|e| e.commit_ts.0).max().unwrap_or(0);
+        let max_lsn: i64 = all_events.iter().map(|e| e.lsn.0 as i64).max().unwrap_or(0);
+        let max_source_ts_micros: i64 = all_events.iter().map(|e| e.commit_ts.0).max().unwrap_or(0);
         let tx_count: i32 = {
             let mut xids: BTreeSet<u32> = BTreeSet::new();
             for e in &all_events {
@@ -1393,11 +1393,10 @@ fn expand_truncates(
         // (shouldn't happen — FileIndex stores what `pk_key` produces)
         // are skipped rather than crashing the cycle.
         for pk_key_str in file_index.all_pks() {
-            let values: Vec<pg2iceberg_core::PgValue> =
-                match serde_json::from_str(pk_key_str) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+            let values: Vec<pg2iceberg_core::PgValue> = match serde_json::from_str(pk_key_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
             if values.len() != pk_cols.len() {
                 continue;
             }

@@ -10,14 +10,14 @@
 
 use crate::clock::{duration_to_micros, TestClock};
 use async_trait::async_trait;
+use pg2iceberg_coord::TableSnapshotState;
 use pg2iceberg_coord::{
     receipt, schema::CoordSchema, CommitBatch, CoordCommitReceipt, CoordError, Coordinator,
     LogEntry, MarkerInfo, OffsetGrant, Result,
 };
-use pg2iceberg_coord::TableSnapshotState;
 use pg2iceberg_core::{Clock, Lsn, TableIdent, Timestamp, WorkerId};
-use std::collections::BTreeSet;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -387,11 +387,7 @@ impl Coordinator for MemoryCoordinator {
             .cloned())
     }
 
-    async fn set_snapshot_progress(
-        &self,
-        ident: &TableIdent,
-        last_pk_key: &str,
-    ) -> Result<()> {
+    async fn set_snapshot_progress(&self, ident: &TableIdent, last_pk_key: &str) -> Result<()> {
         self.state
             .lock()
             .unwrap()
@@ -401,15 +397,14 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn clear_snapshot_progress(&self, ident: &TableIdent) -> Result<()> {
-        self.state
-            .lock()
-            .unwrap()
-            .snapshot_progress
-            .remove(ident);
+        self.state.lock().unwrap().snapshot_progress.remove(ident);
         Ok(())
     }
 
-    async fn query_watermark(&self, ident: &TableIdent) -> Result<Option<pg2iceberg_core::PgValue>> {
+    async fn query_watermark(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<Option<pg2iceberg_core::PgValue>> {
         Ok(self
             .state
             .lock()
@@ -470,11 +465,7 @@ impl Coordinator for MemoryCoordinator {
         Ok(out)
     }
 
-    async fn record_marker_emitted(
-        &self,
-        uuid: &str,
-        table: &TableIdent,
-    ) -> Result<()> {
+    async fn record_marker_emitted(&self, uuid: &str, table: &TableIdent) -> Result<()> {
         self.state
             .lock()
             .unwrap()

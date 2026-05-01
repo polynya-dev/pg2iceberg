@@ -61,13 +61,9 @@ async fn shared_pg() -> &'static SharedPg {
             .await
             .expect("start postgres container");
         let host = container.get_host().await.expect("host");
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("port");
-        let dsn = format!(
-            "host={host} port={port} user=postgres password=postgres dbname=postgres"
-        );
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let dsn =
+            format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
         SharedPg {
             _container: container,
             dsn,
@@ -145,10 +141,7 @@ async fn slot_lifecycle_create_inspect_drop() {
     // Drop slot via the regular client (replication-mode SQL is too
     // restricted for pg_drop_replication_slot()).
     regular
-        .execute(
-            "SELECT pg_drop_replication_slot($1)",
-            &[&slot.as_str()],
-        )
+        .execute("SELECT pg_drop_replication_slot($1)", &[&slot.as_str()])
         .await
         .expect("drop slot");
 }
@@ -237,13 +230,14 @@ async fn publication_tables_reflects_alter_publication() {
         .publication_tables(&pubname)
         .await
         .expect("publication_tables");
-    assert!(members.contains(&ident), "table must be in pub: {members:?}");
+    assert!(
+        members.contains(&ident),
+        "table must be in pub: {members:?}"
+    );
 
     // Drop the table from the publication.
     regular
-        .batch_execute(&format!(
-            "ALTER PUBLICATION {pubname} DROP TABLE {table}"
-        ))
+        .batch_execute(&format!("ALTER PUBLICATION {pubname} DROP TABLE {table}"))
         .await
         .expect("alter pub");
 
@@ -321,10 +315,7 @@ async fn slot_health_query_works_against_real_pg() {
 
     // Cleanup.
     regular
-        .execute(
-            "SELECT pg_drop_replication_slot($1)",
-            &[&slot.as_str()],
-        )
+        .execute("SELECT pg_drop_replication_slot($1)", &[&slot.as_str()])
         .await
         .expect("drop slot");
 }
@@ -442,9 +433,9 @@ async fn start_replication_streams_insert_events() {
         let msg = match tokio::time::timeout(remaining, stream.recv()).await {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => panic!("stream error: {e:?}"),
-            Err(_) => panic!(
-                "recv deadline: inserts_seen={inserts_seen}, commits_seen={commits_seen}"
-            ),
+            Err(_) => {
+                panic!("recv deadline: inserts_seen={inserts_seen}, commits_seen={commits_seen}")
+            }
         };
         match msg {
             DecodedMessage::Relation { ident: t, .. } => {
@@ -464,8 +455,14 @@ async fn start_replication_streams_insert_events() {
     }
 
     assert!(relation_seen, "Relation message must precede first Change");
-    assert!(inserts_seen >= 3, "expected ≥3 Insert events, got {inserts_seen}");
-    assert!(commits_seen >= 1, "expected ≥1 Commit event, got {commits_seen}");
+    assert!(
+        inserts_seen >= 3,
+        "expected ≥3 Insert events, got {inserts_seen}"
+    );
+    assert!(
+        commits_seen >= 1,
+        "expected ≥1 Commit event, got {commits_seen}"
+    );
 }
 
 #[tokio::test]
@@ -501,19 +498,11 @@ async fn discover_schema_against_real_pg() {
     let cols: Vec<_> = schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(cols, vec!["id", "email", "bio", "created_at"]);
 
-    let id = schema
-        .columns
-        .iter()
-        .find(|c| c.name == "id")
-        .unwrap();
+    let id = schema.columns.iter().find(|c| c.name == "id").unwrap();
     assert!(id.is_primary_key);
     assert!(!id.nullable);
 
-    let bio = schema
-        .columns
-        .iter()
-        .find(|c| c.name == "bio")
-        .unwrap();
+    let bio = schema.columns.iter().find(|c| c.name == "bio").unwrap();
     assert!(!bio.is_primary_key);
     assert!(bio.nullable);
 }
@@ -554,10 +543,7 @@ async fn drop_slot_and_publication_against_real_pg() {
     assert!(!client.slot_exists(&slot).await.unwrap());
 
     // Idempotent — second drop is a no-op (slot is gone).
-    client
-        .drop_slot(&slot)
-        .await
-        .expect("idempotent drop_slot");
+    client.drop_slot(&slot).await.expect("idempotent drop_slot");
 
     // Drop publication, then idempotent re-drop.
     client

@@ -32,7 +32,6 @@ use pg2iceberg_core::{
     Timestamp, WorkerId,
 };
 use pg2iceberg_iceberg::Catalog;
-use pg2iceberg_stream::BlobStore;
 use pg2iceberg_logical::materializer::{CounterMaterializerNamer, Materializer};
 use pg2iceberg_logical::pipeline::{CounterBlobNamer, Pipeline};
 use pg2iceberg_pg::DecodedMessage;
@@ -41,6 +40,7 @@ use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
+use pg2iceberg_stream::BlobStore;
 use pollster::block_on;
 use std::collections::BTreeMap;
 
@@ -207,8 +207,8 @@ impl Harness {
         for s in snaps {
             for df in s.data_files {
                 let bytes = block_on(self.blob.get(&df.path)).unwrap();
-                let rows = pg2iceberg_iceberg::read_data_file(&bytes, &schema(table).columns)
-                    .unwrap();
+                let rows =
+                    pg2iceberg_iceberg::read_data_file(&bytes, &schema(table).columns).unwrap();
                 out += rows.len();
             }
         }
@@ -256,8 +256,16 @@ fn two_workers_split_three_tables_round_robin() {
     // a steady-state two-worker deployment. The materializer's own
     // register_consumer call inside cycle() then refreshes a
     // pre-existing entry rather than racing.
-    block_on(h.coord.register_consumer("default", &WorkerId("worker-0".into()), TTL)).unwrap();
-    block_on(h.coord.register_consumer("default", &WorkerId("worker-1".into()), TTL)).unwrap();
+    block_on(
+        h.coord
+            .register_consumer("default", &WorkerId("worker-0".into()), TTL),
+    )
+    .unwrap();
+    block_on(
+        h.coord
+            .register_consumer("default", &WorkerId("worker-1".into()), TTL),
+    )
+    .unwrap();
 
     let n0 = block_on(m0.cycle()).unwrap();
     let n1 = block_on(m1.cycle()).unwrap();
@@ -293,7 +301,11 @@ fn extra_workers_beyond_table_count_idle() {
     //   b (1) → worker-1
     // worker-2 gets nothing.
     for w in ["worker-0", "worker-1", "worker-2"] {
-        block_on(h.coord.register_consumer("default", &WorkerId(w.into()), TTL)).unwrap();
+        block_on(
+            h.coord
+                .register_consumer("default", &WorkerId(w.into()), TTL),
+        )
+        .unwrap();
     }
 
     let n0 = block_on(m0.cycle()).unwrap();
@@ -315,7 +327,11 @@ fn rebalance_on_worker_leave_redistributes_tables() {
     let mut m1 = h.materializer(Some("worker-1"));
 
     for w in ["worker-0", "worker-1"] {
-        block_on(h.coord.register_consumer("default", &WorkerId(w.into()), TTL)).unwrap();
+        block_on(
+            h.coord
+                .register_consumer("default", &WorkerId(w.into()), TTL),
+        )
+        .unwrap();
     }
 
     // First cycle: both workers active.
@@ -341,7 +357,11 @@ fn rebalance_on_worker_leave_redistributes_tables() {
     // Each of the 4 tables now has 2 rows materialized: one from
     // each seed.
     for t in ["a", "b", "c", "d"] {
-        assert_eq!(h.iceberg_count(t), 2, "table {t} has both rows after rebalance");
+        assert_eq!(
+            h.iceberg_count(t),
+            2,
+            "table {t} has both rows after rebalance"
+        );
     }
 }
 
@@ -360,8 +380,11 @@ fn assignment_is_deterministic_across_runs() {
         let mut m1 = h.materializer(Some("bravo"));
         let mut m2 = h.materializer(Some("charlie"));
         for w in ["alpha", "bravo", "charlie"] {
-            block_on(h.coord.register_consumer("default", &WorkerId(w.into()), TTL))
-                .unwrap();
+            block_on(
+                h.coord
+                    .register_consumer("default", &WorkerId(w.into()), TTL),
+            )
+            .unwrap();
         }
         vec![
             ("alpha".into(), block_on(m0.cycle()).unwrap()),
@@ -396,7 +419,10 @@ fn each_table_is_claimed_by_exactly_one_worker() {
     for w in workers.iter_mut() {
         total += block_on(w.cycle()).unwrap();
     }
-    assert_eq!(total, 5, "each of 5 tables processed exactly once across all workers");
+    assert_eq!(
+        total, 5,
+        "each of 5 tables processed exactly once across all workers"
+    );
 
     // And each table got materialized exactly once.
     for t in ["a", "b", "c", "d", "e"] {

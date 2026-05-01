@@ -15,12 +15,12 @@
 use crate::prod::connect::PgConn;
 use crate::schema::CoordSchema;
 use crate::sql;
+use crate::TableSnapshotState;
 use crate::{
     receipt, CommitBatch, CoordCommitReceipt, CoordError, Coordinator, LogEntry, MarkerInfo,
     OffsetGrant, Result,
 };
 use async_trait::async_trait;
-use crate::TableSnapshotState;
 use pg2iceberg_core::{Lsn, TableIdent, WorkerId};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -550,11 +550,7 @@ impl Coordinator for PostgresCoordinator {
         Ok(rows.first().map(|r| r.get::<_, String>(0)))
     }
 
-    async fn set_snapshot_progress(
-        &self,
-        ident: &TableIdent,
-        last_pk_key: &str,
-    ) -> Result<()> {
+    async fn set_snapshot_progress(&self, ident: &TableIdent, last_pk_key: &str) -> Result<()> {
         let key = table_key(ident);
         let client = self.client.lock().await;
         client
@@ -577,7 +573,10 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
-    async fn query_watermark(&self, ident: &TableIdent) -> Result<Option<pg2iceberg_core::PgValue>> {
+    async fn query_watermark(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<Option<pg2iceberg_core::PgValue>> {
         let key = table_key(ident);
         let client = self.client.lock().await;
         let rows = client
@@ -650,11 +649,7 @@ impl Coordinator for PostgresCoordinator {
         Ok(out)
     }
 
-    async fn record_marker_emitted(
-        &self,
-        uuid: &str,
-        table: &TableIdent,
-    ) -> Result<()> {
+    async fn record_marker_emitted(&self, uuid: &str, table: &TableIdent) -> Result<()> {
         let namespace = table.namespace.0.join(".");
         let q = sql::insert_marker_emission(&self.schema);
         let client = self.client.lock().await;

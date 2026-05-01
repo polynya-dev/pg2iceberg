@@ -24,7 +24,9 @@ use pg2iceberg_core::{
     ChangeEvent, ColumnName, ColumnSchema, Lsn, Op, PgValue, Row, TableIdent, TableSchema,
     Timestamp,
 };
-use pg2iceberg_pg::{DecodedMessage, PgClient, PgError, ReplicationStream, SlotMonitor, SnapshotId};
+use pg2iceberg_pg::{
+    DecodedMessage, PgClient, PgError, ReplicationStream, SlotMonitor, SnapshotId,
+};
 use pg2iceberg_query::{watermark_compare, QueryError, WatermarkSource};
 use pg2iceberg_snapshot::{SnapshotError, SnapshotSource};
 use std::collections::{BTreeMap, BTreeSet};
@@ -187,9 +189,7 @@ impl Default for DbState {
 /// Relation message would look like — but the sim stamps
 /// `is_primary_key` from the schema (we know it explicitly) instead
 /// of inferring from REPLICA IDENTITY flags like prod does.
-fn relation_columns_from_schema(
-    schema: &TableSchema,
-) -> Vec<pg2iceberg_pg::RelationColumn> {
+fn relation_columns_from_schema(schema: &TableSchema) -> Vec<pg2iceberg_pg::RelationColumn> {
     schema
         .columns
         .iter()
@@ -306,11 +306,7 @@ impl SimPostgres {
     /// event. Iceberg-side this is a soft-drop (column stays in
     /// the schema as nullable), so subsequent reads are
     /// backward-compatible.
-    pub fn alter_drop_column(
-        &self,
-        ident: &TableIdent,
-        col_name: &str,
-    ) -> Result<()> {
+    pub fn alter_drop_column(&self, ident: &TableIdent, col_name: &str) -> Result<()> {
         let mut s = self.state.lock().unwrap();
         let table = s
             .tables
@@ -393,17 +389,18 @@ impl SimPostgres {
     /// this from `pg_class.oid`; the sim mirrors it via
     /// [`SimPgClient::table_oid`].
     pub fn table_oid(&self, ident: &TableIdent) -> Option<u32> {
-        self.state.lock().unwrap().tables.get(ident).map(|t| t.pg_oid)
+        self.state
+            .lock()
+            .unwrap()
+            .tables
+            .get(ident)
+            .map(|t| t.pg_oid)
     }
 
     /// Test hook: drop a table from a publication. Models the
     /// `ALTER PUBLICATION DROP TABLE` operator action that triggers
     /// the `TableMissingFromPublication` startup invariant.
-    pub fn drop_table_from_publication(
-        &self,
-        publication: &str,
-        ident: &TableIdent,
-    ) -> Result<()> {
+    pub fn drop_table_from_publication(&self, publication: &str, ident: &TableIdent) -> Result<()> {
         let mut s = self.state.lock().unwrap();
         let pubrec = s
             .publications
@@ -1163,10 +1160,7 @@ impl WatermarkSource for SimPostgres {
 
 #[async_trait]
 impl SlotMonitor for SimPostgres {
-    async fn confirmed_flush_lsn(
-        &self,
-        slot: &str,
-    ) -> std::result::Result<Option<Lsn>, PgError> {
+    async fn confirmed_flush_lsn(&self, slot: &str) -> std::result::Result<Option<Lsn>, PgError> {
         match self.slot_state(slot) {
             Ok(s) => Ok(Some(s.confirmed_flush_lsn)),
             Err(_) => Ok(None),
@@ -1343,10 +1337,14 @@ impl PgClient for SimPgClient {
     }
 
     async fn drop_slot(&self, slot: &str) -> std::result::Result<(), PgError> {
-        self.db.drop_slot(slot).map_err(|e| PgError::Other(e.to_string()))
+        self.db
+            .drop_slot(slot)
+            .map_err(|e| PgError::Other(e.to_string()))
     }
 
     async fn drop_publication(&self, name: &str) -> std::result::Result<(), PgError> {
-        self.db.drop_publication(name).map_err(|e| PgError::Other(e.to_string()))
+        self.db
+            .drop_publication(name)
+            .map_err(|e| PgError::Other(e.to_string()))
     }
 }

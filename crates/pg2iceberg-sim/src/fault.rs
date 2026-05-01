@@ -46,11 +46,10 @@ use crate::catalog::MemoryCatalog;
 use crate::coord::MemoryCoordinator;
 use async_trait::async_trait;
 use bytes::Bytes;
-use pg2iceberg_coord::{
-    CommitBatch, CoordCommitReceipt, CoordError, Coordinator, LogEntry,
-    Result as CoordResult,
-};
 use pg2iceberg_coord::TableSnapshotState;
+use pg2iceberg_coord::{
+    CommitBatch, CoordCommitReceipt, CoordError, Coordinator, LogEntry, Result as CoordResult,
+};
 use pg2iceberg_core::{Lsn, TableIdent, WorkerId};
 use pg2iceberg_iceberg::{
     Catalog, IcebergError, PreparedCommit, PreparedCompaction, Result as IcebergResult,
@@ -192,14 +191,18 @@ impl FaultyBlobStore {
 impl BlobStore for FaultyBlobStore {
     async fn put(&self, path: &str, bytes: Bytes) -> BlobResult<()> {
         if self.plan.tick(ops::BLOB_PUT) {
-            return Err(StreamError::Io(format!("injected fault: blob.put {path:?}")));
+            return Err(StreamError::Io(format!(
+                "injected fault: blob.put {path:?}"
+            )));
         }
         self.inner.put(path, bytes).await
     }
 
     async fn get(&self, path: &str) -> BlobResult<Bytes> {
         if self.plan.tick(ops::BLOB_GET) {
-            return Err(StreamError::Io(format!("injected fault: blob.get {path:?}")));
+            return Err(StreamError::Io(format!(
+                "injected fault: blob.get {path:?}"
+            )));
         }
         self.inner.get(path).await
     }
@@ -280,12 +283,7 @@ impl Coordinator for FaultyCoordinator {
         self.inner.get_cursor(group, table).await
     }
 
-    async fn set_cursor(
-        &self,
-        group: &str,
-        table: &TableIdent,
-        to_offset: i64,
-    ) -> CoordResult<()> {
+    async fn set_cursor(&self, group: &str, table: &TableIdent, to_offset: i64) -> CoordResult<()> {
         if self.plan.tick(ops::COORD_SET_CURSOR) {
             return Err(CoordError::Pg("injected fault: set_cursor".into()));
         }
@@ -372,7 +370,9 @@ impl Coordinator for FaultyCoordinator {
         last_pk_key: &str,
     ) -> CoordResult<()> {
         if self.plan.tick(ops::COORD_SAVE_CP) {
-            return Err(CoordError::Pg("injected fault: set_snapshot_progress".into()));
+            return Err(CoordError::Pg(
+                "injected fault: set_snapshot_progress".into(),
+            ));
         }
         self.inner.set_snapshot_progress(ident, last_pk_key).await
     }

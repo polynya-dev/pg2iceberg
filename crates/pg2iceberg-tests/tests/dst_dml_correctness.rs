@@ -13,12 +13,11 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::{
-    ColumnName, ColumnSchema, IcebergType, Lsn, Namespace, Op, PgValue, Row, TableIdent,
-    TableSchema, Timestamp,
+    ColumnName, ColumnSchema, IcebergType, Namespace, PgValue, Row, TableIdent, TableSchema,
+    Timestamp,
 };
 use pg2iceberg_iceberg::read_materialized_state;
 use pg2iceberg_logical::materializer::{CounterMaterializerNamer, Materializer};
@@ -29,7 +28,6 @@ use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
-use pg2iceberg_stream::BlobStore;
 use pollster::block_on;
 use std::collections::BTreeMap;
 
@@ -73,6 +71,7 @@ fn row(id: i32, qty: i32) -> Row {
     r
 }
 
+#[allow(dead_code)]
 struct Harness {
     db: SimPostgres,
     coord: Arc<MemoryCoordinator>,
@@ -289,26 +288,22 @@ fn alter_table_add_column_mid_stream_propagates_to_iceberg() {
     h.drive_then_materialize();
 
     // ALTER TABLE ADD COLUMN note TEXT (nullable).
-    h.db
-        .alter_add_column(
-            &ident(),
-            ColumnSchema {
-                name: "note".into(),
-                field_id: 0, // sim re-allocates monotonically
-                ty: IcebergType::String,
-                nullable: true,
-                is_primary_key: false,
-            },
-        )
-        .unwrap();
+    h.db.alter_add_column(
+        &ident(),
+        ColumnSchema {
+            name: "note".into(),
+            field_id: 0, // sim re-allocates monotonically
+            ty: IcebergType::String,
+            nullable: true,
+            is_primary_key: false,
+        },
+    )
+    .unwrap();
 
     // INSERT a row that uses the new column.
     let mut tx = h.db.begin_tx();
     let mut row3 = row(3, 30);
-    row3.insert(
-        ColumnName("note".into()),
-        PgValue::Text("hello".into()),
-    );
+    row3.insert(ColumnName("note".into()), PgValue::Text("hello".into()));
     tx.insert(&ident(), row3);
     tx.commit(Timestamp(0)).unwrap();
     h.drive_then_materialize();

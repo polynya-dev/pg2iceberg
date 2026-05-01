@@ -91,13 +91,13 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     ready_markers: Vec<MarkerInfo>,
     /// Per-table primary-key column list. Lets the pipeline detect
     /// `UPDATE` events that change the primary key (`before.pk !=
-    /// after.pk`) and split them into a synthetic `Delete` (old PK)
-    /// + `Update` (new PK) so the materializer drops the old row.
-    /// Without this, the old PK becomes orphaned in Iceberg.
-    /// Empty when not configured — pipeline falls back to the
-    /// previous "stage `after` only" behavior, which is wrong for
-    /// PK changes but matches the prior shape for tests that
-    /// haven't registered PKs.
+    /// after.pk`) and split them into a synthetic `Delete` for the
+    /// old PK plus an `Update` for the new PK, so the materializer
+    /// drops the old row. Without this, the old PK becomes orphaned
+    /// in Iceberg. Empty when not configured — pipeline falls back
+    /// to the previous "stage `after` only" behavior, which is
+    /// wrong for PK changes but matches the prior shape for tests
+    /// that haven't registered PKs.
     primary_keys: BTreeMap<TableIdent, Vec<ColumnName>>,
 }
 
@@ -143,11 +143,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     /// correct UPDATE-with-PK-change handling — without it, the
     /// pipeline can't tell whether a PG `UPDATE` changed the PK and
     /// the old row stays orphaned in Iceberg.
-    pub fn register_primary_keys(
-        &mut self,
-        table: TableIdent,
-        pk_cols: Vec<ColumnName>,
-    ) {
+    pub fn register_primary_keys(&mut self, table: TableIdent, pk_cols: Vec<ColumnName>) {
         self.primary_keys.insert(table, pk_cols);
     }
 
@@ -204,9 +200,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                         // an Iceberg-side meta-marker row by the
                         // materializer.
                         if let Some(row) = &evt.after {
-                            if let Some(PgValue::Text(uuid)) =
-                                row.get(&ColumnName("uuid".into()))
-                            {
+                            if let Some(PgValue::Text(uuid)) = row.get(&ColumnName("uuid".into())) {
                                 if let Some(xid) = evt.xid {
                                     self.pending_markers_by_xid
                                         .entry(xid)

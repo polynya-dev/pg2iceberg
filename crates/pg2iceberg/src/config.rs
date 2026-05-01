@@ -499,10 +499,7 @@ impl Config {
         }
         if self.sink.credential_mode == "static" {
             if !self.sink.s3_access_key.is_empty() {
-                props.insert(
-                    "s3.access-key-id".into(),
-                    self.sink.s3_access_key.clone(),
-                );
+                props.insert("s3.access-key-id".into(), self.sink.s3_access_key.clone());
             }
             if !self.sink.s3_secret_key.is_empty() {
                 props.insert(
@@ -782,7 +779,9 @@ sink:
         .unwrap();
         let props = cfg.rest_catalog_props();
         assert_eq!(
-            props.get("header.x-iceberg-access-delegation").map(String::as_str),
+            props
+                .get("header.x-iceberg-access-delegation")
+                .map(String::as_str),
             Some("vended-credentials"),
             "vended mode must set the access-delegation header"
         );
@@ -794,7 +793,7 @@ sink:
         // SAMPLE uses credential_mode=static.
         let props = cfg.rest_catalog_props();
         assert!(
-            props.get("header.x-iceberg-access-delegation").is_none(),
+            !props.contains_key("header.x-iceberg-access-delegation"),
             "static mode must not request vended creds"
         );
     }

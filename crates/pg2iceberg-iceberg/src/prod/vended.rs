@@ -343,13 +343,13 @@ impl VendedBlobStoreRouter {
     }
 
     async fn store_for(&self, key: &str) -> StreamResult<Arc<dyn ObjectStore>> {
-        let entry = self
-            .lookup(key)
-            .ok_or_else(|| StreamError::Io(format!(
+        let entry = self.lookup(key).ok_or_else(|| {
+            StreamError::Io(format!(
                 "vended-router: no per-table store registered for path {key:?} \
                  — ensure every materialized blob writes under a registered table's \
                  S3 location"
-            )))?;
+            ))
+        })?;
         self.fresh_store(&entry)
             .await
             .map_err(|e| StreamError::Io(format!("vended-router: refresh: {e}")))
@@ -396,8 +396,7 @@ impl BlobStore for VendedBlobStoreRouter {
         let mut stream = store.list(prefix_path.as_ref());
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
-            let meta = item
-                .map_err(|e| StreamError::Io(format!("vended list {prefix:?}: {e}")))?;
+            let meta = item.map_err(|e| StreamError::Io(format!("vended list {prefix:?}: {e}")))?;
             out.push(BlobInfo {
                 path: meta.location.to_string(),
                 size: meta.size as u64,
@@ -457,20 +456,14 @@ mod tests {
         async fn ensure_namespace(&self, _ns: &Namespace) -> crate::Result<()> {
             Ok(())
         }
-        async fn load_table(
-            &self,
-            ident: &TableIdent,
-        ) -> crate::Result<Option<TableMetadata>> {
+        async fn load_table(&self, ident: &TableIdent) -> crate::Result<Option<TableMetadata>> {
             *self.load_count.lock().unwrap() += 1;
             Ok(self.tables.lock().unwrap().get(ident).cloned())
         }
         async fn create_table(&self, _schema: &TableSchema) -> crate::Result<TableMetadata> {
             Err(IcebergError::Other("stub: create_table".into()))
         }
-        async fn commit_snapshot(
-            &self,
-            _prepared: PreparedCommit,
-        ) -> crate::Result<TableMetadata> {
+        async fn commit_snapshot(&self, _prepared: PreparedCommit) -> crate::Result<TableMetadata> {
             Err(IcebergError::Other("stub: commit_snapshot".into()))
         }
         async fn commit_compaction(
@@ -588,7 +581,10 @@ mod tests {
             bucket_from_location("s3://my-bucket/path"),
             Some("my-bucket".into())
         );
-        assert_eq!(bucket_from_location("s3://my-bucket"), Some("my-bucket".into()));
+        assert_eq!(
+            bucket_from_location("s3://my-bucket"),
+            Some("my-bucket".into())
+        );
         assert!(bucket_from_location("s3://").is_none());
         assert!(bucket_from_location("file:///tmp").is_none());
     }
@@ -598,8 +594,14 @@ mod tests {
         let cat = Arc::new(StubCatalog::new());
         let a = ident("orders");
         let b = ident("users");
-        cat.add(a.clone(), meta_with("s3://bucket/wh/db/orders", a.clone(), true));
-        cat.add(b.clone(), meta_with("s3://bucket/wh/db/users", b.clone(), true));
+        cat.add(
+            a.clone(),
+            meta_with("s3://bucket/wh/db/orders", a.clone(), true),
+        );
+        cat.add(
+            b.clone(),
+            meta_with("s3://bucket/wh/db/users", b.clone(), true),
+        );
 
         let router = VendedBlobStoreRouter::build(
             cat,
@@ -627,17 +629,19 @@ mod tests {
         let cat = Arc::new(StubCatalog::new());
         let a = ident("orders");
         // has_creds=false → s3.access-key-id is absent
-        cat.add(a.clone(), meta_with("s3://bucket/wh/orders", a.clone(), false));
+        cat.add(
+            a.clone(),
+            meta_with("s3://bucket/wh/orders", a.clone(), false),
+        );
 
-        let err =
-            match VendedBlobStoreRouter::build(cat, &[a], VendedRouterConfig::default()).await {
-                Ok(_) => panic!("expected build to fail with missing creds"),
-                Err(e) => e,
-            };
+        let err = match VendedBlobStoreRouter::build(cat, &[a], VendedRouterConfig::default()).await
+        {
+            Ok(_) => panic!("expected build to fail with missing creds"),
+            Err(e) => e,
+        };
         let msg = format!("{err}");
         assert!(
-            msg.contains("no S3 credentials")
-                && msg.contains("access-delegation"),
+            msg.contains("no S3 credentials") && msg.contains("access-delegation"),
             "error must point operator at the access-delegation header; got: {msg}"
         );
     }
@@ -698,7 +702,10 @@ mod tests {
     async fn router_refresh_reloads_from_catalog_when_near_expiry() {
         let cat = Arc::new(StubCatalog::new());
         let a = ident("orders");
-        cat.add(a.clone(), meta_with("s3://bucket/wh/orders", a.clone(), true));
+        cat.add(
+            a.clone(),
+            meta_with("s3://bucket/wh/orders", a.clone(), true),
+        );
 
         // Build with a tiny TTL + huge refresh buffer so every
         // `fresh_store` call sees expiry-near-now and triggers a
@@ -708,9 +715,13 @@ mod tests {
             refresh_buffer: Duration::from_secs(10),
             default_region: "us-east-1".into(),
         };
-        let router = VendedBlobStoreRouter::build(Arc::clone(&cat) as Arc<dyn Catalog>, &[a.clone()], cfg)
-            .await
-            .unwrap();
+        let router = VendedBlobStoreRouter::build(
+            Arc::clone(&cat) as Arc<dyn Catalog>,
+            std::slice::from_ref(&a),
+            cfg,
+        )
+        .await
+        .unwrap();
         let initial_loads = cat.loads();
         // Read-fast path won't satisfy us — every `fresh_store` will
         // refresh.
@@ -730,7 +741,10 @@ mod tests {
     async fn router_refresh_skipped_when_within_ttl() {
         let cat = Arc::new(StubCatalog::new());
         let a = ident("orders");
-        cat.add(a.clone(), meta_with("s3://bucket/wh/orders", a.clone(), true));
+        cat.add(
+            a.clone(),
+            meta_with("s3://bucket/wh/orders", a.clone(), true),
+        );
 
         // Long TTL + short refresh buffer → no refresh on subsequent
         // lookups within the window.
@@ -739,9 +753,13 @@ mod tests {
             refresh_buffer: Duration::from_secs(60),
             default_region: "us-east-1".into(),
         };
-        let router = VendedBlobStoreRouter::build(Arc::clone(&cat) as Arc<dyn Catalog>, &[a.clone()], cfg)
-            .await
-            .unwrap();
+        let router = VendedBlobStoreRouter::build(
+            Arc::clone(&cat) as Arc<dyn Catalog>,
+            std::slice::from_ref(&a),
+            cfg,
+        )
+        .await
+        .unwrap();
         let after_build_loads = cat.loads();
         let entry = router.lookup("wh/orders/x.parquet").unwrap();
         let _ = router.fresh_store(&entry).await.unwrap();

@@ -56,10 +56,7 @@ where
         .context("coord connect")?;
     let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
     let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
-    coord_concrete
-        .migrate()
-        .await
-        .context("coord migrate")?;
+    coord_concrete.migrate().await.context("coord migrate")?;
     let coord: Arc<dyn Coordinator> = coord_concrete;
 
     // ── pg source ──────────────────────────────────────────────────
@@ -103,9 +100,11 @@ where
         Box::pin(async move {
             let source = PgSnapshotSource::open(&pg_cfg, &to_snapshot)
                 .await
-                .map_err(|e| LifecycleError::Snapshot(
-                    pg2iceberg_snapshot::SnapshotError::Source(format!("{e:#}")),
-                ))?;
+                .map_err(|e| {
+                    LifecycleError::Snapshot(pg2iceberg_snapshot::SnapshotError::Source(format!(
+                        "{e:#}"
+                    )))
+                })?;
             Ok::<Box<dyn pg2iceberg_snapshot::SnapshotSource>, LifecycleError>(Box::new(source))
         }) as SnapshotSourceFactoryFut
     });
@@ -151,6 +150,7 @@ where
 /// Query-mode equivalent of [`build_logical_lifecycle`]. Builds the
 /// prod components and packs them into a [`QueryLifecycle`] for the
 /// library helper to drive.
+#[allow(clippy::type_complexity)]
 pub async fn build_query_lifecycle<C>(
     cfg: &Config,
     catalog: IcebergRustCatalog<C>,
@@ -171,10 +171,7 @@ where
         .context("coord connect")?;
     let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
     let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
-    coord_concrete
-        .migrate()
-        .await
-        .context("coord migrate")?;
+    coord_concrete.migrate().await.context("coord migrate")?;
     let coord: Arc<dyn Coordinator> = coord_concrete;
 
     let pg_tls = match cfg.source.postgres.tls_label() {
@@ -255,13 +252,12 @@ where
     let poll_interval = if cfg.source.query.poll_interval.is_empty() {
         Duration::from_secs(30)
     } else {
-        humantime::parse_duration(&cfg.source.query.poll_interval)
-            .with_context(|| {
-                format!(
-                    "parse query.poll_interval `{}`",
-                    cfg.source.query.poll_interval
-                )
-            })?
+        humantime::parse_duration(&cfg.source.query.poll_interval).with_context(|| {
+            format!(
+                "parse query.poll_interval `{}`",
+                cfg.source.query.poll_interval
+            )
+        })?
     };
 
     Ok(QueryLifecycle {
@@ -285,10 +281,7 @@ pub(crate) async fn __discover_schemas_for_snapshot(
     discover_schemas(tables, pg).await
 }
 
-async fn discover_schemas(
-    tables: &[TableConfig],
-    pg: &PgClientImpl,
-) -> Result<Vec<TableSchema>> {
+async fn discover_schemas(tables: &[TableConfig], pg: &PgClientImpl) -> Result<Vec<TableSchema>> {
     let mut resolved: Vec<TableSchema> = Vec::with_capacity(tables.len());
     for t in tables {
         let schema = if t.has_explicit_columns() {

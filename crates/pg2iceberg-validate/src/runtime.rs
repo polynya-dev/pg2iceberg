@@ -23,9 +23,7 @@
 use crate::watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
 use crate::{validate_startup, SlotState, StartupValidation, TableExistence};
 use pg2iceberg_coord::Coordinator;
-use pg2iceberg_core::{
-    Clock, IdGen, Lsn, Mode, TableIdent, TableSchema, Timestamp, WorkerId,
-};
+use pg2iceberg_core::{Clock, IdGen, Lsn, Mode, TableIdent, TableSchema, Timestamp, WorkerId};
 use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
 use pg2iceberg_logical::{
     materializer::MaterializerNamer,
@@ -162,6 +160,7 @@ pub type MainLoopError = LifecycleError;
 /// then call the same lifecycle function. Slot setup, table
 /// registration, consumer heartbeat, snapshot phase, main loop, and
 /// shutdown drain are *all* in the helper.
+#[allow(clippy::type_complexity)]
 pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// Source PG. Used for slot existence check, publication creation,
     /// slot creation, and `start_replication`.
@@ -202,8 +201,7 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// binary's factory builds a `PgSnapshotSource`; the DST's factory
     /// returns the harness's `SimPostgres` clone wrapped as a trait
     /// object.
-    pub snapshot_source_factory:
-        Box<dyn FnOnce(&[TableSchema]) -> SnapshotSourceFactoryFut + Send>,
+    pub snapshot_source_factory: Box<dyn FnOnce(&[TableSchema]) -> SnapshotSourceFactoryFut + Send>,
     /// Materializer namer. Prod uses `CounterMaterializerNamer`
     /// (counter-suffixed); tests can pass a deterministic namer.
     pub materializer_namer: Arc<dyn MaterializerNamer>,
@@ -229,12 +227,8 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
 /// Boxed future returning the snapshot source. Awkward but unavoidable
 /// — we want the factory to be async (PG snapshot tx setup is async)
 /// AND to be `dyn`-callable.
-pub type SnapshotSourceFactoryFut = std::pin::Pin<
-    Box<
-        dyn Future<Output = Result<Box<dyn SnapshotSource>, LifecycleError>>
-            + Send,
-    >,
->;
+pub type SnapshotSourceFactoryFut =
+    std::pin::Pin<Box<dyn Future<Output = Result<Box<dyn SnapshotSource>, LifecycleError>> + Send>>;
 
 /// Run the *complete* logical-replication lifecycle from already-built
 /// IO components to clean shutdown. Steps:
@@ -274,7 +268,10 @@ where
     //    which case the stamp + check both no-op.
     let connected_system_id = lc.pg.identify_system_id().await?;
     if connected_system_id != 0 {
-        tracing::info!(system_id = connected_system_id, "source cluster fingerprinted");
+        tracing::info!(
+            system_id = connected_system_id,
+            "source cluster fingerprinted"
+        );
         // Stamp once at startup. Idempotent: matching value is a
         // no-op; mismatch returns SystemIdMismatch and we fail fast
         // before any data writes happen.
@@ -391,10 +388,8 @@ where
         // Enable meta-marker emission. The materializer creates the
         // meta-marker Iceberg table in `<meta_namespace>.markers`
         // if missing.
-        let meta_schema = pg2iceberg_logical::materializer::meta_marker_table_schema(
-            meta_ns,
-            "markers",
-        );
+        let meta_schema =
+            pg2iceberg_logical::materializer::meta_marker_table_schema(meta_ns, "markers");
         materializer
             .enable_meta_markers(meta_schema)
             .await
@@ -416,7 +411,12 @@ where
     // 4. Consumer heartbeat.
     let worker_id = WorkerId(format!(
         "lifecycle-{}",
-        lc.id_gen.new_uuid().iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()
+        lc.id_gen
+            .new_uuid()
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     ));
     lc.coord
         .register_consumer(&lc.group, &worker_id, lc.consumer_ttl)
@@ -568,10 +568,7 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
             .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
         let iceberg_name = format!("{}.{}", schema.ident.namespace, schema.ident.name);
         let pg_oid = pg
-            .table_oid(
-                &schema.ident.namespace.0.join("."),
-                &schema.ident.name,
-            )
+            .table_oid(&schema.ident.namespace.0.join("."), &schema.ident.name)
             .await?;
         // Per-table snapshot state from `_pg2iceberg.tables`. Cheap
         // single-row reads — one per registered table at startup.
@@ -782,11 +779,9 @@ where
         Handler::Materialize => {
             // `cycle` failure is fatal (propagates); compaction
             // failure is captured in the outcome and only logged.
-            let outcome = run_materialize_tick(
-                &mut loop_state.materializer,
-                loop_state.compaction.as_ref(),
-            )
-            .await?;
+            let outcome =
+                run_materialize_tick(&mut loop_state.materializer, loop_state.compaction.as_ref())
+                    .await?;
             if let Some(err) = outcome.compaction_error {
                 tracing::warn!(error = %err, "materializer.compact_cycle failed");
             }
@@ -814,10 +809,7 @@ where
                 .unwrap_or(Lsn::ZERO);
             let wal_status = health.as_ref().and_then(|h| h.wal_status);
             let safe_wal_size = health.as_ref().and_then(|h| h.safe_wal_size);
-            let restart_lsn = health
-                .as_ref()
-                .map(|h| h.restart_lsn)
-                .unwrap_or(Lsn::ZERO);
+            let restart_lsn = health.as_ref().map(|h| h.restart_lsn).unwrap_or(Lsn::ZERO);
             let conflicting = health.as_ref().map(|h| h.conflicting).unwrap_or(false);
             let violations = run_watcher_tick(
                 &loop_state.watcher,

@@ -213,8 +213,14 @@ fn cycle_table_records_commits_row_with_user_table_stats() {
     let r = &commits[0];
 
     // Stats that must reflect the user-table commit.
-    assert_eq!(r.get(&ColumnName("table_name".into())), Some(&PgValue::Text("public.orders".into())));
-    assert_eq!(r.get(&ColumnName("mode".into())), Some(&PgValue::Text("logical".into())));
+    assert_eq!(
+        r.get(&ColumnName("table_name".into())),
+        Some(&PgValue::Text("public.orders".into()))
+    );
+    assert_eq!(
+        r.get(&ColumnName("mode".into())),
+        Some(&PgValue::Text("logical".into()))
+    );
     assert_eq!(r.get(&ColumnName("rows".into())), Some(&PgValue::Int8(3)));
     // Worker id stamped from `enable_meta_recording`.
     assert_eq!(
@@ -231,7 +237,10 @@ fn cycle_table_records_commits_row_with_user_table_stats() {
         other => panic!("expected Int8, got {other:?}"),
     };
     assert!(snap > 0, "snapshot_id must be a real catalog id");
-    assert_eq!(snap, seq, "Rust port collapses snapshot_id and sequence_number");
+    assert_eq!(
+        snap, seq,
+        "Rust port collapses snapshot_id and sequence_number"
+    );
 
     // Optional fields populated when nonzero.
     if let Some(PgValue::Int8(lsn)) = r.get(&ColumnName("lsn".into())) {
@@ -253,7 +262,11 @@ fn multiple_cycles_produce_one_commits_row_each() {
         h.drive_then_materialize();
     }
     let commits = h.read_meta_table("commits");
-    assert_eq!(commits.len(), 3, "one row per cycle, three cycles → three rows");
+    assert_eq!(
+        commits.len(),
+        3,
+        "one row per cycle, three cycles → three rows"
+    );
 }
 
 // ── 4. expire_cycle records a maintenance row ────────────────────────
@@ -324,11 +337,10 @@ fn cleanup_orphans_cycle_records_maintenance_row() {
     // grace=0 means "treat everything as old enough to delete"; we
     // pass now_ms much larger than the orphan's mtime so it's
     // definitely past grace.
-    let _ = block_on(h.materializer.cleanup_orphans_cycle(
-        "materialized",
-        i64::MAX / 2,
-        0,
-    ))
+    let _ = block_on(
+        h.materializer
+            .cleanup_orphans_cycle("materialized", i64::MAX / 2, 0),
+    )
     .unwrap();
 
     let maint = h.read_meta_table("maintenance");
@@ -372,7 +384,10 @@ fn record_checkpoint_buffers_then_flushes_via_explicit_flush_meta() {
     let checkpoints = h.read_meta_table("checkpoints");
     assert_eq!(checkpoints.len(), 1);
     let r = &checkpoints[0];
-    assert_eq!(r.get(&ColumnName("lsn".into())), Some(&PgValue::Int8(12345)));
+    assert_eq!(
+        r.get(&ColumnName("lsn".into())),
+        Some(&PgValue::Int8(12345))
+    );
     assert_eq!(
         r.get(&ColumnName("worker_id".into())),
         Some(&PgValue::Text("worker-1".into())),
@@ -398,7 +413,10 @@ fn flush_meta_no_op_when_buffers_empty() {
             name: name.into(),
         }))
         .unwrap();
-        assert!(snaps.is_empty(), "no commits should have been written to {name}");
+        assert!(
+            snaps.is_empty(),
+            "no commits should have been written to {name}"
+        );
     }
 }
 

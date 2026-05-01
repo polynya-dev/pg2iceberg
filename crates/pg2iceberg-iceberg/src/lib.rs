@@ -341,7 +341,10 @@ mod schema_change_tests {
     #[test]
     fn illegal_promotions_rejected() {
         // Narrowing
-        assert!(!is_legal_type_promotion(IcebergType::Long, IcebergType::Int));
+        assert!(!is_legal_type_promotion(
+            IcebergType::Long,
+            IcebergType::Int
+        ));
         assert!(!is_legal_type_promotion(
             IcebergType::Double,
             IcebergType::Float

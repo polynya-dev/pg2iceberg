@@ -26,9 +26,7 @@
 use std::sync::Arc;
 
 use pg2iceberg_coord::TableSnapshotState;
-use pg2iceberg_core::{
-    ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema,
-};
+use pg2iceberg_core::{ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema};
 use pg2iceberg_sim::postgres::{SimPgClient, SimPostgres};
 use pg2iceberg_validate::{
     validate_startup, SlotState, StartupValidation, TableExistence, Violation,
@@ -150,8 +148,7 @@ fn drop_recreate_table_fires_table_identity_changed() {
 
     // Stage per-table state that says "we snapshotted at original_oid."
     let v = block_on(build_startup(&db, Some(complete_state(original_oid))));
-    let err =
-        validate_startup(&v).expect_err("identity change must fail validation");
+    let err = validate_startup(&v).expect_err("identity change must fail validation");
 
     assert!(
         err.violations.iter().any(|x| matches!(
@@ -177,8 +174,7 @@ fn drop_table_from_publication_fires_table_missing_from_publication() {
     db.drop_table_from_publication(PUB, &ident()).unwrap();
 
     let v = block_on(build_startup(&db, Some(complete_state(oid))));
-    let err = validate_startup(&v)
-        .expect_err("publication membership drift must fail validation");
+    let err = validate_startup(&v).expect_err("publication membership drift must fail validation");
 
     assert!(
         err.violations.iter().any(|x| matches!(

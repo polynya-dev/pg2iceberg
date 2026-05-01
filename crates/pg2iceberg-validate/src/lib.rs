@@ -161,10 +161,7 @@ pub enum Violation {
          and the slot cannot be resumed. drop the slot and the Iceberg tables, then \
          re-snapshot from scratch — there is no safe way to skip ahead"
     )]
-    SlotLost {
-        slot_name: String,
-        restart_lsn: Lsn,
-    },
+    SlotLost { slot_name: String, restart_lsn: Lsn },
 
     #[error(
         "replication slot {slot_name:?} is conflicting (killed by physical-replication \
@@ -336,9 +333,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     // 8. Slot is `lost` — WAL recycled past `max_slot_wal_keep_size`.
     //    `wal_status = None` (pre-PG-13) skips this check.
     if let Some(slot) = &v.slot {
-        if slot.exists
-            && matches!(slot.wal_status, Some(pg2iceberg_pg::WalStatus::Lost))
-        {
+        if slot.exists && matches!(slot.wal_status, Some(pg2iceberg_pg::WalStatus::Lost)) {
             violations.push(Violation::SlotLost {
                 slot_name: v.slot_name.clone(),
                 restart_lsn: slot.restart_lsn,
@@ -360,11 +355,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     //     skipped (legacy / first run). Identical to the old
     //     invariant 11; just sourced from per-table state now.
     for t in &v.tables {
-        let stored_oid = t
-            .stored_state
-            .as_ref()
-            .map(|s| s.pg_oid)
-            .unwrap_or(0);
+        let stored_oid = t.stored_state.as_ref().map(|s| s.pg_oid).unwrap_or(0);
         if stored_oid == 0 {
             continue;
         }

@@ -75,9 +75,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     match cfg.source.mode.as_str() {
         "" | "logical" => run_inner(cfg, catalog, blob).await,
         "query" => run_query(cfg, catalog, blob).await,
-        other => anyhow::bail!(
-            "unknown source.mode {other:?}; expected one of: logical, query"
-        ),
+        other => anyhow::bail!("unknown source.mode {other:?}; expected one of: logical, query"),
     }
 }
 
@@ -274,7 +272,7 @@ pub async fn run_stream_only(cfg: Config) -> Result<()> {
     let blob = build_blob_for_run(&cfg, &catalog)
         .await
         .context("build blob store")?;
-    if cfg.source.mode != "" && cfg.source.mode != "logical" {
+    if !cfg.source.mode.is_empty() && cfg.source.mode != "logical" {
         anyhow::bail!(
             "stream-only is logical-mode only; got source.mode={:?}",
             cfg.source.mode
@@ -293,8 +291,8 @@ pub async fn run_stream_only(cfg: Config) -> Result<()> {
     .await
 }
 
-/// Distributed mode: materializer worker only. Builds catalog + coord
-/// + materializer, registers tables, enables distributed mode with
+/// Distributed mode: materializer worker only. Builds catalog, coord,
+/// and materializer, registers tables, enables distributed mode with
 /// the operator-supplied `worker_id`, and loops `cycle()` on the
 /// configured interval. **No PG replication slot is opened** —
 /// staged parquet comes from the coord log written by a paired
@@ -400,19 +398,16 @@ where
     let id_gen = Arc::new(crate::realio::RealIdGen::new());
     let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
         Arc::new(UuidBlobNamer::new(id_gen.clone(), "staged"));
-    let mut lifecycle =
-        crate::setup::build_logical_lifecycle(&cfg, catalog, blob, blob_namer)
-            .await
-            .context("build logical lifecycle")?;
+    let mut lifecycle = crate::setup::build_logical_lifecycle(&cfg, catalog, blob, blob_namer)
+        .await
+        .context("build logical lifecycle")?;
     if let Some(d) = materialize_override {
         // Stream-only: bump the materialize handler interval so far
         // out it never fires. Keeps the shape of the lifecycle the
         // same — slot management, snapshot phase, flush, standby,
         // watcher all run normally.
         lifecycle.schedule.materialize = d;
-        tracing::info!(
-            "stream-only mode: materializer cycle disabled (interval set to {d:?})"
-        );
+        tracing::info!("stream-only mode: materializer cycle disabled (interval set to {d:?})");
     }
 
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
@@ -431,7 +426,6 @@ where
         .context("logical lifecycle")?;
     Ok(())
 }
-
 
 /// Query-mode driver. Polls each table for rows whose watermark
 /// column has advanced past the stored cursor, dedups by PK, writes
@@ -787,7 +781,6 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
     Ok(())
 }
 
-
 /// One-shot: drop the replication slot, drop the publication, and
 /// drop the coordinator schema (CASCADE). Mirrors Go's
 /// `--cleanup`. Idempotent per resource — a missing slot /
@@ -988,9 +981,8 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
         }
     }
 
-    let mat_namer = Arc::new(
-        pg2iceberg_logical::materializer::CounterMaterializerNamer::new("materialized"),
-    );
+    let mat_namer =
+        Arc::new(pg2iceberg_logical::materializer::CounterMaterializerNamer::new("materialized"));
     let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
         Materializer::new(
             Arc::clone(&coord),
@@ -1064,7 +1056,6 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

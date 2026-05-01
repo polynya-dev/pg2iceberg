@@ -21,9 +21,7 @@ use crate::buffer::Buffer;
 use crate::{watermark_compare, QueryError, WatermarkSource};
 use bytes::Bytes;
 use pg2iceberg_coord::{CoordError, Coordinator};
-use pg2iceberg_core::{
-    ColumnName, PgValue, TableIdent, TableSchema,
-};
+use pg2iceberg_core::{ColumnName, PgValue, TableIdent, TableSchema};
 use pg2iceberg_iceberg::{
     promote_re_inserts, rebuild_from_catalog, Catalog, DataFile, FileIndex, IcebergError,
     PreparedCommit, TableWriter, WriterError,

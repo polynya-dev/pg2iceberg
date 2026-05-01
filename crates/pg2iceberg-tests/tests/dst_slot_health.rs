@@ -30,9 +30,7 @@
 use std::sync::Arc;
 
 use pg2iceberg_coord::TableSnapshotState;
-use pg2iceberg_core::{
-    ColumnName, ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema,
-};
+use pg2iceberg_core::{ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema};
 use pg2iceberg_pg::WalStatus;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
@@ -72,10 +70,7 @@ fn schema() -> TableSchema {
 /// instantiating the full LogicalLifecycle. Goes through
 /// `slot_health_for_watcher` → `slot_health` so the SimPgClient
 /// trait wiring is exercised end-to-end.
-async fn build_startup_validation(
-    db: &SimPostgres,
-    slot_name: &str,
-) -> StartupValidation {
+async fn build_startup_validation(db: &SimPostgres, slot_name: &str) -> StartupValidation {
     let pg = SimPgClient::new(db.clone());
     let pg_arc: Arc<dyn pg2iceberg_pg::PgClient> = Arc::new(pg);
 
@@ -114,10 +109,7 @@ async fn build_startup_validation(
             existed: true,
             current_snapshot_id: Some(1),
             current_pg_oid: db.table_oid(&ident()),
-            in_publication: db
-                .publication_tables(PUB)
-                .into_iter()
-                .any(|t| t == ident()),
+            in_publication: db.publication_tables(PUB).into_iter().any(|t| t == ident()),
             stored_state: stored,
         }],
         slot,
@@ -185,7 +177,8 @@ fn unreserved_slot_does_not_fail_startup_but_emits_watcher_warning() {
     db.create_table(schema()).unwrap();
     db.create_publication(PUB, &[ident()]).unwrap();
     db.create_slot(SLOT, PUB).unwrap();
-    db.set_slot_wal_status(SLOT, SimWalStatus::Unreserved).unwrap();
+    db.set_slot_wal_status(SLOT, SimWalStatus::Unreserved)
+        .unwrap();
 
     // Startup: must NOT fail on unreserved alone.
     let v = block_on(build_startup_validation(&db, SLOT));
@@ -210,10 +203,7 @@ fn unreserved_slot_does_not_fail_startup_but_emits_watcher_warning() {
     ));
     let metrics: Arc<dyn pg2iceberg_core::Metrics> =
         Arc::new(pg2iceberg_core::InMemoryMetrics::new());
-    let watcher = InvariantWatcher::new(
-        coord as Arc<dyn pg2iceberg_coord::Coordinator>,
-        metrics,
-    );
+    let watcher = InvariantWatcher::new(coord as Arc<dyn pg2iceberg_coord::Coordinator>, metrics);
 
     let violations = block_on(run_watcher_tick(
         &watcher,
@@ -267,10 +257,7 @@ fn reserved_slot_passes_both_startup_and_watcher() {
     ));
     let metrics: Arc<dyn pg2iceberg_core::Metrics> =
         Arc::new(pg2iceberg_core::InMemoryMetrics::new());
-    let watcher = InvariantWatcher::new(
-        coord as Arc<dyn pg2iceberg_coord::Coordinator>,
-        metrics,
-    );
+    let watcher = InvariantWatcher::new(coord as Arc<dyn pg2iceberg_coord::Coordinator>, metrics);
 
     let violations = block_on(run_watcher_tick(
         &watcher,
@@ -304,10 +291,7 @@ fn fresh_watcher() -> InvariantWatcher {
     ));
     let metrics: Arc<dyn pg2iceberg_core::Metrics> =
         Arc::new(pg2iceberg_core::InMemoryMetrics::new());
-    InvariantWatcher::new(
-        coord as Arc<dyn pg2iceberg_coord::Coordinator>,
-        metrics,
-    )
+    InvariantWatcher::new(coord as Arc<dyn pg2iceberg_coord::Coordinator>, metrics)
 }
 
 #[test]
@@ -400,7 +384,8 @@ fn unreserved_violation_is_not_fatal() {
     db.create_table(schema()).unwrap();
     db.create_publication(PUB, &[ident()]).unwrap();
     db.create_slot(SLOT, PUB).unwrap();
-    db.set_slot_wal_status(SLOT, SimWalStatus::Unreserved).unwrap();
+    db.set_slot_wal_status(SLOT, SimWalStatus::Unreserved)
+        .unwrap();
 
     let pg: Arc<dyn pg2iceberg_pg::SlotMonitor> = Arc::new(SimPgClient::new(db.clone()));
     let health = block_on(pg.slot_health_for_watcher(SLOT))

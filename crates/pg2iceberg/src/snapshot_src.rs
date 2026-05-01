@@ -60,9 +60,7 @@ use pg2iceberg_core::value::{
 };
 use pg2iceberg_core::{ColumnName, ColumnSchema, Lsn, Row, TableIdent, TableSchema};
 use pg2iceberg_pg::prod::value_decode::decode_text;
-use pg2iceberg_query::{
-    QueryError, Result as QueryResult, WatermarkSource,
-};
+use pg2iceberg_query::{QueryError, Result as QueryResult, WatermarkSource};
 use pg2iceberg_snapshot::{Result as SnapshotResult, SnapshotError, SnapshotSource};
 use std::collections::BTreeMap;
 use tokio::sync::Mutex;
@@ -121,7 +119,8 @@ impl PgSnapshotSource {
             .await
             .context("pg_current_wal_lsn (pre-BEGIN fence)")?
             .ok_or_else(|| anyhow::anyhow!("pg_current_wal_lsn returned no rows"))?;
-        let snapshot_lsn = parse_lsn(&lsn_text).with_context(|| format!("parse LSN {lsn_text:?}"))?;
+        let snapshot_lsn =
+            parse_lsn(&lsn_text).with_context(|| format!("parse LSN {lsn_text:?}"))?;
         // BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY locks in a
         // consistent view for every read_chunk call. Any tx that
         // committed in `[snap_lsn, BEGIN-time]` is in the view.
@@ -213,7 +212,7 @@ impl SnapshotSource for PgSnapshotSource {
                 .iter()
                 .map(pg_value_to_sql_literal)
                 .collect::<std::result::Result<_, _>>()
-                .map_err(|e| SnapshotError::Source(e))?;
+                .map_err(SnapshotError::Source)?;
             format!(
                 " WHERE ({pk}) > ({vals})",
                 pk = pk_csv,
@@ -391,9 +390,7 @@ fn format_decimal(d: &CoreDecimal) -> std::result::Result<String, String> {
     let mut buf = [0u8; 16];
     let sign = d.unscaled_be_bytes[0] & 0x80;
     let pad = if sign != 0 { 0xFF } else { 0x00 };
-    for b in &mut buf {
-        *b = pad;
-    }
+    buf.fill(pad);
     let off = 16 - d.unscaled_be_bytes.len();
     buf[off..].copy_from_slice(&d.unscaled_be_bytes);
     let unscaled = i128::from_be_bytes(buf);
@@ -416,7 +413,7 @@ fn format_decimal(d: &CoreDecimal) -> std::result::Result<String, String> {
 }
 
 fn format_time_of_day(micros: i64) -> String {
-    let secs = (micros / 1_000_000) as i64;
+    let secs = micros / 1_000_000;
     let frac_us = (micros % 1_000_000) as u32;
     let h = (secs / 3600) % 24;
     let m = (secs / 60) % 60;
@@ -449,7 +446,10 @@ fn format_timestamp(micros: i64) -> std::result::Result<String, String> {
     if frac_us == 0 {
         Ok(naive.format("%Y-%m-%d %H:%M:%S").to_string())
     } else {
-        Ok(format!("{}.{frac_us:06}", naive.format("%Y-%m-%d %H:%M:%S")))
+        Ok(format!(
+            "{}.{frac_us:06}",
+            naive.format("%Y-%m-%d %H:%M:%S")
+        ))
     }
 }
 
@@ -529,10 +529,7 @@ impl PgWatermarkSource {
     /// must be one of: `int2`, `int4`, `int8`, `date`, `timestamp`,
     /// `timestamptz`. Other types fail at compare-time inside the
     /// query pipeline; we surface a clear error here at startup.
-    pub async fn open(
-        pg_cfg: &PostgresConfig,
-        tables: &[(TableSchema, String)],
-    ) -> Result<Self> {
+    pub async fn open(pg_cfg: &PostgresConfig, tables: &[(TableSchema, String)]) -> Result<Self> {
         let tls = match pg_cfg.tls_label() {
             "webpki" => CoordTls::Webpki,
             _ => CoordTls::Disable,
@@ -617,9 +614,8 @@ impl WatermarkSource for PgWatermarkSource {
         let wm_ident = quote_ident(watermark_col);
 
         let where_sql = if let Some(v) = after {
-            let lit = pg_value_to_sql_literal(v).map_err(|e| {
-                QueryError::Source(format!("watermark literal encode: {e}"))
-            })?;
+            let lit = pg_value_to_sql_literal(v)
+                .map_err(|e| QueryError::Source(format!("watermark literal encode: {e}")))?;
             format!(" WHERE {wm_ident} > {lit}")
         } else {
             // Skip rows where the watermark column is NULL — matches
@@ -658,16 +654,13 @@ impl WatermarkSource for PgWatermarkSource {
                     })?;
                     let value = match raw {
                         None => PgValue::Null,
-                        Some(s) => decode_text(
-                            iceberg_to_pg_type_for_decode(col.ty),
-                            s.as_bytes(),
-                        )
-                        .map_err(|e| {
-                            QueryError::Source(format!(
-                                "decode {} ({:?}) from {s:?}: {e}",
-                                col.name, col.ty
-                            ))
-                        })?,
+                        Some(s) => decode_text(iceberg_to_pg_type_for_decode(col.ty), s.as_bytes())
+                            .map_err(|e| {
+                                QueryError::Source(format!(
+                                    "decode {} ({:?}) from {s:?}: {e}",
+                                    col.name, col.ty
+                                ))
+                            })?,
                     };
                     decoded.insert(ColumnName(col.name.clone()), value);
                 }
@@ -747,7 +740,10 @@ mod tests {
     fn parse_lsn_round_trips() {
         assert_eq!(parse_lsn("0/0").unwrap().0, 0);
         assert_eq!(parse_lsn("1/0").unwrap().0, 0x1_0000_0000);
-        assert_eq!(parse_lsn("12345678/9ABCDEF0").unwrap().0, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(
+            parse_lsn("12345678/9ABCDEF0").unwrap().0,
+            0x1234_5678_9ABC_DEF0
+        );
         assert!(parse_lsn("oops").is_err());
     }
 }

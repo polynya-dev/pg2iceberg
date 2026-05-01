@@ -32,10 +32,7 @@
 
 use async_trait::async_trait;
 use pg2iceberg_coord::Coordinator;
-use pg2iceberg_core::{
-    ChangeEvent, ColumnName, Lsn, Op, Row, TableIdent,
-    TableSchema, Timestamp,
-};
+use pg2iceberg_core::{ChangeEvent, ColumnName, Lsn, Op, Row, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{pk_key, Catalog};
 use pg2iceberg_logical::{Pipeline, PipelineError};
 use pg2iceberg_pg::DecodedMessage;
@@ -296,9 +293,12 @@ impl Snapshotter {
             // Skip tables already complete from a prior pass. Cheap
             // single-row read; avoids re-reading the source for
             // already-snapshotted data.
-            if let Some(state) = self.coord.table_state(&schema.ident).await.map_err(
-                |e| SnapshotError::Source(format!("table_state: {e}")),
-            )? {
+            if let Some(state) = self
+                .coord
+                .table_state(&schema.ident)
+                .await
+                .map_err(|e| SnapshotError::Source(format!("table_state: {e}")))?
+            {
                 if state.snapshot_complete {
                     continue;
                 }
@@ -339,9 +339,7 @@ impl Snapshotter {
                         .mark_table_snapshot_complete(&schema.ident, oid, snap_lsn)
                         .await
                         .map_err(|e| {
-                            SnapshotError::Source(format!(
-                                "mark_table_snapshot_complete: {e}"
-                            ))
+                            SnapshotError::Source(format!("mark_table_snapshot_complete: {e}"))
                         })?;
                     break;
                 }
@@ -403,7 +401,6 @@ impl Snapshotter {
     }
 }
 
-
 /// Outcome of [`run_snapshot_phase`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotPhaseOutcome {
@@ -434,6 +431,7 @@ pub enum SnapshotPhaseOutcome {
 /// **What this function does not do** (caller's responsibility):
 /// - `stream.send_standby(snap_lsn, snap_lsn)` to advance the slot.
 /// - `materializer.cycle()` to publish snapshot rows to Iceberg.
+///
 /// These are tied to the caller's replication-stream and materializer
 /// types, which the snapshot crate doesn't depend on.
 ///

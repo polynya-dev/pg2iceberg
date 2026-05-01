@@ -224,8 +224,7 @@ pub trait PgClient: Send + Sync {
     /// removed a tracked table from the publication mid-run — any
     /// DML during the gap was filtered by the slot, so re-adding
     /// the table requires a full re-snapshot.
-    async fn publication_tables(&self, publication_name: &str)
-        -> Result<Vec<TableIdent>>;
+    async fn publication_tables(&self, publication_name: &str) -> Result<Vec<TableIdent>>;
 
     /// Combined slot health probe. Returns the `restart_lsn`,
     /// `confirmed_flush_lsn`, `wal_status`, `conflicting`, and

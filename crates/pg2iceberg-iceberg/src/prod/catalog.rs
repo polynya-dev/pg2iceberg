@@ -111,7 +111,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             // greenfield deployments.
             Err(e)
                 if e.kind() == ErrorKind::Unexpected
-                    && e.message().contains("Tried to load a table that does not exist") =>
+                    && e.message()
+                        .contains("Tried to load a table that does not exist") =>
             {
                 Ok(None)
             }

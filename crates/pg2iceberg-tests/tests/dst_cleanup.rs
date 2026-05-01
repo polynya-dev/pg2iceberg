@@ -45,7 +45,10 @@ fn fresh_client() -> SimPgClient {
 #[test]
 fn drop_slot_removes_existing_slot() {
     let client = fresh_client();
-    assert!(block_on(client.slot_exists(SLOT)).unwrap(), "seed slot exists");
+    assert!(
+        block_on(client.slot_exists(SLOT)).unwrap(),
+        "seed slot exists"
+    );
     block_on(client.drop_slot(SLOT)).unwrap();
     assert!(
         !block_on(client.slot_exists(SLOT)).unwrap(),

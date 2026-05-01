@@ -57,18 +57,14 @@ async fn shared_pg() -> &'static SharedPg {
             .start()
             .await
             .expect("start postgres container");
-        let host = container
-            .get_host()
-            .await
-            .expect("postgres host");
+        let host = container.get_host().await.expect("postgres host");
         let port = container
             .get_host_port_ipv4(5432)
             .await
             .expect("postgres port");
         // testcontainers-modules' Postgres defaults: db=postgres, user=postgres, password=postgres
-        let dsn = format!(
-            "host={host} port={port} user=postgres password=postgres dbname=postgres"
-        );
+        let dsn =
+            format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
         SharedPg {
             _container: container,
             dsn,
@@ -213,10 +209,7 @@ async fn truncate_log_returns_paths_and_drops_rows() {
         .await
         .unwrap();
 
-    let dropped = coord
-        .truncate_log(&t, 2)
-        .await
-        .expect("truncate_log");
+    let dropped = coord.truncate_log(&t, 2).await.expect("truncate_log");
     assert_eq!(dropped, vec!["s3://b/a.parquet".to_string()]);
 
     let remaining = coord.read_log(&t, 0, 16).await.unwrap();
@@ -285,17 +278,32 @@ async fn lock_try_renew_release_round_trip() {
     let w1 = WorkerId("w1".into());
     let w2 = WorkerId("w2".into());
 
-    assert!(coord.try_lock(&t, &w1, Duration::from_secs(60)).await.unwrap());
+    assert!(coord
+        .try_lock(&t, &w1, Duration::from_secs(60))
+        .await
+        .unwrap());
     // w2 cannot grab a held lock.
-    assert!(!coord.try_lock(&t, &w2, Duration::from_secs(60)).await.unwrap());
+    assert!(!coord
+        .try_lock(&t, &w2, Duration::from_secs(60))
+        .await
+        .unwrap());
     // w1 renews its own lock.
-    assert!(coord.renew_lock(&t, &w1, Duration::from_secs(60)).await.unwrap());
+    assert!(coord
+        .renew_lock(&t, &w1, Duration::from_secs(60))
+        .await
+        .unwrap());
     // w2 cannot renew someone else's.
-    assert!(!coord.renew_lock(&t, &w2, Duration::from_secs(60)).await.unwrap());
+    assert!(!coord
+        .renew_lock(&t, &w2, Duration::from_secs(60))
+        .await
+        .unwrap());
 
     coord.release_lock(&t, &w1).await.unwrap();
     // After release, w2 can acquire.
-    assert!(coord.try_lock(&t, &w2, Duration::from_secs(60)).await.unwrap());
+    assert!(coord
+        .try_lock(&t, &w2, Duration::from_secs(60))
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
@@ -317,7 +325,10 @@ async fn pipeline_meta_round_trip() {
         .unwrap_err();
     assert!(matches!(
         err,
-        pg2iceberg_coord::CoordError::SystemIdMismatch { stored: 7777, connected: 8888 }
+        pg2iceberg_coord::CoordError::SystemIdMismatch {
+            stored: 7777,
+            connected: 8888
+        }
     ));
     assert_eq!(coord.pipeline_system_identifier().await.unwrap(), 7777);
 }

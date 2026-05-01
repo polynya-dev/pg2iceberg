@@ -35,12 +35,12 @@ use pg2iceberg_core::{ColumnName, Namespace, PgValue, TableIdent};
 use pg2iceberg_iceberg::{prod::IcebergRustCatalog, read_materialized_state};
 use pg2iceberg_stream::prod::ObjectStoreBlobStore;
 use testcontainers::core::IntoContainerPort;
+use testcontainers::core::WaitFor;
 use testcontainers::{GenericImage, ImageExt};
 use testcontainers_modules::minio::MinIO;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers::core::WaitFor;
 
 /// Create a bucket by exec'ing `mc` inside a transient minio/mc
 /// container attached to the same docker network as the MinIO
@@ -95,10 +95,7 @@ async fn bring_up_stack() -> Stack {
         .await
         .expect("start minio");
     let minio_host = minio.get_host().await.expect("minio host").to_string();
-    let minio_port = minio
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("minio port");
+    let minio_port = minio.get_host_port_ipv4(9000).await.expect("minio port");
 
     // Create the warehouse bucket via `mc`. Sidecar exits 0 on
     // success; AsyncRunner blocks until the wait_for resolves.
@@ -126,10 +123,7 @@ async fn bring_up_stack() -> Stack {
         .await
         .expect("start iceberg-rest");
     let rest_host = rest.get_host().await.expect("rest host").to_string();
-    let rest_port = rest
-        .get_host_port_ipv4(8181)
-        .await
-        .expect("rest port");
+    let rest_port = rest.get_host_port_ipv4(8181).await.expect("rest port");
     let rest_url = format!("http://{rest_host}:{rest_port}");
 
     // ── Source PG ────────────────────────────────────────────────
@@ -153,13 +147,9 @@ async fn bring_up_stack() -> Stack {
         .await
         .expect("start source pg");
     let pg_host = src_pg.get_host().await.expect("pg host").to_string();
-    let pg_port = src_pg
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("pg port");
-    let pg_dsn = format!(
-        "host={pg_host} port={pg_port} user=postgres password=postgres dbname=postgres"
-    );
+    let pg_port = src_pg.get_host_port_ipv4(5432).await.expect("pg port");
+    let pg_dsn =
+        format!("host={pg_host} port={pg_port} user=postgres password=postgres dbname=postgres");
 
     Stack {
         network,
@@ -186,12 +176,16 @@ async fn regular_client(dsn: &str) -> tokio_postgres::Client {
 
 /// Build a `Config` that points at the live containers.
 fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -> Config {
-    let pg_host = stack.pg_dsn.split_whitespace().find_map(|kv| {
-        kv.strip_prefix("host=").map(str::to_string)
-    }).unwrap();
-    let pg_port: u16 = stack.pg_dsn.split_whitespace().find_map(|kv| {
-        kv.strip_prefix("port=").and_then(|p| p.parse().ok())
-    }).unwrap();
+    let pg_host = stack
+        .pg_dsn
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("host=").map(str::to_string))
+        .unwrap();
+    let pg_port: u16 = stack
+        .pg_dsn
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("port=").and_then(|p| p.parse().ok()))
+        .unwrap();
     Config {
         tables: vec![TableConfig {
             name: format!("public.{table}"),
@@ -264,8 +258,7 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
     // invocations in the same process don't conflict.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .with_test_writer()
         .try_init();
@@ -346,8 +339,7 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
     let shutdown_fut = Box::pin(async move {
         let _ = shutdown_rx.await;
     });
-    let lifecycle_fut =
-        pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown_fut);
+    let lifecycle_fut = pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown_fut);
 
     let ident = TableIdent {
         namespace: Namespace(vec!["public".into()]),
@@ -393,23 +385,16 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let mut last_count = 0usize;
         let visible = loop {
-            let attempt = read_materialized_state(
-                &assert_catalog,
-                blob.as_ref(),
-                &ident,
-                &schema,
-                &pk_cols,
-            )
-            .await;
+            let attempt =
+                read_materialized_state(&assert_catalog, blob.as_ref(), &ident, &schema, &pk_cols)
+                    .await;
             match attempt {
                 Ok(rows) if rows.len() >= 6 => break rows,
                 Ok(rows) => last_count = rows.len(),
                 Err(_) => {} // table may not exist yet
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for Iceberg materialization; last_count={last_count}"
-                );
+                panic!("timed out waiting for Iceberg materialization; last_count={last_count}");
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         };

@@ -35,17 +35,15 @@ use pg2iceberg_core::{
     ColumnName, ColumnSchema, Namespace, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
 use pg2iceberg_iceberg::read_materialized_state;
+use pg2iceberg_iceberg::CompactionConfig;
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{CounterMaterializerNamer, Materializer, Pipeline};
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
-use pg2iceberg_sim::fault::{
-    ops, FaultPlan, FaultyBlobStore, FaultyCatalog, FaultyCoordinator,
-};
+use pg2iceberg_sim::fault::{ops, FaultPlan, FaultyBlobStore, FaultyCatalog, FaultyCoordinator};
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
-use pg2iceberg_iceberg::CompactionConfig;
 use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome, Snapshotter};
 use pg2iceberg_validate::{
     run_logical_main_loop, run_materialize_tick, run_watcher_tick, InvariantWatcher, LogicalLoop,
@@ -270,7 +268,9 @@ fn assert_recovery(h: &mut FaultHarness) -> Result<(), String> {
     for _ in 0..16 {
         h.drive();
         h.try_flush().map_err(|e| format!("recovery flush: {e}"))?;
-        let n = h.try_materialize().map_err(|e| format!("recovery mat: {e}"))?;
+        let n = h
+            .try_materialize()
+            .map_err(|e| format!("recovery mat: {e}"))?;
         if n == 0 {
             break;
         }
@@ -285,10 +285,9 @@ fn assert_recovery(h: &mut FaultHarness) -> Result<(), String> {
     ))
     .map_err(|e| format!("read_materialized_state: {e}"))?;
     sort_by_pk(&mut iceberg_rows);
-    let mut pg_rows = h
-        .db
-        .read_table(&ident())
-        .map_err(|e| format!("read_table: {e}"))?;
+    let mut pg_rows =
+        h.db.read_table(&ident())
+            .map_err(|e| format!("read_table: {e}"))?;
     sort_by_pk(&mut pg_rows);
     if iceberg_rows != pg_rows {
         return Err(format!(
@@ -418,7 +417,11 @@ fn catalog_commit_snapshot_fault_makes_materializer_retryable() {
 
     // Cursor stayed at -1 — nothing got materialized.
     let cursor = block_on(h.coord_inner.get_cursor("default", &ident())).unwrap();
-    assert_eq!(cursor, Some(-1), "cursor must not advance on commit failure");
+    assert_eq!(
+        cursor,
+        Some(-1),
+        "cursor must not advance on commit failure"
+    );
 
     // Recovery: clear, materialize again, assert PG == Iceberg.
     assert_recovery(&mut h).unwrap();
@@ -593,7 +596,9 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
     sort_by_pk(&mut pg);
     assert_eq!(iceberg, pg, "all 10 rows visible in Iceberg after resume");
 
-    let state = block_on(h.coord_inner.table_state(&ident())).unwrap().unwrap();
+    let state = block_on(h.coord_inner.table_state(&ident()))
+        .unwrap()
+        .unwrap();
     assert!(
         state.snapshot_complete,
         "table state must have snapshot_complete=true after resume"
@@ -717,8 +722,9 @@ fn naive_continue_after_flush_failure_loses_events() {
     assert_eq!(pg.len(), 2, "PG has both rows");
     assert_eq!(iceberg.len(), 1, "Iceberg lost id=1 — durability hole");
     assert!(
-        iceberg.iter().all(|r| r.get(&ColumnName("id".into()))
-            != Some(&PgValue::Int4(1))),
+        iceberg
+            .iter()
+            .all(|r| r.get(&ColumnName("id".into())) != Some(&PgValue::Int4(1))),
         "id=1 must be missing from Iceberg in the naive-continue model"
     );
 }
@@ -733,8 +739,7 @@ fn naive_continue_after_flush_failure_loses_events() {
 // matching production behavior — that's a regression signal.
 
 #[test]
-fn binary_materialize_tick_with_compaction_under_blob_put_fault_keeps_replication_progressing()
-{
+fn binary_materialize_tick_with_compaction_under_blob_put_fault_keeps_replication_progressing() {
     // Wire a workload, fault the *compaction* PUT, and call the
     // exact helper the binary uses. Compaction failure must be
     // captured in `outcome.compaction_error` (not propagated as Err)
@@ -851,6 +856,7 @@ fn binary_materialize_tick_compaction_disabled_skips_compaction() {
 // injection automatically.
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
     // **The marker-row fence test.** Pre-seed rows into PG (commits
     // 1..=4 at LSNs L1..L4 < snap_lsn). After slot creation +
@@ -863,7 +869,7 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
     use pg2iceberg_core::{Mode, WorkerId};
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
-    use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
+    use pg2iceberg_validate::LogicalLifecycle;
     use std::time::Duration;
 
     let db = pg2iceberg_sim::postgres::SimPostgres::new();
@@ -905,7 +911,8 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
 
     let snapshot_db = db.clone();
     let snapshot_factory: Box<
-        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut + Send,
+        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut
+            + Send,
     > = Box::new(move |_schemas| {
         Box::pin(async move {
             Ok::<Box<dyn pg2iceberg_snapshot::SnapshotSource>, pg2iceberg_validate::LifecycleError>(
@@ -948,9 +955,8 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
         .enable_all()
         .build()
         .unwrap();
-    let outcome = rt.block_on(async move {
-        run_logical_main_loop_with_immediate_shutdown(lifecycle).await
-    });
+    let outcome =
+        rt.block_on(async move { run_logical_main_loop_with_immediate_shutdown(lifecycle).await });
     assert!(outcome.is_ok(), "lifecycle: {outcome:?}");
 
     // The fence proof: no log_index entries for the table beyond
@@ -993,6 +999,7 @@ where
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
     // The "duplicate-tolerant" fence test: simulate concurrent
     // writes that commit between the slot's consistent_point and
@@ -1025,7 +1032,8 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
     // > snap_lsn. The dedup must absorb the overlap.
     let snapshot_db = db.clone();
     let snapshot_factory: Box<
-        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut + Send,
+        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut
+            + Send,
     > = Box::new(move |_schemas| {
         Box::pin(async move {
             // Concurrent writes. These commit after the lifecycle's
@@ -1099,9 +1107,9 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async move {
-        run_logical_lifecycle(lifecycle, Box::pin(std::future::ready(()))).await
-    })
+    rt.block_on(
+        async move { run_logical_lifecycle(lifecycle, Box::pin(std::future::ready(()))).await },
+    )
     .expect("lifecycle should succeed");
 
     // The headline assertion: PG and Iceberg agree on row state, even
@@ -1126,6 +1134,7 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
     // Exercises the *complete* binary lifecycle via
     // `pg2iceberg_validate::run_logical_lifecycle` against sim
@@ -1176,7 +1185,8 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
 
     let snapshot_db = db.clone();
     let snapshot_factory: Box<
-        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut + Send,
+        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut
+            + Send,
     > = Box::new(move |_schemas| {
         Box::pin(async move {
             Ok::<Box<dyn pg2iceberg_snapshot::SnapshotSource>, pg2iceberg_validate::LifecycleError>(
@@ -1230,12 +1240,15 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
         db.slot_state("lifecycle-slot").is_ok(),
         "slot should exist after lifecycle creates it"
     );
-    let state = block_on(coord_inner.table_state(&ident())).unwrap().unwrap();
+    let state = block_on(coord_inner.table_state(&ident()))
+        .unwrap()
+        .unwrap();
     assert!(state.snapshot_complete);
 }
 
 #[test]
 #[ignore = "pending: requires deterministic IcebergSnapshot state setup; the lifecycle path itself is covered by the test above"]
+#[allow(clippy::type_complexity)]
 fn lifecycle_skips_snapshot_when_slot_already_exists() {
     // Replication slot already exists before lifecycle starts (the
     // "we're resuming" path). Lifecycle skips:
@@ -1278,12 +1291,8 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
         equality_deletes: vec![],
     }))
     .unwrap();
-    block_on(coord_inner.mark_table_snapshot_complete(
-        &ident(),
-        0,
-        pg2iceberg_core::Lsn(1),
-    ))
-    .unwrap();
+    block_on(coord_inner.mark_table_snapshot_complete(&ident(), 0, pg2iceberg_core::Lsn(1)))
+        .unwrap();
 
     let pg_client = Arc::new(SimPgClient::new(db.clone()));
     let pg: Arc<dyn pg2iceberg_pg::PgClient> = pg_client.clone();
@@ -1305,7 +1314,8 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
     let scfc = snapshot_factory_calls.clone();
     let snapshot_db = db.clone();
     let snapshot_factory: Box<
-        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut + Send,
+        dyn FnOnce(&[pg2iceberg_core::TableSchema]) -> pg2iceberg_validate::SnapshotSourceFactoryFut
+            + Send,
     > = Box::new(move |_| {
         scfc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
@@ -1364,7 +1374,7 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
 
 #[test]
 fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
-    use pg2iceberg_core::{Clock as _, InMemoryMetrics, Metrics, WorkerId};
+    use pg2iceberg_core::{InMemoryMetrics, Metrics, WorkerId};
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_pg::SlotMonitor;
     use pg2iceberg_sim::postgres::AsyncSimStream;
@@ -1391,19 +1401,13 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
     let async_stream = Box::new(AsyncSimStream::new(
         h.db.start_replication("slot-fault").unwrap(),
     ));
-    let clock: Arc<dyn pg2iceberg_core::Clock> =
-        Arc::new(pg2iceberg_sim::clock::TestClock::at(0));
+    let clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(pg2iceberg_sim::clock::TestClock::at(0));
     let slot_monitor: Arc<dyn SlotMonitor> = Arc::new(h.db.clone());
 
     let loop_state = LogicalLoop {
         pipeline: std::mem::replace(
             &mut h.pipeline,
-            pg2iceberg_logical::Pipeline::new(
-                h.coord.clone(),
-                h.blob.clone(),
-                h.namer.clone(),
-                64,
-            ),
+            pg2iceberg_logical::Pipeline::new(h.coord.clone(), h.blob.clone(), h.namer.clone(), 64),
         ),
         materializer: std::mem::replace(
             &mut h.materializer,
@@ -1411,7 +1415,9 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
                 h.coord.clone() as Arc<dyn Coordinator>,
                 h.blob.clone(),
                 h.catalog.clone(),
-                Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new("s3://drop")),
+                Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
+                    "s3://drop",
+                )),
                 "drop",
                 128,
             ),
@@ -1445,7 +1451,10 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
         run_logical_main_loop(loop_state, Box::pin(std::future::ready(()))).await
     });
     // Drain failures are non-fatal — logged but don't propagate.
-    assert!(outcome.is_ok(), "main loop should exit cleanly: {outcome:?}");
+    assert!(
+        outcome.is_ok(),
+        "main loop should exit cleanly: {outcome:?}"
+    );
 }
 
 #[test]

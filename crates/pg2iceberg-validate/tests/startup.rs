@@ -430,7 +430,9 @@ fn slot_advanced_externally_skipped_when_no_baseline() {
     let err = validate_startup(&v);
     if let Err(e) = err {
         assert!(
-            !e.violations.iter().any(|x| matches!(x, Violation::SlotAdvancedExternally { .. })),
+            !e.violations
+                .iter()
+                .any(|x| matches!(x, Violation::SlotAdvancedExternally { .. })),
             "tamper check must skip when coord_flushed_lsn is zero; got {:?}",
             e.violations
         );
@@ -456,7 +458,9 @@ fn slot_at_or_behind_coord_record_is_ok() {
     let err = validate_startup(&v);
     if let Err(e) = err {
         assert!(
-            !e.violations.iter().any(|x| matches!(x, Violation::SlotAdvancedExternally { .. })),
+            !e.violations
+                .iter()
+                .any(|x| matches!(x, Violation::SlotAdvancedExternally { .. })),
             "slot lagging coord must not trigger tamper; got {:?}",
             e.violations
         );

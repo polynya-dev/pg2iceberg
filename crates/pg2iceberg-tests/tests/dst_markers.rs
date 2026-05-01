@@ -117,6 +117,7 @@ fn marker_row(uuid: &str) -> Row {
 // namespace. Lets us spin up TWO of these against one DB to model
 // blue/green replicas.
 
+#[allow(dead_code)]
 struct Instance {
     name: &'static str,
     pipeline: Pipeline<MemoryCoordinator>,
@@ -278,13 +279,7 @@ fn marker_insert_is_filtered_from_user_data_staging() {
     db.create_table(markers_schema()).unwrap();
 
     // Boot first — slot's restart_lsn captures here.
-    let mut bg = Instance::boot(
-        "blue",
-        &db,
-        "blue-slot",
-        "blue-pub",
-        "_pg2iceberg_blue",
-    );
+    let mut bg = Instance::boot("blue", &db, "blue-slot", "blue-pub", "_pg2iceberg_blue");
 
     // All inserts AFTER boot so they ride the slot's WAL.
     let mut tx = db.begin_tx();
@@ -329,13 +324,7 @@ fn marker_triggers_immediate_flush_and_materialize_without_timer_tick() {
     db.create_table(accounts_schema()).unwrap();
     db.create_table(markers_schema()).unwrap();
 
-    let mut bg = Instance::boot(
-        "lone",
-        &db,
-        "lone-slot",
-        "lone-pub",
-        "_pg2iceberg_meta",
-    );
+    let mut bg = Instance::boot("lone", &db, "lone-slot", "lone-pub", "_pg2iceberg_meta");
 
     // Insert user data + marker after slot creation.
     let mut tx = db.begin_tx();
@@ -396,20 +385,8 @@ fn two_instances_emit_aligned_meta_markers_for_same_marker_uuid() {
 
     // Boot blue + green BEFORE any INSERTs so both slots capture
     // the same WAL window.
-    let mut blue = Instance::boot(
-        "blue",
-        &db,
-        "blue-slot",
-        "blue-pub",
-        "_pg2iceberg_blue",
-    );
-    let mut green = Instance::boot(
-        "green",
-        &db,
-        "green-slot",
-        "green-pub",
-        "_pg2iceberg_green",
-    );
+    let mut blue = Instance::boot("blue", &db, "blue-slot", "blue-pub", "_pg2iceberg_blue");
+    let mut green = Instance::boot("green", &db, "green-slot", "green-pub", "_pg2iceberg_green");
 
     // Workload: a few INSERTs, then a marker. All after both slots
     // are open so blue and green see identical WAL streams.

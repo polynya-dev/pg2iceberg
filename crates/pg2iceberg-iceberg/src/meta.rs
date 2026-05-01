@@ -230,16 +230,16 @@ impl FlushStats {
             ColumnName("ts".into()),
             PgValue::TimestampTz(TimestampMicros(self.ts_micros)),
         );
-        r.insert(
-            ColumnName("worker_id".into()),
-            opt_text(&self.worker_id),
-        );
+        r.insert(ColumnName("worker_id".into()), opt_text(&self.worker_id));
         r.insert(
             ColumnName("table_name".into()),
             PgValue::Text(self.table_name.clone()),
         );
         r.insert(ColumnName("mode".into()), PgValue::Text(self.mode.clone()));
-        r.insert(ColumnName("snapshot_id".into()), PgValue::Int8(self.snapshot_id));
+        r.insert(
+            ColumnName("snapshot_id".into()),
+            PgValue::Int8(self.snapshot_id),
+        );
         r.insert(
             ColumnName("sequence_number".into()),
             PgValue::Int8(self.sequence_number),
@@ -247,14 +247,8 @@ impl FlushStats {
         r.insert(ColumnName("lsn".into()), opt_int8(self.lsn));
         r.insert(ColumnName("rows".into()), opt_int8(self.rows));
         r.insert(ColumnName("bytes".into()), opt_int8(self.bytes));
-        r.insert(
-            ColumnName("duration_ms".into()),
-            opt_int8(self.duration_ms),
-        );
-        r.insert(
-            ColumnName("data_files".into()),
-            opt_int4(self.data_files),
-        );
+        r.insert(ColumnName("duration_ms".into()), opt_int8(self.duration_ms));
+        r.insert(ColumnName("data_files".into()), opt_int4(self.data_files));
         r.insert(
             ColumnName("delete_files".into()),
             opt_int4(self.delete_files),
@@ -263,14 +257,8 @@ impl FlushStats {
             ColumnName("max_source_ts".into()),
             opt_ts(self.max_source_ts_micros),
         );
-        r.insert(
-            ColumnName("schema_id".into()),
-            opt_int4(self.schema_id),
-        );
-        r.insert(
-            ColumnName("tx_count".into()),
-            opt_int4(self.tx_count),
-        );
+        r.insert(ColumnName("schema_id".into()), opt_int4(self.schema_id));
+        r.insert(ColumnName("tx_count".into()), opt_int4(self.tx_count));
         r.insert(
             ColumnName("pg2iceberg_commit_sha".into()),
             opt_text(&self.pg2iceberg_commit_sha),
@@ -297,10 +285,7 @@ impl CheckpointStats {
             ColumnName("ts".into()),
             PgValue::TimestampTz(TimestampMicros(self.ts_micros)),
         );
-        r.insert(
-            ColumnName("worker_id".into()),
-            opt_text(&self.worker_id),
-        );
+        r.insert(ColumnName("worker_id".into()), opt_text(&self.worker_id));
         r.insert(ColumnName("lsn".into()), opt_int8(self.lsn));
         r.insert(
             ColumnName("last_flush_at".into()),
@@ -345,16 +330,16 @@ impl CompactionStats {
             ColumnName("ts".into()),
             PgValue::TimestampTz(TimestampMicros(self.ts_micros)),
         );
-        r.insert(
-            ColumnName("worker_id".into()),
-            opt_text(&self.worker_id),
-        );
+        r.insert(ColumnName("worker_id".into()), opt_text(&self.worker_id));
         r.insert(
             ColumnName("table_name".into()),
             PgValue::Text(self.table_name.clone()),
         );
         r.insert(ColumnName("partition".into()), opt_text(&self.partition));
-        r.insert(ColumnName("snapshot_id".into()), PgValue::Int8(self.snapshot_id));
+        r.insert(
+            ColumnName("snapshot_id".into()),
+            PgValue::Int8(self.snapshot_id),
+        );
         r.insert(
             ColumnName("sequence_number".into()),
             PgValue::Int8(self.sequence_number),
@@ -383,14 +368,8 @@ impl CompactionStats {
             ColumnName("bytes_before".into()),
             opt_int8(self.bytes_before),
         );
-        r.insert(
-            ColumnName("bytes_after".into()),
-            opt_int8(self.bytes_after),
-        );
-        r.insert(
-            ColumnName("duration_ms".into()),
-            opt_int8(self.duration_ms),
-        );
+        r.insert(ColumnName("bytes_after".into()), opt_int8(self.bytes_after));
+        r.insert(ColumnName("duration_ms".into()), opt_int8(self.duration_ms));
         r.insert(
             ColumnName("pg2iceberg_commit_sha".into()),
             opt_text(&self.pg2iceberg_commit_sha),
@@ -423,10 +402,7 @@ impl MaintenanceStats {
             ColumnName("ts".into()),
             PgValue::TimestampTz(TimestampMicros(self.ts_micros)),
         );
-        r.insert(
-            ColumnName("worker_id".into()),
-            opt_text(&self.worker_id),
-        );
+        r.insert(ColumnName("worker_id".into()), opt_text(&self.worker_id));
         r.insert(
             ColumnName("table_name".into()),
             PgValue::Text(self.table_name.clone()),
@@ -439,14 +415,8 @@ impl MaintenanceStats {
             ColumnName("items_affected".into()),
             opt_int4(self.items_affected),
         );
-        r.insert(
-            ColumnName("bytes_freed".into()),
-            opt_int8(self.bytes_freed),
-        );
-        r.insert(
-            ColumnName("duration_ms".into()),
-            opt_int8(self.duration_ms),
-        );
+        r.insert(ColumnName("bytes_freed".into()), opt_int8(self.bytes_freed));
+        r.insert(ColumnName("duration_ms".into()), opt_int8(self.duration_ms));
         r.insert(
             ColumnName("pg2iceberg_commit_sha".into()),
             opt_text(&self.pg2iceberg_commit_sha),

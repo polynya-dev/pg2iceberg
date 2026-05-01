@@ -25,7 +25,7 @@ pub mod vended;
 
 pub use catalog::IcebergRustCatalog;
 pub use vended::{
-    build_per_table_object_store, bucket_from_location, extract_creds, warehouse_relative_path,
+    bucket_from_location, build_per_table_object_store, extract_creds, warehouse_relative_path,
     VendedBlobStoreRouter, VendedCreds, VendedRouterConfig, DEFAULT_REFRESH_BUFFER,
     DEFAULT_VENDED_TTL,
 };

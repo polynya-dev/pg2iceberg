@@ -20,8 +20,7 @@
 
 use crate::prod::tls::{build_rustls_connector, TlsMode};
 use crate::{
-    DecodedMessage, PgClient, PgError, ReplicationStream, Result, SlotHealth, SnapshotId,
-    WalStatus,
+    DecodedMessage, PgClient, PgError, ReplicationStream, Result, SlotHealth, SnapshotId, WalStatus,
 };
 use async_trait::async_trait;
 use pg2iceberg_core::{Lsn, TableIdent};
@@ -296,17 +295,11 @@ impl PgClient for PgClientImpl {
                     .try_get("conflicting")
                     .map_err(|e| PgError::Protocol(e.to_string()))?;
 
-                let restart_lsn = restart_text
-                    .map(parse_lsn)
-                    .transpose()?
-                    .unwrap_or(Lsn(0));
-                let confirmed_flush_lsn = confirmed_text
-                    .map(parse_lsn)
-                    .transpose()?
-                    .unwrap_or(Lsn(0));
+                let restart_lsn = restart_text.map(parse_lsn).transpose()?.unwrap_or(Lsn(0));
+                let confirmed_flush_lsn =
+                    confirmed_text.map(parse_lsn).transpose()?.unwrap_or(Lsn(0));
                 let wal_status = wal_status_text.map(WalStatus::parse).transpose()?;
-                let safe_wal_size = safe_wal_size_text
-                    .and_then(|s| s.parse::<i64>().ok());
+                let safe_wal_size = safe_wal_size_text.and_then(|s| s.parse::<i64>().ok());
                 let conflicting = conflicting_text
                     .map(|s| s == "t" || s == "true")
                     .unwrap_or(false);
@@ -358,10 +351,7 @@ impl PgClient for PgClientImpl {
         Ok(None)
     }
 
-    async fn publication_tables(
-        &self,
-        publication_name: &str,
-    ) -> Result<Vec<TableIdent>> {
+    async fn publication_tables(&self, publication_name: &str) -> Result<Vec<TableIdent>> {
         let q = format!(
             "SELECT schemaname, tablename \
              FROM pg_publication_tables \
@@ -380,15 +370,11 @@ impl PgClient for PgClientImpl {
                 let schema: &str = row
                     .try_get("schemaname")
                     .map_err(|e| PgError::Protocol(e.to_string()))?
-                    .ok_or_else(|| {
-                        PgError::Protocol("schemaname returned NULL".into())
-                    })?;
+                    .ok_or_else(|| PgError::Protocol("schemaname returned NULL".into()))?;
                 let name: &str = row
                     .try_get("tablename")
                     .map_err(|e| PgError::Protocol(e.to_string()))?
-                    .ok_or_else(|| {
-                        PgError::Protocol("tablename returned NULL".into())
-                    })?;
+                    .ok_or_else(|| PgError::Protocol("tablename returned NULL".into()))?;
                 out.push(TableIdent {
                     namespace: pg2iceberg_core::Namespace(vec![schema.into()]),
                     name: name.into(),
@@ -447,14 +433,12 @@ impl PgClient for PgClientImpl {
                     .ok_or_else(|| {
                         PgError::Protocol("IDENTIFY_SYSTEM returned NULL systemid".into())
                     })?;
-                return id.parse::<u64>().map_err(|e| {
-                    PgError::Protocol(format!("parse systemid {id:?}: {e}"))
-                });
+                return id
+                    .parse::<u64>()
+                    .map_err(|e| PgError::Protocol(format!("parse systemid {id:?}: {e}")));
             }
         }
-        Err(PgError::Protocol(
-            "IDENTIFY_SYSTEM returned no rows".into(),
-        ))
+        Err(PgError::Protocol("IDENTIFY_SYSTEM returned no rows".into()))
     }
 
     async fn start_replication(
@@ -535,10 +519,7 @@ impl PgClient for PgClientImpl {
                  pg2iceberg process) before running cleanup"
             )));
         }
-        let q = format!(
-            "SELECT pg_drop_replication_slot({})",
-            quote_lit(slot)
-        );
+        let q = format!("SELECT pg_drop_replication_slot({})", quote_lit(slot));
         simple_exec(&self.client, &q).await
     }
 
