@@ -454,23 +454,21 @@ impl Config {
             "bearer" if !self.sink.catalog_token.is_empty() => {
                 props.insert("token".into(), self.sink.catalog_token.clone());
             }
-            "oauth2" => {
-                if !self.sink.catalog_client_id.is_empty() {
-                    props.insert(
-                        "oauth2-server-uri".into(),
-                        format!(
-                            "{}/v1/oauth/tokens",
-                            self.sink.catalog_uri.trim_end_matches('/')
-                        ),
-                    );
-                    props.insert(
-                        "credential".into(),
-                        format!(
-                            "{}:{}",
-                            self.sink.catalog_client_id, self.sink.catalog_client_secret
-                        ),
-                    );
-                }
+            "oauth2" if !self.sink.catalog_client_id.is_empty() => {
+                props.insert(
+                    "oauth2-server-uri".into(),
+                    format!(
+                        "{}/v1/oauth/tokens",
+                        self.sink.catalog_uri.trim_end_matches('/')
+                    ),
+                );
+                props.insert(
+                    "credential".into(),
+                    format!(
+                        "{}:{}",
+                        self.sink.catalog_client_id, self.sink.catalog_client_secret
+                    ),
+                );
             }
             _ => {}
         }
