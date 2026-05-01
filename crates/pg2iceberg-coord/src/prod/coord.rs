@@ -508,7 +508,7 @@ impl Coordinator for PostgresCoordinator {
                 let pg_oid: i64 = r.get(0);
                 let snapshot_complete: bool = r.get(1);
                 let snapshot_lsn: i64 = r.get(2);
-                let completed_micros: Option<f64> = r.try_get(3).ok();
+                let completed_micros: Option<f64> = r.try_get(3).map_err(pg)?;
                 Ok(Some(TableSnapshotState {
                     pg_oid: pg_oid as u32,
                     snapshot_complete,

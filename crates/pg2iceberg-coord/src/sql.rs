@@ -427,9 +427,12 @@ pub fn upsert_flushed_lsn(schema: &CoordSchema) -> String {
 // ── Per-table snapshot status ─────────────────────────────────────────
 
 pub fn select_table_state(schema: &CoordSchema) -> String {
+    // Cast to double precision: EXTRACT(EPOCH FROM ...) returns numeric on
+    // PG 13+, which doesn't decode into f64 via FromSql; the explicit cast
+    // gives us a stable f64 column regardless of PG version.
     format!(
         "SELECT pg_oid, snapshot_complete, snapshot_lsn, \
-         EXTRACT(EPOCH FROM completed_at) * 1000000 \
+         (EXTRACT(EPOCH FROM completed_at) * 1000000)::double precision \
          FROM {} WHERE table_name = $1",
         schema.qualify("tables")
     )
