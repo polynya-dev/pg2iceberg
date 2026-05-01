@@ -1317,6 +1317,12 @@ impl PgClient for SimPgClient {
         Ok(0)
     }
 
+    async fn server_version_num(&self) -> std::result::Result<i32, PgError> {
+        // Sim doesn't model PG version differences. Return `0` so the
+        // startup version check skips the assertion in DST runs.
+        Ok(0)
+    }
+
     async fn start_replication(
         &self,
         slot: &str,

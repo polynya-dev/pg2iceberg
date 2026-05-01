@@ -47,7 +47,17 @@ pub struct StartupValidation {
     /// install or first slot creation), where we trust the slot
     /// unconditionally.
     pub coord_flushed_lsn: Lsn,
+    /// Source PG `server_version_num` (e.g. `160004` for 16.4).
+    /// `0` means "skip the check" (DST sims always set 0; production
+    /// always reads a real value). pg2iceberg requires 13+ because
+    /// older PGs lack `pg_replication_slots.wal_status`.
+    pub server_version_num: i32,
 }
+
+/// Minimum supported PostgreSQL `server_version_num`. PG 13.0 is
+/// `130000`; anything lower lacks `pg_replication_slots.wal_status`,
+/// which we depend on for the `SlotLost` startup invariant.
+pub const MIN_PG_VERSION_NUM: i32 = 130000;
 
 impl StartupValidation {
     /// `true` when no registered table has a stored snapshot state in
@@ -89,13 +99,15 @@ pub struct SlotState {
     pub exists: bool,
     pub restart_lsn: Lsn,
     pub confirmed_flush_lsn: Lsn,
-    /// `Some` on PG 13+; `None` on older versions. Drives the
-    /// `wal_status = lost` startup-validation invariant — without
-    /// this we'd attempt `START_REPLICATION` on a slot whose WAL
-    /// is gone and surface a confusing PG error mid-startup.
+    /// Drives the `wal_status = lost` startup-validation invariant —
+    /// without this we'd attempt `START_REPLICATION` on a slot whose
+    /// WAL is gone and surface a confusing PG error mid-startup.
+    /// `None` only when PG returns SQL NULL (transient — slot being
+    /// read by another consumer).
     pub wal_status: Option<pg2iceberg_pg::WalStatus>,
-    /// PG 14+. `true` indicates the slot was killed by physical-
-    /// replication conflict during recovery — also unrecoverable.
+    /// `true` indicates the slot was killed by physical-replication
+    /// conflict during recovery — unrecoverable. PG 14+ only; on PG
+    /// 13 this surfaces as `false`.
     pub conflicting: bool,
 }
 
@@ -211,6 +223,15 @@ pub enum Violation {
         coord_lsn: Lsn,
         slot_lsn: Lsn,
     },
+
+    #[error(
+        "PostgreSQL server_version_num is {found}, but pg2iceberg requires \
+         {required} or higher (PG 13+). Older versions lack the \
+         `pg_replication_slots.wal_status` column required for safe slot \
+         health checks. Upgrade the source PG cluster, or pin a different \
+         pg2iceberg version that supports your PG."
+    )]
+    PgVersionTooOld { found: i32, required: i32 },
 }
 
 /// Aggregate error returned by [`validate_startup`].
@@ -224,6 +245,14 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     let mut violations = Vec::new();
     let fresh = v.fresh();
     let _ = v.config_mode; // retained for future query-mode-specific invariants
+
+    // 0. Refuse to start on PG < 13. Sim leaves this as 0 (skip).
+    if v.server_version_num != 0 && v.server_version_num < MIN_PG_VERSION_NUM {
+        violations.push(Violation::PgVersionTooOld {
+            found: v.server_version_num,
+            required: MIN_PG_VERSION_NUM,
+        });
+    }
 
     // 1. Fresh install but Iceberg tables exist (orphans).
     if fresh {

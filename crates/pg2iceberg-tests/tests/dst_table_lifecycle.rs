@@ -117,6 +117,7 @@ async fn build_startup(
             .slot_state(SLOT)
             .map(|s| s.confirmed_flush_lsn)
             .unwrap_or(Lsn::ZERO),
+        server_version_num: 0,
     }
 }
 

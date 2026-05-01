@@ -613,6 +613,7 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
         .flushed_lsn()
         .await
         .map_err(|e| LifecycleError::Coord(e.to_string()))?;
+    let server_version_num = pg.server_version_num().await?;
     let v = StartupValidation {
         tables,
         slot,
@@ -620,6 +621,7 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
         slot_name: slot_name.to_string(),
         publication_name: publication_name.to_string(),
         coord_flushed_lsn,
+        server_version_num,
     };
     validate_startup(&v).map_err(|e| LifecycleError::Validation(e.to_string()))
 }

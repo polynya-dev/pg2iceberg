@@ -123,6 +123,7 @@ async fn build_startup_validation(db: &SimPostgres, slot_name: &str) -> StartupV
             .slot_state(slot_name)
             .map(|s| s.confirmed_flush_lsn)
             .unwrap_or(Lsn::ZERO),
+        server_version_num: 0,
     }
 }
 

@@ -251,22 +251,17 @@ impl PgClient for PgClientImpl {
         // One query covering every slot field we use: restart_lsn,
         // confirmed_flush_lsn, wal_status, safe_wal_size, conflicting.
         //
-        // We use `to_jsonb(pg_replication_slots.*)` for `wal_status`,
-        // `safe_wal_size`, and `conflicting` so that PG versions that
-        // don't have those columns return NULL instead of a parse
-        // error. Specifically:
-        //   - PG ≤ 12: no `wal_status` / `safe_wal_size`.
-        //   - PG ≤ 13: no `conflicting`.
-        // The base columns (`restart_lsn`, `confirmed_flush_lsn`)
-        // exist on every supported PG version, so we read them
-        // directly. Result: a single SQL works on PG 12+; older
-        // versions just surface the new fields as None/false.
+        // pg2iceberg requires PG 13+ (validated at startup via
+        // `server_version_num`), so `wal_status` and `safe_wal_size`
+        // are always direct columns. `conflicting` was added in PG
+        // 14, so we read it via `to_jsonb` and degrade to `false` on
+        // PG 13.
         let q = format!(
             "SELECT \
                 restart_lsn::text AS restart_lsn, \
                 confirmed_flush_lsn::text AS confirmed_flush_lsn, \
-                (to_jsonb(pg_replication_slots.*) ->> 'wal_status') AS wal_status, \
-                NULLIF(to_jsonb(pg_replication_slots.*) ->> 'safe_wal_size', '') AS safe_wal_size, \
+                wal_status::text AS wal_status, \
+                safe_wal_size::text AS safe_wal_size, \
                 COALESCE((to_jsonb(pg_replication_slots.*) ->> 'conflicting')::boolean, false) AS conflicting \
              FROM pg_replication_slots \
              WHERE slot_name = {}",
@@ -439,6 +434,32 @@ impl PgClient for PgClientImpl {
             }
         }
         Err(PgError::Protocol("IDENTIFY_SYSTEM returned no rows".into()))
+    }
+
+    async fn server_version_num(&self) -> Result<i32> {
+        // `SHOW server_version_num` returns the encoded version string
+        // (e.g. "160004" for PG 16.4). Available on every supported PG.
+        let rows = self
+            .client
+            .simple_query("SHOW server_version_num")
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let v = row
+                    .try_get(0)
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                    .ok_or_else(|| {
+                        PgError::Protocol("SHOW server_version_num returned NULL".into())
+                    })?;
+                return v.parse::<i32>().map_err(|e| {
+                    PgError::Protocol(format!("parse server_version_num {v:?}: {e}"))
+                });
+            }
+        }
+        Err(PgError::Protocol(
+            "SHOW server_version_num returned no rows".into(),
+        ))
     }
 
     async fn start_replication(

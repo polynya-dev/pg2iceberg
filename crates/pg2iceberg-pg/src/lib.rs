@@ -41,7 +41,6 @@ pub enum WalStatus {
 
 impl WalStatus {
     /// Parse from the text form returned by `pg_replication_slots.wal_status::text`.
-    /// PG 13+ only — older versions simply don't have this column.
     pub fn parse(s: &str) -> std::result::Result<Self, PgError> {
         match s {
             "reserved" => Ok(WalStatus::Reserved),
@@ -64,19 +63,17 @@ pub struct SlotHealth {
     pub exists: bool,
     pub restart_lsn: Lsn,
     pub confirmed_flush_lsn: Lsn,
-    /// `Some` on PG 13+; `None` on older versions where the column
-    /// doesn't exist (the prod query uses `to_jsonb` to degrade
-    /// gracefully). The startup `wal_status = lost` check is a
-    /// no-op on older PGs.
+    /// Always present on PG 13+ (the minimum we support). `None`
+    /// only when PG returns SQL NULL — possible while a streaming
+    /// replication client is mid-read of the slot.
     pub wal_status: Option<WalStatus>,
-    /// PG 14+. `false` on older versions. `true` indicates the slot
-    /// was killed by a physical-replication conflict during recovery
-    /// — also unrecoverable.
+    /// `true` indicates the slot was killed by a physical-replication
+    /// conflict during recovery — unrecoverable. PG 14+ only; on PG
+    /// 13 this surfaces as `false`.
     pub conflicting: bool,
-    /// PG 13+. Bytes until the slot crosses into `unreserved`. Negative
-    /// when already past. `None` when the column doesn't exist or is
-    /// NULL. Useful for metrics / dashboards; not directly consumed
-    /// by validation today.
+    /// Bytes until the slot crosses into `unreserved`. Negative when
+    /// already past. `None` when SQL NULL. Useful for metrics /
+    /// dashboards; not directly consumed by validation today.
     pub safe_wal_size: Option<i64>,
 }
 
@@ -231,10 +228,9 @@ pub trait PgClient: Send + Sync {
     /// `safe_wal_size` columns of `pg_replication_slots` in a single
     /// round-trip. Returns `None` when the slot doesn't exist.
     ///
-    /// Pre-PG 13 doesn't have `wal_status` / `safe_wal_size`; pre-PG 14
-    /// doesn't have `conflicting`. The prod impl uses `to_jsonb` to
-    /// degrade gracefully on older versions — those fields surface as
-    /// `None` / `false`.
+    /// pg2iceberg requires PG 13+, so `wal_status` and
+    /// `safe_wal_size` are always available. `conflicting` was added
+    /// in PG 14; on PG 13 it surfaces as `false`.
     async fn slot_health(&self, slot: &str) -> Result<Option<SlotHealth>>;
 
     /// PostgreSQL cluster system identifier — unique per `initdb`,
@@ -246,6 +242,15 @@ pub trait PgClient: Send + Sync {
     /// corrupt downstream Iceberg state. Sourced from the
     /// `IDENTIFY_SYSTEM` replication command.
     async fn identify_system_id(&self) -> Result<u64>;
+
+    /// PostgreSQL `server_version_num` — encoded as `MMmm00` where
+    /// `MM` is the major version and `mm` the minor. PG 13.0 is
+    /// `130000`, PG 16.4 is `160004`. pg2iceberg requires PG 13+
+    /// (anything older lacks the `pg_replication_slots.wal_status`
+    /// column we depend on for startup validation). Returns `0` from
+    /// the sim impl, which the version check treats as
+    /// "skip" — production callers always read a real value.
+    async fn server_version_num(&self) -> Result<i32>;
 
     async fn start_replication(
         &self,
