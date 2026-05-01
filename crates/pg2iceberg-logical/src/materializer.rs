@@ -1401,7 +1401,7 @@ fn expand_truncates(
                 continue;
             }
             let mut row = Row::new();
-            for (col, val) in pk_cols.iter().zip(values.into_iter()) {
+            for (col, val) in pk_cols.iter().zip(values) {
                 row.insert(col.clone(), val);
             }
             out.push(MatEvent {
