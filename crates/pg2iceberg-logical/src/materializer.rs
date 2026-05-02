@@ -215,7 +215,12 @@ fn format_partition_literal(v: &pg2iceberg_core::PartitionLiteral) -> String {
         PartitionLiteral::Double(x) => format!("{}", x.0),
         PartitionLiteral::String(s) => s.clone(),
         PartitionLiteral::Boolean(b) => b.to_string(),
-        PartitionLiteral::Binary(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+        // Iceberg's `PartitionPath.escape` renders `byte[]` values as
+        // standard Base64 (RFC 4648, with `=` padding). The `hive_escape`
+        // step below URL-escapes any `/` or `+` characters that would
+        // be unsafe in path segments. Hex would be simpler but doesn't
+        // match what Spark / Trino / iceberg-rust readers produce.
+        PartitionLiteral::Binary(b) => base64_standard(b),
         PartitionLiteral::Decimal { unscaled, scale } => {
             // Render as decimal-with-point so reads can round-trip
             // back without ambiguity. Scale=0 → integer literal.
@@ -238,6 +243,43 @@ fn format_partition_literal(v: &pg2iceberg_core::PartitionLiteral) -> String {
     }
 }
 
+/// Standard RFC 4648 Base64 encoder. Inlined here rather than
+/// pulling in the `base64` crate because the only callers are
+/// partition-path rendering (a few bytes per call); that doesn't
+/// merit a transitive dep.
+fn base64_standard(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    let mut chunks = bytes.chunks_exact(3);
+    for c in chunks.by_ref() {
+        let n = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let n = (rem[0] as u32) << 16;
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Percent-encode characters that aren't safe in S3 / filesystem
 /// path segments. Mirrors what Spark / Trino / Hive use for
 /// partition path encoding so paths are interchangeable.
@@ -245,7 +287,7 @@ fn hive_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '/' | '=' | '%' | '\\' | '"' | '\'' | ' ' | ':' | '?' | '#' | '[' | ']' => {
+            '/' | '=' | '%' | '\\' | '"' | '\'' | ' ' | ':' | '?' | '#' | '[' | ']' | '+' => {
                 let mut buf = [0u8; 4];
                 for b in c.encode_utf8(&mut buf).bytes() {
                     out.push_str(&format!("%{b:02X}"));
@@ -302,6 +344,15 @@ pub struct Materializer<C: Catalog> {
     /// controls how long a missed heartbeat survives before the
     /// worker drops out of the active list.
     distributed: Option<DistributedMode>,
+    /// PG → Iceberg ident translation, mirroring `Pipeline`'s map.
+    /// `apply_relation` is called with the PG-side ident (the
+    /// pgoutput stream's view), but `tables` is keyed by the
+    /// Iceberg-side ident the lifecycle registered with. Without
+    /// this translation, schema-evolution messages
+    /// (`ALTER TABLE ... ADD COLUMN`, type promotions, drops) would
+    /// silently no-op, and post-ALTER inserts would write to the
+    /// pre-ALTER iceberg schema.
+    table_translation: BTreeMap<TableIdent, TableIdent>,
 }
 
 /// Distributed-mode parameters. Built by
@@ -420,6 +471,19 @@ impl<C: Catalog> Materializer<C> {
             meta_marker: None,
             meta_recorder: None,
             distributed: None,
+            table_translation: BTreeMap::new(),
+        }
+    }
+
+    /// Register a translation from the PG-side ident (carried in
+    /// pgoutput Relation messages) to the Iceberg-side ident this
+    /// materializer's `tables` map is keyed by. Lets schema-
+    /// evolution events from the WAL stream find their target
+    /// table even when `sink.namespace` differs from the PG schema.
+    /// No-op when the two idents are equal.
+    pub fn register_table_translation(&mut self, pg_ident: TableIdent, iceberg_ident: TableIdent) {
+        if pg_ident != iceberg_ident {
+            self.table_translation.insert(pg_ident, iceberg_ident);
         }
     }
 
@@ -709,7 +773,11 @@ impl<C: Catalog> Materializer<C> {
         ident: &TableIdent,
         incoming_columns: &[pg2iceberg_pg::RelationColumn],
     ) -> Result<()> {
-        let entry = match self.tables.get_mut(ident) {
+        // Pgoutput emits Relation messages keyed by PG schema +
+        // table name; our `tables` map is keyed by Iceberg-side
+        // ident. Translate when registered, otherwise fall through.
+        let lookup_ident = self.table_translation.get(ident).unwrap_or(ident).clone();
+        let entry = match self.tables.get_mut(&lookup_ident) {
             Some(e) => e,
             None => return Ok(()),
         };
@@ -733,10 +801,25 @@ impl<C: Catalog> Materializer<C> {
         for c in incoming_columns {
             match current_by_name.get(&c.name) {
                 None => {
+                    // Force `nullable: true` for evolution-time adds.
+                    // Two reasons:
+                    //   1. Iceberg requires new columns to be optional
+                    //      so prior data files (which don't carry the
+                    //      column) read back as NULL. Pushing through a
+                    //      non-nullable add would break readers.
+                    //   2. `c.nullable` is derived from pgoutput's
+                    //      Relation flag bit 0, which means "part of
+                    //      REPLICA IDENTITY" — *not* "is primary key".
+                    //      Under `REPLICA IDENTITY FULL` every column
+                    //      reports `is_replica_identity = 1`, so we'd
+                    //      incorrectly stamp every fresh column as
+                    //      non-nullable. The startup-time PK info from
+                    //      `discover_schemas` is the authoritative
+                    //      source; pgoutput's flag is wire-only signal.
                     changes.push(pg2iceberg_iceberg::SchemaChange::AddColumn {
                         name: c.name.clone(),
                         ty: c.ty,
-                        nullable: c.nullable,
+                        nullable: true,
                     });
                 }
                 Some(existing) => {
@@ -791,8 +874,13 @@ impl<C: Catalog> Materializer<C> {
         // Catalog-side first so a failure leaves the materializer's
         // in-memory state unchanged (next Relation will re-trigger
         // the diff). After success, rebuild the TableWriter so it
-        // encodes with the new column set.
-        self.catalog.evolve_schema(ident, changes.clone()).await?;
+        // encodes with the new column set. Use the Iceberg-side
+        // ident (`lookup_ident`) — `ident` is the PG-side key from
+        // the pgoutput Relation message, which the catalog
+        // wouldn't recognise.
+        self.catalog
+            .evolve_schema(&lookup_ident, changes.clone())
+            .await?;
         pg2iceberg_iceberg::apply_schema_changes(&mut entry.schema, &changes)
             .map_err(MaterializerError::Catalog)?;
         entry.writer = TableWriter::new(entry.schema.clone());

@@ -1,6 +1,24 @@
 //! [`ReplicationStreamImpl`]: production [`ReplicationStream`] wrapping
 //! `postgres_replication::LogicalReplicationStream`.
 //!
+//! ## Why this owns a dedicated reader task
+//!
+//! The replication wire is a single bidirectional `CopyBoth` connection;
+//! both `recv()` (decoded events) and `send_standby()` (slot acks) go
+//! through the same socket. The earlier single-task design wrapped both
+//! in the lifecycle's outer `tokio::select!`, which dropped the in-flight
+//! `next()` future every time a tick won the race. Under tight tick
+//! schedules that left no room for the wire to drain — the underlying
+//! channel that backs `LogicalReplicationStream` filled up, the
+//! tokio-postgres connection task stalled, and post-ack events stopped
+//! being delivered (manifesting as missing schema-evolution + late-tx
+//! events in tests).
+//!
+//! The fix mirrors the Go reference's pattern: a dedicated task owns the
+//! stream, drains decoded events into a bounded mpsc, and serves ack
+//! requests from a small command channel. The outer `select!` no longer
+//! cancels mid-decode — `events_rx.recv()` is fully cancel-safe.
+//!
 //! Translation rules (`LogicalReplicationMessage` → our
 //! [`crate::DecodedMessage`]):
 //!
@@ -34,14 +52,26 @@ use postgres_replication::protocol::{
     LogicalReplicationMessage as PgMsg, ReplicationMessage as PgEnv, Tuple, TupleData,
 };
 use postgres_replication::LogicalReplicationStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_postgres::types::PgLsn;
 
 /// Postgres microsecond epoch starts at 2000-01-01; Unix epoch is
 /// 1970-01-01. Difference in micros is constant and used both ways
 /// for timestamp conversion.
 const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
+
+/// Bounded buffer for decoded events. Mirrors the Go reference's
+/// `make(chan postgres.ChangeEvent, 1000)` so transient main-loop
+/// stalls (materializer cycle, compaction tick) don't backpressure
+/// the wire.
+const EVENTS_CHANNEL_CAPACITY: usize = 1000;
+
+/// Acks are infrequent (once per Standby tick + a final shutdown ack),
+/// so a small queue is enough.
+const CMD_CHANNEL_CAPACITY: usize = 8;
 
 /// Cached relation metadata, populated by `Relation` messages and
 /// consumed by DML decoders.
@@ -57,19 +87,6 @@ struct ColumnInfo {
     pg_type: Option<PgType>,
 }
 
-pub struct ReplicationStreamImpl {
-    stream: Pin<Box<LogicalReplicationStream>>,
-    relations: HashMap<u32, RelationCache>,
-    /// Stashed per-txn metadata between `Begin` and `Commit`. Pgoutput
-    /// only sends xid/commit_ts in the Begin record; DML messages
-    /// inherit those via the surrounding txn.
-    current_txn: Option<TxnContext>,
-    /// Truncate carries N rel_ids; we emit one Change per rel_id.
-    /// Anything that didn't fit in a single message gets buffered here
-    /// and drained on subsequent `recv()` calls.
-    pending: Vec<DecodedMessage>,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct TxnContext {
     final_lsn: Lsn,
@@ -77,60 +94,109 @@ struct TxnContext {
     commit_ts: Timestamp,
 }
 
+/// Commands the reader task accepts on its control channel. Today only
+/// `Standby` is needed; future shutdown / health probes can be added
+/// here without touching the events path.
+enum Cmd {
+    Standby {
+        flushed: Lsn,
+        applied: Lsn,
+        done: oneshot::Sender<Result<()>>,
+    },
+}
+
+pub struct ReplicationStreamImpl {
+    events_rx: mpsc::Receiver<Result<DecodedMessage>>,
+    cmd_tx: mpsc::Sender<Cmd>,
+    reader: JoinHandle<()>,
+}
+
 impl ReplicationStreamImpl {
     pub(crate) fn wrap(stream: LogicalReplicationStream) -> Self {
+        let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
+        let reader = tokio::spawn(reader_task(stream, events_tx, cmd_rx));
         Self {
-            stream: Box::pin(stream),
-            relations: HashMap::new(),
-            current_txn: None,
-            pending: Vec::new(),
+            events_rx,
+            cmd_tx,
+            reader,
         }
+    }
+}
+
+impl Drop for ReplicationStreamImpl {
+    fn drop(&mut self) {
+        // Channels alone usually wind the task down (events_tx blocks on
+        // a closed receiver, cmd_rx returns None when the sender is
+        // dropped), but the task may be parked in `stream.next()` with
+        // no wire activity. Abort guarantees prompt teardown.
+        self.reader.abort();
     }
 }
 
 #[async_trait]
 impl ReplicationStream for ReplicationStreamImpl {
     async fn recv(&mut self) -> Result<DecodedMessage> {
-        loop {
-            if let Some(msg) = self.pending.pop() {
-                return Ok(msg);
-            }
-            let next = self
-                .stream
-                .as_mut()
-                .next()
-                .await
-                .ok_or_else(|| PgError::Connection("replication stream closed".into()))?
-                .map_err(|e| PgError::Protocol(e.to_string()))?;
-            if let Some(out) = self.handle(next)? {
-                return Ok(out);
-            }
-            // None means we consumed an Origin/Type/Message/Relation-cache-only
-            // event and should keep polling.
+        match self.events_rx.recv().await {
+            Some(res) => res,
+            None => Err(PgError::Connection(
+                "replication reader task exited".into(),
+            )),
         }
     }
 
     async fn send_standby(&mut self, flushed: Lsn, applied: Lsn) -> Result<()> {
-        let write_lsn: PgLsn = flushed.0.into();
-        let flush_lsn: PgLsn = flushed.0.into();
-        let apply_lsn: PgLsn = applied.0.into();
-        // Server uses `ts` for measurement-only, not correctness; 0 is
-        // accepted. `reply = 0` means "don't ask me to send another now".
-        self.stream
-            .as_mut()
-            .standby_status_update(write_lsn, flush_lsn, apply_lsn, 0, 0)
+        let (done_tx, done_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Standby {
+                flushed,
+                applied,
+                done: done_tx,
+            })
             .await
-            .map_err(|e| PgError::Protocol(e.to_string()))
+            .map_err(|_| PgError::Connection("replication reader task exited".into()))?;
+        // Wait for the ack to actually hit the wire before returning.
+        // Caller relies on this for the stamp-before-ack discipline:
+        // when `send_standby` returns Ok, the slot has observed `lsn`.
+        done_rx
+            .await
+            .map_err(|_| PgError::Connection("replication reader task dropped ack".into()))?
     }
 }
 
-impl ReplicationStreamImpl {
+#[derive(Default)]
+struct ReaderState {
+    relations: HashMap<u32, RelationCache>,
+    /// Stashed per-txn metadata between `Begin` and `Commit`. Pgoutput
+    /// only sends xid/commit_ts in the Begin record; DML messages
+    /// inherit those via the surrounding txn.
+    current_txn: Option<TxnContext>,
+    /// Truncate carries N rel_ids; we emit one Change per rel_id.
+    /// `VecDeque` so we drain in arrival order with `pop_front`.
+    pending: VecDeque<DecodedMessage>,
+}
+
+impl ReaderState {
     fn handle(&mut self, env: PgEnv<PgMsg>) -> Result<Option<DecodedMessage>> {
         match env {
-            PgEnv::PrimaryKeepAlive(body) => Ok(Some(DecodedMessage::Keepalive {
-                wal_end: Lsn(body.wal_end()),
-                reply_requested: body.reply() != 0,
-            })),
+            // Keepalives are absorbed by the reader task — they're
+            // protocol heartbeats, not consumer events. Forwarding them
+            // through the bounded `events` channel is what created the
+            // case-24 bug: under heavy WAL chatter on tables OUTSIDE the
+            // publication, walsender emits one keepalive per skipped
+            // record (we observed ~1500/s). At that rate the channel
+            // fills, the reader blocks on `events_tx.send`, the inner
+            // tokio-postgres CopyBoth channel backs up, and walsender
+            // suspends decoding for our connection — so subsequent DML
+            // for the publication's actual tables never reaches us.
+            //
+            // No downstream consumer uses `DecodedMessage::Keepalive`
+            // (the pipeline's match arm is a noop, the sim impl doesn't
+            // emit it), so dropping at the reader is purely an
+            // optimization with no behavioural change. If we ever need
+            // `reply_requested` handling we'll respond inline here
+            // rather than forwarding.
+            PgEnv::PrimaryKeepAlive(_) => Ok(None),
             PgEnv::XLogData(xlog) => self.handle_logical(xlog.into_data()),
             // The ReplicationMessage enum is `#[non_exhaustive]`; future
             // variants get treated as keepalive-style noops.
@@ -257,7 +323,7 @@ impl ReplicationStreamImpl {
                 // explode that into one ChangeEvent per rel and queue
                 // the rest for subsequent recv() calls.
                 let rel_ids = t.rel_ids().to_vec();
-                let mut events: Vec<DecodedMessage> = Vec::new();
+                let mut events: VecDeque<DecodedMessage> = VecDeque::new();
                 for rel_id in rel_ids {
                     let rel = match self.relations.get(&rel_id) {
                         Some(r) => r.clone(),
@@ -266,7 +332,7 @@ impl ReplicationStreamImpl {
                         // have nothing to materialize.
                         None => continue,
                     };
-                    events.push(DecodedMessage::Change(self.change_event(
+                    events.push_back(DecodedMessage::Change(self.change_event(
                         rel.ident,
                         Op::Truncate,
                         None,
@@ -274,13 +340,12 @@ impl ReplicationStreamImpl {
                         Vec::new(),
                     )));
                 }
-                if events.is_empty() {
-                    return Ok(None);
-                }
-                let first = events.remove(0);
-                // Buffer the rest in reverse so `pop()` returns them in
-                // arrival order on subsequent recv() calls.
-                events.reverse();
+                let first = match events.pop_front() {
+                    Some(e) => e,
+                    None => return Ok(None),
+                };
+                // Append remaining in arrival order; reader_task drains
+                // `pending` with `pop_front` before reading the next env.
                 self.pending.extend(events);
                 Ok(Some(first))
             }
@@ -320,6 +385,145 @@ impl ReplicationStreamImpl {
             before,
             after,
             unchanged_cols,
+        }
+    }
+}
+
+/// Result of one outer-loop poll. The select! borrows `stream` to wait
+/// on `next()`; restructuring as an enum lets the borrow end before we
+/// run `state.handle()` or call `standby_status_update()` on the stream
+/// in the cmd arm.
+enum Branch {
+    Event(Option<Result<DecodedMessage>>),
+    Cmd(Option<Cmd>),
+    /// PG sent a `PrimaryKeepAlive` with `reply_requested=1`. We must
+    /// respond with a `standby_status_update` carrying any LSN —
+    /// resending `last_ack` confirms liveness without advancing the
+    /// slot beyond what the main loop has durably persisted via the
+    /// cmd-channel ack path. Mirrors pgx's `pglogrepl` behaviour.
+    KeepaliveReplyRequested,
+}
+
+/// Reader task: sole owner of the `LogicalReplicationStream`. Drains
+/// decoded events into `events_tx` and serves ack requests from
+/// `cmd_rx`. Exits cleanly when either channel side is dropped, the
+/// stream errors, or `JoinHandle::abort` fires.
+async fn reader_task(
+    stream: LogicalReplicationStream,
+    events_tx: mpsc::Sender<Result<DecodedMessage>>,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+) {
+    let mut stream: Pin<Box<LogicalReplicationStream>> = Box::pin(stream);
+    let mut state = ReaderState::default();
+    // Last LSN we acked back to PG via `Cmd::Standby`. Reused for
+    // `reply_requested=1` keepalive replies to confirm liveness without
+    // advancing the slot beyond what the main loop has durably persisted.
+    // `0` until the first periodic Standby tick (or the post-snapshot
+    // initial ack) lands; PG accepts that as "consumer is alive but at
+    // unknown position".
+    let mut last_ack: PgLsn = PgLsn::from(0u64);
+
+    loop {
+        // Drain queued events first (e.g. a Truncate that exploded into
+        // multiple per-rel ChangeEvents). Order is preserved via
+        // VecDeque::pop_front. Each send awaits if the events channel
+        // is full — that's the backpressure path; main loop draining
+        // unblocks us.
+        if let Some(msg) = state.pending.pop_front() {
+            if events_tx.send(Ok(msg)).await.is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // Block-scoped borrow: `stream_ref` holds the pinned mutable
+        // reference for the duration of select!, then drops at the
+        // brace so the cmd arm's body can call `stream.as_mut()` again
+        // for `standby_status_update`. Translating the wire error into
+        // our PgError happens inside the arm so `Branch` doesn't have
+        // to name `postgres_replication::Error`.
+        let branch: Branch = {
+            let mut stream_ref = stream.as_mut();
+            tokio::select! {
+                biased;
+                // Bias to events: under load this keeps the wire
+                // draining. `LogicalReplicationStream::next` is
+                // cancel-safe at the buffering level (tokio-postgres
+                // CopyBoth reads from an internal channel), so dropping
+                // this future when the ack arm wins doesn't lose data.
+                next = stream_ref.next() => match next {
+                    None => Branch::Event(Some(Err(PgError::Connection(
+                        "replication stream closed".into(),
+                    )))),
+                    Some(Err(e)) => Branch::Event(Some(Err(PgError::Protocol(e.to_string())))),
+                    // Inline keepalive handling: never goes through the
+                    // events channel. `reply_requested=1` is converted
+                    // to a separate Branch so the outer match can write
+                    // `standby_status_update` once `stream_ref` drops.
+                    Some(Ok(PgEnv::PrimaryKeepAlive(ka))) => {
+                        if ka.reply() != 0 {
+                            Branch::KeepaliveReplyRequested
+                        } else {
+                            Branch::Event(None)
+                        }
+                    }
+                    Some(Ok(env)) => Branch::Event(state.handle(env).transpose()),
+                },
+                cmd = cmd_rx.recv() => Branch::Cmd(cmd),
+            }
+        };
+
+        match branch {
+            Branch::Event(None) => {
+                // state.handle returned Ok(None) — Origin/Type/Message
+                // protocol metadata. Loop and read more.
+            }
+            Branch::Event(Some(Ok(msg))) => {
+                if events_tx.send(Ok(msg)).await.is_err() {
+                    return;
+                }
+            }
+            Branch::Event(Some(Err(e))) => {
+                let _ = events_tx.send(Err(e)).await;
+                return;
+            }
+            Branch::KeepaliveReplyRequested => {
+                if let Err(e) = stream
+                    .as_mut()
+                    .standby_status_update(last_ack, last_ack, last_ack, 0, 0)
+                    .await
+                {
+                    let _ = events_tx.send(Err(PgError::Protocol(e.to_string()))).await;
+                    return;
+                }
+            }
+            Branch::Cmd(None) => return,
+            Branch::Cmd(Some(Cmd::Standby {
+                flushed,
+                applied,
+                done,
+            })) => {
+                let write_lsn: PgLsn = flushed.0.into();
+                let flush_lsn: PgLsn = flushed.0.into();
+                let apply_lsn: PgLsn = applied.0.into();
+                // Cache for keepalive `reply_requested=1` replies so the
+                // reader can confirm liveness without going through the
+                // cmd channel. Update *before* the wire write — even if
+                // it fails, we still want the latest LSN cached for
+                // future replies.
+                last_ack = write_lsn;
+                // Server uses `ts` for measurement-only, not
+                // correctness; 0 is accepted. `reply = 0` means
+                // "don't ask me to send another now".
+                let res = stream
+                    .as_mut()
+                    .standby_status_update(write_lsn, flush_lsn, apply_lsn, 0, 0)
+                    .await
+                    .map_err(|e| PgError::Protocol(e.to_string()));
+                // Caller may have given up (e.g. shutdown); ignore a
+                // closed oneshot rx.
+                let _ = done.send(res);
+            }
         }
     }
 }

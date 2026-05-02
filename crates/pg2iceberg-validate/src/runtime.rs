@@ -398,6 +398,11 @@ where
             .register_table(schema.clone())
             .await
             .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
+        // Same PG → Iceberg ident translation as the pipeline,
+        // applied here so schema-evolution Relation messages from
+        // pgoutput find their target table when `sink.namespace`
+        // differs from the PG schema.
+        materializer.register_table_translation(schema.pg_ident(), schema.ident.clone());
     }
     if let Some(meta_ns) = &lc.meta_namespace {
         // Enable meta-marker emission. The materializer creates the
