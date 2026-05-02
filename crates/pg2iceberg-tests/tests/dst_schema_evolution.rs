@@ -825,7 +825,7 @@ fn long_running_evolution_keeps_pg_and_iceberg_in_sync() {
 
         // ── Insert one row with the current PG schema ──
         let mut row: Row = BTreeMap::new();
-        row.insert(col("id"), PgValue::Int4(step as i32 + 1));
+        row.insert(col("id"), PgValue::Int4(step + 1));
         for (cname, cty) in &pg_cols {
             if cname == "id" {
                 continue;

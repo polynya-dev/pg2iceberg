@@ -29,6 +29,8 @@ CREATE TABLE e2e_column_types (
 
     -- date/time
     col_date         DATE,
+    col_time         TIME,
+    col_timetz       TIMETZ,
     col_timestamp    TIMESTAMP,
     col_timestamptz  TIMESTAMPTZ,
 
@@ -52,7 +54,7 @@ INSERT INTO e2e_column_types (
     col_bool,
     col_text, col_varchar, col_char,
     col_bytea,
-    col_date, col_timestamp, col_timestamptz,
+    col_date, col_time, col_timetz, col_timestamp, col_timestamptz,
     col_uuid,
     col_json, col_jsonb,
     col_inet
@@ -65,7 +67,7 @@ INSERT INTO e2e_column_types (
     true,
     'hello world', 'varchar value', 'padded',
     '\xDEADBEEF',
-    '2025-06-15', '2025-06-15 14:30:45.123456', '2025-06-15 14:30:45.123456+00',
+    '2025-06-15', '14:30:45.123456', '14:30:45.123456+00', '2025-06-15 14:30:45.123456', '2025-06-15 14:30:45.123456+00',
     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
     '{"key": "value"}', '{"nested": {"a": 1}}',
     '192.168.1.1'
@@ -78,7 +80,7 @@ INSERT INTO e2e_column_types (
     NULL,
     NULL, NULL, NULL,
     NULL,
-    NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL,
     NULL,
     NULL, NULL,
     NULL
@@ -91,7 +93,7 @@ INSERT INTO e2e_column_types (
     false,
     '', 'special chars: ''quotes'' & "double"', '0123456789',
     '\x00FF',
-    '1970-01-01', '1970-01-01 00:00:00', '2025-12-31 23:59:59.999999+00',
+    '1970-01-01', '00:00:00', '23:59:59.999999+00', '1970-01-01 00:00:00', '2025-12-31 23:59:59.999999+00',
     '00000000-0000-0000-0000-000000000000',
     '[]', '{"a": null}',
     '::1'

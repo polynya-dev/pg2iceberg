@@ -10,7 +10,7 @@ use crate::fold::{pk_key, MaterializedRow};
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder,
     Float32Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
@@ -696,9 +696,20 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
             }
             Arc::new(b.finish()) as Arc<dyn Array>
         }
-        IcebergType::Time => {
-            return Err(WriterError::TypeNotYetSupported(col.ty));
-        }
+        // Iceberg's `time` is microseconds-since-midnight in i64 storage
+        // (matches Arrow `Time64(Microsecond)` and the Go reference's
+        // `Time64Builder`). PG `TIME WITH TIME ZONE` carries an offset
+        // we don't store — Iceberg's `time` is timezone-naive — so we
+        // accept `PgValue::TimeTz` by extracting just its microseconds
+        // component, mirroring Go's behaviour where TIMETZ collapses to
+        // the same Time64 column.
+        IcebergType::Time => collect_with!(Time64MicrosecondBuilder::with_capacity(n), |v: &PgValue| {
+            match v {
+                PgValue::Time(t) => Some(t.0),
+                PgValue::TimeTz { time, .. } => Some(time.0),
+                _ => None,
+            }
+        }),
     };
 
     Ok(arr)
@@ -1130,41 +1141,14 @@ mod tests {
         assert!(matches!(err, WriterError::MissingColumn { ref col } if col == "qty"));
     }
 
-    #[test]
-    fn unsupported_type_returns_typed_error() {
-        let schema = TableSchema {
-            ident: TableIdent {
-                namespace: Namespace(vec!["public".into()]),
-                name: "needs_uuid".into(),
-            },
-            columns: vec![ColumnSchema {
-                name: "id".into(),
-                field_id: 1,
-                ty: IcebergType::Uuid,
-                nullable: false,
-                is_primary_key: true,
-            }],
-            partition_spec: Vec::new(),
-            pg_schema: None,
-        };
-        let w = TableWriter::new(schema);
-        let mut r = BTreeMap::new();
-        r.insert(col("id"), PgValue::Uuid([0u8; 16]));
-        let err = w
-            .prepare(
-                &[MaterializedRow {
-                    op: Op::Insert,
-                    row: r,
-                    unchanged_cols: vec![],
-                }],
-                &FileIndex::new(),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            WriterError::TypeNotYetSupported(IcebergType::Uuid)
-        ));
-    }
+    // (Previously: `unsupported_type_returns_typed_error` asserted that
+    // `IcebergType::Time` bubbled `WriterError::TypeNotYetSupported`.
+    // Time is now wired through `Time64MicrosecondBuilder`, so every
+    // `IcebergType` variant has a real builder. The guard variant is
+    // kept on `WriterError` for forward-compat — when a new
+    // `IcebergType` variant lands without a builder, the writer's
+    // exhaustive match will require returning `TypeNotYetSupported`
+    // again — but there's no in-tree type to assert it on today.)
 
     // ── partitioned writes ────────────────────────────────────────────────
 
