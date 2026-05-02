@@ -61,5 +61,14 @@ all = { level = "warn", priority = -1 }
 #    maintenance burden of two forks.
 [patch.crates-io]
 iceberg = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches" }
+# `iceberg-catalog-rest` also has to come from the fork: the
+# polynya-patches branch threads the REST `loadTable` response's
+# `config` map through `Table::builder().properties(response_config)`,
+# which the published v0.9.0 omits. Without it, vended-credentials
+# servers (Polaris, Lakekeeper, ...) return per-table S3 STS tokens
+# in `config`, but our `extract_creds` sees an empty map because the
+# `Table::properties()` accessor surfaces nothing.
+iceberg-catalog-rest = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches" }
+iceberg-storage-opendal = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches" }
 tokio-postgres = { git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }
 postgres-replication = { git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }

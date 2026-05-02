@@ -113,7 +113,13 @@ pub fn build_per_table_object_store(
         }
     }
     if let Some(ep) = creds.endpoint.as_deref().filter(|s| !s.is_empty()) {
-        b = b.with_endpoint(ep);
+        // `object_store` defaults `allow_http=false`, which fails any
+        // `http://` request before the wire — MinIO and LocalStack
+        // both vend an `http://` endpoint, so flip it on for plain
+        // HTTP. HTTPS endpoints retain the strict default. Mirrors
+        // the equivalent guard in `build_s3_static`.
+        let allow_http = ep.starts_with("http://");
+        b = b.with_endpoint(ep).with_allow_http(allow_http);
     }
     let store = b
         .build()
@@ -231,22 +237,25 @@ impl VendedBlobStoreRouter {
                      set in catalog_props"
                 ))
             })?;
-            // Pull the table's S3 location from `metadata.location` —
-            // we don't have direct access, but the catalog config
-            // typically also carries `s3.location`. Fall back to
-            // `meta.config.get("s3.location")` for a clean error if
-            // missing.
-            let location = meta
-                .config
-                .get("location")
-                .or_else(|| meta.config.get("s3.location"))
-                .cloned()
-                .ok_or_else(|| {
-                    IcebergError::Other(format!(
-                        "vended-router: no `location` returned for {ident}; \
-                         catalog must include `location` in the loadTable config"
-                    ))
-                })?;
+            // Table's S3 location comes from `metadata.location`,
+            // populated by the catalog. The response-side `config`
+            // map sometimes also has it (older Polaris versions, for
+            // instance), so we fall back to that for compatibility.
+            let location = if !meta.location.is_empty() {
+                meta.location.clone()
+            } else {
+                meta.config
+                    .get("location")
+                    .or_else(|| meta.config.get("s3.location"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        IcebergError::Other(format!(
+                            "vended-router: no `location` returned for {ident}; \
+                             catalog must include `location` in either the table \
+                             metadata or the loadTable config"
+                        ))
+                    })?
+            };
             let bucket = bucket_from_location(&location).ok_or_else(|| {
                 IcebergError::Other(format!(
                     "vended-router: location {location:?} for {ident} is not an s3:// URI"
@@ -322,17 +331,24 @@ impl VendedBlobStoreRouter {
                 entry.ident
             ))
         })?;
-        let bucket = meta
-            .config
-            .get("location")
-            .or_else(|| meta.config.get("s3.location"))
-            .and_then(|loc| bucket_from_location(loc))
-            .ok_or_else(|| {
-                IcebergError::Other(format!(
-                    "vended-router: refresh location missing for {}",
-                    entry.ident
-                ))
-            })?;
+        // Match `build`'s precedence: prefer `metadata.location`
+        // (populated by every Iceberg REST catalog), fall back to a
+        // legacy `location` / `s3.location` key in the response config
+        // for catalogs that don't surface it on the metadata object.
+        let bucket = if !meta.location.is_empty() {
+            bucket_from_location(&meta.location)
+        } else {
+            meta.config
+                .get("location")
+                .or_else(|| meta.config.get("s3.location"))
+                .and_then(|loc| bucket_from_location(loc))
+        }
+        .ok_or_else(|| {
+            IcebergError::Other(format!(
+                "vended-router: refresh location missing for {}",
+                entry.ident
+            ))
+        })?;
         let store = build_per_table_object_store(&creds, &bucket, &self.cfg.default_region)?;
         g.object_store = Arc::clone(&store);
         g.expires_at = SystemTime::now() + self.cfg.default_ttl;
@@ -506,7 +522,6 @@ mod tests {
 
     fn meta_with(location: &str, ident: TableIdent, has_creds: bool) -> TableMetadata {
         let mut config = BTreeMap::new();
-        config.insert("location".into(), location.into());
         if has_creds {
             config.insert("s3.access-key-id".into(), "ASIAFAKE".into());
             config.insert("s3.secret-access-key".into(), "fakesecret".into());
@@ -517,6 +532,7 @@ mod tests {
             schema: dummy_schema(ident),
             current_snapshot_id: None,
             config,
+            location: location.into(),
         }
     }
 

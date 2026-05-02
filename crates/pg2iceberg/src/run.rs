@@ -126,7 +126,11 @@ fn build_blob(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
 /// vended-credentials path for `vended`. The latter requires the
 /// catalog because it has to load each registered table to obtain
 /// per-table S3 credentials.
-async fn build_blob_for_run<C>(
+///
+/// `pub` so the integration tests can drive the exact same path the
+/// binary takes for vended credentials, rather than reconstructing
+/// the wiring inline.
+pub async fn build_blob_for_run<C>(
     cfg: &Config,
     catalog: &IcebergRustCatalog<C>,
 ) -> Result<Arc<dyn BlobStore>>

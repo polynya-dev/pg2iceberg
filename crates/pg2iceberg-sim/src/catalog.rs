@@ -94,6 +94,7 @@ impl Catalog for MemoryCatalog {
             schema: schema.clone(),
             current_snapshot_id: None,
             config: BTreeMap::new(),
+            location: String::new(),
         };
         s.tables.insert(
             ident,

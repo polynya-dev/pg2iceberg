@@ -844,6 +844,7 @@ fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Res
             .current_snapshot()
             .map(|s| s.sequence_number()),
         config,
+        location: table.metadata().location().to_string(),
     })
 }
 

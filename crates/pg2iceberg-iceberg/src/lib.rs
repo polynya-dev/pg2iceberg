@@ -52,6 +52,16 @@ pub struct TableMetadata {
     /// Catalog-vended config (e.g. `s3.access-key-id` etc.). Used by the
     /// vended-credentials S3 router.
     pub config: std::collections::BTreeMap<String, String>,
+    /// Table's storage location, surfaced from
+    /// `iceberg::TableMetadata::location()`. Populated for catalogs
+    /// that return per-table locations (every Iceberg REST catalog
+    /// today does); empty for catalogs that don't. The vended-creds
+    /// router needs this to derive the per-table S3 bucket + base
+    /// path independently of any catalog-vended `location` config
+    /// key (Lakekeeper, for instance, doesn't include `location` in
+    /// the response `config` map even though it sets it in
+    /// `metadata`).
+    pub location: String,
 }
 
 /// Built by the materializer (combining `TableWriter::prepare` output with

@@ -1973,8 +1973,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "892fe71df3f5d1707c7ede042545051aca659a8a4a8ca828c5a13064338f56fc"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches#f7588458ddbb8c8446fa48f65327c59208f8eac1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1994,8 +1993,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b8745ded8db2a4c2febc84ce2d5e9aaf5e2a1c0c9f6a82a1ea8134691e30a0b"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches#f7588458ddbb8c8446fa48f65327c59208f8eac1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3046,6 +3044,8 @@ dependencies = [
  "pg2iceberg-validate",
  "pollster",
  "proptest",
+ "reqwest",
+ "serde_json",
  "testcontainers",
  "testcontainers-modules",
  "tokio",

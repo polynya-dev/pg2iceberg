@@ -36,6 +36,12 @@ anyhow = { version = "1", optional = true }
 uuid = { version = "1", optional = true, features = ["v4"] }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
+# HTTP client used by the Lakekeeper integration tests to issue
+# `/management/v1/bootstrap` and warehouse-create calls. Pulled in only
+# under the `integration` feature so default builds skip the rustls /
+# reqwest compile cost.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 pg2iceberg-coord.workspace = true
@@ -73,4 +79,6 @@ integration = [
     "dep:uuid",
     "dep:tracing",
     "dep:tracing-subscriber",
+    "dep:reqwest",
+    "dep:serde_json",
 ]
