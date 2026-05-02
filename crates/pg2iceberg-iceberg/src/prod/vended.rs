@@ -746,13 +746,10 @@ mod tests {
         // and `BlobStore::register_table` populates the entry then.
         // Boot-time `build` just leaves the entry off, with a warn.
         let cat = Arc::new(StubCatalog::new());
-        let router = VendedBlobStoreRouter::build(
-            cat,
-            &[ident("ghost")],
-            VendedRouterConfig::default(),
-        )
-        .await
-        .expect("build should not fail just because a table is missing");
+        let router =
+            VendedBlobStoreRouter::build(cat, &[ident("ghost")], VendedRouterConfig::default())
+                .await
+                .expect("build should not fail just because a table is missing");
         // Empty entries — no creds loaded for the missing table yet.
         assert_eq!(router.entries.read().await.len(), 0);
     }

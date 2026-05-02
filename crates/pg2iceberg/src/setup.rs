@@ -311,8 +311,7 @@ async fn discover_schemas(
             // the PG schema (legacy behaviour: PG schema doubles as
             // Iceberg namespace).
             if !sink_namespace.is_empty() {
-                s.ident.namespace =
-                    pg2iceberg_core::Namespace(vec![sink_namespace.to_string()]);
+                s.ident.namespace = pg2iceberg_core::Namespace(vec![sink_namespace.to_string()]);
             }
             // Operator-supplied PK overrides discovery.
             if !t.primary_key.is_empty() {

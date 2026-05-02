@@ -248,8 +248,7 @@ fn format_partition_literal(v: &pg2iceberg_core::PartitionLiteral) -> String {
 /// partition-path rendering (a few bytes per call); that doesn't
 /// merit a transitive dep.
 fn base64_standard(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut chunks = bytes.chunks_exact(3);
     for c in chunks.by_ref() {
@@ -677,10 +676,8 @@ impl<C: Catalog> Materializer<C> {
                 // Meta tables are partitioned by `day(ts)` per
                 // `pg2iceberg-iceberg::meta`; render the partition
                 // segment so files land under the right directory.
-                let segment = render_partition_segment(
-                    &state.schema.partition_spec,
-                    &chunk.partition_values,
-                );
+                let segment =
+                    render_partition_segment(&state.schema.partition_spec, &chunk.partition_values);
                 let path = self
                     .namer
                     .next_path(&state.schema.ident, "meta", &segment)

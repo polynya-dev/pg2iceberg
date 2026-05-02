@@ -705,13 +705,15 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
         // Iceberg's `time` is timezone-naive — so `PgValue::TimeTz`
         // collapses to the same Time64 column by taking only its
         // microseconds component.
-        IcebergType::Time => collect_with!(Time64MicrosecondBuilder::with_capacity(n), |v: &PgValue| {
-            match v {
-                PgValue::Time(t) => Some(t.0),
-                PgValue::TimeTz { time, .. } => Some(time.0),
-                _ => None,
-            }
-        }),
+        IcebergType::Time => {
+            collect_with!(Time64MicrosecondBuilder::with_capacity(n), |v: &PgValue| {
+                match v {
+                    PgValue::Time(t) => Some(t.0),
+                    PgValue::TimeTz { time, .. } => Some(time.0),
+                    _ => None,
+                }
+            })
+        }
     };
 
     Ok(arr)

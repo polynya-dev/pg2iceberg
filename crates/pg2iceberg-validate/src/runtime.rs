@@ -325,8 +325,7 @@ where
     };
     // PG-side idents for the publication — namespace = source PG
     // schema, not Iceberg `sink.namespace`.
-    let mut pub_table_idents: Vec<TableIdent> =
-        lc.schemas.iter().map(|s| s.pg_ident()).collect();
+    let mut pub_table_idents: Vec<TableIdent> = lc.schemas.iter().map(|s| s.pg_ident()).collect();
     if lc.meta_namespace.is_some() {
         pub_table_idents.push(markers_table_ident.clone());
     }
@@ -473,10 +472,7 @@ where
             let mut table_oids: std::collections::BTreeMap<TableIdent, u32> =
                 std::collections::BTreeMap::new();
             for s in &lc.schemas {
-                let oid = lc
-                    .pg
-                    .table_oid(s.pg_schema(), &s.ident.name)
-                    .await?;
+                let oid = lc.pg.table_oid(s.pg_schema(), &s.ident.name).await?;
                 if let Some(v) = oid {
                     table_oids.insert(s.ident.clone(), v);
                 }

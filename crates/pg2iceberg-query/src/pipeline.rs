@@ -258,10 +258,7 @@ impl<C: Catalog> QueryPipeline<C> {
                 &entry.partition_spec,
                 &chunk.partition_values,
             );
-            let path = self
-                .namer
-                .next_path(ident, "query-data", &segment)
-                .await;
+            let path = self.namer.next_path(ident, "query-data", &segment).await;
             let byte_size = chunk.chunk.bytes.len() as u64;
             self.blob_store
                 .put(&path, Bytes::clone(&chunk.chunk.bytes))

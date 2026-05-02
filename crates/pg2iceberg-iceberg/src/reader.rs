@@ -102,8 +102,8 @@ fn decode_value(ty: IcebergType, arr: &dyn Array, i: usize) -> Result<PgValue> {
             while bytes.len() > 1 {
                 let head = bytes[0];
                 let next = bytes[1];
-                let head_is_redundant = (head == 0x00 && (next & 0x80) == 0)
-                    || (head == 0xFF && (next & 0x80) != 0);
+                let head_is_redundant =
+                    (head == 0x00 && (next & 0x80) == 0) || (head == 0xFF && (next & 0x80) != 0);
                 if !head_is_redundant {
                     break;
                 }

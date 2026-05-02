@@ -840,11 +840,8 @@ fn long_running_evolution_keeps_pg_and_iceberg_in_sync() {
 
         // ── Parity check ──
         let ice = h.iceberg_schema(&initial_ident);
-        let ice_by_name: BTreeMap<&str, &ColumnSchema> = ice
-            .columns
-            .iter()
-            .map(|c| (c.name.as_str(), c))
-            .collect();
+        let ice_by_name: BTreeMap<&str, &ColumnSchema> =
+            ice.columns.iter().map(|c| (c.name.as_str(), c)).collect();
 
         // PK invariant: `id` is present, non-nullable, field_id stable.
         let id_col = ice_by_name

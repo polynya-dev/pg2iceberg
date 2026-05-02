@@ -139,9 +139,7 @@ impl ReplicationStream for ReplicationStreamImpl {
     async fn recv(&mut self) -> Result<DecodedMessage> {
         match self.events_rx.recv().await {
             Some(res) => res,
-            None => Err(PgError::Connection(
-                "replication reader task exited".into(),
-            )),
+            None => Err(PgError::Connection("replication reader task exited".into())),
         }
     }
 

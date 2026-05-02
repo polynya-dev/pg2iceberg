@@ -916,10 +916,13 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
             .await
             .context("source PG connect")?,
     );
-    let schemas =
-        crate::setup::__discover_schemas_for_snapshot(&cfg.tables, pg.as_ref(), &cfg.sink.namespace)
-            .await
-            .context("discover schemas")?;
+    let schemas = crate::setup::__discover_schemas_for_snapshot(
+        &cfg.tables,
+        pg.as_ref(),
+        &cfg.sink.namespace,
+    )
+    .await
+    .context("discover schemas")?;
 
     // ── early exit: every configured table already snapshotted ─────
     // Per-table state in `_pg2iceberg.tables` replaces the old
