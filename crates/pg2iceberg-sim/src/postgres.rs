@@ -410,6 +410,27 @@ impl SimPostgres {
         Ok(())
     }
 
+    /// Test hook: add a table to an existing publication. Models the
+    /// `ALTER PUBLICATION ADD TABLE` operator action that an operator
+    /// runs when extending an existing pg2iceberg deployment to cover
+    /// a new source table. Mirrors PG semantics: the slot keeps
+    /// running, and `SimReplicationStream::recv` picks up the new
+    /// publication membership on its next call (events emitted
+    /// *before* this call don't get re-streamed — only future events
+    /// for the new table flow through).
+    pub fn add_table_to_publication(&self, publication: &str, ident: &TableIdent) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        if !s.tables.contains_key(ident) {
+            return Err(SimError::UnknownTable(ident.clone()));
+        }
+        let pubrec = s
+            .publications
+            .get_mut(publication)
+            .ok_or_else(|| SimError::UnknownPublication(publication.into()))?;
+        pubrec.tables.insert(ident.clone());
+        Ok(())
+    }
+
     /// Test hook: list a publication's current tables. Mirrors
     /// `pg_publication_tables`.
     pub fn publication_tables(&self, publication: &str) -> Vec<TableIdent> {
