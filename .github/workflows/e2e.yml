@@ -58,10 +58,7 @@ jobs:
 
       - name: Run e2e suite
         env:
-          # Run 4 cases in parallel: the docker-compose PG is
-          # configured with max_replication_slots=20 so 4 concurrent
-          # tests stay well under the cap.
-          PARALLEL: "4"
+          PARALLEL: "1"
         run: ./tests/run.sh
 
       - name: Show stack logs on failure

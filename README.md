@@ -146,7 +146,7 @@ Run `pg2iceberg --help` for the full list and per-subcommand flags.
 ## Code structure
 
 ```
-pg2iceberg-rust/
+pg2iceberg/
 ├── Cargo.toml                 # workspace root; pins polynya-dev/iceberg-rust fork
 ├── crates/
 │   ├── pg2iceberg/            # binary: CLI dispatch, run.rs, setup.rs
