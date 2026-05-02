@@ -501,6 +501,12 @@ impl<C: Catalog> Materializer<C> {
         if self.catalog.load_table(&schema.ident).await?.is_none() {
             self.catalog.create_table(&schema).await?;
         }
+        // Same blob-store hook as `register_table` — for vended-creds
+        // mode, the marker table needs its own per-table credentials.
+        self.blob_store
+            .register_table(&schema.ident)
+            .await
+            .map_err(|e| MaterializerError::Catalog(IcebergError::Other(e.to_string())))?;
         let writer = TableWriter::new(schema.clone());
         self.meta_marker = Some(MetaMarkerWriter {
             schema,
@@ -551,6 +557,13 @@ impl<C: Catalog> Materializer<C> {
             if self.catalog.load_table(&s.ident).await?.is_none() {
                 self.catalog.create_table(s).await?;
             }
+            // Vended-creds blob: register the meta tables too — they
+            // each get their own STS-vended creds. Static-creds blob
+            // ignores.
+            self.blob_store
+                .register_table(&s.ident)
+                .await
+                .map_err(|e| MaterializerError::Catalog(IcebergError::Other(e.to_string())))?;
         }
 
         self.meta_recorder = Some(MetaRecorder {
@@ -706,6 +719,18 @@ impl<C: Catalog> Materializer<C> {
         if self.catalog.load_table(&ident).await?.is_none() {
             self.catalog.create_table(&schema).await?;
         }
+        // Notify the blob store that the table now exists in the
+        // catalog. Static-creds backends ignore this; the
+        // vended-credentials router uses it to load per-table STS
+        // creds and add an entry to its lookup table on the fly.
+        // Idempotent — safe to call repeatedly. Errors propagate as
+        // catalog errors so a vended-creds misconfig surfaces here
+        // (the same place catalog/coord errors do) instead of deeper
+        // in the put path.
+        self.blob_store
+            .register_table(&ident)
+            .await
+            .map_err(|e| MaterializerError::Catalog(IcebergError::Other(e.to_string())))?;
         self.coord.ensure_cursor(&self.group, &ident).await?;
 
         let pk_cols: Vec<ColumnName> = schema

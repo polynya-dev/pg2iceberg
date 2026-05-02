@@ -1,6 +1,5 @@
 //! Vended-credentials S3 router.
 //!
-//! Mirrors `pg2iceberg/iceberg/s3_vended.go` + `s3_vended_router.go`.
 //! Polaris / Snowflake / Tabular catalogs return per-table temporary
 //! S3 credentials in the `loadTable` response when the request carries
 //! the `X-Iceberg-Access-Delegation: vended-credentials` header. These
@@ -205,18 +204,42 @@ impl Default for VendedRouterConfig {
 /// Construction is async because we have to load each table from the
 /// catalog to obtain creds; once built, the router is `Send + Sync`
 /// and shareable.
+///
+/// **Two-phase startup pattern**: at boot, [`Self::build`] best-effort
+/// loads creds for every YAML-configured ident — tables that don't
+/// exist yet (fresh deployment, or new YAML entries on a redeploy
+/// before the materializer's `register_table` has fired) are skipped
+/// with a log line, *not* an error. Later, when the materializer
+/// creates a missing table via `catalog.create_table`, it calls
+/// [`BlobStore::register_table`], which dispatches to
+/// [`Self::register_table_lazy`] and adds the entry on the fly. This
+/// matches Go's `EnsureStorage` two-phase contract and additionally
+/// covers runtime-created tables like `_pg2iceberg.markers`.
 pub struct VendedBlobStoreRouter {
-    entries: Vec<Arc<VendedEntry>>,
+    /// Wrapped in `RwLock` so the materializer's `register_table` hook
+    /// can append entries at runtime. Reads (lookup) hold the lock
+    /// briefly; writes (registration) are rare.
+    entries: tokio::sync::RwLock<Vec<Arc<VendedEntry>>>,
     catalog: Arc<dyn Catalog>,
     cfg: VendedRouterConfig,
 }
 
 impl VendedBlobStoreRouter {
-    /// Build a router by loading each `(ident, location)` from the
-    /// catalog and extracting creds from the response. Errors out if
-    /// any table is missing creds — the binary's startup expects
-    /// vended mode to be fully wired before the lifecycle runs, so
-    /// failing fast surfaces config issues immediately.
+    /// Build a router by best-effort loading each `(ident, location)`
+    /// from the catalog and extracting creds from the response.
+    ///
+    /// Tables that don't exist yet in the catalog are **skipped** (with
+    /// a `tracing::warn`) rather than failing the build. They get
+    /// registered later via [`BlobStore::register_table`], which the
+    /// materializer calls after `catalog.create_table` succeeds. This
+    /// is the chicken-and-egg fix for fresh deployments: at startup
+    /// the YAML lists tables, the catalog has none, so we'd otherwise
+    /// be stuck.
+    ///
+    /// Tables that exist but are missing vended creds (catalog isn't
+    /// configured for vending, or the access-delegation header didn't
+    /// reach it) still error — that's a real misconfiguration we want
+    /// to surface immediately rather than silently skip.
     pub async fn build(
         catalog: Arc<dyn Catalog>,
         idents: &[TableIdent],
@@ -224,64 +247,112 @@ impl VendedBlobStoreRouter {
     ) -> IcebergResult<Self> {
         let mut entries: Vec<Arc<VendedEntry>> = Vec::with_capacity(idents.len());
         for ident in idents {
-            let meta = catalog.load_table(ident).await?.ok_or_else(|| {
-                IcebergError::NotFound(format!(
-                    "vended-router: table {ident} not found in catalog (cannot vend creds)"
-                ))
-            })?;
-            let creds = extract_creds(&meta.config).ok_or_else(|| {
-                IcebergError::Other(format!(
-                    "vended-router: catalog returned no S3 credentials for {ident}; \
-                     check that the catalog is a Polaris/Tabular/Snowflake-style server \
-                     and that `header.x-iceberg-access-delegation: vended-credentials` is \
-                     set in catalog_props"
-                ))
-            })?;
-            // Table's S3 location comes from `metadata.location`,
-            // populated by the catalog. The response-side `config`
-            // map sometimes also has it (older Polaris versions, for
-            // instance), so we fall back to that for compatibility.
-            let location = if !meta.location.is_empty() {
-                meta.location.clone()
-            } else {
-                meta.config
-                    .get("location")
-                    .or_else(|| meta.config.get("s3.location"))
-                    .cloned()
-                    .ok_or_else(|| {
-                        IcebergError::Other(format!(
-                            "vended-router: no `location` returned for {ident}; \
-                             catalog must include `location` in either the table \
-                             metadata or the loadTable config"
-                        ))
-                    })?
-            };
-            let bucket = bucket_from_location(&location).ok_or_else(|| {
-                IcebergError::Other(format!(
-                    "vended-router: location {location:?} for {ident} is not an s3:// URI"
-                ))
-            })?;
-            let base_path = warehouse_relative_path(&location).unwrap_or_default();
-            let object_store = build_per_table_object_store(&creds, &bucket, &cfg.default_region)?;
-            let expires_at = SystemTime::now() + cfg.default_ttl;
-            entries.push(Arc::new(VendedEntry {
-                ident: ident.clone(),
-                base_path,
-                inner: RwLock::new(EntryInner {
-                    object_store,
-                    expires_at,
-                }),
-            }));
+            match Self::build_entry_for(catalog.as_ref(), ident, &cfg).await? {
+                Some(entry) => entries.push(entry),
+                None => {
+                    tracing::warn!(
+                        %ident,
+                        "vended-router: table not yet in catalog at startup; will be \
+                         registered lazily once `materializer.register_table` creates it"
+                    );
+                }
+            }
         }
         // Sort longest base_path first so longest-prefix-match works
         // with a simple linear scan. Two tables can't share a base
         // path, so stable order doesn't matter.
         entries.sort_by_key(|e| std::cmp::Reverse(e.base_path.len()));
         Ok(Self {
-            entries,
+            entries: tokio::sync::RwLock::new(entries),
             catalog,
             cfg,
         })
+    }
+
+    /// Load one ident's metadata + creds and build the per-table
+    /// `VendedEntry`. Returns `Ok(None)` when the table doesn't yet
+    /// exist in the catalog — caller decides whether to skip (boot
+    /// path) or to bail (runtime hook, where the materializer just
+    /// finished `create_table`). Returns `Err` for "table exists but
+    /// no creds" / "invalid location" / underlying catalog errors.
+    async fn build_entry_for(
+        catalog: &dyn Catalog,
+        ident: &TableIdent,
+        cfg: &VendedRouterConfig,
+    ) -> IcebergResult<Option<Arc<VendedEntry>>> {
+        let meta = match catalog.load_table(ident).await? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let creds = extract_creds(&meta.config).ok_or_else(|| {
+            IcebergError::Other(format!(
+                "vended-router: catalog returned no S3 credentials for {ident}; \
+                 check that the catalog is a Polaris/Tabular/Snowflake-style server \
+                 and that `header.x-iceberg-access-delegation: vended-credentials` is \
+                 set in catalog_props"
+            ))
+        })?;
+        // Table's S3 location comes from `metadata.location`,
+        // populated by the catalog. The response-side `config`
+        // map sometimes also has it (older Polaris versions, for
+        // instance), so we fall back to that for compatibility.
+        let location = if !meta.location.is_empty() {
+            meta.location.clone()
+        } else {
+            meta.config
+                .get("location")
+                .or_else(|| meta.config.get("s3.location"))
+                .cloned()
+                .ok_or_else(|| {
+                    IcebergError::Other(format!(
+                        "vended-router: no `location` returned for {ident}; \
+                         catalog must include `location` in either the table \
+                         metadata or the loadTable config"
+                    ))
+                })?
+        };
+        let bucket = bucket_from_location(&location).ok_or_else(|| {
+            IcebergError::Other(format!(
+                "vended-router: location {location:?} for {ident} is not an s3:// URI"
+            ))
+        })?;
+        let base_path = warehouse_relative_path(&location).unwrap_or_default();
+        let object_store = build_per_table_object_store(&creds, &bucket, &cfg.default_region)?;
+        let expires_at = SystemTime::now() + cfg.default_ttl;
+        Ok(Some(Arc::new(VendedEntry {
+            ident: ident.clone(),
+            base_path,
+            inner: RwLock::new(EntryInner {
+                object_store,
+                expires_at,
+            }),
+        })))
+    }
+
+    /// Add (or refresh) an entry for `ident`. Used by the
+    /// `BlobStore::register_table` hook the materializer fires after
+    /// `catalog.create_table` succeeds. Idempotent: re-registering an
+    /// existing ident replaces it with a fresh entry (effectively a
+    /// forced cred refresh).
+    async fn register_table_lazy(&self, ident: &TableIdent) -> IcebergResult<()> {
+        let entry = match Self::build_entry_for(self.catalog.as_ref(), ident, &self.cfg).await? {
+            Some(e) => e,
+            None => {
+                return Err(IcebergError::NotFound(format!(
+                    "vended-router: register_table for {ident} but the catalog says it \
+                     doesn't exist; either the materializer's `create_table` hasn't run \
+                     yet or it failed silently"
+                )));
+            }
+        };
+        let mut entries = self.entries.write().await;
+        // Replace any existing entry for the same ident — register is
+        // idempotent and acts as a cred refresh on repeat calls.
+        entries.retain(|e| e.ident != *ident);
+        entries.push(entry);
+        // Re-sort: longest base_path first for the prefix-match scan.
+        entries.sort_by_key(|e| std::cmp::Reverse(e.base_path.len()));
+        Ok(())
     }
 
     /// Locate the entry whose `base_path` is a prefix of `key`. Returns
@@ -289,8 +360,9 @@ impl VendedBlobStoreRouter {
     /// `base_path` entries (table at bucket root) match everything;
     /// they're sorted last so they only catch keys that didn't match
     /// any more-specific entry.
-    fn lookup(&self, key: &str) -> Option<Arc<VendedEntry>> {
-        for e in &self.entries {
+    async fn lookup(&self, key: &str) -> Option<Arc<VendedEntry>> {
+        let entries = self.entries.read().await;
+        for e in entries.iter() {
             if e.base_path.is_empty() || key.starts_with(&e.base_path) {
                 return Some(Arc::clone(e));
             }
@@ -357,7 +429,7 @@ impl VendedBlobStoreRouter {
     }
 
     async fn store_for(&self, key: &str) -> StreamResult<Arc<dyn ObjectStore>> {
-        let entry = self.lookup(key).ok_or_else(|| {
+        let entry = self.lookup(key).await.ok_or_else(|| {
             StreamError::Io(format!(
                 "vended-router: no per-table store registered for path {key:?} \
                  — ensure every materialized blob writes under a registered table's \
@@ -428,6 +500,14 @@ impl BlobStore for VendedBlobStoreRouter {
             Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(StreamError::Io(format!("vended delete {path:?}: {e}"))),
         }
+    }
+
+    async fn register_table(&self, ident: &TableIdent) -> StreamResult<()> {
+        self.register_table_lazy(ident)
+            .await
+            .map_err(|e| StreamError::Io(format!("vended-router register_table: {e}")))?;
+        tracing::info!(%ident, "vended-router: table registered");
+        Ok(())
     }
 }
 
@@ -629,12 +709,10 @@ mod tests {
         // Two entries, sorted longest base_path first. Both paths
         // are equal length so order is implementation-defined; we
         // just check both are present.
-        assert_eq!(router.entries.len(), 2);
-        let bps: std::collections::BTreeSet<&str> = router
-            .entries
-            .iter()
-            .map(|e| e.base_path.as_str())
-            .collect();
+        let entries = router.entries.read().await;
+        assert_eq!(entries.len(), 2);
+        let bps: std::collections::BTreeSet<&str> =
+            entries.iter().map(|e| e.base_path.as_str()).collect();
         assert!(bps.contains("wh/db/orders"));
         assert!(bps.contains("wh/db/users"));
     }
@@ -662,21 +740,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_build_fails_when_table_missing() {
+    async fn router_build_skips_missing_table_for_late_registration() {
+        // Build no longer fails on missing tables — the materializer's
+        // `register_table` hook fires after `catalog.create_table`,
+        // and `BlobStore::register_table` populates the entry then.
+        // Boot-time `build` just leaves the entry off, with a warn.
         let cat = Arc::new(StubCatalog::new());
-        // Don't add any tables → load_table returns None.
-        let err = match VendedBlobStoreRouter::build(
+        let router = VendedBlobStoreRouter::build(
             cat,
             &[ident("ghost")],
             VendedRouterConfig::default(),
         )
         .await
-        {
-            Ok(_) => panic!("expected build to fail with missing table"),
+        .expect("build should not fail just because a table is missing");
+        // Empty entries — no creds loaded for the missing table yet.
+        assert_eq!(router.entries.read().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn router_register_table_lazy_adds_entry_after_create() {
+        // Boot with an empty catalog (no tables registered yet).
+        let cat = Arc::new(StubCatalog::new());
+        let router = VendedBlobStoreRouter::build(
+            Arc::clone(&cat) as Arc<dyn Catalog>,
+            &[],
+            VendedRouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(router.entries.read().await.len(), 0);
+
+        // Operator creates a table — the materializer would call
+        // `register_table` after `catalog.create_table`. Simulate.
+        let a = ident("orders");
+        cat.add(
+            a.clone(),
+            meta_with("s3://bucket/wh/orders", a.clone(), true),
+        );
+        BlobStore::register_table(&router, &a).await.unwrap();
+
+        // Entry is now present with creds loaded; lookup resolves.
+        assert_eq!(router.entries.read().await.len(), 1);
+        let hit = router.lookup("wh/orders/file.parquet").await.unwrap();
+        assert_eq!(hit.ident, a);
+    }
+
+    #[tokio::test]
+    async fn router_register_table_lazy_errors_when_table_still_missing() {
+        // If the materializer's `register_table` hook fires for a
+        // table the catalog *still* doesn't have, that's a real
+        // misconfiguration — surface it as an error.
+        let cat = Arc::new(StubCatalog::new());
+        let router = VendedBlobStoreRouter::build(
+            Arc::clone(&cat) as Arc<dyn Catalog>,
+            &[],
+            VendedRouterConfig::default(),
+        )
+        .await
+        .unwrap();
+        let err = match BlobStore::register_table(&router, &ident("ghost")).await {
+            Ok(_) => panic!("expected register_table to fail when table doesn't exist"),
             Err(e) => e,
         };
-        let msg = format!("{err}");
-        assert!(msg.contains("not found"));
+        assert!(format!("{err}").contains("doesn't exist"));
     }
 
     #[tokio::test]
@@ -704,13 +830,13 @@ mod tests {
         .unwrap();
 
         // Path under the child's prefix → child entry.
-        let hit = router.lookup("wh/data/orders/file.parquet").unwrap();
+        let hit = router.lookup("wh/data/orders/file.parquet").await.unwrap();
         assert_eq!(hit.ident, child);
         // Path only under the parent's prefix → parent entry.
-        let hit = router.lookup("wh/data/sibling.parquet").unwrap();
+        let hit = router.lookup("wh/data/sibling.parquet").await.unwrap();
         assert_eq!(hit.ident, parent);
         // Path outside both → no match.
-        assert!(router.lookup("other/path.parquet").is_none());
+        assert!(router.lookup("other/path.parquet").await.is_none());
     }
 
     #[tokio::test]
@@ -740,7 +866,7 @@ mod tests {
         let initial_loads = cat.loads();
         // Read-fast path won't satisfy us — every `fresh_store` will
         // refresh.
-        let entry = router.lookup("wh/orders/x.parquet").unwrap();
+        let entry = router.lookup("wh/orders/x.parquet").await.unwrap();
         let _ = router.fresh_store(&entry).await.unwrap();
         let _ = router.fresh_store(&entry).await.unwrap();
         // Both calls should have triggered a load_table refresh.
@@ -776,7 +902,7 @@ mod tests {
         .await
         .unwrap();
         let after_build_loads = cat.loads();
-        let entry = router.lookup("wh/orders/x.parquet").unwrap();
+        let entry = router.lookup("wh/orders/x.parquet").await.unwrap();
         let _ = router.fresh_store(&entry).await.unwrap();
         let _ = router.fresh_store(&entry).await.unwrap();
         // No additional loads — still on the credentials from build().

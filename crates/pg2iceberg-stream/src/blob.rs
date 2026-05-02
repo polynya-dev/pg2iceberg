@@ -9,6 +9,7 @@
 use crate::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use pg2iceberg_core::TableIdent;
 
 /// Metadata about a stored blob, returned by [`BlobStore::list`]. We
 /// normalize `last_modified` to milliseconds since epoch so the orphan
@@ -34,4 +35,18 @@ pub trait BlobStore: Send + Sync {
     /// exist — orphan cleanup races with concurrent compaction commits
     /// can produce phantom deletes; treat them as no-ops.
     async fn delete(&self, path: &str) -> Result<()>;
+    /// Notify the blob store that a new table has been registered with
+    /// the catalog. Static-creds backends ignore this. Vended-creds
+    /// routers use it to load per-table credentials and add a new
+    /// per-table object store on the fly — necessary so newly-created
+    /// tables (e.g. `_pg2iceberg.markers`, or YAML tables added in a
+    /// redeploy that weren't in the catalog yet at startup) are
+    /// routable for subsequent put/get calls.
+    ///
+    /// Idempotent. Implementations should treat repeated calls for the
+    /// same `ident` as a refresh (or no-op if creds are still fresh).
+    async fn register_table(&self, ident: &TableIdent) -> Result<()> {
+        let _ = ident;
+        Ok(())
+    }
 }

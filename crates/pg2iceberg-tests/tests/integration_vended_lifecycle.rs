@@ -399,3 +399,99 @@ async fn vended_creds_chain_resolves_per_table_store_via_lakekeeper() {
     // that we trust independently.
     drop(blob);
 }
+
+/// Companion to the test above: same Lakekeeper stack, but the table
+/// is **created after** `build_blob_for_run` has already run. This
+/// is the fresh-deployment / runtime-table-registration path: the
+/// router boots empty (no YAML tables exist in the catalog yet),
+/// then `BlobStore::register_table` populates an entry once the
+/// materializer's `register_table` creates the table downstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vended_router_late_registers_table_after_create() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let stack = bring_up_vended_stack().await;
+    let mut cfg = config_for_vended_stack(&stack);
+
+    // Pretend the operator just edited YAML to add a brand-new
+    // table. The catalog is empty for this name, so the router's
+    // boot-time `build` should skip it (with a warn) instead of
+    // failing.
+    let table_name = format!("vended_late_{}", uniq());
+    cfg.tables[0].name = format!("public.{table_name}");
+
+    let rest = build_rest_catalog(&cfg).await.expect("rest catalog");
+    let catalog = IcebergRustCatalog::new(Arc::new(rest));
+
+    // Build the vended blob store BEFORE the table exists.
+    // Pre-fix this would have errored "table not found in catalog";
+    // post-fix it logs a warn and returns an empty router.
+    let blob = pg2iceberg::run::build_blob_for_run(&cfg, &catalog)
+        .await
+        .expect("build vended router with no-yet-existing table");
+
+    // Now ensure the namespace + create the table — this is what
+    // the materializer does inside `register_table`.
+    catalog
+        .ensure_namespace(&Namespace(vec!["public".into()]))
+        .await
+        .expect("ensure namespace");
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: table_name.clone(),
+    };
+    let schema = pg2iceberg_core::TableSchema {
+        ident: ident.clone(),
+        columns: vec![pg2iceberg_core::ColumnSchema {
+            name: "id".into(),
+            field_id: 1,
+            ty: pg2iceberg_core::IcebergType::Int,
+            nullable: false,
+            is_primary_key: true,
+        }],
+        partition_spec: vec![],
+        pg_schema: None,
+    };
+    catalog.create_table(&schema).await.expect("create table");
+
+    // Fire the hook the materializer would fire here. After this,
+    // the router has a per-table entry with vended creds.
+    blob.register_table(&ident)
+        .await
+        .expect("late-register table on vended router");
+
+    // Confirm the entry routes correctly: a path under the table's
+    // S3 location should resolve to its per-table store. We assert
+    // on the *type* of error (transport vs lookup-miss), not on the
+    // actual wire result — same network limitation as the previous
+    // test.
+    use pg2iceberg_iceberg::prod::warehouse_relative_path;
+    let meta = catalog
+        .load_table(&ident)
+        .await
+        .expect("post-create load_table")
+        .expect("table exists");
+    let base = warehouse_relative_path(&meta.location).expect("relative path");
+    let probe = format!("{base}/sentinel.parquet");
+    let result = blob.list(&probe).await;
+    match result {
+        Ok(_) => {} // unexpected on the host but not wrong
+        Err(e) => {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("no per-table store registered"),
+                "register_table should have populated the entry, but list still got \
+                 a lookup-miss error: {msg}"
+            );
+            // A transport error reaching `minio:9000` from the host
+            // is expected here; we just want to prove the lookup
+            // resolved past the router and into the per-table store.
+        }
+    }
+    drop(blob);
+}
