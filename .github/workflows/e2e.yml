@@ -1,16 +1,10 @@
 name: E2E
 
-# End-to-end suite: drives the real binary against PG + iceberg-rest +
-# MinIO + ClickHouse via docker-compose, runs every fixture under
-# `tests/cases/`, and diffs each test's ClickHouse output against its
-# `__reference.tsv`. Slow (~10–20s per case × 39 cases), so this is
-# manual / weekly only — not on every PR.
-
 on:
-  workflow_dispatch:
-  schedule:
-    # Sunday 06:00 UTC.
-    - cron: "0 6 * * 0"
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
