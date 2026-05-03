@@ -54,7 +54,11 @@ pg2iceberg-validate.workspace = true
 bytes = "1"
 pollster = "0.4"
 proptest.workspace = true
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+# `test-util` activates `tokio::time::pause` / `advance` for the
+# chaos soak's lifecycle-driving DST: virtual time is the only way
+# to keep `run_logical_main_loop`'s scheduler-driven ticks
+# deterministic under proptest seeds.
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util", "sync"] }
 
 [features]
 # Enables the testcontainers-driven integration tests

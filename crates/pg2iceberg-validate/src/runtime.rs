@@ -1104,6 +1104,36 @@ where
     if let Err(e) = loop_state.stream.send_standby(final_lsn, final_lsn).await {
         tracing::warn!(error = %e, "final send_standby failed");
     }
+    // Update each completed table's `snapshot_lsn` to the final
+    // flushed LSN so the next startup's `SlotAheadOfCheckpoint`
+    // invariant doesn't reject a slot that legitimately advanced
+    // past the original snapshot completion point. Without this,
+    // every restart after CDC progress would refuse to start
+    // (`slot.restart_lsn > max(snapshot_lsn)`). We only re-stamp
+    // tables already marked `snapshot_complete = true` — pending
+    // backfills keep their original (lower) snapshot_lsn so they
+    // can still be diagnosed.
+    if final_lsn > Lsn::ZERO {
+        for ident in &loop_state.watched_tables {
+            match loop_state.coord.table_state(ident).await {
+                Ok(Some(state)) if state.snapshot_complete && state.snapshot_lsn < final_lsn => {
+                    if let Err(e) = loop_state
+                        .coord
+                        .mark_table_snapshot_complete(ident, state.pg_oid, final_lsn)
+                        .await
+                    {
+                        tracing::warn!(
+                            table = %ident,
+                            error = %e,
+                            "failed to bump snapshot_lsn high-water mark on shutdown"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(table = %ident, error = %e, "table_state read failed"),
+            }
+        }
+    }
     let _ = loop_state
         .coord
         .unregister_consumer(&loop_state.group, &loop_state.worker_id)
