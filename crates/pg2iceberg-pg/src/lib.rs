@@ -270,4 +270,18 @@ pub trait PgClient: Send + Sync {
     /// IF EXISTS`, which is a noop on a missing publication. Used by
     /// the operational `cleanup` subcommand alongside [`Self::drop_slot`].
     async fn drop_publication(&self, name: &str) -> Result<()>;
+
+    /// Add a single table to an existing publication. Issues
+    /// `ALTER PUBLICATION <name> ADD TABLE <schema>.<table>`. Used by
+    /// the lifecycle's startup reconciliation to extend the
+    /// publication when a new table appears in the operator's YAML
+    /// (pg2iceberg fully owns publication membership). Idempotent at
+    /// the trait surface — returns `Ok(())` if the table is already
+    /// in the publication (PG returns "table is already in
+    /// publication" error which the prod impl swallows).
+    ///
+    /// Note: ALTER PUBLICATION ADD TABLE captures *future* events
+    /// for the table. Pre-existing rows must be backfilled via
+    /// snapshot; the lifecycle handles that gating.
+    async fn alter_publication_add_table(&self, name: &str, ident: &TableIdent) -> Result<()>;
 }

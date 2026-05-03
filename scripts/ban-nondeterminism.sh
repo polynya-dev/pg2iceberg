@@ -37,7 +37,17 @@ PATTERNS=(
 # is acceptable, and threading a Clock through the 20+ Materializer call sites
 # isn't worth it for an audit-log timestamp. The intent is documented in-place
 # in the `now_micros` doc-comment.
-ALLOW='^crates/pg2iceberg-pg/src/prod/|^crates/pg2iceberg-iceberg/src/prod/|^crates/pg2iceberg-coord/src/prod/|^crates/pg2iceberg-stream/src/prod/|^crates/pg2iceberg/src/|^crates/pg2iceberg-logical/src/materializer\.rs:|^scripts/|^crates/[^/]+/tests/|/target/'
+#
+# Note on validate/runtime.rs: a single `tokio::spawn` call site is allowed
+# in the lifecycle's mid-stream-add-table path — it spawns the background
+# snapshot task that backfills a newly-configured table while CDC for
+# already-configured tables keeps streaming uninterrupted. The DST harness
+# bypasses `run_logical_lifecycle` entirely (chaos soak drives Snapshotter
+# synchronously), so determinism in the DST loop isn't affected. Any *new*
+# `tokio::spawn` site in this file must come with a similar justification:
+# explain why a parallel path is necessary, and either prove the DST
+# bypasses it or extend the harness to drive it deterministically.
+ALLOW='^crates/pg2iceberg-pg/src/prod/|^crates/pg2iceberg-iceberg/src/prod/|^crates/pg2iceberg-coord/src/prod/|^crates/pg2iceberg-stream/src/prod/|^crates/pg2iceberg/src/|^crates/pg2iceberg-logical/src/materializer\.rs:|^crates/pg2iceberg-validate/src/runtime\.rs:|^scripts/|^crates/[^/]+/tests/|/target/'
 
 fail=0
 

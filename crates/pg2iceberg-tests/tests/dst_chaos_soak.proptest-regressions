@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b8663d69d610b77cd3cfe43d3ac8cbbfe3d8d2516b5c335995dc6b1472b6c77a # shrinks to steps = [Insert { table_idx: 0, id: 1 }, DriveFlush, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, InsertToast { table_idx: 1, id: 7 }, Insert { table_idx: 1, id: 4 }, MaterializerCycle, Delete { table_idx: 1, id: 12 }, Update { table_idx: 1, id: 1 }, InjectFault { op: "coord.claim_offsets", count: 3 }, Expire, Insert { table_idx: 2, id: 6 }]
+cc a9ca3d4002ea847cc63d02c35cab31fbfa0be891b98aac8140171bd3ee9c5f33 # shrinks to steps = [Insert { table_idx: 0, id: 1 }, DriveFlush, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, MaterializerCycle, Insert { table_idx: 0, id: 1 }, Expire, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, InsertToast { table_idx: 0, id: 1 }, Delete { table_idx: 1, id: 1 }, Delete { table_idx: 0, id: 6 }, Insert { table_idx: 0, id: 4 }, MaterializerCycle]
+cc 03bbadce149b2359bfd6b7303d3c850b0f848aac23f66aea94a9c6f1b82c5f88 # shrinks to steps = [InjectFault { op: "coord.claim_offsets", count: 2 }, DriveFlush, Insert { table_idx: 2, id: 1 }, AddTable, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 0, id: 1 }, Insert { table_idx: 2, id: 7 }, Insert { table_idx: 1, id: 1 }, Update { table_idx: 4, id: 11 }, InsertToast { table_idx: 0, id: 10 }, Update { table_idx: 4, id: 10 }, DriveFlush, InsertToast { table_idx: 4, id: 10 }, Insert { table_idx: 4, id: 4 }, Insert { table_idx: 0, id: 5 }, Compact]

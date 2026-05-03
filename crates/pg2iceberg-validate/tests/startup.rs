@@ -160,14 +160,19 @@ fn slot_gone_but_lsn_exists_violation() {
     );
 }
 
-// 5. Slot's restart_lsn is ahead of recorded snapshot_lsn (WAL recycled).
+// 5. Slot's restart_lsn is ahead of `coord_flushed_lsn` (the moving
+//    checkpoint). Compares against `coord_flushed_lsn` rather than
+//    `snapshot_lsn` because snapshot_lsn doesn't move with CDC, so
+//    using it would false-positive on every restart with normal CDC
+//    progress (the chaos soak surfaced this).
 #[test]
 fn slot_ahead_of_checkpoint_violation() {
     let mut v = fresh_logical();
     v.tables.push(snapshotted_table("orders", true, 100));
+    v.coord_flushed_lsn = Lsn(150);
     v.slot = Some(SlotState {
         exists: true,
-        restart_lsn: Lsn(200), // WAL recycled past the recorded snapshot
+        restart_lsn: Lsn(200), // ahead of coord checkpoint — tamper / external advance
         confirmed_flush_lsn: Lsn(200),
         ..Default::default()
     });
@@ -176,10 +181,29 @@ fn slot_ahead_of_checkpoint_violation() {
         &err,
         &Violation::SlotAheadOfCheckpoint {
             restart_lsn: Lsn(200),
-            snapshot_lsn: Lsn(100),
+            snapshot_lsn: Lsn(150),
             slot_name: "pg2iceberg".into(),
         },
     );
+}
+
+/// Slot ahead of snapshot_lsn but in lockstep with coord_flushed_lsn —
+/// this is normal CDC progress and must NOT trip
+/// `SlotAheadOfCheckpoint`.
+#[test]
+fn slot_ahead_of_snapshot_lsn_but_tracking_coord_does_not_violate() {
+    let mut v = fresh_logical();
+    v.tables.push(snapshotted_table("orders", true, 100));
+    // coord_flushed_lsn moves with the slot; snapshot_lsn stays at
+    // the original snapshot completion point.
+    v.coord_flushed_lsn = Lsn(200);
+    v.slot = Some(SlotState {
+        exists: true,
+        restart_lsn: Lsn(200),
+        confirmed_flush_lsn: Lsn(200),
+        ..Default::default()
+    });
+    validate_startup(&v).expect("normal CDC progress should validate cleanly");
 }
 
 // 6. Snapshot complete but LSN is 0 (crashed mid-stamp).
@@ -238,9 +262,13 @@ fn snapshot_complete_lsn_zero_in_query_mode_is_ok() {
     assert!(validate_startup(&v).is_ok());
 }
 
-// 7. Snapshot complete but Iceberg table has no snapshots.
+// 7. Snapshot complete but Iceberg table has no snapshots — used to
+//    fire `SnapshotCompleteButTableNoSnapshot`. The invariant was
+//    removed (see lib.rs comment); a legitimate `AddTable` on an
+//    empty source table reaches this exact state and shouldn't be
+//    flagged. Identity changes are still caught via invariant 11.
 #[test]
-fn snapshot_complete_but_table_has_no_snapshot_violation() {
+fn snapshot_complete_but_table_has_no_snapshot_does_not_violate() {
     let mut v = fresh_logical();
     v.slot = Some(SlotState {
         exists: true,
@@ -252,18 +280,12 @@ fn snapshot_complete_but_table_has_no_snapshot_violation() {
         pg_table: ident("orders"),
         iceberg_name: "orders".into(),
         existed: true,
-        current_snapshot_id: None, // iceberg table exists but has no snapshots
+        current_snapshot_id: None, // empty table, never had data — OK
         current_pg_oid: Some(42),
         in_publication: true,
         stored_state: Some(snapshot_state(42, 100)),
     });
-    let err = validate_startup(&v).unwrap_err();
-    assert_one_violation(
-        &err,
-        &Violation::SnapshotCompleteButTableNoSnapshot {
-            table: "orders".into(),
-        },
-    );
+    validate_startup(&v).expect("empty-table state should validate cleanly");
 }
 
 // 8. Slot wal_status == Lost — WAL recycled past `max_slot_wal_keep_size`.

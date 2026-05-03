@@ -17,7 +17,7 @@ pub mod watcher;
 pub use runtime::{
     drain_and_shutdown, run_logical_lifecycle, run_logical_main_loop, run_materialize_tick,
     run_watcher_tick, LifecycleError, LogicalLifecycle, LogicalLoop, MainLoopError,
-    MaterializeTickOutcome, SnapshotSourceFactoryFut,
+    MaterializeTickOutcome, SnapshotSourceFactory, SnapshotSourceFactoryFut,
 };
 pub use watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
 
@@ -309,25 +309,26 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
         }
     }
 
-    // 5. Slot's restart_lsn is ahead of every recorded snapshot_lsn
-    //    (WAL recycled past where we last said we were caught up).
-    //    Use the *max* recorded snapshot_lsn — if the slot is past
-    //    even our furthest-ahead table, the gap is real.
+    // 5. Slot's restart_lsn is ahead of our coord-side checkpoint.
+    //    Compares against `coord_flushed_lsn` (the moving high-water
+    //    mark stamped on every standby ack), NOT against
+    //    `snapshot_lsn` — `snapshot_lsn` is set once at snapshot
+    //    completion and never moves, so under normal CDC progress
+    //    `slot.restart_lsn` legitimately advances past it. The
+    //    actual concern this invariant catches is "the slot moved
+    //    without us recording the ack" (operator manually advanced
+    //    via `pg_replication_slot_advance`, or another consumer
+    //    interfered). That's slot.restart_lsn > coord_flushed_lsn.
+    //    Skip when coord_flushed_lsn is `Lsn::ZERO` (fresh install
+    //    has no baseline yet).
     if let Some(slot) = &v.slot {
-        if slot.exists {
-            let max_snapshot_lsn = v
-                .tables
-                .iter()
-                .filter_map(|t| t.stored_state.as_ref().map(|s| s.snapshot_lsn))
-                .max()
-                .unwrap_or(Lsn::ZERO);
-            if max_snapshot_lsn > Lsn::ZERO && slot.restart_lsn > max_snapshot_lsn {
-                violations.push(Violation::SlotAheadOfCheckpoint {
-                    restart_lsn: slot.restart_lsn,
-                    snapshot_lsn: max_snapshot_lsn,
-                    slot_name: v.slot_name.clone(),
-                });
-            }
+        if slot.exists && v.coord_flushed_lsn > Lsn::ZERO && slot.restart_lsn > v.coord_flushed_lsn
+        {
+            violations.push(Violation::SlotAheadOfCheckpoint {
+                restart_lsn: slot.restart_lsn,
+                snapshot_lsn: v.coord_flushed_lsn,
+                slot_name: v.slot_name.clone(),
+            });
         }
     }
 
@@ -346,18 +347,16 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
         }
     }
 
-    // 7. Per-table snapshot_complete but the catalog table has no
-    //    snapshots — the iceberg table was likely recreated
-    //    externally.
-    for t in &v.tables {
-        if let Some(state) = &t.stored_state {
-            if state.snapshot_complete && t.existed && t.current_snapshot_id.is_none() {
-                violations.push(Violation::SnapshotCompleteButTableNoSnapshot {
-                    table: t.iceberg_name.clone(),
-                });
-            }
-        }
-    }
+    // (Old invariant 7 — "snapshot_complete=true but catalog has no
+    //  snapshots — iceberg table was likely recreated externally" —
+    //  was removed because it false-positived on the legitimate
+    //  empty-table case: `AddTable` on a brand-new empty source
+    //  table marks coord `snapshot_complete = true` (the snapshot
+    //  ran; there were just no rows) but neither sim nor prod
+    //  catalog commits an empty snapshot, so `current_snapshot_id`
+    //  stays `None`. The "external table wipe" scenario this
+    //  invariant aimed to catch is also covered by invariant 11
+    //  `TableIdentityChanged` — a recreate produces a new pg_oid.)
 
     // 8. Slot is `lost` — WAL recycled past `max_slot_wal_keep_size`.
     //    `wal_status = None` (pre-PG-13) skips this check.

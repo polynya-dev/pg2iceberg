@@ -1,0 +1,53 @@
+name: Nightly soak
+
+# Runs the long-running, opt-in DST soak tests that PR CI keeps
+# `#[ignore]`'d to keep PR latency low. Cron fires once per day; a
+# manual dispatch is also wired so an engineer can trigger it
+# on-demand after landing a meaningful pipeline change.
+
+on:
+  schedule:
+    # 04:30 UTC daily — late enough that morning PRs in the Asia
+    # window aren't waiting on the runner pool, but early enough
+    # that EU/US engineers see results when they start the day.
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  chaos-soak-extended:
+    name: chaos_soak_extended_seeds (50k seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Per-seed runtime in release mode is ~3-4ms (small in-memory
+      # sim, bounded workload). 50k seeds finishes in ~3-4 minutes
+      # on the GitHub-hosted runner pool — well inside the 30-min
+      # timeout and a much deeper sweep than the 4k local default.
+      # If a regression starts shrinking, proptest's shrink path
+      # adds a few minutes of additional wall-clock; the timeout
+      # still catches a runaway shrink.
+      CHAOS_SOAK_CASES: "50000"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache from PR CI's `build-test` job so the
+          # release-mode artifacts don't evict the dev-mode ones
+          # PR runs depend on.
+          key: nightly-soak
+
+      - name: cargo test --release chaos_soak_extended_seeds
+        run: |
+          cargo test \
+            --release \
+            -p pg2iceberg-tests \
+            --test dst_chaos_soak \
+            chaos_soak_extended_seeds \
+            -- --ignored --nocapture
