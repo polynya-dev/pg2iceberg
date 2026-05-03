@@ -304,6 +304,15 @@ struct TableEntry {
     file_index: FileIndex,
     /// Cached writer; `TableWriter::new` precomputes Arrow schemas once.
     writer: TableWriter,
+    /// When `true`, `cycle()` skips this table — its CDC events
+    /// accumulate in `log_index` but are NOT applied to Iceberg
+    /// until a snapshot task calls [`Materializer::mark_snapshot_complete`].
+    /// Set by [`Materializer::register_table_pending`] for tables
+    /// that need a backfill snapshot before any CDC apply (the
+    /// mid-stream-add path). Defaults to `false` for the legacy
+    /// [`Materializer::register_table`] entry, preserving existing
+    /// behavior where the lifecycle gates the whole snapshot phase.
+    gated_until_snapshot: bool,
 }
 
 pub struct Materializer<C: Catalog> {
@@ -753,9 +762,43 @@ impl<C: Catalog> Materializer<C> {
                 pk_cols,
                 file_index,
                 writer,
+                gated_until_snapshot: false,
             },
         );
         Ok(())
+    }
+
+    /// Variant of [`Self::register_table`] for the mid-stream-add
+    /// path: registers the table the same way, but marks it
+    /// `gated_until_snapshot = true` so [`Self::cycle`] won't apply
+    /// any of its CDC events to Iceberg until a backfill snapshot
+    /// task calls [`Self::mark_snapshot_complete`].
+    ///
+    /// Used by `pg2iceberg_validate::run_logical_lifecycle` when it
+    /// detects a configured table whose `coord.table_state` is not
+    /// yet `snapshot_complete = true`. The lifecycle then spawns a
+    /// background snapshot task; while that task runs, CDC events
+    /// for this table land in `log_index` but stay un-materialized.
+    /// Once the task finishes its final per-table flush and stamps
+    /// the coord row, it calls `mark_snapshot_complete` to ungate
+    /// materialization.
+    pub async fn register_table_pending(&mut self, schema: TableSchema) -> Result<()> {
+        self.register_table(schema.clone()).await?;
+        if let Some(entry) = self.tables.get_mut(&schema.ident) {
+            entry.gated_until_snapshot = true;
+        }
+        Ok(())
+    }
+
+    /// Lift the gate set by [`Self::register_table_pending`]. Called
+    /// by the background snapshot task once the table's
+    /// `coord.tables` row is stamped with `snapshot_complete = true`
+    /// so the next `cycle()` picks the table up. No-op if the table
+    /// wasn't gated (idempotent).
+    pub fn mark_snapshot_complete(&mut self, ident: &TableIdent) {
+        if let Some(entry) = self.tables.get_mut(ident) {
+            entry.gated_until_snapshot = false;
+        }
     }
 
     /// Apply a pgoutput Relation message: diff `incoming_columns`
@@ -965,8 +1008,22 @@ impl<C: Catalog> Materializer<C> {
     }
 
     pub async fn cycle(&mut self) -> Result<usize> {
-        // 1. Default path: process every registered table.
-        let mut idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
+        // 1. Default path: process every registered table whose
+        //    backfill-snapshot gate is open. Tables registered via
+        //    [`Self::register_table_pending`] (mid-stream additions
+        //    waiting on a background snapshot task) are filtered
+        //    out — their CDC events stay durable in `log_index` but
+        //    don't reach Iceberg until the task calls
+        //    [`Self::mark_snapshot_complete`]. Without this, a table
+        //    would receive Update/Delete CDC events for rows that
+        //    don't yet exist in Iceberg and silently materialize
+        //    phantoms.
+        let mut idents: Vec<TableIdent> = self
+            .tables
+            .iter()
+            .filter(|(_, e)| !e.gated_until_snapshot)
+            .map(|(t, _)| t.clone())
+            .collect();
 
         // 2. Distributed path: refresh heartbeat, read active-worker
         //    list, compute deterministic round-robin assignment,

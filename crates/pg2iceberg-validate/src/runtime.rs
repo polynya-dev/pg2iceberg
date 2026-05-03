@@ -150,6 +150,15 @@ pub enum LifecycleError {
     /// `conflicting` flips to true; the main loop propagates it.
     #[error("slot health regressed: {0}")]
     SlotHealth(String),
+    /// A background snapshot task (the mid-stream-add path) failed
+    /// for one of the configured tables. Surfaced from the main
+    /// loop's pending-snapshot channel arm. Distinct from
+    /// `Snapshot` (which wraps `pg2iceberg_snapshot::SnapshotError`
+    /// from the synchronous fresh-slot path) so operators can tell
+    /// "the boot snapshot blew up" from "the live add-table
+    /// backfill blew up."
+    #[error("background snapshot failed for {ident}: {error}")]
+    BackgroundSnapshot { ident: String, error: String },
 }
 
 /// Type alias for backwards-compat — the previous loop-only error
@@ -202,7 +211,7 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// binary's factory builds a `PgSnapshotSource`; the DST's factory
     /// returns the harness's `SimPostgres` clone wrapped as a trait
     /// object.
-    pub snapshot_source_factory: Box<dyn FnOnce(&[TableSchema]) -> SnapshotSourceFactoryFut + Send>,
+    pub snapshot_source_factory: SnapshotSourceFactory,
     /// Materializer namer. Prod uses `CounterMaterializerNamer`
     /// (counter-suffixed); tests can pass a deterministic namer.
     pub materializer_namer: Arc<dyn MaterializerNamer>,
@@ -230,6 +239,12 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
 /// AND to be `dyn`-callable.
 pub type SnapshotSourceFactoryFut =
     std::pin::Pin<Box<dyn Future<Output = Result<Box<dyn SnapshotSource>, LifecycleError>> + Send>>;
+
+/// Type alias for the snapshot-source factory closure. The
+/// `LogicalLifecycle` field and the helper that consumes it both
+/// reference this; named here so clippy's type-complexity lint
+/// doesn't fire at every call site.
+pub type SnapshotSourceFactory = Box<dyn FnOnce(&[TableSchema]) -> SnapshotSourceFactoryFut + Send>;
 
 /// Run the *complete* logical-replication lifecycle from already-built
 /// IO components to clean shutdown. Steps:
@@ -267,6 +282,13 @@ where
     //    silently re-using one cluster's LSN against another
     //    cluster's WAL. Sim's `identify_system_id` returns 0, in
     //    which case the stamp + check both no-op.
+    // Factory is `FnOnce` — exactly one of the snapshot paths
+    // (synchronous fresh-slot OR background mid-stream-add) consumes
+    // it. Stash in an `Option` so the compiler can see each branch
+    // does its own `take()` rather than tracking a moved field
+    // through a runtime mutex of mutually-exclusive blocks.
+    let mut factory_slot: Option<SnapshotSourceFactory> = Some(lc.snapshot_source_factory);
+
     let connected_system_id = lc.pg.identify_system_id().await?;
     if connected_system_id != 0 {
         tracing::info!(
@@ -353,6 +375,36 @@ where
         tracing::info!(slot = %lc.slot_name, "replication slot exists, resuming");
     }
 
+    // 2.5. Reconcile publication membership. pg2iceberg fully owns
+    //      the publication — the operator's YAML is the source of
+    //      truth, and on every restart the lifecycle ensures the
+    //      publication contains every configured table. New tables
+    //      added to YAML get an `ALTER PUBLICATION ADD TABLE` here
+    //      (fresh-slot path's `create_publication` covers them
+    //      already; this also fills in any gap left by an earlier
+    //      `create_publication failed; assuming it exists` warn).
+    //      Idempotent at the trait surface — already-member is
+    //      treated as success, so a crash between ALTER and the
+    //      downstream snapshot stamp resumes cleanly.
+    let pub_members_now: BTreeSet<TableIdent> = lc
+        .pg
+        .publication_tables(&lc.publication_name)
+        .await
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default();
+    for pg_ident in &pub_table_idents {
+        if !pub_members_now.contains(pg_ident) {
+            lc.pg
+                .alter_publication_add_table(&lc.publication_name, pg_ident)
+                .await?;
+            tracing::info!(
+                publication = %lc.publication_name,
+                table = %pg_ident,
+                "publication extended (operator added table to YAML)"
+            );
+        }
+    }
+
     // 3. Build pipeline + materializer + register tables.
     let mut pipeline = Pipeline::new(
         Arc::clone(&lc.coord),
@@ -393,11 +445,44 @@ where
         &lc.group,
         lc.mat_cycle_limit,
     );
+    // Tables that need a backfill snapshot before any of their CDC
+    // events are applied to Iceberg. Computed here so we can register
+    // each schema with the right gate (`register_table_pending` vs
+    // `register_table`). The list drives the spawn-background-task
+    // logic later — empty when there's nothing to backfill.
+    let mut pending_backfill: Vec<TableSchema> = Vec::new();
     for schema in &lc.schemas {
-        materializer
-            .register_table(schema.clone())
-            .await
-            .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
+        // skip_snapshot=true is the operator's "I've already
+        // populated this table externally; don't backfill" toggle —
+        // these tables are never pending. Fresh-slot path runs the
+        // synchronous snapshot phase below, so non-skip tables
+        // there also aren't pending. Only the non-fresh-slot case
+        // with a missing or incomplete coord row counts as pending.
+        let needs_backfill = !slot_was_fresh
+            && !lc.skip_snapshot_idents.contains(&schema.ident)
+            && lc
+                .coord
+                .table_state(&schema.ident)
+                .await
+                .map_err(|e| LifecycleError::Coord(e.to_string()))?
+                .map(|s| !s.snapshot_complete)
+                .unwrap_or(true);
+        if needs_backfill {
+            materializer
+                .register_table_pending(schema.clone())
+                .await
+                .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
+            pending_backfill.push(schema.clone());
+            tracing::info!(
+                table = %schema.ident,
+                "table needs backfill snapshot (gated until background task completes)"
+            );
+        } else {
+            materializer
+                .register_table(schema.clone())
+                .await
+                .map_err(|e| LifecycleError::Catalog(e.to_string()))?;
+        }
         // Same PG → Iceberg ident translation as the pipeline,
         // applied here so schema-evolution Relation messages from
         // pgoutput find their target table when `sink.namespace`
@@ -459,7 +544,12 @@ where
             );
             None
         } else {
-            let source = (lc.snapshot_source_factory)(&to_snapshot).await?;
+            let source = (factory_slot
+                .take()
+                .expect("factory_slot consumed before fresh-slot snapshot path"))(
+                &to_snapshot
+            )
+            .await?;
             tracing::info!(
                 count = to_snapshot.len(),
                 snap_lsn = ?source.snapshot_lsn().await?,
@@ -501,6 +591,83 @@ where
         }
     } else {
         None
+    };
+
+    // 5b. Background snapshot for mid-stream-added tables. Triggered
+    //     when the slot already exists (so step 5's synchronous
+    //     fresh-slot snapshot didn't run) and at least one configured
+    //     table has no `snapshot_complete = true` row in coord. The
+    //     task runs concurrently with the main loop's CDC processing —
+    //     existing tables don't pause for the new table's backfill.
+    //     The materializer's per-table `gated_until_snapshot` gate
+    //     keeps CDC events for the pending tables out of Iceberg
+    //     until the task signals completion via the channel.
+    let (pending_snapshot_handle, pending_snapshot_rx) = if !slot_was_fresh
+        && !pending_backfill.is_empty()
+    {
+        let mut table_oids: std::collections::BTreeMap<TableIdent, u32> =
+            std::collections::BTreeMap::new();
+        for s in &pending_backfill {
+            if let Some(oid) = lc.pg.table_oid(s.pg_schema(), &s.ident.name).await? {
+                table_oids.insert(s.ident.clone(), oid);
+            }
+        }
+        // Per-table primary keys + ident translations the
+        // background pipeline needs to mirror the main pipeline's
+        // configuration. Computed once here so the spawned task
+        // closure stays `'static`.
+        let pk_per_table: std::collections::BTreeMap<TableIdent, Vec<pg2iceberg_core::ColumnName>> =
+            pending_backfill
+                .iter()
+                .map(|s| {
+                    (
+                        s.ident.clone(),
+                        s.primary_key_columns()
+                            .map(|c| pg2iceberg_core::ColumnName(c.name.clone()))
+                            .collect(),
+                    )
+                })
+                .collect();
+        let translation_per_table: std::collections::BTreeMap<TableIdent, TableIdent> =
+            pending_backfill
+                .iter()
+                .map(|s| (s.pg_ident(), s.ident.clone()))
+                .collect();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PendingSnapshotMsg>();
+        let factory = factory_slot
+            .take()
+            .expect("factory_slot consumed before background snapshot path");
+        let coord_for_task = Arc::clone(&lc.coord);
+        let blob_for_task = Arc::clone(&lc.blob);
+        let blob_namer_for_task = Arc::clone(&lc.blob_namer);
+        let metrics_for_task = Arc::clone(&lc.metrics);
+        let flush_rows = lc.flush_rows;
+        let pending_for_task = pending_backfill.clone();
+        let handle = tokio::spawn(async move {
+            run_pending_snapshot_task(
+                factory,
+                pending_for_task,
+                coord_for_task,
+                blob_for_task,
+                blob_namer_for_task,
+                metrics_for_task,
+                flush_rows,
+                pk_per_table,
+                translation_per_table,
+                table_oids,
+                pg2iceberg_snapshot::DEFAULT_CHUNK_SIZE,
+                tx,
+            )
+            .await;
+        });
+        tracing::info!(
+            count = pending_backfill.len(),
+            "background snapshot task spawned for mid-stream-added tables"
+        );
+        (Some(handle), Some(rx))
+    } else {
+        (None, None)
     };
 
     // 6. start_replication AT the right LSN. Snapshot↔CDC fence:
@@ -549,6 +716,8 @@ where
         compaction: lc.compaction,
         worker_id,
         consumer_ttl: lc.consumer_ttl,
+        pending_snapshot_rx,
+        pending_snapshot_handle,
     };
     run_logical_main_loop(loop_state, shutdown).await
 }
@@ -662,6 +831,28 @@ pub struct LogicalLoop<C: Coordinator + ?Sized + 'static, Cat: Catalog + 'static
     pub compaction: Option<CompactionConfig>,
     pub worker_id: WorkerId,
     pub consumer_ttl: Duration,
+    /// Optional channel: a background snapshot task pumps
+    /// per-table completion notifications here. The main loop calls
+    /// [`Materializer::mark_snapshot_complete`] to lift the gate
+    /// installed by [`Materializer::register_table_pending`] so
+    /// CDC events for that table start flowing into Iceberg.
+    /// `None` when no mid-stream snapshots are in flight.
+    pub pending_snapshot_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PendingSnapshotMsg>>,
+    /// Background snapshot task handle. Awaited on graceful
+    /// shutdown so the task gets a chance to flush its final
+    /// chunks; aborted on hard shutdown if we can't wait.
+    pub pending_snapshot_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Per-table completion message from a background snapshot task to
+/// the main loop. `result.Ok` means the table is fully snapshotted +
+/// `coord.tables.snapshot_complete = true` is stamped; main loop
+/// then calls [`Materializer::mark_snapshot_complete`]. `result.Err`
+/// surfaces a fatal failure; main loop propagates it as
+/// [`MainLoopError::Snapshot`] so the operator sees the regression.
+pub struct PendingSnapshotMsg {
+    pub ident: TableIdent,
+    pub result: std::result::Result<(), String>,
 }
 
 /// Run the full replication main loop until `shutdown` resolves.
@@ -697,9 +888,36 @@ where
         let next = ticker.next_due();
         let tick_sleep = micros_to_duration(next, now);
 
+        // Recv from the pending-snapshot channel without holding a
+        // mutable borrow across the select! arm (the `if`-guard reads
+        // the option, then the arm body re-borrows). When the
+        // channel is `None` (no background snapshot task), the
+        // future never resolves and the arm never fires.
         tokio::select! {
             biased;
             _ = &mut shutdown => break,
+            Some(msg) = async {
+                match loop_state.pending_snapshot_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => None,
+                }
+            } => {
+                match msg.result {
+                    Ok(()) => {
+                        loop_state.materializer.mark_snapshot_complete(&msg.ident);
+                        tracing::info!(
+                            table = %msg.ident,
+                            "background snapshot complete; materializer ungated"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(MainLoopError::BackgroundSnapshot {
+                            ident: format!("{}", msg.ident),
+                            error,
+                        });
+                    }
+                }
+            }
             res = loop_state.stream.recv() => {
                 let msg = res.map_err(|e| MainLoopError::Recv(e.to_string()))?;
                 // Relation messages drive schema evolution: diff
@@ -897,4 +1115,116 @@ where
 fn micros_to_duration(next: Timestamp, now: Timestamp) -> Duration {
     let until_next = (next.0.saturating_sub(now.0)).max(0) as u64;
     Duration::from_micros(until_next.min(1_000_000))
+}
+
+/// Backfill snapshots a list of mid-stream-added tables in the
+/// background while the main lifecycle's CDC loop runs uninterrupted.
+///
+/// The task owns a *separate* `Pipeline` instance that shares
+/// `coord` / `blob` / `blob_namer` with the main pipeline. Both
+/// pipelines stage events into the same coord (atomic
+/// `claim_offsets` keeps log_index offsets consistent) and write
+/// blobs through the same atomic-counter namer (no path
+/// collisions). The materializer reads from coord; it doesn't
+/// care which pipeline staged what.
+///
+/// Per pending table, the task:
+/// 1. Calls `Snapshotter::run` with that single schema. Snapshotter
+///    reads PG via the shared `SnapshotSource`, pushes rows
+///    through this task's pipeline, flushes per-chunk, stamps
+///    progress + completion in coord (`mark_table_snapshot_complete`).
+/// 2. Sends `PendingSnapshotMsg { ident, result: Ok(()) }` so the
+///    main loop calls `materializer.mark_snapshot_complete` and
+///    starts applying the table's CDC events.
+///
+/// On failure, sends `Err` and exits — the main loop converts to
+/// [`MainLoopError::BackgroundSnapshot`] and the operator restarts
+/// pg2iceberg, which re-enters the snapshot via the per-table
+/// progress cursor in coord.
+#[allow(clippy::too_many_arguments)]
+async fn run_pending_snapshot_task(
+    snapshot_source_factory: SnapshotSourceFactory,
+    pending_schemas: Vec<TableSchema>,
+    coord: Arc<dyn Coordinator>,
+    blob: Arc<dyn BlobStore>,
+    blob_namer: Arc<dyn BlobNamer>,
+    metrics: Arc<dyn pg2iceberg_core::Metrics>,
+    flush_rows: usize,
+    pk_per_table: std::collections::BTreeMap<TableIdent, Vec<pg2iceberg_core::ColumnName>>,
+    translation_per_table: std::collections::BTreeMap<TableIdent, TableIdent>,
+    table_oids: std::collections::BTreeMap<TableIdent, u32>,
+    chunk_size: usize,
+    tx: tokio::sync::mpsc::UnboundedSender<PendingSnapshotMsg>,
+) {
+    // Build the task-local pipeline. Same configuration shape as the
+    // main pipeline, just owned by this task. Marker mode is NOT
+    // enabled — markers fire on user CDC, not on snapshot rows.
+    let mut pipeline: Pipeline<dyn Coordinator> = Pipeline::with_metrics(
+        Arc::clone(&coord),
+        Arc::clone(&blob),
+        Arc::clone(&blob_namer),
+        flush_rows,
+        metrics,
+    );
+    for (ident, pks) in &pk_per_table {
+        if !pks.is_empty() {
+            pipeline.register_primary_keys(ident.clone(), pks.clone());
+        }
+    }
+    for (pg_ident, ice_ident) in &translation_per_table {
+        if pg_ident != ice_ident {
+            pipeline.register_table_translation(pg_ident.clone(), ice_ident.clone());
+        }
+    }
+
+    let source = match snapshot_source_factory(&pending_schemas).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Source-construction failure is fatal — without a source
+            // none of the pending tables can be backfilled. Surface
+            // the error against the first pending ident; the operator
+            // sees one error rather than N copies.
+            if let Some(first) = pending_schemas.first() {
+                let _ = tx.send(PendingSnapshotMsg {
+                    ident: first.ident.clone(),
+                    result: Err(format!("snapshot source factory: {e}")),
+                });
+            }
+            return;
+        }
+    };
+
+    for schema in &pending_schemas {
+        let snapshotter = pg2iceberg_snapshot::Snapshotter::new(Arc::clone(&coord))
+            .with_chunk_size(chunk_size)
+            .with_table_oids(table_oids.clone());
+        match snapshotter
+            .run(source.as_ref(), std::slice::from_ref(schema), &mut pipeline)
+            .await
+        {
+            Ok(_snap_lsn) => {
+                // The pipeline's flush is per-chunk inside
+                // Snapshotter::run; nothing more to do here. Emit
+                // the per-table completion. If the receiver is
+                // gone (main loop exited / shut down), drop
+                // silently — the task exits anyway.
+                let _ = tx.send(PendingSnapshotMsg {
+                    ident: schema.ident.clone(),
+                    result: Ok(()),
+                });
+                tracing::info!(table = %schema.ident, "background snapshot table complete");
+            }
+            Err(e) => {
+                let _ = tx.send(PendingSnapshotMsg {
+                    ident: schema.ident.clone(),
+                    result: Err(format!("snapshot run: {e}")),
+                });
+                // Stop on first failure — the operator will restart
+                // pg2iceberg, which re-enters this path with the
+                // per-table progress cursor that resumes from where
+                // we left off.
+                return;
+            }
+        }
+    }
 }

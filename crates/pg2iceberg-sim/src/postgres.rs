@@ -1374,4 +1374,14 @@ impl PgClient for SimPgClient {
             .drop_publication(name)
             .map_err(|e| PgError::Other(e.to_string()))
     }
+
+    async fn alter_publication_add_table(
+        &self,
+        name: &str,
+        ident: &TableIdent,
+    ) -> std::result::Result<(), PgError> {
+        self.db
+            .add_table_to_publication(name, ident)
+            .map_err(|e| PgError::Other(e.to_string()))
+    }
 }

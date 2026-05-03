@@ -1437,6 +1437,8 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
         compaction: None,
         worker_id: WorkerId("dst-fault-worker".into()),
         consumer_ttl: Duration::from_secs(60),
+        pending_snapshot_rx: None,
+        pending_snapshot_handle: None,
     };
 
     // Shutdown future fires immediately so the loop runs zero

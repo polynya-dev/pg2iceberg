@@ -558,6 +558,35 @@ impl PgClient for PgClientImpl {
         let q = format!("DROP PUBLICATION IF EXISTS {}", quote_ident(name));
         simple_exec(&self.client, &q).await
     }
+
+    async fn alter_publication_add_table(&self, name: &str, ident: &TableIdent) -> Result<()> {
+        let qualified = if ident.namespace.0.is_empty() {
+            quote_ident(&ident.name)
+        } else {
+            format!(
+                "{}.{}",
+                quote_ident(&ident.namespace.0.join(".")),
+                quote_ident(&ident.name)
+            )
+        };
+        let q = format!(
+            "ALTER PUBLICATION {} ADD TABLE {}",
+            quote_ident(name),
+            qualified
+        );
+        match simple_exec(&self.client, &q).await {
+            Ok(()) => Ok(()),
+            // Idempotency: PG raises SQLSTATE 42710 ("relation … is
+            // already member of publication") when the table is
+            // already in the publication. Treat as success so a
+            // crash-restart between ALTER and downstream state
+            // updates can re-enter cleanly.
+            Err(PgError::Protocol(msg)) if msg.contains("is already member of publication") => {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 async fn simple_exec(client: &Client, q: &str) -> Result<()> {
