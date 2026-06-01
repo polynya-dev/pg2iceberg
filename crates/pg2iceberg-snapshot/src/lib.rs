@@ -351,7 +351,7 @@ impl Snapshotter {
                 let new_key = pk_key(last_in_chunk, &pk_cols);
 
                 if let Some(prev) = last_pk_key.as_deref() {
-                    if new_key.as_str() <= prev {
+                    if new_key.as_str() == prev {
                         return Err(SnapshotError::Source(format!(
                             "snapshot source did not advance past PK {prev} for table {}; got {new_key}",
                             schema.ident
