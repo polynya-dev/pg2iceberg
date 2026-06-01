@@ -3,13 +3,14 @@
 //! live replication and verify Iceberg state == PG ground truth at every
 //! point.
 
+use async_trait::async_trait;
 use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
-    ColumnName, ColumnSchema, Namespace, PgValue, Row, TableIdent, TableSchema, Timestamp,
+    ColumnName, ColumnSchema, Lsn, Namespace, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
-use pg2iceberg_iceberg::read_materialized_state;
+use pg2iceberg_iceberg::{pk_key, read_materialized_state};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{CounterMaterializerNamer, Materializer, Pipeline};
 use pg2iceberg_sim::blob::MemoryBlobStore;
@@ -17,7 +18,9 @@ use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
-use pg2iceberg_snapshot::{run_snapshot, run_snapshot_chunked, Snapshotter};
+use pg2iceberg_snapshot::{
+    run_snapshot, run_snapshot_chunked, Result as SnapResult, SnapshotSource, Snapshotter,
+};
 use pollster::block_on;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -525,6 +528,96 @@ fn chunked_snapshot_with_zero_chunk_size_panics() {
         .unwrap();
     }));
     assert!(result.is_err(), "chunk_size=0 must panic");
+}
+
+// ---------- regression: PK-advance guard must not be lexicographic ----------
+
+/// A `SnapshotSource` that returns rows ordered by **numeric** PK ASC,
+/// mirroring real Postgres (`ORDER BY pk ASC` with a row-value
+/// `WHERE (pk) > (cursor)`). `SimPostgres` can't reproduce the bug below
+/// because it stores/filters rows by the lexicographic `pk_key` string,
+/// so source order and the guard agree; real PG orders numerically.
+struct NumericPkSource {
+    /// Pre-sorted by numeric PK ASC.
+    rows: Vec<Row>,
+    pk_cols: Vec<ColumnName>,
+    lsn: Lsn,
+}
+
+#[async_trait]
+impl SnapshotSource for NumericPkSource {
+    async fn snapshot_lsn(&self) -> SnapResult<Lsn> {
+        Ok(self.lsn)
+    }
+
+    async fn read_chunk(
+        &self,
+        _ident: &TableIdent,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> SnapResult<Vec<Row>> {
+        // Resume strictly after the row whose canonical key == cursor,
+        // preserving numeric order (rows are already numerically sorted).
+        let start = match after_pk_key {
+            None => 0,
+            Some(after) => self
+                .rows
+                .iter()
+                .position(|r| pk_key(r, &self.pk_cols) == after)
+                .map(|i| i + 1)
+                .unwrap_or(self.rows.len()),
+        };
+        Ok(self
+            .rows
+            .iter()
+            .skip(start)
+            .take(chunk_size)
+            .cloned()
+            .collect())
+    }
+}
+
+#[test]
+fn snapshot_advances_across_integer_pk_digit_width_boundary() {
+    // Regression for the snapshot no-progress guard. It used to compare
+    // canonical PK keys lexicographically (`new_key <= prev`). With a
+    // numerically-ordered source, a chunk boundary that crosses a
+    // digit-width boundary produces keys where, as strings,
+    // `[{"Int4":10}]` < `[{"Int4":9}]` ('1' < '9'). The guard then
+    // falsely concluded the snapshot "did not advance past PK 9" and
+    // aborted — breaking every integer-PK table larger than chunk_size.
+    // The guard now compares for equality (true no-progress) only.
+    let mut h = boot(&[]); // PG side unused; the mock drives the snapshot.
+
+    let rows: Vec<Row> = (1..=12).map(|i| row(i, i * 10)).collect();
+    let src = NumericPkSource {
+        rows,
+        pk_cols: vec![col("id")],
+        lsn: Lsn(1),
+    };
+
+    // chunk_size 9 => chunk 1 ends at PK 9, chunk 2 ends at PK 12 — the
+    // boundary that broke the old lexicographic comparison.
+    let snap_lsn = block_on(run_snapshot_chunked(
+        &src,
+        h.coord.clone() as Arc<dyn Coordinator>,
+        &[schema()],
+        &mut h.pipeline,
+        9,
+    ))
+    .expect("snapshot must advance across the 9->10..12 digit-width boundary");
+
+    h.stream.send_standby(snap_lsn);
+    block_on(h.materializer.cycle()).unwrap();
+
+    let iceberg = read_iceberg(&h);
+    let expected: Vec<Row> = (1..=12).map(|i| row(i, i * 10)).collect();
+    assert_eq!(
+        iceberg.len(),
+        12,
+        "every row across the digit-width boundary must materialize"
+    );
+    assert_eq!(iceberg, expected);
 }
 
 #[test]
