@@ -624,3 +624,69 @@ async fn drop_slot_rejects_active_slot() {
         .await
         .expect("drop publication");
 }
+
+#[tokio::test]
+async fn slot_health_hangs_on_streaming_connection_needs_dedicated() {
+    // Regression for the watcher-hang bug: the lifecycle's slot-health
+    // watcher must run on a connection SEPARATE from the one
+    // `start_replication` puts into COPY-BOTH streaming mode. On the
+    // streaming connection, a normal `slot_health` query queues behind
+    // the never-ending copy stream and hangs forever — which froze the
+    // whole main loop one tick after snapshot (see
+    // `pg2iceberg::setup`'s dedicated `slot_monitor` connection).
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+
+    let table = format!("sh_{}", uniq());
+    let pubname = format!("shp_{}", uniq());
+    let slot = format!("shs_{}", uniq());
+
+    regular
+        .batch_execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY)"))
+        .await
+        .expect("create table");
+
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: table.clone(),
+    };
+
+    // The streaming client: publication + slot + START_REPLICATION.
+    let streamer = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("streamer connect");
+    streamer
+        .create_publication(&pubname, std::slice::from_ref(&ident))
+        .await
+        .expect("publication");
+    let cp = streamer.create_slot(&slot).await.expect("slot");
+    let _stream = streamer
+        .start_replication(&slot, cp, &pubname)
+        .await
+        .expect("start_replication");
+
+    // slot_health on the SAME (now COPY-BOTH) connection must hang: the
+    // query can't make progress behind the active copy stream. This is
+    // the exact failure that stalled the watcher (and thus CDC).
+    let on_streaming =
+        tokio::time::timeout(Duration::from_secs(3), streamer.slot_health(&slot)).await;
+    assert!(
+        on_streaming.is_err(),
+        "slot_health on the streaming (COPY-BOTH) connection must hang — \
+         that's why the watcher needs a dedicated connection"
+    );
+
+    // slot_health on a DEDICATED connection completes promptly — this is
+    // what the fix wires up for the watcher.
+    let monitor = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("monitor connect");
+    let health = tokio::time::timeout(Duration::from_secs(10), monitor.slot_health(&slot))
+        .await
+        .expect("dedicated-connection slot_health must not hang")
+        .expect("slot_health query ok");
+    assert!(
+        health.is_some(),
+        "the slot exists, so a dedicated-connection probe returns its health"
+    );
+}
