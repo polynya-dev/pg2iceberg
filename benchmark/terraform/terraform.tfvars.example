@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars and edit. The shim's public ALB has no auth,
+# so lock it to your own IP.
+#
+#   allowed_cidr = "$(curl -s https://checkip.amazonaws.com)/32"
+allowed_cidr = "1.2.3.4/32"
+
+# region = "ap-southeast-1"

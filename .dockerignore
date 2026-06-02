@@ -1,0 +1,12 @@
+# Keep the Docker build context small. The build only needs Cargo
+# manifests + crates/ source; everything below is regenerated inside the
+# image or is irrelevant to the build.
+target/
+.git/
+.venv/
+**/node_modules/
+benchmark/
+example/
+docs/
+*.md
+.github/

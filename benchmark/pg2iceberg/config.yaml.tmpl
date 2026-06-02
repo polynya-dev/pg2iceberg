@@ -1,0 +1,53 @@
+tables:
+  - name: public.riders
+  - name: public.drivers
+  - name: public.rides
+  - name: public.payments
+  - name: public.ratings
+
+source:
+  mode: logical
+  postgres:
+    host: ${PG_HOST}
+    port: ${PG_PORT}
+    database: ${PG_DATABASE}
+    user: ${PG_USER}
+    password: ${PG_PASSWORD}
+    # disable: pg2iceberg's Rust TLS can't verify the Amazon RDS CA
+    # (webpki roots only). Connection stays inside the private VPC.
+    sslmode: disable
+  logical:
+    publication_name: pg2iceberg_pub
+    slot_name: pg2iceberg_slot
+
+sink:
+  # AWS Glue Iceberg REST catalog. SigV4-signed (the polynya-patches REST
+  # client signs when catalog_auth=sigv4); signing name auto-detected as
+  # `glue`. credential_mode=iam: the task role writes data files to the
+  # S3 warehouse directly — Glue does not vend credentials.
+  catalog_uri: https://glue.${REGION}.amazonaws.com/iceberg
+  catalog_auth: sigv4
+  credential_mode: iam
+  warehouse: ${WAREHOUSE}
+  namespace: ${NAMESPACE}
+  s3_region: ${REGION}
+  # Glue's REST `warehouse` is the catalog id (account id), distinct from
+  # the s3:// warehouse above used by the blob store. catalog_props is
+  # merged last, so this overrides only what's sent to the catalog.
+  #
+  # The s3.* creds make iceberg-rust's opendal FileIO sign catalog-side
+  # writes explicitly: opendal/reqsign only falls back to IMDS otherwise,
+  # which doesn't exist on Fargate. The entrypoint exports these AWS_*
+  # vars from the task-role container-credentials endpoint. disable-*
+  # stops the IMDS/config-load probes entirely.
+  catalog_props:
+    warehouse: "${GLUE_CATALOG_ID}"
+    s3.access-key-id: "${AWS_ACCESS_KEY_ID}"
+    s3.secret-access-key: "${AWS_SECRET_ACCESS_KEY}"
+    s3.session-token: "${AWS_SESSION_TOKEN}"
+    s3.disable-config-load: "true"
+    s3.disable-ec2-metadata: "true"
+  flush_interval: ${FLUSH_INTERVAL}
+  flush_rows: ${FLUSH_ROWS}
+
+state: {}

@@ -48,9 +48,10 @@ all = { level = "warn", priority = -1 }
 # forks pg2iceberg-rust depends on:
 #
 # 1. `iceberg` → `polynya-dev/iceberg-rust@polynya-patches`. Based on
-#    upstream v0.9.0 plus three non-invasive patches: `TransactionAction`
-#    visibility, a new `UpdateSchemaAction`, and a mixed-content
-#    `FastAppendAction` that accepts both data and equality-delete files.
+#    upstream v0.9.0 plus four non-invasive patches: `TransactionAction`
+#    visibility, a new `UpdateSchemaAction`, a mixed-content
+#    `FastAppendAction` that accepts both data and equality-delete files,
+#    and AWS SigV4 signing in the REST client (for S3 Tables / Glue).
 #    See `crates/pg2iceberg-iceberg/src/prod/gap_audit.rs` for context.
 #
 # 2. `tokio-postgres` + `postgres-replication` → `iambriccardo/rust-postgres`

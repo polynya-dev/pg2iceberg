@@ -451,6 +451,25 @@ impl Config {
             "bearer" if !self.sink.catalog_token.is_empty() => {
                 props.insert("token".into(), self.sink.catalog_token.clone());
             }
+            "sigv4" => {
+                // AWS-native Iceberg REST endpoints (S3 Tables, Glue)
+                // require SigV4-signed requests. The REST client (see the
+                // polynya-patches SigV4 patch) signs when these props are
+                // set; the signing name is the AWS service (`s3tables`
+                // for S3 Tables, `glue` for Glue), region from s3_region.
+                props.insert("rest.sigv4-enabled".into(), "true".into());
+                if !self.sink.s3_region.is_empty() {
+                    props.insert("rest.signing-region".into(), self.sink.s3_region.clone());
+                }
+                let signing_name = if self.sink.catalog_uri.contains("s3tables") {
+                    "s3tables"
+                } else if self.sink.catalog_uri.contains("glue") {
+                    "glue"
+                } else {
+                    "execute-api"
+                };
+                props.insert("rest.signing-name".into(), signing_name.into());
+            }
             "oauth2" if !self.sink.catalog_client_id.is_empty() => {
                 props.insert(
                     "oauth2-server-uri".into(),

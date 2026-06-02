@@ -68,7 +68,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         anyhow::bail!("sink.catalog_uri is required");
     }
     let catalog = build_rest_catalog(&cfg).await?;
-    let catalog = IcebergRustCatalog::new(Arc::new(catalog));
+    let catalog = IcebergRustCatalog::new(Arc::new(catalog))
+        .with_warehouse(Some(cfg.sink.warehouse.clone()));
     let blob = build_blob_for_run(&cfg, &catalog)
         .await
         .context("build blob store")?;

@@ -1,0 +1,13 @@
+# Terraform state, local provider cache, and operator-specific vars.
+# State can contain resource ARNs/IPs and is environment-specific;
+# terraform.tfvars carries the operator's `allowed_cidr` (their IP).
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+# Single-platform provider hashes; `tofu init` regenerates per-OS.
+terraform/.terraform.lock.hcl
+
+# Local k6 / run artifacts (lag.csv, summary.json, report.md, ...)
+loadtest/out/
+*.log

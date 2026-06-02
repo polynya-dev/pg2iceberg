@@ -47,11 +47,27 @@ use crate::{
 /// `GlueCatalog`) and exposes it as our [`Catalog`] trait.
 pub struct IcebergRustCatalog<C: IcebergCatalogTrait> {
     inner: Arc<C>,
+    /// s3:// warehouse base. Some catalogs (AWS Glue's Iceberg REST)
+    /// require `create_table` to carry an explicit `location` rather
+    /// than assigning one server-side. When set, new tables are created
+    /// at `{warehouse}/{namespace}/{table}`. `None` lets the catalog
+    /// assign (reference REST catalogs, S3 Tables).
+    warehouse: Option<String>,
 }
 
 impl<C: IcebergCatalogTrait> IcebergRustCatalog<C> {
     pub fn new(inner: Arc<C>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            warehouse: None,
+        }
+    }
+
+    /// Set the s3:// warehouse base used to compute explicit table
+    /// locations on `create_table` (required by AWS Glue).
+    pub fn with_warehouse(mut self, warehouse: Option<String>) -> Self {
+        self.warehouse = warehouse.filter(|w| !w.is_empty());
+        self
     }
 }
 
@@ -59,6 +75,7 @@ impl<C: IcebergCatalogTrait> Clone for IcebergRustCatalog<C> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            warehouse: self.warehouse.clone(),
         }
     }
 }
@@ -123,6 +140,19 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     async fn create_table(&self, schema: &TableSchema) -> Result<TableMetadata> {
         let ns = to_iceberg_namespace(&schema.ident.namespace)?;
         let ice_schema = to_iceberg_schema(schema)?;
+        // Explicit table location: `{warehouse}/{namespace}/{table}`.
+        // Required by AWS Glue's Iceberg REST endpoint (it won't assign
+        // one); `None` for catalogs that assign server-side. Uses the
+        // `location_opt` fallback setter so the builder type-state is
+        // unchanged whether or not a warehouse is configured.
+        let location = self.warehouse.as_ref().map(|w| {
+            format!(
+                "{}/{}/{}",
+                w.trim_end_matches('/'),
+                schema.ident.namespace.0.join("/"),
+                schema.ident.name
+            )
+        });
         // TypedBuilder switches type-state when `partition_spec()` is
         // called, so we have to choose at compile time which arm to
         // build. The `clone()` on `ice_schema` is the cost of avoiding
@@ -130,12 +160,14 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let creation = if schema.partition_spec.is_empty() {
             TableCreation::builder()
                 .name(schema.ident.name.clone())
+                .location_opt(location)
                 .schema(ice_schema)
                 .build()
         } else {
             let unbound = to_iceberg_unbound_partition_spec(schema)?;
             TableCreation::builder()
                 .name(schema.ident.name.clone())
+                .location_opt(location)
                 .schema(ice_schema)
                 .partition_spec(unbound)
                 .build()
