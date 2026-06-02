@@ -70,7 +70,18 @@ where
             .context("PG connect")?,
     );
     let pg: Arc<dyn PgClient> = pg_concrete.clone();
-    let slot_monitor: Arc<dyn SlotMonitor> = pg_concrete.clone();
+    // The slot-health watcher MUST run on its own connection. `pg_concrete`
+    // is put into COPY-BOTH streaming mode by `start_replication`; after
+    // that, any normal query on it (the watcher's `slot_health`) queues
+    // behind the never-ending copy stream and hangs forever — stalling the
+    // entire main loop and silently halting CDC after the first watcher
+    // tick. A dedicated connection keeps slot-health probes independent of
+    // the streaming connection.
+    let slot_monitor: Arc<dyn SlotMonitor> = Arc::new(
+        PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+            .await
+            .context("PG connect (slot monitor)")?,
+    );
 
     // ── schema discovery (PG-specific) ─────────────────────────────
     let schemas = discover_schemas(&cfg.tables, pg_concrete.as_ref(), &cfg.sink.namespace).await?;

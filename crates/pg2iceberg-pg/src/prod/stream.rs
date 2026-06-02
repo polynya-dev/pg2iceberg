@@ -115,7 +115,7 @@ impl ReplicationStreamImpl {
     pub(crate) fn wrap(stream: LogicalReplicationStream) -> Self {
         let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
-        let reader = tokio::spawn(reader_task(stream, events_tx, cmd_rx));
+        let reader = tokio::spawn(reader_task(Box::pin(stream), events_tx, cmd_rx));
         Self {
             events_rx,
             cmd_tx,
@@ -402,16 +402,64 @@ enum Branch {
     KeepaliveReplyRequested,
 }
 
-/// Reader task: sole owner of the `LogicalReplicationStream`. Drains
+/// One item read off the replication wire. Mirrors the subset of
+/// `postgres_replication::ReplicationMessage` the reader acts on, but as
+/// our own type — the wire-protocol structs have no public constructors,
+/// so abstracting at this level is what lets [`reader_task`] be driven by
+/// a mock in tests.
+pub(crate) enum WireItem {
+    /// Server heartbeat. `reply_requested` mirrors PG's
+    /// `PrimaryKeepAlive.reply()`.
+    Keepalive { reply_requested: bool },
+    /// A logical-replication message to decode via [`ReaderState::handle`].
+    Logical(PgEnv<PgMsg>),
+    /// Stream ended cleanly.
+    Closed,
+    /// Wire/protocol error.
+    Error(String),
+}
+
+/// The replication wire the reader owns: a source of [`WireItem`]s plus
+/// the standby-ack write. Abstracted away from
+/// `LogicalReplicationStream` so [`reader_task`] is unit-testable — the
+/// deadlock it guards against (a `Cmd::Standby` starved by a keepalive
+/// flood) is invisible to the DST sim, which replaces the whole reader.
+#[async_trait]
+pub(crate) trait ReplicationWire: Send {
+    async fn next(&mut self) -> WireItem;
+    async fn standby(&mut self, write: PgLsn, flush: PgLsn, apply: PgLsn) -> Result<()>;
+}
+
+#[async_trait]
+impl ReplicationWire for Pin<Box<LogicalReplicationStream>> {
+    async fn next(&mut self) -> WireItem {
+        match StreamExt::next(self).await {
+            None => WireItem::Closed,
+            Some(Err(e)) => WireItem::Error(e.to_string()),
+            Some(Ok(PgEnv::PrimaryKeepAlive(ka))) => WireItem::Keepalive {
+                reply_requested: ka.reply() != 0,
+            },
+            Some(Ok(env)) => WireItem::Logical(env),
+        }
+    }
+
+    async fn standby(&mut self, write: PgLsn, flush: PgLsn, apply: PgLsn) -> Result<()> {
+        self.as_mut()
+            .standby_status_update(write, flush, apply, 0, 0)
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))
+    }
+}
+
+/// Reader task: sole owner of the replication [`ReplicationWire`]. Drains
 /// decoded events into `events_tx` and serves ack requests from
 /// `cmd_rx`. Exits cleanly when either channel side is dropped, the
 /// stream errors, or `JoinHandle::abort` fires.
-async fn reader_task(
-    stream: LogicalReplicationStream,
+async fn reader_task<W: ReplicationWire>(
+    mut wire: W,
     events_tx: mpsc::Sender<Result<DecodedMessage>>,
     mut cmd_rx: mpsc::Receiver<Cmd>,
 ) {
-    let mut stream: Pin<Box<LogicalReplicationStream>> = Box::pin(stream);
     let mut state = ReaderState::default();
     // Last LSN we acked back to PG via `Cmd::Standby`. Reused for
     // `reply_requested=1` keepalive replies to confirm liveness without
@@ -434,47 +482,44 @@ async fn reader_task(
             continue;
         }
 
-        // Block-scoped borrow: `stream_ref` holds the pinned mutable
-        // reference for the duration of select!, then drops at the
-        // brace so the cmd arm's body can call `stream.as_mut()` again
-        // for `standby_status_update`. Translating the wire error into
-        // our PgError happens inside the arm so `Branch` doesn't have
-        // to name `postgres_replication::Error`.
-        let branch: Branch = {
-            let mut stream_ref = stream.as_mut();
-            tokio::select! {
-                biased;
-                // Bias to events: under load this keeps the wire
-                // draining. `LogicalReplicationStream::next` is
-                // cancel-safe at the buffering level (tokio-postgres
-                // CopyBoth reads from an internal channel), so dropping
-                // this future when the ack arm wins doesn't lose data.
-                next = stream_ref.next() => match next {
-                    None => Branch::Event(Some(Err(PgError::Connection(
-                        "replication stream closed".into(),
-                    )))),
-                    Some(Err(e)) => Branch::Event(Some(Err(PgError::Protocol(e.to_string())))),
-                    // Inline keepalive handling: never goes through the
-                    // events channel. `reply_requested=1` is converted
-                    // to a separate Branch so the outer match can write
-                    // `standby_status_update` once `stream_ref` drops.
-                    Some(Ok(PgEnv::PrimaryKeepAlive(ka))) => {
-                        if ka.reply() != 0 {
-                            Branch::KeepaliveReplyRequested
-                        } else {
-                            Branch::Event(None)
-                        }
+        let branch: Branch = tokio::select! {
+            biased;
+            // Service standby acks FIRST. The slot only advances when the
+            // main loop's Standby tick reaches the wire via `Cmd::Standby`
+            // (which blocks on a oneshot until we ack here). If `wire.next()`
+            // were biased ahead of this, a keepalive flood — exactly what PG
+            // emits when the slot is pinned and there's heavy WAL churn on
+            // tables OUTSIDE the publication (e.g. the `_pg2iceberg` coord
+            // schema, written every main-loop iteration) — keeps `next`
+            // perpetually ready, starves this arm, and `send_standby`
+            // deadlocks: the ack that would advance the slot and stop the
+            // flood can never be processed. Standby cmds are rare (~every
+            // standby_interval), so checking them first costs nothing and
+            // the event arm below still drains the wire. Regression test:
+            // `tests::standby_is_serviced_under_keepalive_flood`.
+            cmd = cmd_rx.recv() => Branch::Cmd(cmd),
+            item = wire.next() => match item {
+                WireItem::Closed => Branch::Event(Some(Err(PgError::Connection(
+                    "replication stream closed".into(),
+                )))),
+                WireItem::Error(e) => Branch::Event(Some(Err(PgError::Protocol(e)))),
+                // Keepalives never go through the events channel.
+                WireItem::Keepalive { reply_requested } => {
+                    if reply_requested {
+                        Branch::KeepaliveReplyRequested
+                    } else {
+                        Branch::Event(None)
                     }
-                    Some(Ok(env)) => Branch::Event(state.handle(env).transpose()),
-                },
-                cmd = cmd_rx.recv() => Branch::Cmd(cmd),
-            }
+                }
+                WireItem::Logical(env) => Branch::Event(state.handle(env).transpose()),
+            },
         };
 
         match branch {
             Branch::Event(None) => {
                 // state.handle returned Ok(None) — Origin/Type/Message
-                // protocol metadata. Loop and read more.
+                // protocol metadata, or a dropped keepalive. Loop and
+                // read more.
             }
             Branch::Event(Some(Ok(msg))) => {
                 if events_tx.send(Ok(msg)).await.is_err() {
@@ -486,12 +531,8 @@ async fn reader_task(
                 return;
             }
             Branch::KeepaliveReplyRequested => {
-                if let Err(e) = stream
-                    .as_mut()
-                    .standby_status_update(last_ack, last_ack, last_ack, 0, 0)
-                    .await
-                {
-                    let _ = events_tx.send(Err(PgError::Protocol(e.to_string()))).await;
+                if let Err(e) = wire.standby(last_ack, last_ack, last_ack).await {
+                    let _ = events_tx.send(Err(e)).await;
                     return;
                 }
             }
@@ -510,19 +551,97 @@ async fn reader_task(
                 // it fails, we still want the latest LSN cached for
                 // future replies.
                 last_ack = write_lsn;
-                // Server uses `ts` for measurement-only, not
-                // correctness; 0 is accepted. `reply = 0` means
-                // "don't ask me to send another now".
-                let res = stream
-                    .as_mut()
-                    .standby_status_update(write_lsn, flush_lsn, apply_lsn, 0, 0)
-                    .await
-                    .map_err(|e| PgError::Protocol(e.to_string()));
+                let res = wire.standby(write_lsn, flush_lsn, apply_lsn).await;
                 // Caller may have given up (e.g. shutdown); ignore a
                 // closed oneshot rx.
                 let _ = done.send(res);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// A wire that floods non-reply keepalives — each `next()` is
+    /// immediately ready — until `stop` is set, then reports the stream
+    /// closed so the reader exits. Records standby acks. Models PG
+    /// emitting a continuous keepalive stream (slot pinned + heavy
+    /// non-published WAL): every `next()` poll is ready, so a reader
+    /// biased to the stream would never poll `cmd_rx`.
+    struct FloodWire {
+        standbys: Arc<Mutex<Vec<(PgLsn, PgLsn, PgLsn)>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ReplicationWire for FloodWire {
+        async fn next(&mut self) -> WireItem {
+            if self.stop.load(Ordering::Relaxed) {
+                WireItem::Closed
+            } else {
+                WireItem::Keepalive {
+                    reply_requested: false,
+                }
+            }
+        }
+        async fn standby(&mut self, w: PgLsn, f: PgLsn, a: PgLsn) -> Result<()> {
+            self.standbys.lock().unwrap().push((w, f, a));
+            Ok(())
+        }
+    }
+
+    /// Regression for the replication-reader deadlock: under a keepalive
+    /// flood, a `Cmd::Standby` (the main loop's slot ack) must still be
+    /// serviced. With the reader biased to the stream it never is — the
+    /// slot never advances and CDC silently stops after the snapshot.
+    /// Multi-thread so the flood (a busy, non-yielding reader) runs on one
+    /// worker while this test drives the assertions + timeout on another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standby_is_serviced_under_keepalive_flood() {
+        let standbys = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let wire = FloodWire {
+            standbys: standbys.clone(),
+            stop: stop.clone(),
+        };
+        let (events_tx, _events_rx) =
+            mpsc::channel::<Result<DecodedMessage>>(EVENTS_CHANNEL_CAPACITY);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
+        let reader = tokio::spawn(reader_task(wire, events_tx, cmd_rx));
+
+        // Issue a standby ack, exactly like the main loop's Standby tick.
+        let (done_tx, done_rx) = oneshot::channel();
+        cmd_tx
+            .send(Cmd::Standby {
+                flushed: Lsn(42),
+                applied: Lsn(42),
+                done: done_tx,
+            })
+            .await
+            .expect("reader accepts the cmd");
+
+        // New (cmd-first): resolves immediately. Old (stream-first): the
+        // flood starves it and this times out.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx).await;
+
+        // Stop the flood so the reader exits cleanly regardless of outcome
+        // (it polls `next()` every iteration even when stream-biased).
+        stop.store(true, Ordering::Relaxed);
+        let _ = reader.await;
+
+        let ack = res
+            .expect("standby ack starved by keepalive flood — reader deadlock regressed")
+            .expect("reader dropped the ack oneshot");
+        assert!(ack.is_ok(), "standby should succeed, got {ack:?}");
+        assert_eq!(
+            standbys.lock().unwrap().as_slice(),
+            &[(PgLsn::from(42u64), PgLsn::from(42u64), PgLsn::from(42u64))],
+            "reader should have written exactly the requested standby LSN",
+        );
     }
 }
 
