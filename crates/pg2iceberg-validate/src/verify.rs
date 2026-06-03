@@ -80,12 +80,19 @@ where
         .map(|c| ColumnName(c.name.clone()))
         .collect();
 
-    // 1. Read PG ground truth chunked.
+    // 1. Read PG ground truth chunked. The source is addressed by the
+    // *PG* identity (`pg_schema`.table), which differs from `schema.ident`
+    // whenever `sink.namespace` remaps the Iceberg namespace (e.g. PG
+    // `public.riders` → Iceberg `rideshare.riders`). The snapshot source
+    // keys its table map by `pg_ident()`; using `schema.ident` here would
+    // miss it with "unknown table". The Iceberg read in step 2 uses
+    // `schema.ident`.
+    let pg_ident = schema.pg_ident();
     let mut pg_by_pk: BTreeMap<String, Row> = BTreeMap::new();
     let mut last_pk: Option<String> = None;
     loop {
         let chunk = source
-            .read_chunk(&schema.ident, chunk_size, last_pk.as_deref())
+            .read_chunk(&pg_ident, chunk_size, last_pk.as_deref())
             .await?;
         if chunk.is_empty() {
             break;

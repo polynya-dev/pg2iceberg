@@ -185,7 +185,6 @@ fn build_s3_static(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
         anyhow::bail!("sink.s3_endpoint is required for credential_mode=static");
     }
     let bucket = bucket_from_warehouse(&cfg.sink.warehouse)?;
-    let prefix = prefix_from_warehouse(&cfg.sink.warehouse);
     // object_store defaults `allow_http=false`. With the default,
     // reqwest is built with `https_only(true)` and refuses `http://`
     // requests at send time with "builder error for url (...)" — no
@@ -206,12 +205,14 @@ fn build_s3_static(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
         .with_virtual_hosted_style_request(false)
         .build()
         .context("AmazonS3Builder build")?;
-    let store: Arc<dyn object_store::ObjectStore> = if let Some(p) = prefix {
-        Arc::new(object_store::prefix::PrefixStore::new(inner, p))
-    } else {
-        Arc::new(inner)
-    };
-    Ok(Arc::new(ObjectStoreBlobStore::new(store)))
+    // No `PrefixStore`: namers and the Iceberg catalog emit full
+    // `s3://<bucket>/<warehouse-subpath>/...` paths, and `parse_path`
+    // strips only `s3://<bucket>/` — so the bucket-relative key already
+    // carries the warehouse subpath. Wrapping in a PrefixStore keyed on
+    // that same subpath would apply it twice (`warehouse/warehouse/...`),
+    // writing data files where the manifest's absolute paths don't point,
+    // so external readers (Athena/Spark/...) can't find them.
+    Ok(Arc::new(ObjectStoreBlobStore::new(Arc::new(inner))))
 }
 
 fn build_s3_iam(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
@@ -219,7 +220,6 @@ fn build_s3_iam(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
         anyhow::bail!("sink.warehouse is required for credential_mode=iam");
     }
     let bucket = bucket_from_warehouse(&cfg.sink.warehouse)?;
-    let prefix = prefix_from_warehouse(&cfg.sink.warehouse);
     let mut builder = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
         .with_region(&cfg.sink.s3_region);
@@ -232,12 +232,8 @@ fn build_s3_iam(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
             .with_allow_http(allow_http);
     }
     let inner = builder.build().context("AmazonS3Builder build")?;
-    let store: Arc<dyn object_store::ObjectStore> = if let Some(p) = prefix {
-        Arc::new(object_store::prefix::PrefixStore::new(inner, p))
-    } else {
-        Arc::new(inner)
-    };
-    Ok(Arc::new(ObjectStoreBlobStore::new(store)))
+    // See `build_s3_static` for why there is no `PrefixStore` here.
+    Ok(Arc::new(ObjectStoreBlobStore::new(Arc::new(inner))))
 }
 
 /// Extract the bucket name from `s3://bucket/path` or `s3a://bucket/path`.
@@ -252,22 +248,6 @@ fn bucket_from_warehouse(warehouse: &str) -> Result<String> {
         .filter(|s| !s.is_empty())
         .with_context(|| format!("warehouse missing bucket: {warehouse:?}"))?;
     Ok(bucket.to_string())
-}
-
-/// Extract the path-prefix portion of `s3://bucket/prefix/...`. Returns
-/// `None` if the warehouse points directly at the bucket root.
-fn prefix_from_warehouse(warehouse: &str) -> Option<String> {
-    let stripped = warehouse
-        .strip_prefix("s3://")
-        .or_else(|| warehouse.strip_prefix("s3a://"))?;
-    let mut parts = stripped.splitn(2, '/');
-    parts.next()?;
-    let p = parts.next()?.trim_matches('/');
-    if p.is_empty() {
-        None
-    } else {
-        Some(p.to_string())
-    }
 }
 
 /// Distributed mode: WAL writer only. Same as [`run`] in logical mode,
@@ -655,6 +635,16 @@ async fn build_one_shot_materializer(
                 .discover_schema(&ns, &name)
                 .await
                 .with_context(|| format!("discover schema for {}", t.name))?;
+            // The Iceberg namespace comes from `sink.namespace`, mirroring
+            // `discover_schemas` in setup.rs (which the streaming
+            // materializer uses to create the tables). Without this remap
+            // these one-shot paths resolve the PG-schema-named table
+            // (e.g. `public.riders`) instead of the materialized
+            // `<sink.namespace>.riders` and fail with "table does not
+            // exist" against every catalog.
+            if !cfg.sink.namespace.is_empty() {
+                s.ident.namespace = pg2iceberg_core::Namespace(vec![cfg.sink.namespace.clone()]);
+            }
             if !t.primary_key.is_empty() {
                 let pk_set: std::collections::BTreeSet<&str> =
                     t.primary_key.iter().map(String::as_str).collect();
@@ -730,6 +720,16 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
                 .discover_schema(&ns, &name)
                 .await
                 .with_context(|| format!("discover schema for {}", t.name))?;
+            // The Iceberg namespace comes from `sink.namespace`, mirroring
+            // `discover_schemas` in setup.rs (which the streaming
+            // materializer uses to create the tables). Without this remap
+            // these one-shot paths resolve the PG-schema-named table
+            // (e.g. `public.riders`) instead of the materialized
+            // `<sink.namespace>.riders` and fail with "table does not
+            // exist" against every catalog.
+            if !cfg.sink.namespace.is_empty() {
+                s.ident.namespace = pg2iceberg_core::Namespace(vec![cfg.sink.namespace.clone()]);
+            }
             if !t.primary_key.is_empty() {
                 let pk_set: std::collections::BTreeSet<&str> =
                     t.primary_key.iter().map(String::as_str).collect();
@@ -1110,16 +1110,5 @@ mod tests {
     fn bucket_from_warehouse_rejects_other_schemes() {
         assert!(bucket_from_warehouse("gs://x").is_err());
         assert!(bucket_from_warehouse("just/a/path").is_err());
-    }
-
-    #[test]
-    fn prefix_from_warehouse_returns_path_or_none() {
-        assert_eq!(prefix_from_warehouse("s3://b"), None);
-        assert_eq!(prefix_from_warehouse("s3://b/"), None);
-        assert_eq!(prefix_from_warehouse("s3://b/x"), Some("x".to_string()));
-        assert_eq!(
-            prefix_from_warehouse("s3://b/staged/data/"),
-            Some("staged/data".to_string())
-        );
     }
 }
