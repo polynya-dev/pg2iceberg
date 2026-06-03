@@ -451,6 +451,84 @@ impl ReplicationWire for Pin<Box<LogicalReplicationStream>> {
     }
 }
 
+/// Process a `Cmd` from the main loop. Returns `false` when the cmd
+/// channel is closed (reader should exit).
+///
+/// Servicing a `Standby` here writes the ack to the wire and fulfils the
+/// `done` oneshot the main loop is blocked on (`send_standby`). Doing
+/// this even while the reader is *waiting for events-channel capacity*
+/// (see [`send_servicing_cmds`]) is what prevents the reader↔main-loop
+/// deadlock: the main loop's Standby tick blocks on `done` while it has
+/// stopped draining the events channel, so if the reader could only ack
+/// after a `send` completes, a full events channel would wedge both
+/// sides permanently. Regression test: `tests::standby_acked_while_events_channel_full`.
+async fn handle_cmd<W: ReplicationWire>(
+    wire: &mut W,
+    last_ack: &mut PgLsn,
+    cmd: Option<Cmd>,
+) -> bool {
+    match cmd {
+        None => false,
+        Some(Cmd::Standby {
+            flushed,
+            applied,
+            done,
+        }) => {
+            let write_lsn: PgLsn = flushed.0.into();
+            let flush_lsn: PgLsn = flushed.0.into();
+            let apply_lsn: PgLsn = applied.0.into();
+            // Cache for keepalive `reply_requested=1` replies so the
+            // reader can confirm liveness without going through the cmd
+            // channel. Update *before* the wire write — even if it fails,
+            // we still want the latest LSN cached for future replies.
+            *last_ack = write_lsn;
+            let res = wire.standby(write_lsn, flush_lsn, apply_lsn).await;
+            // Caller may have given up (e.g. shutdown); ignore a closed rx.
+            let _ = done.send(res);
+            true
+        }
+    }
+}
+
+/// Send one decoded message to the consumer, but keep servicing `cmd_rx`
+/// while waiting for events-channel capacity. Returns `false` if the
+/// reader should exit (consumer gone or cmd channel closed).
+///
+/// A bare `events_tx.send(msg).await` would park the reader on a full
+/// channel *without* polling `cmd_rx` — and the main loop, blocked in
+/// `send_standby` awaiting an ack while no longer draining the channel,
+/// would never free a slot. `select!`ing the send permit against
+/// `cmd_rx` breaks that cycle: a `Standby` is acked, the main loop
+/// resumes draining, a slot frees, and the send completes.
+async fn send_servicing_cmds<W: ReplicationWire>(
+    wire: &mut W,
+    events_tx: &mpsc::Sender<Result<DecodedMessage>>,
+    cmd_rx: &mut mpsc::Receiver<Cmd>,
+    last_ack: &mut PgLsn,
+    msg: Result<DecodedMessage>,
+) -> bool {
+    let mut msg = Some(msg);
+    loop {
+        tokio::select! {
+            biased;
+            // Ack a pending Standby even though we can't send yet.
+            cmd = cmd_rx.recv() => {
+                if !handle_cmd(wire, last_ack, cmd).await {
+                    return false;
+                }
+            }
+            permit = events_tx.reserve() => match permit {
+                Ok(permit) => {
+                    permit.send(msg.take().expect("msg sent exactly once"));
+                    return true;
+                }
+                // Consumer dropped the receiver — reader should exit.
+                Err(_) => return false,
+            },
+        }
+    }
+}
+
 /// Reader task: sole owner of the replication [`ReplicationWire`]. Drains
 /// decoded events into `events_tx` and serves ack requests from
 /// `cmd_rx`. Exits cleanly when either channel side is dropped, the
@@ -476,7 +554,9 @@ async fn reader_task<W: ReplicationWire>(
         // is full — that's the backpressure path; main loop draining
         // unblocks us.
         if let Some(msg) = state.pending.pop_front() {
-            if events_tx.send(Ok(msg)).await.is_err() {
+            if !send_servicing_cmds(&mut wire, &events_tx, &mut cmd_rx, &mut last_ack, Ok(msg))
+                .await
+            {
                 return;
             }
             continue;
@@ -522,12 +602,18 @@ async fn reader_task<W: ReplicationWire>(
                 // read more.
             }
             Branch::Event(Some(Ok(msg))) => {
-                if events_tx.send(Ok(msg)).await.is_err() {
+                if !send_servicing_cmds(&mut wire, &events_tx, &mut cmd_rx, &mut last_ack, Ok(msg))
+                    .await
+                {
                     return;
                 }
             }
             Branch::Event(Some(Err(e))) => {
-                let _ = events_tx.send(Err(e)).await;
+                // Deliver the terminal error (best-effort, still acking a
+                // pending Standby if the channel is full), then exit.
+                let _ =
+                    send_servicing_cmds(&mut wire, &events_tx, &mut cmd_rx, &mut last_ack, Err(e))
+                        .await;
                 return;
             }
             Branch::KeepaliveReplyRequested => {
@@ -536,25 +622,10 @@ async fn reader_task<W: ReplicationWire>(
                     return;
                 }
             }
-            Branch::Cmd(None) => return,
-            Branch::Cmd(Some(Cmd::Standby {
-                flushed,
-                applied,
-                done,
-            })) => {
-                let write_lsn: PgLsn = flushed.0.into();
-                let flush_lsn: PgLsn = flushed.0.into();
-                let apply_lsn: PgLsn = applied.0.into();
-                // Cache for keepalive `reply_requested=1` replies so the
-                // reader can confirm liveness without going through the
-                // cmd channel. Update *before* the wire write — even if
-                // it fails, we still want the latest LSN cached for
-                // future replies.
-                last_ack = write_lsn;
-                let res = wire.standby(write_lsn, flush_lsn, apply_lsn).await;
-                // Caller may have given up (e.g. shutdown); ignore a
-                // closed oneshot rx.
-                let _ = done.send(res);
+            Branch::Cmd(cmd) => {
+                if !handle_cmd(&mut wire, &mut last_ack, cmd).await {
+                    return;
+                }
             }
         }
     }
@@ -641,6 +712,74 @@ mod reader_tests {
             standbys.lock().unwrap().as_slice(),
             &[(PgLsn::from(42u64), PgLsn::from(42u64), PgLsn::from(42u64))],
             "reader should have written exactly the requested standby LSN",
+        );
+    }
+
+    /// Regression for the second reader deadlock (found via the AWS
+    /// benchmark + a tokio task dump): when the events channel is FULL,
+    /// the reader must still service a `Cmd::Standby`. A bare
+    /// `events_tx.send().await` parks the reader on the full channel
+    /// without polling `cmd_rx`; the main loop, blocked in `send_standby`
+    /// awaiting that ack while it has stopped draining the channel, then
+    /// never frees a slot → both wedge. `send_servicing_cmds` must ack
+    /// the standby anyway, letting the main loop resume and drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standby_acked_while_events_channel_full() {
+        let standbys = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = FloodWire {
+            standbys: standbys.clone(),
+            stop: Arc::new(AtomicBool::new(true)),
+        };
+        // Capacity-1 events channel, pre-filled → the next send must wait.
+        let (events_tx, mut events_rx) = mpsc::channel::<Result<DecodedMessage>>(1);
+        events_tx
+            .send(Ok(DecodedMessage::Begin {
+                final_lsn: Lsn(1),
+                xid: 1,
+            }))
+            .await
+            .expect("prime the channel");
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
+        let mut last_ack = PgLsn::from(0u64);
+
+        // The main loop's slot ack, queued while the channel is full.
+        let (done_tx, done_rx) = oneshot::channel();
+        cmd_tx
+            .send(Cmd::Standby {
+                flushed: Lsn(42),
+                applied: Lsn(42),
+                done: done_tx,
+            })
+            .await
+            .expect("queue the standby");
+
+        let msg2 = Ok(DecodedMessage::Begin {
+            final_lsn: Lsn(2),
+            xid: 2,
+        });
+        let helper = send_servicing_cmds(&mut wire, &events_tx, &mut cmd_rx, &mut last_ack, msg2);
+
+        let driver = async {
+            // Fix: acked despite no free slot. Pre-fix: parked in send,
+            // never acked → this times out.
+            let ack = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+                .await
+                .expect("standby starved by a full events channel — deadlock regressed")
+                .expect("reader dropped the ack oneshot");
+            assert!(ack.is_ok(), "standby should succeed, got {ack:?}");
+            // Free a slot so the queued send can complete.
+            let first = events_rx.recv().await.expect("first message");
+            assert!(matches!(first, Ok(DecodedMessage::Begin { xid: 1, .. })));
+        };
+
+        let (sent, ()) = tokio::join!(helper, driver);
+        assert!(sent, "send should complete once a slot frees");
+        let second = events_rx.recv().await.expect("second message");
+        assert!(matches!(second, Ok(DecodedMessage::Begin { xid: 2, .. })));
+        assert_eq!(
+            standbys.lock().unwrap().as_slice(),
+            &[(PgLsn::from(42u64), PgLsn::from(42u64), PgLsn::from(42u64))],
+            "standby LSN should have reached the wire while the channel was full",
         );
     }
 }
