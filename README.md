@@ -1,9 +1,10 @@
 # pg2iceberg
 
-pg2iceberg replicates data from Postgres directly to Iceberg, no Kafka needed. Opinionated by design:
-- Specifically replicates Postgres → Iceberg, nothing else.
+pg2iceberg mirrors data from Postgres directly to Iceberg, no Kafka needed. Opinionated by design:
+- Only supports Postgres as source and Iceberg as destination, nothing else.
+- Mirrors data, i.e. source and target contain the same data. So no such thing as skipping snapshot.
+- Stateless, all state lives in Postgres and S3. This makes operation simple.
 - Assumes pg2iceberg is the sole writer of the Iceberg tables it manages, including compaction.
-- Captures changes via logical replication only, so the source needs `wal_level=logical`.
 
 ```mermaid
 graph LR
@@ -44,7 +45,7 @@ graph LR
   StagedB -.->|offset index| Coord
 ```
 
-pg2iceberg captures WAL change events via PostgreSQL logical replication and stages them as Parquet files in S3. A lightweight coordination layer in the source Postgres database (`_pg2iceberg` schema) tracks offsets and materializer progress. Since the write path only involves S3 uploads + a small PG transaction (no Iceberg catalog on the hot path), the replication slot LSN can be advanced quickly, minimizing WAL retention on the source.
+pg2iceberg captures WAL change events via PostgreSQL logical replication and stages them as Parquet files in S3 via [leaderless log protocol](https://github.com/lakestream-io/leaderless-log-protocol/). A lightweight coordination layer in the source Postgres database (`_pg2iceberg` schema) tracks offsets and materializer progress. Since the write path only involves S3 uploads + a small PG transaction (no Iceberg catalog on the hot path), the replication slot LSN can be advanced quickly, minimizing WAL retention on the source.
 
 A materializer, which runs at a separate interval, reads the staged Parquet files and merges them into the corresponding Iceberg tables using merge-on-read (equality deletes for updates/deletes, data files for inserts).
 
@@ -55,25 +56,46 @@ Staged files use a fixed Parquet schema regardless of source table changes: meta
 **Single-process** (default `pg2iceberg run`): one process runs the WAL writer and materializer together. Simplest to deploy.
 
 ```
-+------------------------------+
-|  pg2iceberg run              |
-|  +----------+  +------------+|
-|  |WAL Writer|->|Materializer||
-|  +----------+  +------------+|
-+------------------------------+
+┌──────────┐
+│ Postgres │
+└────┬─────┘
+     │ logical replication
+     ▼
+┌─ pg2iceberg run ────────────────┐
+│ WAL writer                      │
+│   │ staged Parquet + log_index  │
+│   ▼                             │
+│ Materializer                    │
+└────┬────────────────────────────┘
+     ▼
+┌─────────┐
+│ Iceberg │
+└─────────┘
 ```
 
 **Distributed**: one `pg2iceberg stream-only` process owns the replication slot; N `pg2iceberg materializer-only --worker-id <id>` workers each claim a deterministic slice of tables via heartbeat-based coordination. Workers can be added or removed dynamically — tables rebalance on the next cycle.
 
 ```
-+------------------+   +--------------------------+   +--------------------------+
-| stream-only      |   | materializer-only        |   | materializer-only        |
-| +------------+   |   |  --worker-id worker-a    |   |  --worker-id worker-b    |
-| | WAL Writer |   |   |  (tables 1, 3)           |   |  (tables 2, 4)           |
-| +------------+   |   +--------------------------+   +--------------------------+
-+------------------+              ^                                ^
-                                  +-- _pg2iceberg.consumer ---------+
-                                       (heartbeat registry)
+┌──────────┐
+│ Postgres │
+└────┬─────┘
+     │ logical replication (one slot)
+     ▼
+┌─ pg2iceberg stream-only ────────┐
+│ WAL writer                      │
+└────┬────────────────────────────┘
+     │ staged Parquet + log_index
+     ├────────────────────────────────────┐
+     ▼                                    ▼
+┌─ materializer-only ─────────────┐  ┌─ materializer-only ─────────────┐
+│ --worker-id worker-a            │  │ --worker-id worker-b            │
+│ tables 1, 3                     │  │ tables 2, 4                     │
+└────┬────────────────────────────┘  └────┬────────────────────────────┘
+     └─────────────────┬──────────────────┘
+                       ▼
+                  ┌─────────┐
+                  │ Iceberg │
+                  └─────────┘
 ```
 
 ### Coordination
