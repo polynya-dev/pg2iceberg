@@ -235,7 +235,6 @@ async fn live_add_table_backfills_via_background_snapshot() {
         compaction: None,
         flush_rows: 64,
         mat_cycle_limit: 128,
-        consumer_ttl: Duration::from_secs(60),
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(CounterMaterializerNamer::new("s3://table")),
         blob_namer: Arc::new(CounterBlobNamer::new("s3://stage")),

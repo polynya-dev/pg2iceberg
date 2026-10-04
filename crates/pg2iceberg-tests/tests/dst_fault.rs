@@ -873,7 +873,6 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
     use pg2iceberg_validate::LogicalLifecycle;
-    use std::time::Duration;
 
     let db = pg2iceberg_sim::postgres::SimPostgres::new();
     db.create_table(schema()).unwrap();
@@ -941,7 +940,6 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
         compaction: None,
         flush_rows: 64,
         mat_cycle_limit: 128,
-        consumer_ttl: Duration::from_secs(60),
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://fence-table",
@@ -1016,7 +1014,6 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
     use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
-    use std::time::Duration;
 
     let db = pg2iceberg_sim::postgres::SimPostgres::new();
     db.create_table(schema()).unwrap();
@@ -1093,7 +1090,6 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
         compaction: None,
         flush_rows: 64,
         mat_cycle_limit: 128,
-        consumer_ttl: Duration::from_secs(60),
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://fence-conc",
@@ -1142,15 +1138,14 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
     // Exercises the *complete* binary lifecycle via
     // `pg2iceberg_validate::run_logical_lifecycle` against sim
     // plumbing: slot existence check, publication + slot creation,
-    // start_replication, table registration, consumer registration,
-    // snapshot decision, main loop, drain. This is the test the
+    // start_replication, table registration, snapshot decision, main
+    // loop, drain. This is the test the
     // user asked for: every step the binary does is now part of
     // the fault-DST coverage surface.
     use pg2iceberg_core::{InMemoryMetrics, Mode};
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
     use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
-    use std::time::Duration;
 
     let db = pg2iceberg_sim::postgres::SimPostgres::new();
     db.create_table(schema()).unwrap();
@@ -1215,7 +1210,6 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
         compaction: None,
         flush_rows: 64,
         mat_cycle_limit: 128,
-        consumer_ttl: Duration::from_secs(60),
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://table",
@@ -1232,10 +1226,33 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
         .enable_all()
         .build()
         .unwrap();
-    let outcome = rt.block_on(async move {
-        run_logical_lifecycle(lifecycle, Box::pin(std::future::ready(()))).await
-    });
+    // The shutdown future is first polled by the main loop's
+    // `select!`, i.e. mid-run — after every setup step, before the
+    // drain. Snapshot the consumer group there and resolve
+    // immediately so the loop still runs zero iterations.
+    let mid_run_consumers = Arc::new(std::sync::Mutex::new(None));
+    let shutdown = {
+        let coord = coord_inner.clone();
+        let seen = mid_run_consumers.clone();
+        Box::pin(async move {
+            let workers = coord.active_consumers("default").await.unwrap();
+            *seen.lock().unwrap() = Some(workers);
+        })
+    };
+    let outcome = rt.block_on(async move { run_logical_lifecycle(lifecycle, shutdown).await });
     assert!(outcome.is_ok(), "lifecycle should succeed: {outcome:?}");
+
+    // The WAL-writer lifecycle must not join the materializer
+    // consumer group. In `stream-only` mode a registered entry is
+    // counted by `materializer-only` workers in their round-robin
+    // split, but this process never materializes — so the tables
+    // assigned to it would stall forever.
+    let consumers = mid_run_consumers.lock().unwrap().take();
+    assert_eq!(
+        consumers,
+        Some(vec![]),
+        "lifecycle registered a phantom materializer consumer"
+    );
 
     // After shutdown: the slot was created, the snapshot ran, and
     // per-table state says snapshot is complete.
@@ -1263,7 +1280,6 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
     use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
-    use std::time::Duration;
 
     let db = pg2iceberg_sim::postgres::SimPostgres::new();
     db.create_table(schema()).unwrap();
@@ -1345,7 +1361,6 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
         compaction: None,
         flush_rows: 64,
         mat_cycle_limit: 128,
-        consumer_ttl: Duration::from_secs(60),
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://table",
@@ -1377,11 +1392,10 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
 
 #[test]
 fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
-    use pg2iceberg_core::{InMemoryMetrics, Metrics, WorkerId};
+    use pg2iceberg_core::{InMemoryMetrics, Metrics};
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_pg::SlotMonitor;
     use pg2iceberg_sim::postgres::AsyncSimStream;
-    use std::time::Duration;
 
     // Boot a normal sim harness, then re-package its components into
     // a `LogicalLoop` and run the library main loop with a
@@ -1435,8 +1449,6 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
         slot_name: "slot-fault".into(),
         schedule: Schedule::default(),
         compaction: None,
-        worker_id: WorkerId("dst-fault-worker".into()),
-        consumer_ttl: Duration::from_secs(60),
         pending_snapshot_rx: None,
         pending_snapshot_handle: None,
     };
