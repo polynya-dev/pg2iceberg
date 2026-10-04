@@ -24,9 +24,7 @@ use pg2iceberg_coord::{
 };
 use pg2iceberg_core::{IdGen, TableSchema};
 use pg2iceberg_iceberg::prod::IcebergRustCatalog;
-use pg2iceberg_logical::{
-    materializer::CounterMaterializerNamer, pipeline::BlobNamer, Materializer,
-};
+use pg2iceberg_logical::{materializer::UuidMaterializerNamer, pipeline::BlobNamer, Materializer};
 use pg2iceberg_pg::prod::{PgClientImpl, TlsMode as PgTls};
 use pg2iceberg_stream::{prod::ObjectStoreBlobStore, BlobStore};
 use std::collections::HashMap;
@@ -622,7 +620,10 @@ async fn build_one_shot_materializer(
     }
 
     let mat_base = format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/'));
-    let mat_namer = Arc::new(CounterMaterializerNamer::new(mat_base));
+    let mat_namer = Arc::new(UuidMaterializerNamer::new(
+        Arc::new(crate::realio::RealIdGen::new()),
+        mat_base,
+    ));
     let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
         Materializer::new(
             coord,
@@ -975,8 +976,7 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     }
 
     let mat_base = format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/'));
-    let mat_namer =
-        Arc::new(pg2iceberg_logical::materializer::CounterMaterializerNamer::new(mat_base));
+    let mat_namer = Arc::new(UuidMaterializerNamer::new(id_gen.clone(), mat_base));
     let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
         Materializer::new(
             Arc::clone(&coord),

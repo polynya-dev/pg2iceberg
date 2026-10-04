@@ -1469,19 +1469,6 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
     );
 }
 
-#[test]
-#[ignore = "GAP: materializer-crash recovery requires FileIndex rebuild from catalog history"]
-fn materializer_crash_during_commit_loses_in_memory_state() {
-    // Documents the follow-up: today the harness doesn't rebuild
-    // the materializer's FileIndex from catalog history on restart.
-    // A real materializer crash mid-commit would lose the in-memory
-    // FileIndex, and a re-insert promotion would
-    // mis-classify already-committed PKs as fresh inserts. The
-    // FileIndex rebuild path exists in the iceberg crate
-    // (`rebuild_from_catalog`); the harness just doesn't exercise it
-    // yet.
-}
-
 // ── Smoke-style proptest ──────────────────────────────────────────
 
 use proptest::prelude::*;
