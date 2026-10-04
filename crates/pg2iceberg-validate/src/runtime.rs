@@ -23,7 +23,7 @@
 use crate::watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
 use crate::{validate_startup, SlotState, StartupValidation, TableExistence};
 use pg2iceberg_coord::Coordinator;
-use pg2iceberg_core::{Clock, IdGen, Lsn, Mode, TableIdent, TableSchema, Timestamp, WorkerId};
+use pg2iceberg_core::{Clock, IdGen, Lsn, Mode, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
 use pg2iceberg_logical::{
     materializer::MaterializerNamer,
@@ -168,8 +168,8 @@ pub type MainLoopError = LifecycleError;
 /// Inputs for [`run_logical_lifecycle`]. The binary builds this with
 /// prod components; the fault-DST builds it with sim components — both
 /// then call the same lifecycle function. Slot setup, table
-/// registration, consumer heartbeat, snapshot phase, main loop, and
-/// shutdown drain are *all* in the helper.
+/// registration, snapshot phase, main loop, and shutdown drain are
+/// *all* in the helper.
 #[allow(clippy::type_complexity)]
 pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// Source PG. Used for slot existence check, publication creation,
@@ -205,7 +205,6 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     pub flush_rows: usize,
     /// Materializer cycle limit (entries-per-cycle cap).
     pub mat_cycle_limit: usize,
-    pub consumer_ttl: Duration,
     /// Built lazily — only invoked if the snapshot phase actually
     /// needs to run (fresh slot, snapshot not already complete). The
     /// binary's factory builds a `PgSnapshotSource`; the DST's factory
@@ -254,14 +253,19 @@ pub type SnapshotSourceFactory = Box<dyn FnOnce(&[TableSchema]) -> SnapshotSourc
 /// 3. `start_replication`.
 /// 4. Build pipeline + materializer + watcher.
 /// 5. Register every schema on the materializer.
-/// 6. Register the consumer (heartbeat for distributed-worker quorum).
-/// 7. If slot was fresh, run the snapshot phase via
+/// 6. If slot was fresh, run the snapshot phase via
 ///    [`pg2iceberg_snapshot::run_snapshot_phase`] using the supplied
 ///    factory; ack the slot at the snapshot LSN; run a materialize
 ///    cycle to publish snapshot rows to Iceberg.
-/// 8. Run the main loop until `shutdown` resolves (handler dispatch +
-///    heartbeat).
-/// 9. Drain: final flush, send_standby, unregister consumer.
+/// 7. Run the main loop until `shutdown` resolves (handler dispatch).
+/// 8. Drain: final flush, send_standby.
+///
+/// The lifecycle deliberately does **not** register in the
+/// `_pg2iceberg.consumer` group. That registry is the membership list
+/// `materializer-only` workers round-robin tables over; in
+/// `stream-only` mode an entry for this process would be assigned a
+/// share of tables it never materializes. In single-process `run`
+/// mode nothing reads it at all.
 ///
 /// **Fault-DST coverage:** every step above is exercised by sim
 /// plumbing. Bugs in any step (e.g. forgetting to create the
@@ -513,21 +517,6 @@ where
     }
     tracing::info!(count = lc.schemas.len(), "tables registered");
 
-    // 4. Consumer heartbeat.
-    let worker_id = WorkerId(format!(
-        "lifecycle-{}",
-        lc.id_gen
-            .new_uuid()
-            .iter()
-            .take(4)
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    ));
-    lc.coord
-        .register_consumer(&lc.group, &worker_id, lc.consumer_ttl)
-        .await
-        .map_err(|e| LifecycleError::Coord(e.to_string()))?;
-
     // 5. Snapshot phase (only on fresh slot). Returns the snapshot
     //    LSN we'll use as the replication start LSN — this is the
     //    snapshot↔CDC fence.
@@ -714,8 +703,6 @@ where
         slot_name: lc.slot_name,
         schedule: lc.schedule,
         compaction: lc.compaction,
-        worker_id,
-        consumer_ttl: lc.consumer_ttl,
         pending_snapshot_rx,
         pending_snapshot_handle,
     };
@@ -815,7 +802,7 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
 /// against. The binary builds this with prod components; the
 /// fault-DST builds it with sim components — both then call
 /// [`run_logical_main_loop`] to execute the same handler-dispatch +
-/// heartbeat + drain logic.
+/// drain logic.
 pub struct LogicalLoop<C: Coordinator + ?Sized + 'static, Cat: Catalog + 'static> {
     pub pipeline: Pipeline<C>,
     pub materializer: Materializer<Cat>,
@@ -829,8 +816,6 @@ pub struct LogicalLoop<C: Coordinator + ?Sized + 'static, Cat: Catalog + 'static
     pub slot_name: String,
     pub schedule: Schedule,
     pub compaction: Option<CompactionConfig>,
-    pub worker_id: WorkerId,
-    pub consumer_ttl: Duration,
     /// Optional channel: a background snapshot task pumps
     /// per-table completion notifications here. The main loop calls
     /// [`Materializer::mark_snapshot_complete`] to lift the gate
@@ -863,8 +848,7 @@ pub struct PendingSnapshotMsg {
 /// 2. On replication event → [`Pipeline::process`].
 /// 3. On tick → fire due handlers via [`run_materialize_tick`] /
 ///    [`run_watcher_tick`] (the helpers the binary used to inline).
-/// 4. Heartbeat the coord.
-/// 5. On shutdown → final flush + send_standby + unregister.
+/// 4. On shutdown → final flush + send_standby.
 ///
 /// **Why this is a library function:** the production binary's
 /// `run_inner` used to inline this whole loop (~80 lines), which
@@ -961,18 +945,6 @@ where
         for h in ticker.fire_due(now) {
             dispatch_handler(&mut loop_state, h).await?;
         }
-
-        // Heartbeat (best-effort — coord errors are logged at the
-        // call site in the binary; here we swallow because the
-        // watcher will surface any cursor-vs-log_index drift).
-        let _ = loop_state
-            .coord
-            .register_consumer(
-                &loop_state.group,
-                &loop_state.worker_id,
-                loop_state.consumer_ttl,
-            )
-            .await;
     }
 
     drain_and_shutdown(loop_state).await
@@ -1134,10 +1106,6 @@ where
             }
         }
     }
-    let _ = loop_state
-        .coord
-        .unregister_consumer(&loop_state.group, &loop_state.worker_id)
-        .await;
     tracing::info!(?final_lsn, "main loop exited cleanly");
     Ok(())
 }

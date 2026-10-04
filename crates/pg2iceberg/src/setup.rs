@@ -141,7 +141,6 @@ where
         },
         flush_rows: cfg.sink.flush_rows,
         mat_cycle_limit: 64,
-        consumer_ttl: Duration::from_secs(60),
         snapshot_source_factory,
         materializer_namer: Arc::new(CounterMaterializerNamer::new(format!(
             "{}/materialized",

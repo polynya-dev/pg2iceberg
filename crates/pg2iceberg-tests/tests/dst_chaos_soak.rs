@@ -431,7 +431,6 @@ impl ChaosHarness {
             }),
             flush_rows: 64,
             mat_cycle_limit: 128,
-            consumer_ttl: Duration::from_secs(60),
             snapshot_source_factory: snapshot_factory,
             materializer_namer: Arc::clone(&self.materializer_namer)
                 as Arc<dyn pg2iceberg_logical::materializer::MaterializerNamer>,

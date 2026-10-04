@@ -42,7 +42,16 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ContainerAsync;
 
-/// Create a bucket by exec'ing `mc` inside a transient minio/mc
+// `minio/minio` and `minio/mc` are no longer pullable from Docker Hub
+// (or quay.io), which breaks `MinIO::default()`'s pinned image.
+// `pgsty/*` is a community-maintained fork shipping the same binaries
+// with the same entrypoints, so it's a drop-in replacement.
+const MINIO_IMAGE: &str = "pgsty/minio";
+const MINIO_TAG: &str = "RELEASE.2026-08-04T00-00-00Z";
+const MC_IMAGE: &str = "pgsty/mc";
+const MC_TAG: &str = "RELEASE.2026-09-16T00-00-00Z";
+
+/// Create a bucket by exec'ing `mc` inside a transient `mc`
 /// container attached to the same docker network as the MinIO
 /// container. Avoids dragging the AWS SDK into our test-only dep
 /// tree.
@@ -53,7 +62,7 @@ async fn create_bucket_via_mc(network: &str, bucket: &str) {
          do sleep 0.5; done; \
          mc mb --ignore-existing local/{bucket}"
     );
-    let _container = GenericImage::new("minio/mc", "latest")
+    let _container = GenericImage::new(MC_IMAGE, MC_TAG)
         .with_wait_for(WaitFor::Exit(ExitWaitStrategy::new().with_exit_code(0)))
         .with_entrypoint("/bin/sh")
         .with_network(network)
@@ -89,6 +98,8 @@ async fn bring_up_stack() -> Stack {
 
     // ── MinIO ────────────────────────────────────────────────────
     let minio: ContainerAsync<MinIO> = MinIO::default()
+        .with_name(MINIO_IMAGE)
+        .with_tag(MINIO_TAG)
         .with_network(&network)
         .with_hostname("minio")
         .start()
