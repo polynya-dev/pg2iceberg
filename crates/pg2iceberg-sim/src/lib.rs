@@ -10,4 +10,5 @@ pub mod catalog;
 pub mod clock;
 pub mod coord;
 pub mod fault;
+pub mod id;
 pub mod postgres;

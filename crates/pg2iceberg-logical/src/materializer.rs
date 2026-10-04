@@ -29,7 +29,7 @@ use pg2iceberg_coord::{Coordinator, LogEntry};
 use pg2iceberg_core::metrics::{names, Labels};
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
-    ColumnName, ColumnSchema, Metrics, Namespace, NoopMetrics, Op, PgValue, Row, TableIdent,
+    ColumnName, ColumnSchema, IdGen, Metrics, Namespace, NoopMetrics, Op, PgValue, Row, TableIdent,
     TableSchema,
 };
 use pg2iceberg_iceberg::meta::{
@@ -127,8 +127,11 @@ pub trait MaterializerNamer: Send + Sync {
     async fn next_path(&self, table: &TableIdent, kind: &str, partition_segment: &str) -> String;
 }
 
-/// Deterministic counter-based namer. Production uses an `IdGen`-backed UUID
-/// suffix; this is the sim variant.
+/// Deterministic counter-based namer for the sim and tests. Never use it
+/// in production: its counter restarts at 0 in every process, so after a
+/// restart it hands out paths a previous process already committed — and
+/// uploading to one overwrites a live data file. Production uses
+/// [`UuidMaterializerNamer`].
 pub struct CounterMaterializerNamer {
     counter: std::sync::atomic::AtomicU64,
     base: String,
@@ -149,25 +152,67 @@ impl MaterializerNamer for CounterMaterializerNamer {
         let n = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Layout: `<base>/<table>/data/[<col=val>/...]/<kind>-<n>.parquet`.
-        // Data and eq-delete files share the `data/` subdirectory
-        // (Iceberg writers always co-locate them); meta / compact /
-        // marker outputs go in their own per-kind subdir.
-        let kind_dir = match kind {
-            "data" | "eq-delete" => "data",
-            other => other,
-        };
-        if partition_segment.is_empty() {
-            format!(
-                "{}/{}/{}/{kind}-{n:010}.parquet",
-                self.base, table.name, kind_dir
-            )
-        } else {
-            format!(
-                "{}/{}/{}/{}/{kind}-{n:010}.parquet",
-                self.base, table.name, kind_dir, partition_segment
-            )
+        file_path(
+            &self.base,
+            table,
+            kind,
+            partition_segment,
+            &format!("{n:010}"),
+        )
+    }
+}
+
+/// Production namer: a random UUID per file, so paths never repeat —
+/// not across restarts, and not between distributed workers.
+pub struct UuidMaterializerNamer {
+    id_gen: Arc<dyn IdGen>,
+    base: String,
+}
+
+impl UuidMaterializerNamer {
+    pub fn new(id_gen: Arc<dyn IdGen>, base: impl Into<String>) -> Self {
+        Self {
+            id_gen,
+            base: base.into(),
         }
+    }
+}
+
+#[async_trait]
+impl MaterializerNamer for UuidMaterializerNamer {
+    async fn next_path(&self, table: &TableIdent, kind: &str, partition_segment: &str) -> String {
+        let id: String = self
+            .id_gen
+            .new_uuid()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        file_path(&self.base, table, kind, partition_segment, &id)
+    }
+}
+
+/// Layout: `<base>/<table>/data/[<col=val>/...]/<kind>-<id>.parquet`.
+/// Data and eq-delete files share the `data/` subdirectory (Iceberg
+/// writers always co-locate them); meta / compact / marker outputs go in
+/// their own per-kind subdir.
+fn file_path(
+    base: &str,
+    table: &TableIdent,
+    kind: &str,
+    partition_segment: &str,
+    id: &str,
+) -> String {
+    let kind_dir = match kind {
+        "data" | "eq-delete" => "data",
+        other => other,
+    };
+    if partition_segment.is_empty() {
+        format!("{base}/{}/{kind_dir}/{kind}-{id}.parquet", table.name)
+    } else {
+        format!(
+            "{base}/{}/{kind_dir}/{partition_segment}/{kind}-{id}.parquet",
+            table.name
+        )
     }
 }
 

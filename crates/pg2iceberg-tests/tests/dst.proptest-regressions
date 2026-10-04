@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 7a6d9f9068793aeb59e94e1d2dc689c3f2f96c92d1f913f1c538b690a10fb4c2 # shrinks to steps = [UnpublishedWrite { qty: 0 }]
+cc f4004e88b64de3768c2445a6cbe938954df146915f87ee4743a5ecabfc77fdec # shrinks to steps = [Insert { id: 1, qty: 0 }, DriveFlush, MaterializerCycle, RestartMaterializer, Insert { id: 2, qty: 0 }]

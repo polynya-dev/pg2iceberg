@@ -254,7 +254,7 @@ pub struct SinkConfig {
 
     /// Blob-store prefix where the materializer writes data files.
     /// Orphan cleanup operates only under this prefix. Should match
-    /// the path scheme `CounterMaterializerNamer` produces in
+    /// the path scheme `UuidMaterializerNamer` produces in
     /// `run.rs`. Default `materialized/` mirrors what the binary uses.
     #[serde(default = "default_materialized_prefix")]
     pub materialized_prefix: String,

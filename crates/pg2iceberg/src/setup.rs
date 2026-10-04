@@ -18,7 +18,7 @@ use pg2iceberg_coord::{
 };
 use pg2iceberg_core::{InMemoryMetrics, TableIdent, TableSchema};
 use pg2iceberg_iceberg::prod::IcebergRustCatalog;
-use pg2iceberg_logical::{materializer::CounterMaterializerNamer, pipeline::BlobNamer};
+use pg2iceberg_logical::{materializer::UuidMaterializerNamer, pipeline::BlobNamer};
 use pg2iceberg_pg::{
     prod::{PgClientImpl, TlsMode as PgTls},
     PgClient, SlotMonitor,
@@ -43,6 +43,10 @@ where
 {
     let clock = Arc::new(RealClock);
     let id_gen = Arc::new(RealIdGen::new());
+    let materializer_namer = Arc::new(UuidMaterializerNamer::new(
+        id_gen.clone(),
+        format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/')),
+    ));
 
     // ── coord ──────────────────────────────────────────────────────
     let coord_dsn = cfg.coord_dsn();
@@ -141,10 +145,7 @@ where
         flush_rows: cfg.sink.flush_rows,
         mat_batch_rows: cfg.sink.materializer_batch_rows,
         snapshot_source_factory,
-        materializer_namer: Arc::new(CounterMaterializerNamer::new(format!(
-            "{}/materialized",
-            cfg.sink.warehouse.trim_end_matches('/')
-        ))),
+        materializer_namer,
         blob_namer,
         metrics: Arc::new(InMemoryMetrics::new()),
         // Blue-green marker mode. Operators set
@@ -221,4 +222,32 @@ async fn discover_schemas(
         resolved.push(schema);
     }
     Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pg2iceberg_core::Namespace;
+    use pg2iceberg_logical::materializer::MaterializerNamer;
+
+    /// Every process builds its own namer. A restarted process must never
+    /// hand out a path an earlier one used: uploading to it would
+    /// overwrite a data file a committed snapshot still references.
+    #[tokio::test]
+    async fn materializer_file_names_never_repeat_across_processes() {
+        let table = TableIdent {
+            namespace: Namespace(vec!["public".into()]),
+            name: "t".into(),
+        };
+        let base = "s3://warehouse/materialized";
+        let first = UuidMaterializerNamer::new(Arc::new(RealIdGen::new()), base);
+        let restarted = UuidMaterializerNamer::new(Arc::new(RealIdGen::new()), base);
+        let a = first.next_path(&table, "data", "").await;
+        let b = restarted.next_path(&table, "data", "").await;
+        assert_ne!(a, b);
+        assert!(
+            a.starts_with("s3://warehouse/materialized/t/data/data-") && a.ends_with(".parquet"),
+            "{a}"
+        );
+    }
 }

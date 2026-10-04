@@ -55,7 +55,17 @@ impl MemoryBlobStore {
 impl BlobStore for MemoryBlobStore {
     async fn put(&self, path: &str, bytes: Bytes) -> Result<()> {
         let ms = self.clock_ms.fetch_add(1, Ordering::SeqCst);
-        self.inner.lock().unwrap().insert(
+        let mut inner = self.inner.lock().unwrap();
+        // pg2iceberg never rewrites a file: every path it writes is meant
+        // to be new. S3 would silently replace the object — and with it
+        // data a committed snapshot may still reference — so the sim
+        // refuses, turning any path reuse into a loud failure.
+        if inner.contains_key(path) {
+            return Err(StreamError::Io(format!(
+                "refusing to overwrite existing blob {path}"
+            )));
+        }
+        inner.insert(
             path.to_string(),
             Entry {
                 bytes,

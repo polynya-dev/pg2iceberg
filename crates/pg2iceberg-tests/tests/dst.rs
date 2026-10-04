@@ -27,9 +27,10 @@
 //! steps so the proptest exercises pipeline/materializer ordering, and
 //! `CrashAndRestart` models pipeline-process crashes between flushes.
 //!
-//! Pipeline-only crash for now: the materializer's FileIndex rebuild
-//! from catalog history is a tracked follow-up. Once it lands, we
-//! can crash the materializer in DST too.
+//! `RestartMaterializer` crashes the materializer too: a new instance
+//! rebuilds its FileIndex from catalog history, and must never reuse a
+//! file path a committed snapshot references (the sim blob store refuses
+//! overwrites).
 
 use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
@@ -41,12 +42,14 @@ use pg2iceberg_iceberg::read_materialized_state;
 use pg2iceberg_iceberg::{
     Catalog, PreparedCommit, PreparedCompaction, SchemaChange, Snapshot, TableMetadata,
 };
+use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
-use pg2iceberg_logical::{CounterMaterializerNamer, Materializer, Pipeline};
+use pg2iceberg_logical::{Materializer, Pipeline};
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
+use pg2iceberg_sim::id::SeqIdGen;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pg2iceberg_snapshot::Snapshotter;
 use pg2iceberg_stream::codec::decode_chunk;
@@ -170,6 +173,10 @@ enum Step {
     /// durable storage and the parallel materializer worker process. Phase
     /// 8.5 will extend this to also crash the materializer.
     CrashAndRestart,
+    /// Materializer-process crash: a new materializer — fresh file namer,
+    /// FileIndex rebuilt from the catalog — over the same durable coord,
+    /// catalog, and blob store.
+    RestartMaterializer,
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
@@ -189,6 +196,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         3 => Just(Step::DriveFlush),
         2 => Just(Step::MaterializerCycle),
         1 => Just(Step::CrashAndRestart),
+        1 => Just(Step::RestartMaterializer),
     ]
 }
 
@@ -197,6 +205,12 @@ fn workload() -> impl Strategy<Value = Vec<Step>> {
 }
 
 // ---------- harness ----------
+
+/// The production file namer: a fresh instance per materializer
+/// incarnation, drawing from the shared UUID sequence.
+fn mat_namer(id_gen: &Arc<SeqIdGen>) -> Arc<dyn MaterializerNamer> {
+    Arc::new(UuidMaterializerNamer::new(id_gen.clone(), "s3://table"))
+}
 
 struct DstHarness {
     db: SimPostgres,
@@ -217,6 +231,9 @@ struct DstHarness {
     noise_next_id: i32,
     /// Last PK handed out by `BigTx` inserts (kept clear of `1..=6`).
     next_bulk_id: i32,
+    /// UUID source for materializer file names, shared by every
+    /// materializer incarnation — like real UUIDs, never repeating.
+    id_gen: Arc<SeqIdGen>,
 }
 
 impl DstHarness {
@@ -250,7 +267,8 @@ impl DstHarness {
         let namer = Arc::new(CounterBlobNamer::new("s3://stage"));
         let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
 
-        let mat_namer = Arc::new(CounterMaterializerNamer::new("s3://table"));
+        let id_gen = Arc::new(SeqIdGen::new());
+        let mat_namer = mat_namer(&id_gen);
         let audited = Arc::new(AuditedCatalog {
             inner: catalog.clone(),
             blob: blob_store.clone(),
@@ -283,6 +301,7 @@ impl DstHarness {
             live: seeds.iter().map(|(id, _)| *id).collect(),
             noise_next_id: 0,
             next_bulk_id: 1000,
+            id_gen,
         }
     }
 
@@ -304,7 +323,8 @@ impl DstHarness {
         let namer = Arc::new(CounterBlobNamer::new("s3://stage"));
         let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
 
-        let mat_namer = Arc::new(CounterMaterializerNamer::new("s3://table"));
+        let id_gen = Arc::new(SeqIdGen::new());
+        let mat_namer = mat_namer(&id_gen);
         let audited = Arc::new(AuditedCatalog {
             inner: catalog.clone(),
             blob: blob_store.clone(),
@@ -337,6 +357,7 @@ impl DstHarness {
             live: BTreeSet::new(),
             noise_next_id: 0,
             next_bulk_id: 1000,
+            id_gen,
         }
     }
 
@@ -376,6 +397,19 @@ impl DstHarness {
 
     /// Pipeline-process crash. Slot, coord, and blob store survive (durable
     /// storage); pipeline state and replication-stream cursor are lost.
+    fn restart_materializer(&mut self) {
+        let mut materializer = Materializer::new(
+            self.coord.clone() as Arc<dyn Coordinator>,
+            self.blob_store.clone(),
+            self.audited.clone(),
+            mat_namer(&self.id_gen),
+            "default",
+            MAT_BATCH,
+        );
+        block_on(materializer.register_table(schema())).unwrap();
+        self.materializer = materializer;
+    }
+
     fn crash_and_restart(&mut self) {
         // Drain + ack first so we model "graceful crash after a flush" — the
         // simpler case. Mid-flush crashes (orphan blobs from PUT-without-claim)
@@ -466,6 +500,7 @@ impl DstHarness {
             Step::DrivePartial { n } => self.drive_partial(*n),
             Step::FlushTick => self.flush_and_ack(),
             Step::CrashMidStream => self.crash_mid_stream(),
+            Step::RestartMaterializer => self.restart_materializer(),
         }
     }
 }
@@ -943,6 +978,21 @@ proptest! {
 //
 // As DST surfaces failing seeds we pin them here as deterministic tests so the
 // regression doesn't reappear silently. None yet.
+
+/// A materializer restart must never write over a file a committed
+/// snapshot still references (the sim blob store refuses overwrites).
+#[test]
+fn materializer_restart_never_overwrites_committed_files() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::RestartMaterializer);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
 
 #[test]
 fn happy_path_one_insert_one_flush() {
