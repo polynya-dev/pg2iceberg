@@ -9,7 +9,7 @@
 //! never-snapshotted).
 
 use pg2iceberg_coord::TableSnapshotState;
-use pg2iceberg_core::{Lsn, Mode, Namespace, TableIdent};
+use pg2iceberg_core::{Lsn, Namespace, TableIdent};
 use pg2iceberg_validate::{
     validate_startup, SlotState, StartupValidation, TableExistence, ValidationError, Violation,
 };
@@ -24,13 +24,12 @@ fn ident(name: &str) -> TableIdent {
 fn fresh_logical() -> StartupValidation {
     StartupValidation {
         tables: vec![],
-        slot: Some(SlotState {
+        slot: SlotState {
             exists: false,
             restart_lsn: Lsn::ZERO,
             confirmed_flush_lsn: Lsn::ZERO,
             ..Default::default()
-        }),
-        config_mode: Mode::Logical,
+        },
         slot_name: "pg2iceberg".into(),
         ..Default::default()
     }
@@ -102,12 +101,12 @@ fn orphaned_tables_violation() {
 #[test]
 fn orphaned_slot_violation() {
     let mut v = fresh_logical();
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(50),
         confirmed_flush_lsn: Lsn(50),
         ..Default::default()
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
         &err,
@@ -124,12 +123,12 @@ fn missing_tables_violation() {
     // Table was previously snapshotted (state recorded) but the user
     // dropped the Iceberg table.
     v.tables.push(snapshotted_table("orders", false, 100));
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(100),
         ..Default::default()
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
         &err,
@@ -144,12 +143,12 @@ fn missing_tables_violation() {
 fn slot_gone_but_lsn_exists_violation() {
     let mut v = fresh_logical();
     v.tables.push(snapshotted_table("orders", true, 100));
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: false, // slot disappeared
         restart_lsn: Lsn::ZERO,
         confirmed_flush_lsn: Lsn::ZERO,
         ..Default::default()
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
         &err,
@@ -170,12 +169,12 @@ fn slot_ahead_of_checkpoint_violation() {
     let mut v = fresh_logical();
     v.tables.push(snapshotted_table("orders", true, 100));
     v.coord_flushed_lsn = Lsn(150);
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(200), // ahead of coord checkpoint — tamper / external advance
         confirmed_flush_lsn: Lsn(200),
         ..Default::default()
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
         &err,
@@ -197,12 +196,12 @@ fn slot_ahead_of_snapshot_lsn_but_tracking_coord_does_not_violate() {
     // coord_flushed_lsn moves with the slot; snapshot_lsn stays at
     // the original snapshot completion point.
     v.coord_flushed_lsn = Lsn(200);
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(200),
         confirmed_flush_lsn: Lsn(200),
         ..Default::default()
-    });
+    };
     validate_startup(&v).expect("normal CDC progress should validate cleanly");
 }
 
@@ -224,12 +223,12 @@ fn snapshot_complete_but_lsn_zero_violation() {
             completed_at_micros: Some(0),
         }),
     });
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn::ZERO,
         confirmed_flush_lsn: Lsn::ZERO,
         ..Default::default()
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
         &err,
@@ -239,43 +238,15 @@ fn snapshot_complete_but_lsn_zero_violation() {
     );
 }
 
-// 6 — query mode shouldn't trigger because LSN doesn't apply.
-#[test]
-fn snapshot_complete_lsn_zero_in_query_mode_is_ok() {
-    let mut v = fresh_logical();
-    v.config_mode = Mode::Query;
-    v.tables.push(TableExistence {
-        pg_table: ident("orders"),
-        iceberg_name: "orders".into(),
-        existed: true,
-        current_snapshot_id: Some(1),
-        current_pg_oid: Some(42),
-        in_publication: true,
-        stored_state: Some(TableSnapshotState {
-            pg_oid: 42,
-            snapshot_complete: true,
-            snapshot_lsn: Lsn::ZERO,
-            completed_at_micros: Some(0),
-        }),
-    });
-    v.slot = None;
-    assert!(validate_startup(&v).is_ok());
-}
-
-// 7. Snapshot complete but Iceberg table has no snapshots — used to
-//    fire `SnapshotCompleteButTableNoSnapshot`. The invariant was
-//    removed (see lib.rs comment); a legitimate `AddTable` on an
-//    empty source table reaches this exact state and shouldn't be
-//    flagged. Identity changes are still caught via invariant 11.
 #[test]
 fn snapshot_complete_but_table_has_no_snapshot_does_not_violate() {
     let mut v = fresh_logical();
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(100),
         ..Default::default()
-    });
+    };
     v.tables.push(TableExistence {
         pg_table: ident("orders"),
         iceberg_name: "orders".into(),
@@ -293,13 +264,13 @@ fn snapshot_complete_but_table_has_no_snapshot_does_not_violate() {
 fn slot_lost_violation() {
     let mut v = fresh_logical();
     v.tables.push(snapshotted_table("orders", true, 100));
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(50),
         confirmed_flush_lsn: Lsn(50),
         wal_status: Some(pg2iceberg_pg::WalStatus::Lost),
         conflicting: false,
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
         &err,
@@ -315,13 +286,13 @@ fn slot_lost_violation() {
 fn slot_unreserved_does_not_fail_startup() {
     let mut v = fresh_logical();
     v.tables.push(snapshotted_table("orders", true, 100));
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(100),
         wal_status: Some(pg2iceberg_pg::WalStatus::Unreserved),
         conflicting: false,
-    });
+    };
     assert!(validate_startup(&v).is_ok());
 }
 
@@ -330,13 +301,13 @@ fn slot_unreserved_does_not_fail_startup() {
 fn slot_conflicting_violation() {
     let mut v = fresh_logical();
     v.tables.push(snapshotted_table("orders", true, 100));
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(100),
         wal_status: Some(pg2iceberg_pg::WalStatus::Reserved),
         conflicting: true,
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
         &err,
@@ -350,12 +321,12 @@ fn slot_conflicting_violation() {
 #[test]
 fn table_identity_changed_violation() {
     let mut v = fresh_logical();
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(100),
         ..Default::default()
-    });
+    };
     v.tables.push(TableExistence {
         pg_table: ident("orders"),
         iceberg_name: "orders".into(),
@@ -381,12 +352,12 @@ fn table_identity_changed_violation() {
 fn table_missing_from_publication_violation() {
     let mut v = fresh_logical();
     v.publication_name = "pg2iceberg_pub".into();
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(100),
         ..Default::default()
-    });
+    };
     v.tables.push(TableExistence {
         pg_table: ident("orders"),
         iceberg_name: "orders".into(),
@@ -416,12 +387,12 @@ fn slot_advanced_externally_violation() {
     // We last acked at 100. Slot is now at 5000 — 4900 LSNs of
     // skipped WAL we never saw.
     v.coord_flushed_lsn = Lsn(100);
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(5000),
         ..Default::default()
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_one_violation(
         &err,
@@ -441,12 +412,12 @@ fn slot_advanced_externally_skipped_when_no_baseline() {
     let mut v = fresh_logical();
     v.tables.push(snapshotted_table("orders", true, 100));
     v.coord_flushed_lsn = Lsn::ZERO; // bootstrap
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(5000),
         ..Default::default()
-    });
+    };
     // Slot is way ahead but no baseline to compare against — skip.
     // Other invariants may fire, but not SlotAdvancedExternally.
     let err = validate_startup(&v);
@@ -471,12 +442,12 @@ fn slot_at_or_behind_coord_record_is_ok() {
     v.coord_flushed_lsn = Lsn(5000);
     // Slot lags us by one tick's worth — normal: we wrote coord
     // before the standby ack and crashed in between.
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(4500),
         ..Default::default()
-    });
+    };
     let err = validate_startup(&v);
     if let Err(e) = err {
         assert!(
@@ -494,12 +465,12 @@ fn slot_exactly_matches_coord_record_is_ok() {
     let mut v = fresh_logical();
     v.tables.push(snapshotted_table("orders", true, 100));
     v.coord_flushed_lsn = Lsn(5000);
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(100),
         confirmed_flush_lsn: Lsn(5000),
         ..Default::default()
-    });
+    };
     assert!(validate_startup(&v).is_ok());
 }
 
@@ -515,12 +486,12 @@ fn multiple_violations_all_reported() {
         current_snapshot_id: Some(1),
         ..Default::default()
     });
-    v.slot = Some(SlotState {
+    v.slot = SlotState {
         exists: true,
         restart_lsn: Lsn(50),
         confirmed_flush_lsn: Lsn(50),
         ..Default::default()
-    });
+    };
     let err = validate_startup(&v).unwrap_err();
     assert_eq!(err.violations.len(), 2, "got: {:?}", err.violations);
 }

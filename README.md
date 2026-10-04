@@ -3,6 +3,7 @@
 pg2iceberg replicates data from Postgres directly to Iceberg, no Kafka needed. Opinionated by design:
 - Specifically replicates Postgres → Iceberg, nothing else.
 - Assumes pg2iceberg is the sole writer of the Iceberg tables it manages, including compaction.
+- Captures changes via logical replication only, so the source needs `wal_level=logical`.
 
 ```mermaid
 graph LR
@@ -16,10 +17,6 @@ graph LR
 ```
 
 ## How it works
-
-pg2iceberg can operate in **logical replication** mode (recommended, full CDC) or **query** mode (watermark-based polling for Postgres replicas without `wal_level=logical`).
-
-### Logical replication mode
 
 ```mermaid
 graph LR
@@ -53,7 +50,7 @@ A materializer, which runs at a separate interval, reads the staged Parquet file
 
 Staged files use a fixed Parquet schema regardless of source table changes: metadata columns (`_op`, `_lsn`, `_ts`, `_unchanged_cols`) plus a JSON `_data` column containing user data. Schema evolution (`ALTER TABLE`) only affects the Iceberg materialized table, not the staging layer.
 
-#### Deployment modes
+### Deployment modes
 
 **Single-process** (default `pg2iceberg run`): one process runs the WAL writer and materializer together. Simplest to deploy.
 
@@ -79,7 +76,7 @@ Staged files use a fixed Parquet schema regardless of source table changes: meta
                                        (heartbeat registry)
 ```
 
-#### Coordination
+### Coordination
 
 All coordination state lives under the `_pg2iceberg` schema in the source (or a dedicated state) Postgres:
 
@@ -94,33 +91,10 @@ All coordination state lives under the `_pg2iceberg` schema in the source (or a 
 | `flushed_lsn` | Singleton: highest LSN we've acked the slot to (slot-tamper detection) |
 | `tables` | Per-table snapshot status + `pg_class.oid` (drop-recreate detection) |
 | `snapshot_progress` | Per-table mid-snapshot resume cursor |
-| `query_watermarks` | Per-table watermark for query mode |
 | `pending_markers` | Pending blue-green replica-alignment markers |
 | `marker_emissions` | Per-(uuid, table) marker emission record (idempotent dedup) |
 
 Coordinator write amplification is negligible: a few small PG writes per flush regardless of batch size.
-
-### Query mode
-
-```mermaid
-graph LR
-  subgraph Postgres
-      TableA["Table A"]
-      TableB["Table B"]
-  end
-
-  subgraph Iceberg
-      TargetA[Table A]
-      TargetB[Table B]
-  end
-
-  TableA -->|"SELECT WHERE watermark > $1"| TargetA
-  TableB -->|"SELECT WHERE watermark > $1"| TargetB
-```
-
-Query mode polls Postgres using watermark-based `SELECT` queries and writes directly to the materialized Iceberg tables. Each row is an upsert (equality delete + insert) keyed by primary key.
-
-Query mode is simpler but cannot detect hard deletes and has no transaction semantics. Use logical mode when you need full CDC fidelity.
 
 ## CLI subcommands
 
@@ -130,7 +104,7 @@ pg2iceberg <SUBCOMMAND> --config /etc/pg2iceberg/config.yaml [flags...]
 
 | Subcommand | Purpose |
 |---|---|
-| `run` | Long-running pipeline. Logical or query mode depending on `source.mode`. |
+| `run` | Long-running pipeline: initial snapshot, then CDC via logical replication. |
 | `snapshot` | One-shot: run the initial snapshot phase per configured table, then exit. Auto-creates the slot first so a later `run` doesn't lose WAL. |
 | `cleanup` | Drop the replication slot, drop the publication, and `DROP SCHEMA … CASCADE` on the coordinator. Resets PG-side state ahead of a re-bootstrap. **Doesn't drop Iceberg tables** — do that out-of-band. |
 | `compact` | One-shot: run a single compaction pass over every configured table, then exit. For cron / k8s `CronJob`. |
@@ -150,14 +124,13 @@ pg2iceberg/
 ├── Cargo.toml                 # workspace root; pins polynya-dev/iceberg-rust fork
 ├── crates/
 │   ├── pg2iceberg/            # binary: CLI dispatch, run.rs, setup.rs
-│   ├── pg2iceberg-core/       # types only (no IO): Lsn, ChangeEvent, TableSchema, Mode, …
+│   ├── pg2iceberg-core/       # types only (no IO): Lsn, ChangeEvent, TableSchema, …
 │   ├── pg2iceberg-pg/         # PG client: pgoutput stream, slot health, replication trait
 │   ├── pg2iceberg-coord/      # Coordinator trait + SQL + Postgres impl
 │   ├── pg2iceberg-stream/     # BlobStore trait + object_store-backed prod impl + codec
 │   ├── pg2iceberg-iceberg/    # Catalog trait, TableWriter, MoR fold, vended-S3 router, meta tables
 │   ├── pg2iceberg-logical/    # Pipeline + Materializer + ticker schedule
 │   ├── pg2iceberg-snapshot/   # Resumable snapshot phase
-│   ├── pg2iceberg-query/      # Query-mode pipeline
 │   ├── pg2iceberg-validate/   # Startup invariants + lifecycle helper + verify subcommand
 │   ├── pg2iceberg-sim/        # Memory-backed implementations of every prod trait (DST harness)
 │   └── pg2iceberg-tests/      # DST scenario tests + testcontainers integration tests
@@ -243,7 +216,6 @@ Configuration is YAML-first; see [`config.example.yaml`](config.example.yaml) fo
 |---|---|---|
 | `POSTGRES_URL` | `source.postgres.dsn` | PostgreSQL connection URL |
 | `TABLES` | `tables` | List of source tables to replicate |
-| `MODE` | `source.mode` | `logical` (default) or `query` |
 | `SLOT_NAME` | `source.logical.slot_name` | Replication slot (default: `pg2iceberg_slot`) |
 | `PUBLICATION_NAME` | `source.logical.publication_name` | Publication (default: `pg2iceberg_pub`) |
 | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` | Iceberg REST catalog URL |

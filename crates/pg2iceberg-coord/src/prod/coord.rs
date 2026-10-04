@@ -575,46 +575,6 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
-    async fn query_watermark(
-        &self,
-        ident: &TableIdent,
-    ) -> Result<Option<pg2iceberg_core::PgValue>> {
-        let key = table_key(ident);
-        let client = self.client.lock().await;
-        let rows = client
-            .query(&sql::select_query_watermark(&self.schema), &[&key])
-            .await
-            .map_err(pg)?;
-        match rows.first() {
-            Some(r) => {
-                let payload: serde_json::Value = r.get(0);
-                let v: pg2iceberg_core::PgValue = serde_json::from_value(payload)
-                    .map_err(|e| CoordError::Other(format!("query_watermark deserialize: {e}")))?;
-                Ok(Some(v))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn set_query_watermark(
-        &self,
-        ident: &TableIdent,
-        watermark: &pg2iceberg_core::PgValue,
-    ) -> Result<()> {
-        let key = table_key(ident);
-        let payload = serde_json::to_value(watermark)
-            .map_err(|e| CoordError::Other(format!("query_watermark serialize: {e}")))?;
-        let client = self.client.lock().await;
-        client
-            .execute(
-                &sql::upsert_query_watermark(&self.schema),
-                &[&key, &payload],
-            )
-            .await
-            .map_err(pg)?;
-        Ok(())
-    }
-
     async fn pending_markers_for_table(
         &self,
         table: &TableIdent,

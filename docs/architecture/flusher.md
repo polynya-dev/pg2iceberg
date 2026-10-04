@@ -46,7 +46,6 @@ The coordinator role is filled by the **source PostgreSQL database** itself. Thi
 | `flushed_lsn` | Singleton: highest LSN we've acked the slot to |
 | `tables` | Per-table snapshot status + `pg_class.oid` |
 | `snapshot_progress` | Per-table mid-snapshot resume cursor |
-| `query_watermarks` | Per-table query-mode cursor |
 | `pending_markers` / `marker_emissions` | Blue-green marker bookkeeping |
 
 **Append** (flusher → log):

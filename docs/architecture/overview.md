@@ -4,11 +4,7 @@ icon: lucide/cpu
 
 # Overview
 
-pg2iceberg has two operating modes:
-
-**Logical replication mode** (recommended) decouples WAL capture from Iceberg writes. The flusher captures row changes from PostgreSQL and stages them as Parquet files in S3. The materializer runs on a separate interval, reads the staged files, and merges them into Iceberg using merge-on-read semantics. This split means the replication slot LSN can be advanced quickly — the hot write path never touches the Iceberg catalog.
-
-**Query mode** polls PostgreSQL with watermark-based SELECT queries and writes directly to Iceberg. Simpler, but cannot detect hard deletes and has no transaction semantics.
+pg2iceberg replicates via PostgreSQL logical replication and decouples WAL capture from Iceberg writes. The flusher captures row changes from PostgreSQL and stages them as Parquet files in S3. The materializer runs on a separate interval, reads the staged files, and merges them into Iceberg using merge-on-read semantics. This split means the replication slot LSN can be advanced quickly — the hot write path never touches the Iceberg catalog.
 
 ```
                     ┌─────────────────────────────────────────────────────┐

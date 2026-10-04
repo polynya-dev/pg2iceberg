@@ -67,7 +67,6 @@ nav = [
   { "Usage" = [
     { "Configuration" = "usage/configuration.md" },
     { "Managing Tables" = "usage/managing-tables.md" },
-    { "Query Mode" = "usage/query-mode.md" },
     { "Partitioning" = "usage/partitioning.md" },
     { "Type Mapping" = "usage/type-mapping.md" },
     { "Operational Modes" = "usage/modes.md" },

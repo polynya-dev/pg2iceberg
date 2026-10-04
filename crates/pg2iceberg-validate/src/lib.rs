@@ -21,7 +21,7 @@ pub use runtime::{
 };
 pub use watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
 
-use pg2iceberg_core::{Lsn, Mode, TableIdent};
+use pg2iceberg_core::{Lsn, TableIdent};
 use thiserror::Error;
 
 /// State observed at pipeline startup. Built by the binary by querying
@@ -32,12 +32,12 @@ use thiserror::Error;
 #[derive(Clone, Debug, Default)]
 pub struct StartupValidation {
     pub tables: Vec<TableExistence>,
-    /// `None` for query mode (no replication slot).
-    pub slot: Option<SlotState>,
-    pub config_mode: Mode,
+    /// The replication slot; `exists: false` when it hasn't been
+    /// created yet.
+    pub slot: SlotState,
     pub slot_name: String,
     /// Publication name — used in the `TableMissingFromPublication`
-    /// violation message. Empty in query mode.
+    /// violation message.
     pub publication_name: String,
     /// Highest LSN we (pg2iceberg) have ever told the slot to flush
     /// past, read from `_pg2iceberg.flushed_lsn`. Compared to
@@ -244,7 +244,6 @@ pub struct ValidationError {
 pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), ValidationError> {
     let mut violations = Vec::new();
     let fresh = v.fresh();
-    let _ = v.config_mode; // retained for future query-mode-specific invariants
 
     // 0. Refuse to start on PG < 13. Sim leaves this as 0 (skip).
     if v.server_version_num != 0 && v.server_version_num < MIN_PG_VERSION_NUM {
@@ -268,14 +267,10 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     }
 
     // 2. Fresh install but replication slot exists.
-    if fresh {
-        if let Some(slot) = &v.slot {
-            if slot.exists {
-                violations.push(Violation::OrphanedSlot {
-                    slot_name: v.slot_name.clone(),
-                });
-            }
-        }
+    if fresh && v.slot.exists {
+        violations.push(Violation::OrphanedSlot {
+            slot_name: v.slot_name.clone(),
+        });
     }
 
     // 3. Previously-tracked table missing in catalog. "Tracked"
@@ -293,17 +288,15 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
 
     // 4. Some table has snapshot_lsn > 0 but slot is gone. WAL
     //    behind that LSN is lost; can't resume CDC safely.
-    if let Some(slot) = &v.slot {
-        if !slot.exists {
-            for t in &v.tables {
-                if let Some(state) = &t.stored_state {
-                    if state.snapshot_lsn > Lsn::ZERO {
-                        violations.push(Violation::SlotGoneButLsnExists {
-                            snapshot_lsn: state.snapshot_lsn,
-                            slot_name: v.slot_name.clone(),
-                        });
-                        break;
-                    }
+    if !v.slot.exists {
+        for t in &v.tables {
+            if let Some(state) = &t.stored_state {
+                if state.snapshot_lsn > Lsn::ZERO {
+                    violations.push(Violation::SlotGoneButLsnExists {
+                        snapshot_lsn: state.snapshot_lsn,
+                        slot_name: v.slot_name.clone(),
+                    });
+                    break;
                 }
             }
         }
@@ -321,28 +314,24 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     //    interfered). That's slot.restart_lsn > coord_flushed_lsn.
     //    Skip when coord_flushed_lsn is `Lsn::ZERO` (fresh install
     //    has no baseline yet).
-    if let Some(slot) = &v.slot {
-        if slot.exists && v.coord_flushed_lsn > Lsn::ZERO && slot.restart_lsn > v.coord_flushed_lsn
-        {
-            violations.push(Violation::SlotAheadOfCheckpoint {
-                restart_lsn: slot.restart_lsn,
-                snapshot_lsn: v.coord_flushed_lsn,
-                slot_name: v.slot_name.clone(),
-            });
-        }
+    if v.slot.exists && v.coord_flushed_lsn > Lsn::ZERO && v.slot.restart_lsn > v.coord_flushed_lsn
+    {
+        violations.push(Violation::SlotAheadOfCheckpoint {
+            restart_lsn: v.slot.restart_lsn,
+            snapshot_lsn: v.coord_flushed_lsn,
+            slot_name: v.slot_name.clone(),
+        });
     }
 
     // 6. Per-table snapshot_complete but snapshot_lsn = 0 (crashed
     //    after marking complete but before the LSN was stamped, or
-    //    legacy bug). Only applies to logical mode.
-    if v.config_mode == Mode::Logical {
-        for t in &v.tables {
-            if let Some(state) = &t.stored_state {
-                if state.snapshot_complete && state.snapshot_lsn == Lsn::ZERO {
-                    violations.push(Violation::SnapshotCompleteButLsnZero {
-                        table: t.iceberg_name.clone(),
-                    });
-                }
+    //    legacy bug).
+    for t in &v.tables {
+        if let Some(state) = &t.stored_state {
+            if state.snapshot_complete && state.snapshot_lsn == Lsn::ZERO {
+                violations.push(Violation::SnapshotCompleteButLsnZero {
+                    table: t.iceberg_name.clone(),
+                });
             }
         }
     }
@@ -360,22 +349,18 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
 
     // 8. Slot is `lost` — WAL recycled past `max_slot_wal_keep_size`.
     //    `wal_status = None` (pre-PG-13) skips this check.
-    if let Some(slot) = &v.slot {
-        if slot.exists && matches!(slot.wal_status, Some(pg2iceberg_pg::WalStatus::Lost)) {
-            violations.push(Violation::SlotLost {
-                slot_name: v.slot_name.clone(),
-                restart_lsn: slot.restart_lsn,
-            });
-        }
+    if v.slot.exists && matches!(v.slot.wal_status, Some(pg2iceberg_pg::WalStatus::Lost)) {
+        violations.push(Violation::SlotLost {
+            slot_name: v.slot_name.clone(),
+            restart_lsn: v.slot.restart_lsn,
+        });
     }
 
     // 9. Slot is `conflicting` (PG 14+) — killed by physical-rep conflict.
-    if let Some(slot) = &v.slot {
-        if slot.exists && slot.conflicting {
-            violations.push(Violation::SlotConflicting {
-                slot_name: v.slot_name.clone(),
-            });
-        }
+    if v.slot.exists && v.slot.conflicting {
+        violations.push(Violation::SlotConflicting {
+            slot_name: v.slot_name.clone(),
+        });
     }
 
     // 10. Per-table `pg_class.oid` changed → `DROP TABLE` + recreate.
@@ -432,17 +417,15 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     //     apply a tolerance: the standby tick writes coord *before*
     //     ack-ing the slot, so in normal operation the slot's value
     //     never exceeds our recorded value.
-    if let Some(slot) = &v.slot {
-        if slot.exists
-            && v.coord_flushed_lsn > Lsn::ZERO
-            && slot.confirmed_flush_lsn > v.coord_flushed_lsn
-        {
-            violations.push(Violation::SlotAdvancedExternally {
-                slot_name: v.slot_name.clone(),
-                coord_lsn: v.coord_flushed_lsn,
-                slot_lsn: slot.confirmed_flush_lsn,
-            });
-        }
+    if v.slot.exists
+        && v.coord_flushed_lsn > Lsn::ZERO
+        && v.slot.confirmed_flush_lsn > v.coord_flushed_lsn
+    {
+        violations.push(Violation::SlotAdvancedExternally {
+            slot_name: v.slot_name.clone(),
+            coord_lsn: v.coord_flushed_lsn,
+            slot_lsn: v.slot.confirmed_flush_lsn,
+        });
     }
 
     if violations.is_empty() {

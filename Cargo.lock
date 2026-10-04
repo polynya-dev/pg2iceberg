@@ -2842,7 +2842,6 @@ dependencies = [
  "pg2iceberg-iceberg",
  "pg2iceberg-logical",
  "pg2iceberg-pg",
- "pg2iceberg-query",
  "pg2iceberg-snapshot",
  "pg2iceberg-stream",
  "pg2iceberg-validate",
@@ -2952,25 +2951,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg2iceberg-query"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "bytes",
- "pg2iceberg-coord",
- "pg2iceberg-core",
- "pg2iceberg-iceberg",
- "pg2iceberg-logical",
- "pg2iceberg-pg",
- "pg2iceberg-sim",
- "pg2iceberg-stream",
- "pollster",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "pg2iceberg-sim"
 version = "0.0.0"
 dependencies = [
@@ -2980,7 +2960,6 @@ dependencies = [
  "pg2iceberg-core",
  "pg2iceberg-iceberg",
  "pg2iceberg-pg",
- "pg2iceberg-query",
  "pg2iceberg-snapshot",
  "pg2iceberg-stream",
  "pollster",

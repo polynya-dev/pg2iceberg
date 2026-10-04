@@ -7,8 +7,8 @@
 //! reads with a plain Iceberg query — no scraping logs, no extra
 //! metrics pipeline.
 //!
-//! - `<meta_ns>.commits` — one row per user-table commit (logical mode:
-//!   per materialize cycle; query mode: per query-flush cycle).
+//! - `<meta_ns>.commits` — one row per user-table commit (per
+//!   materialize cycle).
 //! - `<meta_ns>.checkpoints` — one row per checkpoint save.
 //! - `<meta_ns>.compactions` — one row per compaction commit.
 //! - `<meta_ns>.maintenance` — one row per snapshot-expiry / orphan-cleanup
@@ -201,7 +201,7 @@ pub struct FlushStats {
     pub worker_id: String,
     /// PG-qualified table name, e.g. `"public.orders"`.
     pub table_name: String,
-    /// `"logical"` or `"query"`.
+    /// Always `"logical"`; kept so existing meta tables keep their schema.
     pub mode: String,
     pub snapshot_id: i64,
     /// Iceberg `sequence_number`. The Rust port collapses iceberg's

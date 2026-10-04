@@ -28,8 +28,6 @@ pg2iceberg run --config config.yaml
 
 The WAL writer captures row-level changes via PostgreSQL logical replication and stages them to S3 + the `_pg2iceberg.log_index` table. The materializer reads from that staging layer and writes Iceberg data files via the catalog.
 
-`run` dispatches on `source.mode` in the YAML — `logical` (default) drives the CDC pipeline; `query` drives the watermark-poll pipeline.
-
 ## `stream-only` + `materializer-only` — distributed
 
 One process owns the replication slot; N worker processes claim a deterministic round-robin slice of tables.

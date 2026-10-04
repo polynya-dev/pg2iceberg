@@ -380,21 +380,6 @@ impl Coordinator for FaultyCoordinator {
     async fn clear_snapshot_progress(&self, ident: &TableIdent) -> CoordResult<()> {
         self.inner.clear_snapshot_progress(ident).await
     }
-
-    async fn query_watermark(
-        &self,
-        ident: &TableIdent,
-    ) -> CoordResult<Option<pg2iceberg_core::PgValue>> {
-        self.inner.query_watermark(ident).await
-    }
-
-    async fn set_query_watermark(
-        &self,
-        ident: &TableIdent,
-        watermark: &pg2iceberg_core::PgValue,
-    ) -> CoordResult<()> {
-        self.inner.set_query_watermark(ident, watermark).await
-    }
 }
 
 // ── Catalog wrapper ────────────────────────────────────────────────

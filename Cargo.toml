@@ -7,7 +7,6 @@ members = [
     "crates/pg2iceberg-stream",
     "crates/pg2iceberg-iceberg",
     "crates/pg2iceberg-logical",
-    "crates/pg2iceberg-query",
     "crates/pg2iceberg-snapshot",
     "crates/pg2iceberg-validate",
     "crates/pg2iceberg-sim",
@@ -33,7 +32,6 @@ pg2iceberg-coord = { path = "crates/pg2iceberg-coord" }
 pg2iceberg-stream = { path = "crates/pg2iceberg-stream" }
 pg2iceberg-iceberg = { path = "crates/pg2iceberg-iceberg" }
 pg2iceberg-logical = { path = "crates/pg2iceberg-logical" }
-pg2iceberg-query = { path = "crates/pg2iceberg-query" }
 pg2iceberg-snapshot = { path = "crates/pg2iceberg-snapshot" }
 pg2iceberg-validate = { path = "crates/pg2iceberg-validate" }
 pg2iceberg-sim = { path = "crates/pg2iceberg-sim" }

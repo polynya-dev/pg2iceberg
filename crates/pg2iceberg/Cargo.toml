@@ -23,7 +23,6 @@ pg2iceberg-coord = { path = "../pg2iceberg-coord", features = ["prod"] }
 pg2iceberg-iceberg = { path = "../pg2iceberg-iceberg", features = ["prod"] }
 pg2iceberg-stream.workspace = true
 pg2iceberg-logical.workspace = true
-pg2iceberg-query.workspace = true
 pg2iceberg-snapshot.workspace = true
 pg2iceberg-validate.workspace = true
 

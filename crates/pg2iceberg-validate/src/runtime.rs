@@ -23,7 +23,7 @@
 use crate::watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
 use crate::{validate_startup, SlotState, StartupValidation, TableExistence};
 use pg2iceberg_coord::Coordinator;
-use pg2iceberg_core::{Clock, IdGen, Lsn, Mode, TableIdent, TableSchema, Timestamp};
+use pg2iceberg_core::{Clock, IdGen, Lsn, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
 use pg2iceberg_logical::{
     materializer::MaterializerNamer,
@@ -219,7 +219,6 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// Metrics surface. `InMemoryMetrics` for tests + the binary;
     /// follow-on Prometheus exporter wraps the same trait.
     pub metrics: Arc<dyn pg2iceberg_core::Metrics>,
-    pub mode: Mode,
     /// Blue-green marker mode. When `Some(meta_namespace)`,
     /// pg2iceberg watches `_pg2iceberg.markers` in the source PG
     /// (auto-included in the publication) and emits
@@ -320,7 +319,6 @@ where
         &lc.schemas,
         &lc.slot_name,
         &lc.publication_name,
-        lc.mode,
         connected_system_id,
     )
     .await?;
@@ -721,7 +719,6 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
     schemas: &[TableSchema],
     slot_name: &str,
     publication_name: &str,
-    mode: Mode,
     _connected_system_id: u64,
 ) -> Result<(), LifecycleError> {
     // One round-trip lookup of the publication's current tables;
@@ -762,20 +759,20 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
     // restart_lsn, confirmed_flush_lsn, wal_status, conflicting,
     // safe_wal_size.
     let slot = match pg.slot_health(slot_name).await? {
-        Some(h) => Some(SlotState {
+        Some(h) => SlotState {
             exists: true,
             restart_lsn: h.restart_lsn,
             confirmed_flush_lsn: h.confirmed_flush_lsn,
             wal_status: h.wal_status,
             conflicting: h.conflicting,
-        }),
-        None => Some(SlotState {
+        },
+        None => SlotState {
             exists: false,
             restart_lsn: Lsn::ZERO,
             confirmed_flush_lsn: Lsn::ZERO,
             wal_status: None,
             conflicting: false,
-        }),
+        },
     };
     // Our durable record of the highest LSN we've ever told the slot
     // to flush past. `Lsn::ZERO` means no record yet (fresh install
@@ -789,7 +786,6 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
     let v = StartupValidation {
         tables,
         slot,
-        config_mode: mode,
         slot_name: slot_name.to_string(),
         publication_name: publication_name.to_string(),
         coord_flushed_lsn,

@@ -39,7 +39,7 @@ ALTER PUBLICATION pg2iceberg_pub DROP TABLE public.products;
 
 ## Changing table configuration
 
-All config changes — partition transforms, watermark column, primary key — take effect on restart. There is no hot-reload.
+All config changes — partition transforms, primary key — take effect on restart. There is no hot-reload.
 
 For partition changes specifically: the new partition spec is applied to the Iceberg table during the next materialization cycle after restart. Existing data files are not rewritten; only new commits use the updated spec.
 

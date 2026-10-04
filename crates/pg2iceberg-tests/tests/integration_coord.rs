@@ -30,7 +30,7 @@ use pg2iceberg_coord::{
     schema::CoordSchema,
     CommitBatch, Coordinator, MarkerInfo, OffsetClaim,
 };
-use pg2iceberg_core::{Lsn, Namespace, PgValue, TableIdent, WorkerId};
+use pg2iceberg_core::{Lsn, Namespace, TableIdent, WorkerId};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt};
@@ -372,30 +372,6 @@ async fn snapshot_progress_round_trip() {
     assert!(coord.snapshot_progress(&t).await.unwrap().is_none());
     // Idempotent.
     coord.clear_snapshot_progress(&t).await.unwrap();
-}
-
-#[tokio::test]
-async fn query_watermark_round_trip() {
-    let coord = fresh_coord().await;
-    let t = ident("public", "orders");
-    assert!(coord.query_watermark(&t).await.unwrap().is_none());
-
-    coord
-        .set_query_watermark(&t, &PgValue::Int8(42))
-        .await
-        .unwrap();
-    assert_eq!(
-        coord.query_watermark(&t).await.unwrap(),
-        Some(PgValue::Int8(42))
-    );
-    coord
-        .set_query_watermark(&t, &PgValue::Int8(99))
-        .await
-        .unwrap();
-    assert_eq!(
-        coord.query_watermark(&t).await.unwrap(),
-        Some(PgValue::Int8(99))
-    );
 }
 
 #[tokio::test]

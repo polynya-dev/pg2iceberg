@@ -1,11 +1,11 @@
 //! Binary configuration.
 //!
-//! Sections: `tables` (list), `source.{postgres, logical, query}`,
+//! Sections: `tables` (list), `source.{postgres, logical}`,
 //! `sink` (catalog + storage + credential mode + flush knobs),
 //! `state` (coordinator location).
 //!
 //! Some fields are accepted by the deserializer but not yet consumed
-//! at runtime (query-mode settings, materializer cycle knobs,
+//! at runtime (materializer cycle knobs,
 //! control-plane metadata, etc.). They're carried in the schema so
 //! configs round-trip cleanly while features land. Hence the
 //! crate-level `dead_code` allow on the config structs — *fields*,
@@ -43,8 +43,6 @@ pub struct TableConfig {
     /// schema discovery found in the source `pg_index`.
     #[serde(default)]
     pub primary_key: Vec<String>,
-    #[serde(default)]
-    pub watermark_column: String,
     /// Optional column declarations. When provided, these override
     /// schema discovery; useful for tables where the source columns
     /// don't match what you want to materialize, or for testing.
@@ -77,14 +75,13 @@ pub struct ColumnConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceConfig {
-    /// `"logical"` (default) or `"query"`.
+    /// Replication mode. `"logical"` (the default) is the only one;
+    /// kept so existing configs that spell it out still parse.
     #[serde(default = "default_mode")]
     pub mode: String,
     pub postgres: PostgresConfig,
     #[serde(default)]
     pub logical: LogicalConfig,
-    #[serde(default)]
-    pub query: QueryConfig,
 }
 
 impl Default for SourceConfig {
@@ -93,7 +90,6 @@ impl Default for SourceConfig {
             mode: default_mode(),
             postgres: PostgresConfig::default(),
             logical: LogicalConfig::default(),
-            query: QueryConfig::default(),
         }
     }
 }
@@ -176,12 +172,6 @@ fn default_publication() -> String {
 
 fn default_slot() -> String {
     "pg2iceberg_slot".into()
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct QueryConfig {
-    #[serde(default)]
-    pub poll_interval: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -420,7 +410,22 @@ impl Config {
             .with_context(|| format!("read config from {}", path.display()))?;
         let cfg: Config = serde_yaml::from_str(&raw)
             .with_context(|| format!("parse config at {}", path.display()))?;
+        cfg.validate_mode()?;
         Ok(cfg)
+    }
+
+    /// Reject anything but logical replication up front, so every
+    /// subcommand fails fast with a pointer instead of half-starting.
+    fn validate_mode(&self) -> Result<()> {
+        match self.source.mode.as_str() {
+            "" | "logical" => Ok(()),
+            "query" => anyhow::bail!(
+                "source.mode \"query\" is no longer supported: pg2iceberg only replicates \
+                 via logical replication. Set source.mode to \"logical\" (or remove it) and \
+                 enable wal_level=logical on the source"
+            ),
+            other => anyhow::bail!("unknown source.mode {other:?}; expected \"logical\""),
+        }
     }
 
     /// Connection string for the coordinator. Defaults to the source
@@ -670,6 +675,44 @@ sink:
 state:
   coordinator_schema: _pg2iceberg
 "#;
+
+    #[test]
+    fn query_mode_is_rejected_with_a_pointer_to_logical() {
+        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        cfg.source.mode = "query".into();
+        let err = cfg.validate_mode().unwrap_err().to_string();
+        assert!(
+            err.contains("no longer supported") && err.contains("wal_level=logical"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn logical_or_unset_mode_is_accepted() {
+        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        for mode in ["", "logical"] {
+            cfg.source.mode = mode.into();
+            cfg.validate_mode().unwrap();
+        }
+    }
+
+    #[test]
+    fn leftover_query_mode_keys_still_parse() {
+        // Configs written for the removed query mode may still carry
+        // its keys after switching to logical; they're ignored.
+        let yaml = SAMPLE
+            .replace(
+                "    primary_key: [id]\n",
+                "    primary_key: [id]\n    watermark_column: updated_at\n",
+            )
+            .replace(
+                "  logical:\n",
+                "  query:\n    poll_interval: 30s\n  logical:\n",
+            );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        cfg.validate_mode().unwrap();
+        assert_eq!(cfg.tables[0].name, "public.orders");
+    }
 
     #[test]
     fn parses_go_shaped_yaml() {

@@ -202,7 +202,6 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             name: format!("public.{table}"),
             skip_snapshot: false,
             primary_key: vec![],
-            watermark_column: String::new(),
             columns: vec![],
             iceberg: Default::default(),
         }],
@@ -221,7 +220,6 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
                 slot_name: slot.into(),
                 standby_interval: String::new(),
             },
-            query: Default::default(),
         },
         sink: SinkConfig {
             catalog_uri: stack.rest_url.clone(),
