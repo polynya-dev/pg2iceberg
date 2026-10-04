@@ -20,6 +20,8 @@
 //!    runs through the entire stack, `read_table(SimPostgres)` and
 //!    `read_materialized_state(MemoryCatalog)` must be byte-equal (sorted
 //!    by PK).
+//! 6. **No WAL retention at quiescence:** `slot.confirmed_flush_lsn` ==
+//!    end of WAL, even when the tail only touched unpublished tables.
 //!
 //! Workload generator interleaves `MaterializerCycle` with the pipeline
 //! steps so the proptest exercises pipeline/materializer ordering, and
@@ -93,6 +95,24 @@ fn row(id: i32, qty: i32) -> Row {
     r
 }
 
+/// A table outside the publication. Its WAL never reaches the
+/// pipeline, so it models every write the slot must not stay pinned
+/// behind: other app tables, other databases on the cluster, and
+/// pg2iceberg's own coord writes.
+fn noise_ident() -> TableIdent {
+    TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: "noise".into(),
+    }
+}
+
+fn noise_schema() -> TableSchema {
+    TableSchema {
+        ident: noise_ident(),
+        ..schema()
+    }
+}
+
 fn pk_only(id: i32) -> Row {
     let mut r = BTreeMap::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
@@ -111,6 +131,10 @@ enum Step {
     Delete { id: i32 },
     /// `BEGIN; INSERT id, qty; ROLLBACK`. Exercises the rollback path.
     RollbackInsert { id: i32, qty: i32 },
+    /// `BEGIN; INSERT INTO noise ...; COMMIT` — WAL for a table outside
+    /// the publication. pgoutput skips the whole transaction, so only a
+    /// keepalive tells the pipeline it can ack past it.
+    UnpublishedWrite { qty: i32 },
     /// Drive replication + flush + ack: a complete pipeline cycle.
     DriveFlush,
     /// Run one materializer cycle for every registered table.
@@ -132,6 +156,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         3 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::Update { id, qty }),
         2 => id.clone().prop_map(|id| Step::Delete { id }),
         1 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::RollbackInsert { id, qty }),
+        3 => qty.clone().prop_map(|qty| Step::UnpublishedWrite { qty }),
         3 => Just(Step::DriveFlush),
         2 => Just(Step::MaterializerCycle),
         1 => Just(Step::CrashAndRestart),
@@ -157,6 +182,8 @@ struct DstHarness {
     /// the workload runner to pre-filter ops the proptest generator can't
     /// know about (state-dependent validity).
     live: BTreeSet<i32>,
+    /// Next PK for `noise` inserts (always fresh, so they never conflict).
+    noise_next_id: i32,
 }
 
 impl DstHarness {
@@ -166,6 +193,7 @@ impl DstHarness {
     fn boot_with_seeds(seeds: &[(i32, i32)]) -> Self {
         let db = SimPostgres::new();
         db.create_table(schema()).unwrap();
+        db.create_table(noise_schema()).unwrap();
 
         if !seeds.is_empty() {
             let mut tx = db.begin_tx();
@@ -212,12 +240,14 @@ impl DstHarness {
             materializer,
             stream,
             live: seeds.iter().map(|(id, _)| *id).collect(),
+            noise_next_id: 0,
         }
     }
 
     fn boot() -> Self {
         let db = SimPostgres::new();
         db.create_table(schema()).unwrap();
+        db.create_table(noise_schema()).unwrap();
         db.create_publication(PUB, &[ident()]).unwrap();
         db.create_slot(SLOT, PUB).unwrap();
 
@@ -255,6 +285,7 @@ impl DstHarness {
             materializer,
             stream,
             live: BTreeSet::new(),
+            noise_next_id: 0,
         }
     }
 
@@ -334,6 +365,12 @@ impl DstHarness {
                 tx.insert(&ident(), row(*id, *qty));
                 tx.rollback();
             }
+            Step::UnpublishedWrite { qty } => {
+                self.noise_next_id += 1;
+                let mut tx = self.db.begin_tx();
+                tx.insert(&noise_ident(), row(self.noise_next_id, *qty));
+                tx.commit(Timestamp(0)).unwrap();
+            }
             Step::DriveFlush => {
                 self.drive();
                 self.flush_and_ack();
@@ -358,6 +395,20 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
         if h.materialize() == 0 {
             break;
         }
+    }
+
+    // 6. No WAL retention at quiescence: the slot is acked up to the end
+    //    of WAL, including WAL that only touched unpublished tables.
+    //    Otherwise PG can't recycle it until the next published change.
+    let slot =
+        h.db.slot_state(SLOT)
+            .map_err(|e| format!("slot_state failed: {e}"))?;
+    let wal_end = h.db.current_lsn();
+    if slot.confirmed_flush_lsn != wal_end {
+        return Err(format!(
+            "invariant 6 (WAL retention): slot confirmed_flush_lsn {:?} != WAL end {wal_end:?} at quiescence",
+            slot.confirmed_flush_lsn
+        ));
     }
 
     let entries = block_on(h.coord.read_log(&ident(), 0, 1_000_000))
@@ -595,6 +646,20 @@ fn happy_path_one_insert_one_flush() {
     let mut h = DstHarness::boot();
     h.run_step(&Step::Insert { id: 1, qty: 10 });
     h.run_step(&Step::DriveFlush);
+    check_invariants(&mut h).unwrap();
+}
+
+/// Writes only to tables outside the publication after the last
+/// published change: pgoutput sends nothing for them, so the slot must
+/// advance from the caught-up keepalive alone (invariant 6).
+#[test]
+fn unpublished_writes_do_not_pin_the_slot() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    for qty in 0..3 {
+        h.run_step(&Step::UnpublishedWrite { qty });
+    }
     check_invariants(&mut h).unwrap();
 }
 

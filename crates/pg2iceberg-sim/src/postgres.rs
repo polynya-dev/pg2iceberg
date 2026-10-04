@@ -595,6 +595,7 @@ impl SimPostgres {
             slot: slot.to_string(),
             publication: slot_state.publication,
             cursor_lsn: slot_state.restart_lsn,
+            keepalive_sent: Lsn::ZERO,
         })
     }
 }
@@ -952,11 +953,21 @@ impl Drop for TxHandle {
 /// poll until new entries appear. `send_standby` advances both
 /// `confirmed_flush_lsn` and `restart_lsn`, mirroring how the production
 /// pipeline acks the slot.
+///
+/// Models two pgoutput (PG 15+) behaviours that matter for slot
+/// advancement: transactions with no change for the publication are
+/// skipped entirely (no Begin/Commit), and once caught up the walsender
+/// sends a keepalive carrying its WAL position if the slot hasn't
+/// confirmed it. Together they're the only way the consumer learns it
+/// may ack past WAL that carried nothing for it.
 pub struct SimReplicationStream {
     db: SimPostgres,
     slot: String,
     publication: String,
     cursor_lsn: Lsn,
+    /// `wal_end` of the last keepalive sent, so a caught-up stream
+    /// sends one per new position instead of on every `recv`.
+    keepalive_sent: Lsn,
 }
 
 impl SimReplicationStream {
@@ -974,12 +985,28 @@ impl SimReplicationStream {
             .expect("slot points to existing publication")
             .tables;
 
-        for entry in &s.wal {
+        for (i, entry) in s.wal.iter().enumerate() {
             if entry.lsn <= self.cursor_lsn {
                 continue;
             }
             match &entry.kind {
                 WalKind::Begin => {
+                    // pgoutput skips a transaction with nothing for the
+                    // publication — no Begin/Commit at all. Jump the
+                    // cursor to its Commit; only a later keepalive tells
+                    // the consumer it can ack past it.
+                    let tx = s.wal[i + 1..].iter().filter(|e| e.xid == entry.xid);
+                    let publishes = tx.clone().any(|e| {
+                        matches!(&e.kind, WalKind::Change(evt) if pub_tables.contains(&evt.table))
+                    });
+                    if !publishes {
+                        if let Some(commit) =
+                            tx.into_iter().find(|e| matches!(e.kind, WalKind::Commit))
+                        {
+                            self.cursor_lsn = commit.lsn;
+                        }
+                        continue;
+                    }
                     self.cursor_lsn = entry.lsn;
                     return Some(DecodedMessage::Begin {
                         final_lsn: entry.lsn,
@@ -1015,6 +1042,22 @@ impl SimReplicationStream {
             }
         }
 
+        // Caught up. Like the walsender before it sleeps, send a
+        // keepalive carrying the position decoded so far if the slot
+        // hasn't confirmed it — once per position, so an idle stream
+        // still returns `None`.
+        let confirmed = s
+            .slots
+            .get(&self.slot)
+            .map(|slot| slot.confirmed_flush_lsn)
+            .unwrap_or(Lsn::ZERO);
+        if self.cursor_lsn > confirmed && self.cursor_lsn > self.keepalive_sent {
+            self.keepalive_sent = self.cursor_lsn;
+            return Some(DecodedMessage::Keepalive {
+                wal_end: self.cursor_lsn,
+                reply_requested: false,
+            });
+        }
         None
     }
 

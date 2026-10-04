@@ -464,6 +464,81 @@ async fn start_replication_streams_insert_events() {
 }
 
 #[tokio::test]
+async fn keepalive_wal_end_covers_writes_to_unpublished_tables() {
+    // The slot-advance fix leans on two pgoutput behaviours: a
+    // transaction that only touches tables outside the publication is
+    // skipped entirely (no Begin/Commit), and the walsender's keepalive
+    // `wal_end` still moves past it. Without the keepalive, nothing would
+    // tell us we may ack that WAL and the slot would pin it.
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+
+    let published = format!("pub_t_{}", uniq());
+    let noise = format!("noise_t_{}", uniq());
+    let pubname = format!("p_{}", uniq());
+    let slot = format!("s_{}", uniq());
+    regular
+        .batch_execute(&format!(
+            "CREATE TABLE {published} (id INT PRIMARY KEY); \
+             CREATE TABLE {noise} (id INT PRIMARY KEY, payload TEXT)"
+        ))
+        .await
+        .expect("create tables");
+
+    let client = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("repl connect");
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: published.clone(),
+    };
+    client
+        .create_publication(&pubname, std::slice::from_ref(&ident))
+        .await
+        .expect("publication");
+    let cp = client.create_slot(&slot).await.expect("slot");
+    let mut stream = client
+        .start_replication(&slot, cp, &pubname)
+        .await
+        .expect("start_replication");
+
+    // Only unpublished writes, each its own transaction.
+    let current_lsn = || async {
+        let row = regular
+            .query_one("SELECT (pg_current_wal_insert_lsn() - '0/0')::bigint", &[])
+            .await
+            .expect("current lsn");
+        pg2iceberg_core::Lsn(row.get::<_, i64>(0) as u64)
+    };
+    let mut before_last = current_lsn().await;
+    for i in 0..50 {
+        before_last = current_lsn().await;
+        regular
+            .execute(
+                &format!("INSERT INTO {noise} (id, payload) VALUES ($1, repeat('x', 200))"),
+                &[&i],
+            )
+            .await
+            .expect("noise insert");
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let msg = match tokio::time::timeout(remaining, stream.recv()).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => panic!("stream error: {e:?}"),
+            Err(_) => panic!("no keepalive past {before_last:?} within 30s"),
+        };
+        match msg {
+            DecodedMessage::Keepalive { wal_end, .. } if wal_end > before_last => break,
+            DecodedMessage::Keepalive { .. } => {}
+            other => panic!("unpublished-only transactions must not be streamed, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn discover_schema_against_real_pg() {
     // Validates `PgClientImpl::discover_schema` against
     // information_schema + pg_index for a real table — covers PK

@@ -13,10 +13,12 @@ use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
-    ColumnName, ColumnSchema, Lsn, Namespace, Op, PgValue, Row, TableIdent, TableSchema, Timestamp,
+    ChangeEvent, ColumnName, ColumnSchema, Lsn, Namespace, Op, PgValue, Row, TableIdent,
+    TableSchema, Timestamp,
 };
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::Pipeline;
+use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
@@ -259,4 +261,102 @@ fn second_flush_after_more_txns_appends_offsets_contiguously() {
     assert_eq!((entries[0].start_offset, entries[0].end_offset), (0, 1));
     assert_eq!((entries[1].start_offset, entries[1].end_offset), (1, 3));
     assert_eq!(h.pipeline.flushed_lsn(), last);
+}
+
+// ── keepalive-driven slot advance ──────────────────────────────────────
+//
+// pgoutput sends nothing for transactions that only touch unpublished
+// tables, so a keepalive's `wal_end` is the only signal that the slot can
+// be acked past that WAL. These feed messages by hand: the sim only sends
+// keepalives once caught up, never mid-transaction.
+
+fn insert(xid: u32, lsn: u64, id: i32) -> DecodedMessage {
+    DecodedMessage::Change(ChangeEvent {
+        table: ident("orders"),
+        op: Op::Insert,
+        lsn: Lsn(lsn),
+        commit_ts: Timestamp(0),
+        xid: Some(xid),
+        before: None,
+        after: Some(row(&[("id", PgValue::Int4(id)), ("qty", PgValue::Int4(1))])),
+        unchanged_cols: vec![],
+    })
+}
+
+fn keepalive(wal_end: u64) -> DecodedMessage {
+    DecodedMessage::Keepalive {
+        wal_end: Lsn(wal_end),
+        reply_requested: false,
+    }
+}
+
+#[test]
+fn keepalive_between_txns_advances_flushed_lsn_past_unpublished_wal() {
+    let mut h = boot();
+    for msg in [
+        DecodedMessage::Begin {
+            final_lsn: Lsn(10),
+            xid: 1,
+        },
+        insert(1, 11, 1),
+        DecodedMessage::Commit {
+            commit_lsn: Lsn(12),
+            xid: 1,
+        },
+        keepalive(50),
+    ] {
+        block_on(h.pipeline.process(msg)).unwrap();
+    }
+    // The flush that stages tx 1 also covers the WAL up to the keepalive.
+    assert_eq!(block_on(h.pipeline.flush()).unwrap(), Some(Lsn(50)));
+    assert_eq!(h.pipeline.flushed_lsn(), Lsn(50));
+
+    // Idle: a later keepalive alone advances it, staging nothing.
+    let blobs = h.blob_store.paths().len();
+    block_on(h.pipeline.process(keepalive(80))).unwrap();
+    assert_eq!(block_on(h.pipeline.flush()).unwrap(), Some(Lsn(80)));
+    assert_eq!(
+        h.blob_store.paths().len(),
+        blobs,
+        "no blob for an empty flush"
+    );
+    assert_eq!(
+        block_on(h.coord.read_log(&ident("orders"), 0, 10))
+            .unwrap()
+            .len(),
+        1,
+        "no log_index row for an empty flush"
+    );
+
+    // Nothing new since: flush is a no-op again.
+    assert_eq!(block_on(h.pipeline.flush()).unwrap(), None);
+}
+
+#[test]
+fn keepalive_inside_open_tx_is_not_trusted() {
+    // pgoutput sends a transaction once its commit is decoded, so a
+    // keepalive mid-transaction can carry a `wal_end` beyond that commit.
+    // Acking it before the commit is flushed would lose the transaction
+    // on a crash: the slot would resume after it.
+    let mut h = boot();
+    for msg in [
+        DecodedMessage::Begin {
+            final_lsn: Lsn(10),
+            xid: 1,
+        },
+        insert(1, 11, 1),
+        keepalive(100),
+    ] {
+        block_on(h.pipeline.process(msg)).unwrap();
+    }
+    assert_eq!(block_on(h.pipeline.flush()).unwrap(), None);
+    assert_eq!(h.pipeline.flushed_lsn(), Lsn::ZERO);
+
+    block_on(h.pipeline.process(DecodedMessage::Commit {
+        commit_lsn: Lsn(12),
+        xid: 1,
+    }))
+    .unwrap();
+    assert_eq!(block_on(h.pipeline.flush()).unwrap(), Some(Lsn(12)));
+    assert_eq!(h.pipeline.flushed_lsn(), Lsn(12));
 }

@@ -120,6 +120,11 @@ impl Sink {
         !self.committed.is_empty()
     }
 
+    /// `true` while a transaction has begun but not yet committed.
+    pub fn has_open_tx(&self) -> bool {
+        !self.open_txns.is_empty()
+    }
+
     /// Drains every committed tx into per-table writers, flushes them, and
     /// returns the resulting chunks plus the highest commit_lsn covered.
     /// Returns `None` when nothing is ready.
