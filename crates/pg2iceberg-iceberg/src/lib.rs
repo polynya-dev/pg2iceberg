@@ -15,7 +15,9 @@ pub mod reader;
 pub mod verify;
 pub mod writer;
 
-pub use compact::{compact_table, CompactError, CompactionConfig, CompactionOutcome};
+pub use compact::{
+    compact_table, CompactError, CompactedFile, CompactionConfig, CompactionOutcome,
+};
 pub use file_index::{rebuild_from_catalog, FileIndex};
 pub use fold::{fold_events, pk_key, MaterializedRow};
 pub use materialize::{promote_re_inserts, resolve_unchanged_cols};

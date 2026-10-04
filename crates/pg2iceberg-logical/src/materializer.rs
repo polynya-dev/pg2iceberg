@@ -1315,6 +1315,12 @@ impl<C: Catalog> Materializer<C> {
     /// table's in-memory FileIndex is rebuilt from the catalog so
     /// subsequent materializer cycles route deletes against the new file
     /// set rather than the old (now-superseded) one.
+    /// The materializer's `FileIndex` for `ident` (tests compare it with a
+    /// rebuild from the catalog).
+    pub fn file_index(&self, ident: &TableIdent) -> Option<&FileIndex> {
+        self.tables.get(ident).map(|t| &t.file_index)
+    }
+
     pub async fn compact_table(
         &mut self,
         ident: &TableIdent,
@@ -1345,6 +1351,9 @@ impl<C: Catalog> Materializer<C> {
             ident,
             &schema,
             &pk_cols,
+            // Lets the pass find files with deleted rows without reading
+            // the table; the index tracks exactly this catalog's state.
+            Some(&entry.file_index),
             config,
         )
         .await
@@ -1354,17 +1363,20 @@ impl<C: Catalog> Materializer<C> {
         // new catalog state. Stale entries pointing at compacted-away
         // files would route deletes incorrectly.
         if let Some(o) = &outcome {
+            // Remap what the pass rewrote rather than rebuilding FileIndex
+            // from catalog history, which would re-read the whole table
+            // (and briefly hold a second full index) on every pass.
             let entry_mut = self.tables.get_mut(ident).expect("checked above");
-            let fresh = pg2iceberg_iceberg::rebuild_from_catalog(
-                self.catalog.as_ref(),
-                self.blob_store.as_ref(),
-                ident,
-                &entry_mut.schema,
-                &entry_mut.pk_cols,
-            )
-            .await
-            .map_err(|e| MaterializerError::Compact(e.to_string()))?;
-            entry_mut.file_index = fresh;
+            for path in &o.rewritten_files {
+                entry_mut.file_index.remove_file(path);
+            }
+            for f in &o.added_files {
+                entry_mut.file_index.add_file(
+                    f.path.clone(),
+                    f.pk_keys.clone(),
+                    f.partition_values.clone(),
+                );
+            }
 
             // Record + flush a meta `compactions` row. Best-effort:
             // any meta-write error is logged but doesn't roll back

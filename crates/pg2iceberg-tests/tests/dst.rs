@@ -38,7 +38,7 @@ use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
     ColumnName, ColumnSchema, Namespace, Op, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
-use pg2iceberg_iceberg::read_materialized_state;
+use pg2iceberg_iceberg::{read_materialized_state, CompactionConfig};
 use pg2iceberg_iceberg::{
     Catalog, PreparedCommit, PreparedCompaction, SchemaChange, Snapshot, TableMetadata,
 };
@@ -177,6 +177,10 @@ enum Step {
     /// FileIndex rebuilt from the catalog — over the same durable coord,
     /// catalog, and blob store.
     RestartMaterializer,
+    /// One compaction pass with an input budget so small it rewrites a
+    /// single dirty file (or two clean ones) at a time, leaving older
+    /// deletes and the rest of the table for later passes.
+    Compact,
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
@@ -197,6 +201,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         2 => Just(Step::MaterializerCycle),
         1 => Just(Step::CrashAndRestart),
         1 => Just(Step::RestartMaterializer),
+        2 => Just(Step::Compact),
     ]
 }
 
@@ -275,6 +280,7 @@ impl DstHarness {
             db: db.clone(),
             violations: Mutex::new(Vec::new()),
             fail_next_commit: Default::default(),
+            audit_paused: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -331,6 +337,7 @@ impl DstHarness {
             db: db.clone(),
             violations: Mutex::new(Vec::new()),
             fail_next_commit: Default::default(),
+            audit_paused: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -384,6 +391,56 @@ impl DstHarness {
 
     fn materialize(&mut self) -> usize {
         block_on(self.materializer.cycle()).unwrap()
+    }
+
+    /// A partial compaction pass must not change what readers see. The
+    /// audited catalog checks the commit against transaction boundaries;
+    /// this checks the stronger before == after.
+    fn compact(&mut self) {
+        let cfg = CompactionConfig {
+            data_file_threshold: 1,
+            delete_file_threshold: 1,
+            // Around the size of a few-row file, so the table mixes
+            // small files with large ones only deletes make worth
+            // rewriting.
+            target_size_bytes: 1024,
+            max_input_bytes_per_pass: 1,
+        };
+        let state = |h: &Self| {
+            let mut rows = block_on(read_materialized_state(
+                h.catalog.as_ref(),
+                h.blob_store.as_ref(),
+                &ident(),
+                &schema(),
+                &[ColumnName("id".into())],
+            ))
+            .unwrap();
+            sort_by_pk(&mut rows);
+            rows
+        };
+        let before = state(self);
+        block_on(self.materializer.compact_table(&ident(), &cfg)).unwrap();
+        // The materializer updates its FileIndex from what the pass
+        // rewrote; it must match a rebuild from catalog history.
+        let rebuilt = block_on(pg2iceberg_iceberg::rebuild_from_catalog(
+            self.catalog.as_ref(),
+            self.blob_store.as_ref(),
+            &ident(),
+            &schema(),
+            &[ColumnName("id".into())],
+        ))
+        .unwrap();
+        assert_eq!(
+            self.materializer.file_index(&ident()),
+            Some(&rebuilt),
+            "FileIndex drifted from the catalog after compaction"
+        );
+        let after = state(self);
+        if before != after {
+            self.audited.violations.lock().unwrap().push(format!(
+                "compaction changed the table: before {before:?}, after {after:?}"
+            ));
+        }
     }
 
     /// Run a Snapshotter-driven snapshot phase against the harness's source.
@@ -501,6 +558,7 @@ impl DstHarness {
             Step::FlushTick => self.flush_and_ack(),
             Step::CrashMidStream => self.crash_mid_stream(),
             Step::RestartMaterializer => self.restart_materializer(),
+            Step::Compact => self.compact(),
         }
     }
 }
@@ -634,10 +692,16 @@ struct AuditedCatalog {
     violations: Mutex<Vec<String>>,
     /// When set, the next multi-step commit fails without committing.
     fail_next_commit: std::sync::atomic::AtomicBool,
+    /// When set, commits aren't audited — for tests that count blob reads
+    /// (an audit reads the whole table).
+    audit_paused: std::sync::atomic::AtomicBool,
 }
 
 impl AuditedCatalog {
     async fn audit(&self) {
+        if self.audit_paused.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if let Err(e) = atomic_visibility(&self.inner, &self.blob, &self.db).await {
             self.violations
                 .lock()
@@ -1099,6 +1163,66 @@ fn failed_multi_step_commit_leaves_nothing_and_retry_lands_it() {
     for _ in 0..100 {
         h.run_step(&Step::MaterializerCycle);
         check_step_invariants(&h).unwrap();
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A compaction pass that rewrites one dirty file must not re-read the
+/// rest of the table: the materializer's FileIndex is updated from what
+/// the pass rewrote, not rebuilt from catalog history.
+#[test]
+fn compaction_does_not_replay_the_table() {
+    let mut h = DstHarness::boot();
+    for id in 1..=20 {
+        h.run_step(&Step::Insert { id, qty: 1 });
+        h.run_step(&Step::DriveFlush);
+        h.run_step(&Step::MaterializerCycle);
+    }
+    // Row 1's first file is now dirty: its only row is dead.
+    h.run_step(&Step::Update { id: 1, qty: 2 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        target_size_bytes: 1024,
+        max_input_bytes_per_pass: 1,
+    };
+    h.audited
+        .audit_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = h.blob_store.gets();
+    let out = block_on(h.materializer.compact_table(&ident(), &cfg))
+        .unwrap()
+        .expect("the dirty file is rewritten");
+    let reads = h.blob_store.gets() - before;
+    h.audited
+        .audit_paused
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(out.input_data_files, 1);
+    assert!(reads <= 4, "one compaction pass read {reads} files");
+    check_invariants(&mut h).unwrap();
+}
+
+/// A pass that carries live rows into a new file must point FileIndex at
+/// it (the `Compact` step checks FileIndex against a catalog rebuild).
+#[test]
+fn compaction_moves_live_rows_in_file_index() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::BigTx {
+        inserts: 10,
+        qty: 1,
+    });
+    h.run_step(&Step::DriveFlush);
+    for _ in 0..20 {
+        h.run_step(&Step::MaterializerCycle);
+    }
+    // Kill one row of the first multi-row file; its other rows stay live.
+    h.run_step(&Step::Update { id: 1001, qty: 9 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    for _ in 0..10 {
+        h.run_step(&Step::Compact);
     }
     check_invariants(&mut h).unwrap();
 }

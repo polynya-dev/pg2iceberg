@@ -1,9 +1,9 @@
 //! Compaction: rewrite small data files + apply equality deletes inline,
 //! emitting a single `Operation::Replace` snapshot.
 //!
-//! Mirrors `iceberg/compact.go`'s algorithm but routes new files through
-//! `TableWriter::prepare` so partition-aware grouping is correct (Go's
-//! reference dumps everything into one bucket — see
+//! Mirrors `iceberg/compact.go`'s algorithm but derives each output row's
+//! partition through `TableWriter` so partition-aware grouping is correct
+//! (Go's reference dumps everything into one bucket — see
 //! `project_compaction_partition_bug` memory).
 //!
 //! ## Algorithm
@@ -13,43 +13,61 @@
 //!    `Snapshot.removed_paths`).
 //! 2. Threshold check: bail with `None` if both file counts are below
 //!    their thresholds.
-//! 3. Read every live delete file → `delete_pks: PK → max delete-snap-seq`.
-//! 4. Identify affected data files: those smaller than `target_size_bytes/2`,
-//!    or those containing any deleted PK.
-//! 5. Read affected data files → rows tagged with their source-snapshot seq.
-//! 6. Dedup by PK, keeping the highest-seq row.
-//! 7. Apply seq-aware deletes: drop rows where `delete_seq[pk] > row_seq`.
-//!    Iceberg's spec: an equality delete with seq S applies to rows from
-//!    files with seq < S. Higher-seq rows are immune.
-//! 8. Run survivors through `TableWriter::prepare` — partition tuples are
-//!    computed per row, files are grouped per partition, output is
-//!    bit-identical to materializer-emitted commits.
-//! 9. Upload each chunk; build `PreparedCompaction { added_data_files,
-//!    removed_paths }` (removed = affected data + ALL delete files).
-//! 10. `Catalog::commit_compaction` issues an `Operation::Replace`
-//!     snapshot via the upstream `RewriteFilesAction`.
+//! 3. Plan the pass ([`plan_pass`]): candidates are small files
+//!    (< `target_size_bytes / 2`) and *dirty* files — ones holding rows a
+//!    live delete has killed. Oldest first, take candidates until
+//!    `max_input_bytes_per_pass`; the rest wait for a later pass.
+//! 4. Retire every delete file no remaining dirty file could still need.
+//! 5. Load deleted PKs (`PK → max delete seq`) from the delete files that
+//!    can apply to an input.
+//! 6. Stream the inputs one record batch at a time: drop rows a delete
+//!    applies to (`delete_seq > row_seq`), encode survivors straight into
+//!    the open output file, and upload it once it reaches the target size.
+//! 7. `Catalog::commit_compaction` issues one `Operation::Replace`
+//!    snapshot removing the inputs + retired deletes and adding outputs.
+//!
+//! ## Memory
+//!
+//! At most one decoded record batch ([`DECODE_BATCH_ROWS`]) of one input
+//! file is alive at a time, next to that file's encoded bytes and the
+//! encoded bytes of one open output file (≈ `target_size_bytes`). What
+//! grows with the table instead: the live-file lists (O(files)), the
+//! deleted-PK set (O(live equality-delete rows) — what every MoR reader
+//! holds anyway, and retiring deletes keeps it down) and the caller's
+//! `FileIndex` (already resident in the materializer).
 //!
 //! ## Correctness rules we don't violate
 //!
-//! - **Partition awareness.** Output files are tagged with their
-//!   partition tuple, courtesy of `TableWriter::prepare`. Mixed-partition
-//!   files (Go's bug) cannot be produced by this code path because the
-//!   writer fans rows out by partition.
+//! - **Partition awareness.** An output file holds one partition tuple,
+//!   computed per row by `TableWriter`; a row of another tuple closes the
+//!   open file first.
 //! - **Seq-aware deletes.** A delete with seq 5 cannot retroactively delete
-//!   a row from snap 7. The dedup step keeps the highest-seq row;
-//!   apply-deletes only drops it if `delete_seq > row_seq`.
+//!   a row from snap 7: a row is dropped only if `delete_seq > row_seq`.
+//! - **Rewritten rows keep their verdict.** Outputs land at the Replace
+//!   snapshot's new sequence number, above every live delete. So no delete
+//!   newly applies to a rewritten row, and none could still drop one —
+//!   which is why every delete that applies to an input row is applied
+//!   here, before the row moves.
+//! - **A delete outlives every row it may apply to.** A delete with seq
+//!   `t` is retired only when no dirty data file with seq `< t` remains
+//!   after this pass. Clean files don't hold it back: by definition no
+//!   live delete applies to any of their rows.
 //! - **No partial rewrites.** We rewrite a data file fully or not at all.
 //!   Partial rewrites would lose rows.
 //! - **Atomicity.** Either the entire `Replace` snapshot lands, or none
 //!   of it. The catalog's commit path is the gate.
 
-use crate::reader::read_data_file;
-use crate::writer::{TableWriter, WriterError};
+use crate::reader::RowBatches;
+use crate::writer::{StreamingDataFile, TableWriter, WriterError};
 use crate::{Catalog, DataFile, FileIndex, IcebergError, PreparedCompaction, Snapshot};
-use pg2iceberg_core::{ColumnName, ColumnSchema, Op, Row, TableIdent, TableSchema};
+use pg2iceberg_core::{ColumnName, ColumnSchema, PartitionLiteral, Row, TableIdent, TableSchema};
 use pg2iceberg_stream::{BlobStore, StreamError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
+
+/// Rows decoded per record batch. Bounds how many rows a pass holds at
+/// once, however large its input files are.
+pub const DECODE_BATCH_ROWS: usize = 1024;
 
 /// Knobs that decide whether a table is worth compacting and how to
 /// size the output.
@@ -57,22 +75,34 @@ use thiserror::Error;
 pub struct CompactionConfig {
     /// Trigger compaction when live data files >= this count.
     pub data_file_threshold: usize,
-    /// Trigger compaction when live delete files >= this count. Delete
-    /// files always get rewritten away when compaction runs (their PKs
-    /// fold into the surviving rows), so even a single sufficiently-old
-    /// delete is a reason to compact.
+    /// Trigger compaction when live delete files >= this count. A delete
+    /// file is dropped once no data file it could apply to remains, so
+    /// even a single sufficiently-old delete is a reason to compact.
     pub delete_file_threshold: usize,
     /// Files smaller than `target_size_bytes / 2` are eligible for
-    /// rewrite. Default 128 MiB target → 64 MiB minimum.
+    /// rewrite, and output files roll over at this size. Default
+    /// 128 MiB target → 64 MiB minimum.
     pub target_size_bytes: u64,
+    /// Most data-file bytes one pass rewrites. Bounds a pass's I/O and
+    /// duration (memory is bounded regardless); the remaining candidates
+    /// wait for later passes. A pass always takes at least one file, or
+    /// two when merging clean ones, so it makes progress.
+    pub max_input_bytes_per_pass: u64,
+}
+
+impl CompactionConfig {
+    /// Default pass budget, in target-size files.
+    pub const DEFAULT_PASS_TARGET_FILES: u64 = 4;
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
+        let target_size_bytes = 128 * 1024 * 1024;
         Self {
             data_file_threshold: 8,
             delete_file_threshold: 4,
-            target_size_bytes: 128 * 1024 * 1024,
+            target_size_bytes,
+            max_input_bytes_per_pass: target_size_bytes * Self::DEFAULT_PASS_TARGET_FILES,
         }
     }
 }
@@ -83,12 +113,31 @@ impl Default for CompactionConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactionOutcome {
     pub input_data_files: usize,
+    /// Delete files dropped by this pass.
     pub input_delete_files: usize,
     pub output_data_files: usize,
     pub rows_rewritten: u64,
     pub rows_removed_by_deletes: u64,
     pub bytes_before: u64,
     pub bytes_after: u64,
+    /// Most decoded rows held in memory at once during the pass.
+    pub peak_rows_in_memory: u64,
+    /// Candidate files left over for a later pass by the input budget.
+    pub pending_files: usize,
+    /// Data files the pass rewrote (now removed from the table).
+    pub rewritten_files: Vec<String>,
+    /// Files the pass added, with the PKs each holds — so the caller can
+    /// update its `FileIndex` without replaying the table. Bounded by the
+    /// pass budget, like the rest of the pass.
+    pub added_files: Vec<CompactedFile>,
+}
+
+/// One output file of a compaction pass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompactedFile {
+    pub path: String,
+    pub pk_keys: Vec<String>,
+    pub partition_values: Vec<PartitionLiteral>,
 }
 
 #[derive(Debug, Error)]
@@ -103,12 +152,12 @@ pub enum CompactError {
 
 pub type Result<T> = std::result::Result<T, CompactError>;
 
-/// One live file's metadata: byte size + the snapshot sequence it was
-/// added in. Used both for size-thresholding and for seq-aware delete
-/// application.
+/// One live file's manifest metadata.
 #[derive(Clone, Debug)]
 struct LiveFile {
     byte_size: u64,
+    record_count: u64,
+    partition_values: Vec<PartitionLiteral>,
     /// Snapshot seq the file was added in. Iceberg attaches sequence
     /// numbers to manifest entries; for files added via `FastAppend`
     /// the entry's seq matches the snapshot's seq, which we surface as
@@ -119,15 +168,46 @@ struct LiveFile {
     seq: i64,
 }
 
-/// Run a compaction cycle. Returns `Ok(None)` if the table is below
-/// thresholds (no work needed), `Ok(Some(_))` after a successful
-/// compaction commit.
+impl LiveFile {
+    fn new(df: &DataFile, seq: i64) -> Self {
+        Self {
+            byte_size: df.byte_size,
+            record_count: df.record_count,
+            partition_values: df.partition_values.clone(),
+            seq,
+        }
+    }
+}
+
+/// What one pass does: which data files it rewrites (in processing
+/// order) and which delete files it drops.
+#[derive(Debug, Default)]
+struct PassPlan {
+    inputs: Vec<(String, LiveFile)>,
+    retired_deletes: Vec<String>,
+    pending_files: usize,
+}
+
+/// Run one compaction pass. Returns `Ok(None)` if the table is below
+/// thresholds or has nothing worth rewriting, `Ok(Some(_))` after a
+/// successful compaction commit.
+///
+/// `live_pks` is the caller's PK → file index for this table, consistent
+/// with the catalog (the materializer's own). It lets the pass find the
+/// files holding deleted rows without reading any file: a file has dead
+/// rows iff fewer of its rows are live than it holds. Correctness leans
+/// on one direction of it — a PK it maps to a file must be live there —
+/// which the materializer already relies on for TOAST resolution. A
+/// stale index can only make files look dirtier (costing a rewrite),
+/// never cleaner. With `None`, any file older than a live delete counts
+/// as dirty, so deletes retire only once every older file is rewritten.
 ///
 /// `path_for_chunk` is an async closure called per output chunk; the
 /// caller is responsible for producing globally-unique paths (e.g. via
 /// UUID). `(table_ident, chunk_index)` is passed in. Async-shaped to
 /// match the materializer's existing async-trait `MaterializerNamer`,
 /// which generates UUID-suffixed paths via an async `IdGen`.
+#[allow(clippy::too_many_arguments)]
 pub async fn compact_table<C, F, Fut>(
     catalog: &C,
     blob_store: &dyn BlobStore,
@@ -135,6 +215,7 @@ pub async fn compact_table<C, F, Fut>(
     ident: &TableIdent,
     schema: &TableSchema,
     pk_cols: &[ColumnName],
+    live_pks: Option<&FileIndex>,
     config: &CompactionConfig,
 ) -> Result<Option<CompactionOutcome>>
 where
@@ -155,159 +236,296 @@ where
         return Ok(None);
     }
 
-    // Read every live delete file → delete_pks: PK → max delete-snap-seq.
+    let plan = plan_pass(&live_data, &live_deletes, live_pks, config);
+    if plan.inputs.is_empty() && plan.retired_deletes.is_empty() {
+        return Ok(None);
+    }
+
+    let mut peak_rows: u64 = 0;
+
+    // Deleted PKs → highest delete seq. Only deletes newer than some
+    // input can drop one of its rows.
     let pk_schema: Vec<ColumnSchema> = schema
         .columns
         .iter()
         .filter(|c| c.is_primary_key)
         .cloned()
         .collect();
+    let oldest_input = plan.inputs.iter().map(|(_, f)| f.seq).min();
     let mut delete_pks: HashMap<String, i64> = HashMap::new();
     for (path, meta) in &live_deletes {
+        if !oldest_input.is_some_and(|s| meta.seq > s) {
+            continue;
+        }
         let bytes = blob_store.get(path).await?;
-        let rows = read_data_file(&bytes, &pk_schema)?;
-        for row in rows {
-            let key = crate::fold::pk_key(&row, pk_cols);
-            // Highest seq wins — covers re-deletes of the same PK.
-            delete_pks
-                .entry(key)
-                .and_modify(|e| {
-                    if meta.seq > *e {
-                        *e = meta.seq
-                    }
-                })
-                .or_insert(meta.seq);
-        }
-    }
-
-    // Affected data files: small ones + any containing a deleted PK.
-    let small_threshold = config.target_size_bytes / 2;
-    let mut affected: BTreeMap<String, LiveFile> = BTreeMap::new();
-    for (path, meta) in &live_data {
-        if meta.byte_size < small_threshold {
-            affected.insert(path.clone(), meta.clone());
-        }
-    }
-    if !delete_pks.is_empty() {
-        for (path, meta) in &live_data {
-            if affected.contains_key(path) {
-                continue;
-            }
-            let bytes = blob_store.get(path).await?;
-            let rows = read_data_file(&bytes, &schema.columns)?;
-            if rows
-                .iter()
-                .any(|r| delete_pks.contains_key(&crate::fold::pk_key(r, pk_cols)))
-            {
-                affected.insert(path.clone(), meta.clone());
+        for batch in RowBatches::new(bytes, &pk_schema, DECODE_BATCH_ROWS)? {
+            let rows = batch?;
+            peak_rows = peak_rows.max(rows.len() as u64);
+            for row in rows {
+                // Highest seq wins — covers re-deletes of the same PK.
+                let seq = delete_pks
+                    .entry(crate::fold::pk_key(&row, pk_cols))
+                    .or_insert(meta.seq);
+                *seq = (*seq).max(meta.seq);
             }
         }
-    }
-
-    if affected.is_empty() && live_deletes.is_empty() {
-        return Ok(None);
-    }
-
-    // Read affected files → rows tagged with their snapshot seq.
-    let mut rows_with_seq: Vec<(Row, i64)> = Vec::new();
-    let mut bytes_before: u64 = 0;
-    for (path, meta) in &affected {
-        bytes_before += meta.byte_size;
-        let bytes = blob_store.get(path).await?;
-        let rows = read_data_file(&bytes, &schema.columns)?;
-        for row in rows {
-            rows_with_seq.push((row, meta.seq));
-        }
-    }
-    for meta in live_deletes.values() {
-        bytes_before += meta.byte_size;
-    }
-    let total_input_rows = rows_with_seq.len() as u64;
-
-    // Dedup by PK keeping highest seq.
-    let mut dedup: BTreeMap<String, (Row, i64)> = BTreeMap::new();
-    for (row, seq) in rows_with_seq {
-        let key = crate::fold::pk_key(&row, pk_cols);
-        match dedup.get(&key) {
-            Some((_, existing_seq)) if *existing_seq >= seq => {
-                // Keep the older entry — current one is stale.
-            }
-            _ => {
-                dedup.insert(key, (row, seq));
-            }
-        }
-    }
-
-    let after_dedup = dedup.len();
-    // Apply seq-aware deletes: drop iff delete_seq > row_seq.
-    dedup.retain(|key, (_, row_seq)| match delete_pks.get(key) {
-        Some(del_seq) => del_seq <= row_seq,
-        None => true,
-    });
-    let rows_removed_by_deletes = (after_dedup - dedup.len()) as u64;
-
-    // Wrap survivors as Insert ops for TableWriter.
-    let materialized: Vec<crate::fold::MaterializedRow> = dedup
-        .into_values()
-        .map(|(row, _)| crate::fold::MaterializedRow {
-            op: Op::Insert,
-            row,
-            unchanged_cols: vec![],
-        })
-        .collect();
-
-    // If no survivors AND no removals, nothing to commit. (e.g. all rows
-    // deleted but we don't have any data files to remove either.)
-    if materialized.is_empty() && affected.is_empty() && live_deletes.is_empty() {
-        return Ok(None);
     }
 
     let writer = TableWriter::new(schema.clone());
-    let prepared = writer.prepare(&materialized, &FileIndex::new())?;
-
-    // Upload compacted chunks; build added DataFiles.
-    let mut added_files: Vec<DataFile> = Vec::with_capacity(prepared.data.len());
-    let mut bytes_after: u64 = 0;
-    for (i, chunk) in prepared.data.into_iter().enumerate() {
-        let path = path_for_chunk(ident, i).await;
-        let byte_size = chunk.chunk.bytes.len() as u64;
-        bytes_after += byte_size;
-        blob_store
-            .put(&path, bytes::Bytes::clone(&chunk.chunk.bytes))
-            .await?;
-        added_files.push(DataFile {
-            path,
-            record_count: chunk.chunk.record_count,
-            byte_size,
-            equality_field_ids: vec![],
-            partition_values: chunk.partition_values,
-        });
+    let mut out = OutputFiles::default();
+    let mut rows_rewritten: u64 = 0;
+    let mut rows_removed_by_deletes: u64 = 0;
+    let mut bytes_before: u64 = 0;
+    for (path, meta) in &plan.inputs {
+        bytes_before += meta.byte_size;
+        let bytes = blob_store.get(path).await?;
+        for batch in RowBatches::new(bytes, &schema.columns, DECODE_BATCH_ROWS)? {
+            let rows = batch?;
+            peak_rows = peak_rows.max(rows.len() as u64);
+            rows_rewritten += rows.len() as u64;
+            // A delete applies iff it is strictly newer than the row.
+            // Rewritten rows land above every live delete, so a delete
+            // not applied now would never apply again.
+            let survivors: Vec<&Row> = rows
+                .iter()
+                .filter(|r| {
+                    delete_pks
+                        .get(&crate::fold::pk_key(r, pk_cols))
+                        .is_none_or(|del_seq| *del_seq <= meta.seq)
+                })
+                .collect();
+            rows_removed_by_deletes += (rows.len() - survivors.len()) as u64;
+            // Write runs of rows sharing a partition tuple; a new tuple
+            // closes the open file. Inputs come grouped by partition, so
+            // a run is normally the whole batch.
+            let tuples = survivors
+                .iter()
+                .map(|r| writer.partition_tuple(r))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut run_start = 0;
+            while run_start < survivors.len() {
+                let tuple = &tuples[run_start];
+                let run_end = (run_start..survivors.len())
+                    .find(|&i| tuples[i] != *tuple)
+                    .unwrap_or(survivors.len());
+                if out.open_tuple().is_some_and(|t| t != tuple) {
+                    out.close(blob_store, &path_for_chunk, ident).await?;
+                }
+                out.write(&writer, tuple, &survivors[run_start..run_end], pk_cols)?;
+                if out.open_size() >= config.target_size_bytes {
+                    out.close(blob_store, &path_for_chunk, ident).await?;
+                }
+                run_start = run_end;
+            }
+        }
+    }
+    out.close(blob_store, &path_for_chunk, ident).await?;
+    for path in &plan.retired_deletes {
+        bytes_before += live_deletes[path].byte_size;
     }
 
-    // removed_paths = affected data files + every delete file (deletes
-    // are folded into surviving data, no longer needed).
-    let mut removed_paths: Vec<String> = affected.keys().cloned().collect();
-    removed_paths.extend(live_deletes.keys().cloned());
+    let mut removed_paths: Vec<String> = plan.inputs.iter().map(|(p, _)| p.clone()).collect();
+    removed_paths.extend(plan.retired_deletes.iter().cloned());
     removed_paths.sort();
     removed_paths.dedup();
 
+    let bytes_after = out.added.iter().map(|f| f.byte_size).sum();
+    let output_data_files = out.added.len();
+    let added_files = out
+        .added
+        .iter()
+        .zip(std::mem::take(&mut out.added_pks))
+        .map(|(f, pk_keys)| CompactedFile {
+            path: f.path.clone(),
+            pk_keys,
+            partition_values: f.partition_values.clone(),
+        })
+        .collect();
     catalog
         .commit_compaction(PreparedCompaction {
             ident: ident.clone(),
-            added_data_files: added_files.clone(),
+            added_data_files: out.added,
             removed_paths,
         })
         .await?;
 
     Ok(Some(CompactionOutcome {
-        input_data_files: affected.len(),
-        input_delete_files: live_deletes.len(),
-        output_data_files: added_files.len(),
-        rows_rewritten: total_input_rows,
+        input_data_files: plan.inputs.len(),
+        input_delete_files: plan.retired_deletes.len(),
+        output_data_files,
+        rows_rewritten,
         rows_removed_by_deletes,
         bytes_before,
         bytes_after,
+        peak_rows_in_memory: peak_rows,
+        pending_files: plan.pending_files,
+        rewritten_files: plan.inputs.into_iter().map(|(p, _)| p).collect(),
+        added_files,
     }))
+}
+
+/// The output side of a pass: at most one open file, plus the files
+/// already uploaded.
+#[derive(Default)]
+struct OutputFiles {
+    open: Option<(Vec<PartitionLiteral>, StreamingDataFile)>,
+    /// PK keys of the rows in the open file.
+    open_pks: Vec<String>,
+    added: Vec<DataFile>,
+    /// PK keys of each added file, parallel to `added`.
+    added_pks: Vec<Vec<String>>,
+}
+
+impl OutputFiles {
+    /// Append rows of partition `tuple`; the caller closes any open file
+    /// of another tuple first.
+    fn write(
+        &mut self,
+        writer: &TableWriter,
+        tuple: &[PartitionLiteral],
+        rows: &[&Row],
+        pk_cols: &[ColumnName],
+    ) -> Result<()> {
+        if self.open.is_none() {
+            self.open = Some((tuple.to_vec(), writer.start_data_file()?));
+        }
+        let (_, file) = self.open.as_mut().expect("opened above");
+        file.write(rows)?;
+        self.open_pks
+            .extend(rows.iter().map(|r| crate::fold::pk_key(r, pk_cols)));
+        Ok(())
+    }
+
+    fn open_tuple(&self) -> Option<&[PartitionLiteral]> {
+        self.open.as_ref().map(|(t, _)| t.as_slice())
+    }
+
+    fn open_size(&self) -> u64 {
+        self.open.as_ref().map_or(0, |(_, f)| f.estimated_size())
+    }
+
+    async fn close<F, Fut>(
+        &mut self,
+        blob_store: &dyn BlobStore,
+        path_for_chunk: &F,
+        ident: &TableIdent,
+    ) -> Result<()>
+    where
+        F: Fn(&TableIdent, usize) -> Fut,
+        Fut: std::future::Future<Output = String>,
+    {
+        let Some((partition_values, file)) = self.open.take() else {
+            return Ok(());
+        };
+        let pks = std::mem::take(&mut self.open_pks);
+        if file.record_count() == 0 {
+            return Ok(());
+        }
+        let chunk = file.finish()?;
+        let path = path_for_chunk(ident, self.added.len()).await;
+        let byte_size = chunk.bytes.len() as u64;
+        blob_store.put(&path, chunk.bytes).await?;
+        self.added.push(DataFile {
+            path,
+            record_count: chunk.record_count,
+            byte_size,
+            equality_field_ids: vec![],
+            partition_values,
+        });
+        self.added_pks.push(pks);
+        Ok(())
+    }
+}
+
+/// Decide what one pass rewrites and which deletes it retires.
+fn plan_pass(
+    live_data: &BTreeMap<String, LiveFile>,
+    live_deletes: &BTreeMap<String, LiveFile>,
+    live_pks: Option<&FileIndex>,
+    config: &CompactionConfig,
+) -> PassPlan {
+    let newest_delete = live_deletes.values().map(|d| d.seq).max();
+    let live_rows = live_pks.map(FileIndex::live_rows_per_file);
+    // Dirty: some live delete may have killed one of the file's rows. Only
+    // a delete newer than the file can; past that, trust the index's
+    // count of live rows when there is one.
+    let is_dirty = |path: &str, f: &LiveFile| {
+        newest_delete.is_some_and(|d| d > f.seq)
+            && live_rows
+                .as_ref()
+                .is_none_or(|counts| counts.get(path).copied().unwrap_or(0) < f.record_count)
+    };
+
+    // Candidates grouped by partition, each group oldest first.
+    let small = config.target_size_bytes / 2;
+    let mut groups: Vec<Vec<(&String, &LiveFile, bool)>> = Vec::new();
+    for (path, f) in live_data {
+        let dirty = is_dirty(path, f);
+        if !dirty && f.byte_size >= small {
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|g| g[0].1.partition_values == f.partition_values)
+        {
+            Some(g) => g.push((path, f, dirty)),
+            None => groups.push(vec![(path, f, dirty)]),
+        }
+    }
+    // A lone clean file has nothing to merge with: rewriting it would
+    // reproduce it, every pass.
+    groups.retain(|g| g.len() > 1 || g[0].2);
+    for g in &mut groups {
+        g.sort_by(|a, b| (a.1.seq, a.0).cmp(&(b.1.seq, b.0)));
+    }
+    // Oldest group first: retiring a delete needs every older dirty file
+    // gone, so old files are the ones holding deletes back.
+    groups.sort_by(|a, b| (a[0].1.seq, a[0].0).cmp(&(b[0].1.seq, b[0].0)));
+
+    let mut inputs: Vec<(String, LiveFile)> = Vec::new();
+    let mut taken_bytes: u64 = 0;
+    let mut pending_files = 0;
+    'groups: for g in &groups {
+        let first_of_group = inputs.len();
+        for (i, (path, f, _)) in g.iter().enumerate() {
+            // Always make progress: a dirty file, or a pair of clean
+            // ones, even when it alone exceeds the budget.
+            let progress_floor = if g[0].2 { 1 } else { 2 };
+            let within_floor = first_of_group == 0 && i < progress_floor;
+            if !within_floor && taken_bytes + f.byte_size > config.max_input_bytes_per_pass {
+                // A clean file cut off from its partners would be
+                // rewritten alone; let it wait for them.
+                if inputs.len() - first_of_group == 1 && !g[0].2 {
+                    inputs.pop();
+                }
+                pending_files = groups.iter().map(Vec::len).sum::<usize>() - inputs.len();
+                break 'groups;
+            }
+            taken_bytes += f.byte_size;
+            inputs.push(((*path).clone(), (*f).clone()));
+        }
+    }
+
+    // Retire a delete once no dirty file it could apply to (seq below
+    // its own) survives this pass. Inputs are excluded: their rows have
+    // every delete applied before they move.
+    let taken: BTreeSet<&str> = inputs.iter().map(|(p, _)| p.as_str()).collect();
+    let oldest_remaining_dirty = live_data
+        .iter()
+        .filter(|(path, f)| !taken.contains(path.as_str()) && is_dirty(path, f))
+        .map(|(_, f)| f.seq)
+        .min();
+    let retired_deletes = live_deletes
+        .iter()
+        .filter(|(_, d)| oldest_remaining_dirty.is_none_or(|s| d.seq <= s))
+        .map(|(p, _)| p.clone())
+        .collect();
+
+    PassPlan {
+        inputs,
+        retired_deletes,
+        pending_files,
+    }
 }
 
 /// Walk the snapshot history and compute (data, deletes) live now: each
@@ -328,25 +546,13 @@ fn compute_live_files(
             if removed.contains(df.path.as_str()) {
                 continue;
             }
-            data.insert(
-                df.path.clone(),
-                LiveFile {
-                    byte_size: df.byte_size,
-                    seq: snap.id,
-                },
-            );
+            data.insert(df.path.clone(), LiveFile::new(df, snap.id));
         }
         for df in &snap.delete_files {
             if removed.contains(df.path.as_str()) {
                 continue;
             }
-            deletes.insert(
-                df.path.clone(),
-                LiveFile {
-                    byte_size: df.byte_size,
-                    seq: snap.id,
-                },
-            );
+            deletes.insert(df.path.clone(), LiveFile::new(df, snap.id));
         }
     }
     (data, deletes)

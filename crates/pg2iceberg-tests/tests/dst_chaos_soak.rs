@@ -428,6 +428,7 @@ impl ChaosHarness {
                 data_file_threshold: 2,
                 delete_file_threshold: 1,
                 target_size_bytes: 4 * 1024 * 1024,
+                ..Default::default()
             }),
             flush_rows: 64,
             mat_batch_rows: 128,

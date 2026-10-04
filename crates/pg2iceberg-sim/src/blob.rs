@@ -21,11 +21,18 @@ pub struct MemoryBlobStore {
     /// discriminate "old" vs "fresh" blobs without a real wall clock.
     /// Tests can also override via [`MemoryBlobStore::set_clock_ms`].
     clock_ms: AtomicI64,
+    /// `get` calls so far — lets tests assert how much an operation reads.
+    gets: std::sync::atomic::AtomicU64,
 }
 
 impl MemoryBlobStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Number of `get` calls so far.
+    pub fn gets(&self) -> u64 {
+        self.gets.load(Ordering::SeqCst)
     }
 
     /// Test-only: enumerate every stored path.
@@ -76,6 +83,7 @@ impl BlobStore for MemoryBlobStore {
     }
 
     async fn get(&self, path: &str) -> Result<Bytes> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         self.inner
             .lock()
             .unwrap()

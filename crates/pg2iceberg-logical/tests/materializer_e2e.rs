@@ -377,6 +377,7 @@ fn compact_cycle_merges_small_files_after_many_materialize_cycles() {
         data_file_threshold: 3,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let outcomes = block_on(h.materializer.compact_cycle(&cfg)).unwrap();
     assert_eq!(outcomes.len(), 1, "one table compacted");
@@ -402,6 +403,7 @@ fn compact_cycle_below_threshold_returns_empty() {
         data_file_threshold: 8,
         delete_file_threshold: 4,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let outcomes = block_on(h.materializer.compact_cycle(&cfg)).unwrap();
     assert!(outcomes.is_empty(), "below threshold: nothing compacted");
@@ -426,6 +428,7 @@ fn compact_cycle_then_subsequent_materialize_cycle_handles_new_inserts() {
         data_file_threshold: 3,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     block_on(h.materializer.compact_cycle(&cfg)).unwrap();
 

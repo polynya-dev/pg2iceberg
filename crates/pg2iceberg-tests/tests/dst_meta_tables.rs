@@ -442,6 +442,7 @@ fn compact_table_records_compactions_row() {
         // Force compaction: any table with >=2 small files qualifies.
         data_file_threshold: 2,
         delete_file_threshold: 1,
+        ..Default::default()
     };
     let outcome = block_on(h.materializer.compact_table(&ident(), &cfg)).unwrap();
     assert!(outcome.is_some(), "compaction should have run");

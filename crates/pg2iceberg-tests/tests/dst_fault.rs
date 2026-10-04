@@ -759,6 +759,7 @@ fn binary_materialize_tick_with_compaction_under_blob_put_fault_keeps_replicatio
             data_file_threshold: 1,
             delete_file_threshold: 1,
             target_size_bytes: 1024 * 1024 * 1024,
+            ..Default::default()
         }),
     ))
     .expect("first cycle should succeed");
@@ -777,6 +778,7 @@ fn binary_materialize_tick_with_compaction_under_blob_put_fault_keeps_replicatio
             data_file_threshold: 1,
             delete_file_threshold: 1,
             target_size_bytes: 1024 * 1024 * 1024,
+            ..Default::default()
         }),
     ));
     // Either the cycle's PUT failed (Err) OR the compaction's PUT

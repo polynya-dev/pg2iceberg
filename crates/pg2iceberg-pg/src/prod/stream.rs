@@ -73,6 +73,17 @@ const EVENTS_CHANNEL_CAPACITY: usize = 1000;
 /// so a small queue is enough.
 const CMD_CHANNEL_CAPACITY: usize = 8;
 
+/// How often a reader parked on a full events channel re-sends its last
+/// ack as a status update. Parked, it can't read the wire to answer the
+/// server's keepalive requests; without these, PG's `wal_sender_timeout`
+/// (60s by default) closes the connection whenever the main loop is busy
+/// that long — a long materialize or compaction, say.
+const BLOCKED_STATUS_INTERVAL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(20)
+} else {
+    std::time::Duration::from_secs(10)
+};
+
 /// Cached relation metadata, populated by `Relation` messages and
 /// consumed by DML decoders.
 #[derive(Debug, Clone)]
@@ -528,6 +539,13 @@ async fn send_servicing_cmds<W: ReplicationWire>(
                 // Consumer dropped the receiver — reader should exit.
                 Err(_) => return false,
             },
+            // Still parked: keep the connection alive (see
+            // `BLOCKED_STATUS_INTERVAL`) by re-sending the last ack.
+            _ = tokio::time::sleep(BLOCKED_STATUS_INTERVAL) => {
+                if wire.standby(*last_ack, *last_ack, *last_ack).await.is_err() {
+                    return false;
+                }
+            }
         }
     }
 }
@@ -827,6 +845,46 @@ mod reader_tests {
             &[(PgLsn::from(42u64), PgLsn::from(42u64), PgLsn::from(42u64))],
             "standby LSN should have reached the wire while the channel was full",
         );
+    }
+
+    /// Parked on a full events channel, the reader can't read the wire to
+    /// answer keepalive requests — it must still send status updates on
+    /// its own, or `wal_sender_timeout` closes the connection while the
+    /// main loop is busy.
+    #[tokio::test]
+    async fn status_update_sent_while_blocked_on_full_events_channel() {
+        let standbys = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = FloodWire {
+            standbys: standbys.clone(),
+            stop: Arc::new(AtomicBool::new(true)),
+            wal_end: 0,
+        };
+        let (events_tx, _events_rx) = mpsc::channel::<Result<DecodedMessage>>(1);
+        events_tx
+            .send(Ok(DecodedMessage::Begin {
+                final_lsn: Lsn(1),
+                xid: 1,
+            }))
+            .await
+            .expect("prime the channel");
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
+        let mut last_ack = PgLsn::from(7u64);
+        let blocked = send_servicing_cmds(
+            &mut wire,
+            &events_tx,
+            &mut cmd_rx,
+            &mut last_ack,
+            Ok(DecodedMessage::Begin {
+                final_lsn: Lsn(2),
+                xid: 2,
+            }),
+        );
+        // The channel never drains: only what reaches the wire matters.
+        let _ = tokio::time::timeout(BLOCKED_STATUS_INTERVAL * 5, blocked).await;
+        let sent = standbys.lock().unwrap().clone();
+        let ack = (PgLsn::from(7u64), PgLsn::from(7u64), PgLsn::from(7u64));
+        assert!(!sent.is_empty(), "no status update while blocked");
+        assert!(sent.iter().all(|s| *s == ack), "{sent:?}");
     }
 
     /// A wire that yields whatever the test pushes, parking when there's

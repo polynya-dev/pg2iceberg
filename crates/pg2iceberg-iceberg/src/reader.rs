@@ -6,12 +6,13 @@
 //! subcommand.
 
 use crate::writer::WriterError;
+use arrow_array::RecordBatch;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimestampMicros};
 use pg2iceberg_core::{ColumnName, ColumnSchema, IcebergType, PgValue, Row};
 use std::collections::BTreeMap;
@@ -23,40 +24,76 @@ pub type Result<T> = std::result::Result<T, WriterError>;
 /// the table's full schema for data files, or the PK-only subset for
 /// equality-delete files.
 pub fn read_data_file(bytes: &[u8], cols: &[ColumnSchema]) -> Result<Vec<Row>> {
-    let owned = Bytes::copy_from_slice(bytes);
-    let builder = ParquetRecordBatchReaderBuilder::try_new(owned)
-        .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?;
-    let reader = builder
-        .build()
-        .map_err(|e| WriterError::Encode(format!("parquet reader build: {e}")))?;
-
     let mut out = Vec::new();
-    for batch in reader {
-        let batch = batch.map_err(|e| WriterError::Encode(format!("read batch: {e}")))?;
-        for i in 0..batch.num_rows() {
-            let mut row: Row = BTreeMap::new();
-            for col in cols {
-                let key = ColumnName(col.name.clone());
-                // Schema-evolution-tolerant read: if the parquet
-                // file pre-dates an `AddColumn`, the file simply
-                // doesn't carry the new column and Iceberg readers
-                // project NULL. Mirrors that behavior here so a
-                // mid-stream `ALTER TABLE ADD COLUMN` doesn't
-                // require backfilling old data files. Equality-delete
-                // reads (cols = PK-only) still hit every column
-                // they need, since PKs aren't dropped.
-                let Some(arr) = batch.column_by_name(&col.name) else {
-                    row.insert(key, PgValue::Null);
-                    continue;
-                };
-                if arr.is_null(i) {
-                    row.insert(key, PgValue::Null);
-                } else {
-                    row.insert(key, decode_value(col.ty, arr.as_ref(), i)?);
-                }
+    for batch in RowBatches::new(Bytes::copy_from_slice(bytes), cols, DEFAULT_BATCH_ROWS)? {
+        out.extend(batch?);
+    }
+    Ok(out)
+}
+
+/// Rows per batch when the caller doesn't care.
+const DEFAULT_BATCH_ROWS: usize = 1024;
+
+/// Decodes a data file one record batch at a time, so a caller that
+/// processes rows as they come holds at most `batch_rows` decoded rows
+/// (plus the encoded file) instead of the whole file — a decoded `Row`
+/// is many times larger than its Parquet encoding.
+pub struct RowBatches {
+    reader: ParquetRecordBatchReader,
+    cols: Vec<ColumnSchema>,
+}
+
+impl RowBatches {
+    pub fn new(bytes: Bytes, cols: &[ColumnSchema], batch_rows: usize) -> Result<Self> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?
+            .with_batch_size(batch_rows.max(1))
+            .build()
+            .map_err(|e| WriterError::Encode(format!("parquet reader build: {e}")))?;
+        Ok(Self {
+            reader,
+            cols: cols.to_vec(),
+        })
+    }
+}
+
+impl Iterator for RowBatches {
+    type Item = Result<Vec<Row>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = match self.reader.next()? {
+            Ok(b) => b,
+            Err(e) => return Some(Err(WriterError::Encode(format!("read batch: {e}")))),
+        };
+        Some(decode_batch(&batch, &self.cols))
+    }
+}
+
+fn decode_batch(batch: &RecordBatch, cols: &[ColumnSchema]) -> Result<Vec<Row>> {
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let mut row: Row = BTreeMap::new();
+        for col in cols {
+            let key = ColumnName(col.name.clone());
+            // Schema-evolution-tolerant read: if the parquet
+            // file pre-dates an `AddColumn`, the file simply
+            // doesn't carry the new column and Iceberg readers
+            // project NULL. Mirrors that behavior here so a
+            // mid-stream `ALTER TABLE ADD COLUMN` doesn't
+            // require backfilling old data files. Equality-delete
+            // reads (cols = PK-only) still hit every column
+            // they need, since PKs aren't dropped.
+            let Some(arr) = batch.column_by_name(&col.name) else {
+                row.insert(key, PgValue::Null);
+                continue;
+            };
+            if arr.is_null(i) {
+                row.insert(key, PgValue::Null);
+            } else {
+                row.insert(key, decode_value(col.ty, arr.as_ref(), i)?);
             }
-            out.push(row);
         }
+        out.push(row);
     }
     Ok(out)
 }
