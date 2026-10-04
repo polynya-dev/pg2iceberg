@@ -56,25 +56,46 @@ Staged files use a fixed Parquet schema regardless of source table changes: meta
 **Single-process** (default `pg2iceberg run`): one process runs the WAL writer and materializer together. Simplest to deploy.
 
 ```
-+------------------------------+
-|  pg2iceberg run              |
-|  +----------+  +------------+|
-|  |WAL Writer|->|Materializer||
-|  +----------+  +------------+|
-+------------------------------+
+┌──────────┐
+│ Postgres │
+└────┬─────┘
+     │ logical replication
+     ▼
+┌─ pg2iceberg run ────────────────┐
+│ WAL writer                      │
+│   │ staged Parquet + log_index  │
+│   ▼                             │
+│ Materializer                    │
+└────┬────────────────────────────┘
+     ▼
+┌─────────┐
+│ Iceberg │
+└─────────┘
 ```
 
 **Distributed**: one `pg2iceberg stream-only` process owns the replication slot; N `pg2iceberg materializer-only --worker-id <id>` workers each claim a deterministic slice of tables via heartbeat-based coordination. Workers can be added or removed dynamically — tables rebalance on the next cycle.
 
 ```
-+------------------+   +--------------------------+   +--------------------------+
-| stream-only      |   | materializer-only        |   | materializer-only        |
-| +------------+   |   |  --worker-id worker-a    |   |  --worker-id worker-b    |
-| | WAL Writer |   |   |  (tables 1, 3)           |   |  (tables 2, 4)           |
-| +------------+   |   +--------------------------+   +--------------------------+
-+------------------+              ^                                ^
-                                  +-- _pg2iceberg.consumer ---------+
-                                       (heartbeat registry)
+┌──────────┐
+│ Postgres │
+└────┬─────┘
+     │ logical replication (one slot)
+     ▼
+┌─ pg2iceberg stream-only ────────┐
+│ WAL writer                      │
+└────┬────────────────────────────┘
+     │ staged Parquet + log_index
+     ├────────────────────────────────────┐
+     ▼                                    ▼
+┌─ materializer-only ─────────────┐  ┌─ materializer-only ─────────────┐
+│ --worker-id worker-a            │  │ --worker-id worker-b            │
+│ tables 1, 3                     │  │ tables 2, 4                     │
+└────┬────────────────────────────┘  └────┬────────────────────────────┘
+     └─────────────────┬──────────────────┘
+                       ▼
+                  ┌─────────┐
+                  │ Iceberg │
+                  └─────────┘
 ```
 
 ### Coordination
