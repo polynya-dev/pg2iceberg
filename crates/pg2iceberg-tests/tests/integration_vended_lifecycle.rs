@@ -286,6 +286,7 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
             s3_region: "us-east-1".into(),
             flush_interval: String::new(),
             flush_rows: 1000,
+            materializer_batch_rows: 50_000,
             materializer_interval: String::new(),
             compaction_data_files: 8,
             compaction_delete_files: 4,

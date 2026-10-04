@@ -315,6 +315,40 @@ struct TableEntry {
     gated_until_snapshot: bool,
 }
 
+/// Log entries fetched per `read_log` call while a cycle drains a table.
+const LOG_PAGE_ENTRIES: usize = 64;
+/// Default `cycle_rows`, in multiples of `batch_rows`.
+const DEFAULT_STEPS_PER_CYCLE: usize = 8;
+
+/// Steps read but not yet committed. Committed together, as one atomic
+/// `commit_snapshots`, so a transaction spanning several steps becomes
+/// visible at once.
+#[derive(Default)]
+struct Unit {
+    /// Steps already folded and uploaded.
+    steps: Vec<PreparedCommit>,
+    /// Decoded events of the step being built.
+    buf: Vec<MatEvent>,
+    /// Log offset just past the last entry consumed.
+    end_offset: Option<u64>,
+    folded: usize,
+    xids: BTreeSet<u32>,
+    max_lsn: i64,
+    max_source_ts_micros: i64,
+}
+
+/// Whether a cut between `last` (end of what's buffered) and `next`
+/// (start of the next log entry) falls between transactions. A spilled
+/// transaction's chunks are consecutive in the log and share its xid; a
+/// replayed duplicate also carries the same xid, so it's kept with the
+/// original.
+fn is_tx_boundary(last: Option<&MatEvent>, next: Option<&MatEvent>) -> bool {
+    match (last.and_then(|e| e.xid), next.and_then(|e| e.xid)) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
 pub struct Materializer<C: Catalog> {
     coord: Arc<dyn Coordinator>,
     blob_store: Arc<dyn BlobStore>,
@@ -322,7 +356,13 @@ pub struct Materializer<C: Catalog> {
     namer: Arc<dyn MaterializerNamer>,
     tables: BTreeMap<TableIdent, TableEntry>,
     group: String,
-    cycle_limit: usize,
+    /// Most change events folded into one snapshot step — the bound on
+    /// what a cycle holds in memory, however large a transaction is.
+    batch_rows: usize,
+    /// Change events a cycle reads before it stops between commits (it
+    /// always finishes the transaction it's in). Lets one cycle catch up
+    /// through many steps instead of one batch per tick.
+    cycle_rows: usize,
     metrics: Arc<dyn Metrics>,
     /// Optional meta-marker table state. When `Some`, every
     /// successful `cycle_table` queries pending markers from the
@@ -444,7 +484,7 @@ impl<C: Catalog> Materializer<C> {
         catalog: Arc<C>,
         namer: Arc<dyn MaterializerNamer>,
         group: impl Into<String>,
-        cycle_limit: usize,
+        batch_rows: usize,
     ) -> Self {
         Self::with_metrics(
             coord,
@@ -452,7 +492,7 @@ impl<C: Catalog> Materializer<C> {
             catalog,
             namer,
             group,
-            cycle_limit,
+            batch_rows,
             Arc::new(NoopMetrics),
         )
     }
@@ -463,10 +503,10 @@ impl<C: Catalog> Materializer<C> {
         catalog: Arc<C>,
         namer: Arc<dyn MaterializerNamer>,
         group: impl Into<String>,
-        cycle_limit: usize,
+        batch_rows: usize,
         metrics: Arc<dyn Metrics>,
     ) -> Self {
-        assert!(cycle_limit > 0);
+        assert!(batch_rows > 0);
         Self {
             coord,
             blob_store,
@@ -474,7 +514,8 @@ impl<C: Catalog> Materializer<C> {
             namer,
             tables: BTreeMap::new(),
             group: group.into(),
-            cycle_limit,
+            batch_rows,
+            cycle_rows: batch_rows.saturating_mul(DEFAULT_STEPS_PER_CYCLE),
             metrics,
             meta_marker: None,
             meta_recorder: None,
@@ -1315,31 +1356,70 @@ impl<C: Catalog> Materializer<C> {
         Ok(outcome)
     }
 
+    /// Override how many change events one cycle reads before stopping
+    /// between commits. Defaults to `batch_rows` × 8.
+    pub fn with_cycle_rows(mut self, cycle_rows: usize) -> Self {
+        assert!(cycle_rows > 0);
+        self.cycle_rows = cycle_rows;
+        self
+    }
+
+    /// Materialize pending log entries for one table. Entries are folded
+    /// in steps of at most `batch_rows` events; steps are committed
+    /// together, as one atomic `commit_snapshots`, up to a transaction
+    /// boundary — so a transaction spanning many steps is never partly
+    /// visible, and memory stays bounded however large it is. Keeps
+    /// committing until the log is drained or `cycle_rows` events were
+    /// read. Returns rows folded.
     pub async fn cycle_table(&mut self, ident: &TableIdent) -> Result<usize> {
         let mut labels = Labels::new();
         labels.insert("table".into(), ident.name.clone());
         self.metrics
             .counter(names::MATERIALIZER_CYCLE_TOTAL, &labels, 1);
+        if !self.tables.contains_key(ident) {
+            return Err(MaterializerError::UnknownTable(ident.clone()));
+        }
 
-        let entry = self
-            .tables
-            .get(ident)
-            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
-
-        // 1. Cursor.
         let cursor = self
             .coord
             .get_cursor(&self.group, ident)
             .await?
             .unwrap_or(-1);
-        let after_offset = if cursor < 0 { 0 } else { cursor as u64 };
+        let mut after = if cursor < 0 { 0 } else { cursor as u64 };
+        let mut unit = Unit::default();
+        let mut events_read = 0usize;
+        let mut folded = 0usize;
+        let mut read_any = false;
+        'read: loop {
+            let entries = self.coord.read_log(ident, after, LOG_PAGE_ENTRIES).await?;
+            if entries.is_empty() {
+                break;
+            }
+            read_any = true;
+            for e in entries {
+                let bytes = self.blob_store.get(&e.s3_path).await?;
+                let events = decode_chunk(&bytes)?;
+                if !unit.buf.is_empty() && unit.buf.len() + events.len() > self.batch_rows {
+                    if is_tx_boundary(unit.buf.last(), events.first()) {
+                        folded += self.commit_unit(ident, &mut unit).await?;
+                        if events_read >= self.cycle_rows {
+                            // Leave this entry for the next cycle.
+                            break 'read;
+                        }
+                    } else {
+                        // A transaction spans this boundary: stage what's
+                        // buffered as an intermediate step and keep going.
+                        self.prepare_step(ident, &mut unit).await?;
+                    }
+                }
+                events_read += events.len();
+                unit.buf.extend(events);
+                unit.end_offset = Some(e.end_offset);
+                after = e.end_offset;
+            }
+        }
 
-        // 2. Log entries.
-        let entries = self
-            .coord
-            .read_log(ident, after_offset, self.cycle_limit)
-            .await?;
-        if entries.is_empty() {
+        if !read_any {
             // No new events for this table — but a marker may have
             // landed in coord that this table is now eligible to
             // emit (because it has nothing pending past the
@@ -1350,44 +1430,46 @@ impl<C: Catalog> Materializer<C> {
             }
             return Ok(0);
         }
-        let max_end_offset = entries.iter().map(|e| e.end_offset).max().unwrap();
+        // The end of the claimed log is always a transaction boundary:
+        // claims hold whole transactions.
+        folded += self.commit_unit(ident, &mut unit).await?;
+        Ok(folded)
+    }
 
-        // 3. Decode every staged file.
-        let mut all_events: Vec<MatEvent> = Vec::new();
-        for e in &entries {
-            let bytes = self.blob_store.get(&e.s3_path).await?;
-            let mut chunk = decode_chunk(&bytes)?;
-            all_events.append(&mut chunk);
+    /// Fold the buffered events into one snapshot step: upload its data
+    /// and equality-delete files and add the step to `unit`. FileIndex is
+    /// updated now, as if committed, so later steps of the same unit
+    /// promote re-inserts and resolve TOAST against these rows;
+    /// [`Self::commit_unit`] rebuilds it if the commit fails.
+    async fn prepare_step(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<()> {
+        let events = std::mem::take(&mut unit.buf);
+        if events.is_empty() {
+            return Ok(());
+        }
+        // Observability stats come from the raw events, before the fold
+        // collapses them to one row per PK.
+        for e in &events {
+            unit.max_lsn = unit.max_lsn.max(e.lsn.0 as i64);
+            unit.max_source_ts_micros = unit.max_source_ts_micros.max(e.commit_ts.0);
+            if let Some(x) = e.xid {
+                unit.xids.insert(x);
+            }
         }
 
-        // 3b. Capture per-cycle observability stats from `all_events`
-        //     BEFORE the fold collapses them to per-PK. We need the
-        //     full event stream to compute max LSN, max source-side
-        //     ts, and the distinct-xid count for the meta `commits`
-        //     row.
-        let max_lsn: i64 = all_events.iter().map(|e| e.lsn.0 as i64).max().unwrap_or(0);
-        let max_source_ts_micros: i64 = all_events.iter().map(|e| e.commit_ts.0).max().unwrap_or(0);
-        let tx_count: i32 = {
-            let mut xids: BTreeSet<u32> = BTreeSet::new();
-            for e in &all_events {
-                if let Some(x) = e.xid {
-                    xids.insert(x);
-                }
-            }
-            xids.len() as i32
-        };
-
-        // 3c. Expand any TRUNCATE events into per-PK deletes against
-        //     the current FileIndex. A `TRUNCATE` in PG drops every
-        //     row; in Iceberg we model that as one equality-delete
-        //     per known PK so the next snapshot's MoR reads return
-        //     zero rows. Subsequent same-tx INSERTs survive the
-        //     fold's last-write-wins on the same PK.
-        all_events = expand_truncates(all_events, &entry.file_index, &entry.pk_cols);
+        let entry = self
+            .tables
+            .get(ident)
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        // Expand any TRUNCATE events into per-PK deletes against the
+        // current FileIndex. A `TRUNCATE` in PG drops every row; in
+        // Iceberg we model that as one equality-delete per known PK so the
+        // next snapshot's MoR reads return zero rows. Subsequent same-tx
+        // INSERTs survive the fold's last-write-wins on the same PK.
+        let events = expand_truncates(events, &entry.file_index, &entry.pk_cols);
 
         // Fold + TOAST + re-insert. Pre-fetch any prior data files needed
         // for TOAST resolution; that's cheap when no UPDATE has unchanged_cols.
-        let mut folded = fold_events(all_events, &entry.pk_cols);
+        let mut folded = fold_events(events, &entry.pk_cols);
         let prior_paths = collect_toast_paths(&folded, &entry.file_index, &entry.pk_cols);
         let prior_rows_by_path = self.fetch_prior_rows(&prior_paths, &entry.schema).await?;
         resolve_unchanged_cols(
@@ -1397,21 +1479,16 @@ impl<C: Catalog> Materializer<C> {
             &prior_rows_by_path,
         )?;
         promote_re_inserts(&mut folded, &entry.file_index, &entry.pk_cols);
-
         if folded.is_empty() {
-            // Nothing to materialize; still advance the cursor — those log
-            // entries were processed.
-            self.coord
-                .set_cursor(&self.group, ident, max_end_offset as i64)
-                .await?;
-            return Ok(0);
+            return Ok(());
         }
+        unit.folded += folded.len();
 
-        // 5. Prepare + upload. Output is one parquet file per (partition,
-        //    kind) — for unpartitioned tables that's a single file per kind.
-        //    The writer consults FileIndex for tier-2 resolution of
-        //    partition tuples on `Delete` rows whose row payload doesn't
-        //    carry the partition source columns.
+        // Prepare + upload. Output is one parquet file per (partition,
+        // kind) — for unpartitioned tables that's a single file per kind.
+        // The writer consults FileIndex for tier-2 resolution of
+        // partition tuples on `Delete` rows whose row payload doesn't
+        // carry the partition source columns.
         let prepared_files = entry.writer.prepare(&folded, &entry.file_index)?;
         let pk_field_ids = entry.writer.pk_field_ids();
 
@@ -1460,74 +1537,98 @@ impl<C: Catalog> Materializer<C> {
             deleted_pks.extend(chunk.pk_keys);
         }
 
-        // 6. Commit catalog snapshot — durability gate.
-        let data_files_count = data_files.len() as i32;
-        let delete_files_count = delete_files.len() as i32;
-        let bytes_written: i64 = data_files
-            .iter()
-            .chain(delete_files.iter())
-            .map(|f| f.byte_size as i64)
-            .sum();
-        let cycle_started_micros = now_micros();
-        let post_commit_meta = self
-            .catalog
-            .commit_snapshot(PreparedCommit {
-                ident: ident.clone(),
-                data_files,
-                equality_deletes: delete_files,
-            })
-            .await?;
-        let commit_duration_ms = (now_micros() - cycle_started_micros) / 1000;
-
-        // 7. Advance cursor only after commit success.
-        self.coord
-            .set_cursor(&self.group, ident, max_end_offset as i64)
-            .await?;
-
-        // 8. Update FileIndex.
         let entry_mut = self.tables.get_mut(ident).expect("checked above");
         // Removed PKs first (so a later add for the same PK overrides cleanly).
         entry_mut.file_index.remove_pks(&deleted_pks);
         for (path, pks, partition_values) in data_pk_groups {
             entry_mut.file_index.add_file(path, pks, partition_values);
         }
+        unit.steps.push(PreparedCommit {
+            ident: ident.clone(),
+            data_files,
+            equality_deletes: delete_files,
+        });
+        Ok(())
+    }
 
-        // 9. Blue-green meta-marker emission. After cursor +
-        //    FileIndex are durable, query the coord for any pending
-        //    markers covered by this cycle's LSN window. Writes
-        //    `(uuid, table_name, snapshot_id)` rows to the
-        //    meta-marker Iceberg table — that's the per-instance
-        //    audit trail for blue-green replica diffing.
-        // Pass the *new* cursor (= max_end_offset) so the coord's
-        // eligibility check considers everything we just committed
-        // as processed.
+    /// Commit every step of `unit` as one atomic table update, then
+    /// advance the cursor past it. Returns rows folded.
+    async fn commit_unit(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<usize> {
+        self.prepare_step(ident, unit).await?;
+        let unit = std::mem::take(unit);
+        let Some(end_offset) = unit.end_offset else {
+            return Ok(0);
+        };
+        let files = || unit.steps.iter().flat_map(|s| s.data_files.iter());
+        let data_files_count = files().count() as i32;
+        let delete_files_count = unit
+            .steps
+            .iter()
+            .map(|s| s.equality_deletes.len())
+            .sum::<usize>() as i32;
+        let bytes_written: i64 = unit
+            .steps
+            .iter()
+            .flat_map(|s| s.data_files.iter().chain(s.equality_deletes.iter()))
+            .map(|f| f.byte_size as i64)
+            .sum();
+
+        // Commit catalog snapshots — durability gate.
+        let started_micros = now_micros();
+        let committed = if unit.steps.is_empty() {
+            None
+        } else {
+            match self.catalog.commit_snapshots(unit.steps).await {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    // FileIndex already reflects the uncommitted steps;
+                    // restore it to the catalog's truth before surfacing
+                    // the error, so a retry doesn't fold against rows that
+                    // never landed.
+                    self.rebuild_file_index(ident).await?;
+                    return Err(e.into());
+                }
+            }
+        };
+        let commit_duration_ms = (now_micros() - started_micros) / 1000;
+
+        // Advance cursor only after commit success.
+        self.coord
+            .set_cursor(&self.group, ident, end_offset as i64)
+            .await?;
+
+        // Blue-green meta-marker emission. After cursor + FileIndex are
+        // durable, query the coord for any pending markers covered by
+        // this unit's LSN window. Writes `(uuid, table_name, snapshot_id)`
+        // rows to the meta-marker Iceberg table — that's the per-instance
+        // audit trail for blue-green replica diffing. Pass the *new*
+        // cursor so the coord's eligibility check considers everything we
+        // just committed as processed.
         if self.meta_marker.is_some() {
-            self.emit_pending_markers(ident, max_end_offset as i64)
-                .await?;
+            self.emit_pending_markers(ident, end_offset as i64).await?;
         }
 
-        // 10. Control-plane meta `commits` row + flush. Best-effort:
-        //     a meta-flush failure is logged but doesn't roll back
-        //     the user-table commit (already durable above).
-        let folded_len = folded.len();
-        if self.meta_recorder.is_some() {
-            let snap_id = post_commit_meta.current_snapshot_id.unwrap_or(0);
+        // Control-plane meta `commits` row + flush. Best-effort: a
+        // meta-flush failure is logged but doesn't roll back the
+        // user-table commit (already durable above).
+        if let (Some(meta), true) = (&committed, self.meta_recorder.is_some()) {
+            let snap_id = meta.current_snapshot_id.unwrap_or(0);
             self.record_flush(FlushStats {
-                ts_micros: cycle_started_micros,
+                ts_micros: started_micros,
                 worker_id: String::new(),
                 table_name: format!("{}", ident),
                 mode: "logical".into(),
                 snapshot_id: snap_id,
                 sequence_number: snap_id,
-                lsn: max_lsn,
-                rows: folded_len as i64,
+                lsn: unit.max_lsn,
+                rows: unit.folded as i64,
                 bytes: bytes_written,
                 duration_ms: commit_duration_ms,
                 data_files: data_files_count,
                 delete_files: delete_files_count,
-                max_source_ts_micros,
+                max_source_ts_micros: unit.max_source_ts_micros,
                 schema_id: 0,
-                tx_count,
+                tx_count: unit.xids.len() as i32,
                 pg2iceberg_commit_sha: String::new(),
             });
             if let Err(e) = self.flush_meta().await {
@@ -1539,9 +1640,25 @@ impl<C: Catalog> Materializer<C> {
             }
         }
 
+        let mut labels = Labels::new();
+        labels.insert("table".into(), ident.name.clone());
         self.metrics
-            .counter(names::MATERIALIZER_ROWS_TOTAL, &labels, folded_len as u64);
-        Ok(folded_len)
+            .counter(names::MATERIALIZER_ROWS_TOTAL, &labels, unit.folded as u64);
+        Ok(unit.folded)
+    }
+
+    async fn rebuild_file_index(&mut self, ident: &TableIdent) -> Result<()> {
+        let entry = self.tables.get_mut(ident).expect("checked by caller");
+        entry.file_index = rebuild_from_catalog(
+            self.catalog.as_ref(),
+            self.blob_store.as_ref(),
+            ident,
+            &entry.schema,
+            &entry.pk_cols,
+        )
+        .await
+        .map_err(|e| MaterializerError::Catalog(IcebergError::Other(e.to_string())))?;
+        Ok(())
     }
 
     /// Emit meta-marker rows for any pending markers eligible for

@@ -939,7 +939,7 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
         schedule: Schedule::default(),
         compaction: None,
         flush_rows: 64,
-        mat_cycle_limit: 128,
+        mat_batch_rows: 128,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://fence-table",
@@ -1088,7 +1088,7 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
         schedule: Schedule::default(),
         compaction: None,
         flush_rows: 64,
-        mat_cycle_limit: 128,
+        mat_batch_rows: 128,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://fence-conc",
@@ -1207,7 +1207,7 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
         schedule: Schedule::default(),
         compaction: None,
         flush_rows: 64,
-        mat_cycle_limit: 128,
+        mat_batch_rows: 128,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://table",
@@ -1356,7 +1356,7 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
         schedule: Schedule::default(),
         compaction: None,
         flush_rows: 64,
-        mat_cycle_limit: 128,
+        mat_batch_rows: 128,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://table",

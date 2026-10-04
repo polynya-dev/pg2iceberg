@@ -327,6 +327,10 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
         "materializer-only worker starting"
     );
 
+    // Sleep between cycles only once caught up: while a backlog remains,
+    // each cycle (bounded by its row budget) is followed straight away by
+    // the next.
+    let mut pause = cycle_interval;
     loop {
         tokio::select! {
             biased;
@@ -338,14 +342,19 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
                 tracing::info!("SIGTERM received, materializer-only shutting down");
                 break;
             }
-            _ = tokio::time::sleep(cycle_interval) => {
-                if let Err(e) = materializer.cycle().await {
-                    // Log but don't fail loudly: a transient blob /
-                    // coord error shouldn't take the worker out of
-                    // the rotation. Persistent errors will surface
-                    // via metrics + the next operator-side check.
-                    tracing::warn!(error = %e, "materializer cycle failed; will retry next interval");
-                }
+            _ = tokio::time::sleep(pause) => {
+                pause = match materializer.cycle().await {
+                    Ok(0) => cycle_interval,
+                    Ok(_) => std::time::Duration::ZERO,
+                    Err(e) => {
+                        // Log but don't fail loudly: a transient blob /
+                        // coord error shouldn't take the worker out of
+                        // the rotation. Persistent errors will surface
+                        // via metrics + the next operator-side check.
+                        tracing::warn!(error = %e, "materializer cycle failed; will retry next interval");
+                        cycle_interval
+                    }
+                };
             }
         }
     }
@@ -615,7 +624,14 @@ async fn build_one_shot_materializer(
     let mat_base = format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/'));
     let mat_namer = Arc::new(CounterMaterializerNamer::new(mat_base));
     let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
-        Materializer::new(coord, blob, catalog, mat_namer, &cfg.state.group, 64);
+        Materializer::new(
+            coord,
+            blob,
+            catalog,
+            mat_namer,
+            &cfg.state.group,
+            cfg.sink.materializer_batch_rows,
+        );
     for s in &resolved_schemas {
         materializer
             .register_table(s.clone())
@@ -968,7 +984,7 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
             Arc::clone(&catalog),
             mat_namer,
             &cfg.state.group,
-            64,
+            cfg.sink.materializer_batch_rows,
         );
     for schema in &schemas {
         materializer

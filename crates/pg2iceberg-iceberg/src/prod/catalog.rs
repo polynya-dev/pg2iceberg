@@ -28,6 +28,7 @@ use iceberg::spec::{
     DataContentType, DataFile as IcebergDataFile, DataFileBuilder, DataFileFormat, Literal,
     NestedField, PrimitiveLiteral, PrimitiveType, Schema as IcebergSchema, Struct, Type,
 };
+use iceberg::table::Table;
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
 use iceberg::TableUpdate;
 use iceberg::{
@@ -149,78 +150,52 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     }
 
     async fn commit_snapshot(&self, prepared: PreparedCommit) -> Result<TableMetadata> {
-        if prepared.data_files.is_empty() && prepared.equality_deletes.is_empty() {
-            // No work — match the sim-catalog noop semantics so the materializer
-            // can flush "no data, no deletes" without a snapshot bump.
-            let it = to_iceberg_table_ident(&prepared.ident)?;
-            let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
-            return metadata_from_table(&prepared.ident, &table);
-        }
+        self.commit_snapshots(vec![prepared]).await
+    }
 
-        let it = to_iceberg_table_ident(&prepared.ident)?;
+    async fn commit_snapshots(&self, steps: Vec<PreparedCommit>) -> Result<TableMetadata> {
+        let ident = steps
+            .first()
+            .map(|s| s.ident.clone())
+            .ok_or_else(|| IcebergError::Other("commit_snapshots: no steps".into()))?;
+        if steps.iter().any(|s| s.ident != ident) {
+            return Err(IcebergError::Other(
+                "commit_snapshots: steps span several tables".into(),
+            ));
+        }
+        let it = to_iceberg_table_ident(&ident)?;
         let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
-        let spec_id = table.metadata().default_partition_spec_id();
-        let part_field_count = table.metadata().default_partition_spec().fields().len();
-
-        let mut all_files: Vec<IcebergDataFile> =
-            Vec::with_capacity(prepared.data_files.len() + prepared.equality_deletes.len());
-        for df in &prepared.data_files {
-            let partition =
-                build_partition_struct(&df.partition_values, part_field_count, &df.path)?;
-            all_files.push(
-                DataFileBuilder::default()
-                    .content(DataContentType::Data)
-                    .file_path(df.path.clone())
-                    .file_format(DataFileFormat::Parquet)
-                    .file_size_in_bytes(df.byte_size)
-                    .record_count(df.record_count)
-                    .partition(partition)
-                    .partition_spec_id(spec_id)
-                    .build()
-                    .map_err(|e| IcebergError::Other(format!("data file build: {e}")))?,
-            );
-        }
-        for df in &prepared.equality_deletes {
-            if df.equality_field_ids.is_empty() {
-                return Err(IcebergError::Other(format!(
-                    "equality-delete file {} has empty equality_field_ids; refusing to \
-                     commit a delete that wouldn't match any rows",
-                    df.path
-                )));
+        let mut files: Vec<Vec<IcebergDataFile>> = Vec::with_capacity(steps.len());
+        for step in &steps {
+            if !step.data_files.is_empty() || !step.equality_deletes.is_empty() {
+                files.push(to_iceberg_files(step, &table)?);
             }
-            let partition =
-                build_partition_struct(&df.partition_values, part_field_count, &df.path)?;
-            all_files.push(
-                DataFileBuilder::default()
-                    .content(DataContentType::EqualityDeletes)
-                    .file_path(df.path.clone())
-                    .file_format(DataFileFormat::Parquet)
-                    .file_size_in_bytes(df.byte_size)
-                    .record_count(df.record_count)
-                    .equality_ids(Some(df.equality_field_ids.clone()))
-                    .partition(partition)
-                    .partition_spec_id(spec_id)
-                    .build()
-                    .map_err(|e| IcebergError::Other(format!("delete file build: {e}")))?,
-            );
         }
 
         let tx = Transaction::new(&table);
-        let action = tx
-            .fast_append()
-            // The materializer guarantees unique paths via `RollingWriter`'s
-            // counter-based namer; skip iceberg-rust's path-dedup which would
-            // otherwise scan the full manifest list on each commit.
-            .with_check_duplicate(false)
-            // FastAppendAction (forked) routes by `content_type()` into
-            // separate data and delete manifests at commit time.
-            .add_data_files(all_files);
-        let tx = action.apply(tx).map_err(map_iceberg_err)?;
+        let tx = match files.len() {
+            // No work — match the sim-catalog noop semantics so the
+            // materializer can flush "no data, no deletes" without a
+            // snapshot bump.
+            0 => return metadata_from_table(&ident, &table),
+            1 => tx
+                .fast_append()
+                // The materializer guarantees unique file paths; skip
+                // iceberg-rust's path-dedup, which would otherwise scan the
+                // full manifest list on each commit.
+                .with_check_duplicate(false)
+                // FastAppendAction (forked) routes by `content_type()` into
+                // separate data and delete manifests at commit time.
+                .add_data_files(files.remove(0))
+                .apply(tx),
+            _ => ChainedAppendAction { steps: files }.apply(tx),
+        }
+        .map_err(map_iceberg_err)?;
         let updated = tx
             .commit(self.inner.as_ref())
             .await
             .map_err(map_iceberg_err)?;
-        metadata_from_table(&prepared.ident, &updated)
+        metadata_from_table(&ident, &updated)
     }
 
     async fn commit_compaction(
@@ -476,6 +451,106 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
 }
 
 // ───── inline transaction actions ────────────────────────────────────────
+
+/// Translate one prepared step's data + equality-delete files into
+/// iceberg `DataFile`s against `table`'s default partition spec.
+fn to_iceberg_files(prepared: &PreparedCommit, table: &Table) -> Result<Vec<IcebergDataFile>> {
+    let spec_id = table.metadata().default_partition_spec_id();
+    let part_field_count = table.metadata().default_partition_spec().fields().len();
+    let mut all_files: Vec<IcebergDataFile> =
+        Vec::with_capacity(prepared.data_files.len() + prepared.equality_deletes.len());
+    for df in &prepared.data_files {
+        let partition = build_partition_struct(&df.partition_values, part_field_count, &df.path)?;
+        all_files.push(
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(df.path.clone())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(df.byte_size)
+                .record_count(df.record_count)
+                .partition(partition)
+                .partition_spec_id(spec_id)
+                .build()
+                .map_err(|e| IcebergError::Other(format!("data file build: {e}")))?,
+        );
+    }
+    for df in &prepared.equality_deletes {
+        if df.equality_field_ids.is_empty() {
+            return Err(IcebergError::Other(format!(
+                "equality-delete file {} has empty equality_field_ids; refusing to \
+                 commit a delete that wouldn't match any rows",
+                df.path
+            )));
+        }
+        let partition = build_partition_struct(&df.partition_values, part_field_count, &df.path)?;
+        all_files.push(
+            DataFileBuilder::default()
+                .content(DataContentType::EqualityDeletes)
+                .file_path(df.path.clone())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(df.byte_size)
+                .record_count(df.record_count)
+                .equality_ids(Some(df.equality_field_ids.clone()))
+                .partition(partition)
+                .partition_spec_id(spec_id)
+                .build()
+                .map_err(|e| IcebergError::Other(format!("delete file build: {e}")))?,
+        );
+    }
+    Ok(all_files)
+}
+
+/// Several fast-appends committed as one table update. Each step becomes
+/// its own snapshot — parent = the previous step, next sequence number —
+/// so a step's equality deletes hide rows written by earlier steps; but
+/// `main` moves in a single catalog commit, so readers see all steps or
+/// none.
+///
+/// The fork's `Transaction` can't simply hold several `fast_append`s:
+/// each re-asserts that `main` is still at its pre-commit snapshot, and
+/// the catalog checks every requirement against the base table, so the
+/// second one always conflicts. Instead this action chains the steps
+/// against a local copy of the table and keeps only the first step's
+/// requirements — what Java's `UpdateRequirements` does. Pure metadata
+/// plumbing over public fork APIs, like [`ExpireSnapshotsAction`].
+struct ChainedAppendAction {
+    steps: Vec<Vec<IcebergDataFile>>,
+}
+
+#[async_trait]
+impl TransactionAction for ChainedAppendAction {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        let mut local = table.clone();
+        let mut updates = Vec::new();
+        let mut requirements = None;
+        for files in &self.steps {
+            let append = Transaction::new(&local)
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(files.clone());
+            let mut step = Arc::new(append).commit(&local).await?;
+            let step_updates = step.take_updates();
+            requirements.get_or_insert(step.take_requirements());
+            let mut builder = local
+                .metadata()
+                .clone()
+                .into_builder(local.metadata_location().map(str::to_string));
+            for update in &step_updates {
+                builder = update.clone().apply(builder)?;
+            }
+            let mut next = Table::builder()
+                .identifier(local.identifier().clone())
+                .file_io(local.file_io().clone())
+                .metadata(builder.build()?.metadata);
+            if let Some(location) = local.metadata_location() {
+                next = next.metadata_location(location);
+            }
+            local = next.build()?;
+            updates.extend(step_updates);
+        }
+        Ok(ActionCommit::new(updates, requirements.unwrap_or_default()))
+    }
+}
 
 /// Inline `TransactionAction` that emits `TableUpdate::RemoveSnapshots`.
 /// We don't add this to the iceberg-rust fork because it's pure metadata

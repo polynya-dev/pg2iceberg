@@ -203,8 +203,9 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     pub schedule: Schedule,
     pub compaction: Option<CompactionConfig>,
     pub flush_rows: usize,
-    /// Materializer cycle limit (entries-per-cycle cap).
-    pub mat_cycle_limit: usize,
+    /// Materializer step size in change events — the bound on its memory
+    /// (see [`Materializer::new`]).
+    pub mat_batch_rows: usize,
     /// Built lazily — only invoked if the snapshot phase actually
     /// needs to run (fresh slot, snapshot not already complete). The
     /// binary's factory builds a `PgSnapshotSource`; the DST's factory
@@ -445,7 +446,7 @@ where
         Arc::clone(&lc.catalog),
         Arc::clone(&lc.materializer_namer),
         &lc.group,
-        lc.mat_cycle_limit,
+        lc.mat_batch_rows,
     );
     // Tables that need a backfill snapshot before any of their CDC
     // events are applied to Iceberg. Computed here so we can register

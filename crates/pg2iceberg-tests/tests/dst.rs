@@ -38,6 +38,9 @@ use pg2iceberg_core::{
     ColumnName, ColumnSchema, Namespace, Op, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
 use pg2iceberg_iceberg::read_materialized_state;
+use pg2iceberg_iceberg::{
+    Catalog, PreparedCommit, PreparedCompaction, SchemaChange, Snapshot, TableMetadata,
+};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{CounterMaterializerNamer, Materializer, Pipeline};
 use pg2iceberg_sim::blob::MemoryBlobStore;
@@ -51,7 +54,7 @@ use pg2iceberg_stream::BlobStore;
 use pollster::block_on;
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const TABLE_NAME: &str = "orders";
 const PUB: &str = "pub1";
@@ -202,7 +205,9 @@ struct DstHarness {
     catalog: Arc<MemoryCatalog>,
     namer: Arc<CounterBlobNamer>,
     pipeline: Pipeline<MemoryCoordinator>,
-    materializer: Materializer<MemoryCatalog>,
+    materializer: Materializer<AuditedCatalog>,
+    /// The materializer's catalog: checks invariant 10 after every commit.
+    audited: Arc<AuditedCatalog>,
     stream: SimReplicationStream,
     /// Mirror of which PK ids are currently live in the source DB. Used by
     /// the workload runner to pre-filter ops the proptest generator can't
@@ -246,10 +251,16 @@ impl DstHarness {
         let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
 
         let mat_namer = Arc::new(CounterMaterializerNamer::new("s3://table"));
+        let audited = Arc::new(AuditedCatalog {
+            inner: catalog.clone(),
+            blob: blob_store.clone(),
+            db: db.clone(),
+            violations: Mutex::new(Vec::new()),
+        });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
             blob_store.clone(),
-            catalog.clone(),
+            audited.clone(),
             mat_namer,
             "default",
             MAT_BATCH,
@@ -266,6 +277,7 @@ impl DstHarness {
             namer,
             pipeline,
             materializer,
+            audited,
             stream,
             live: seeds.iter().map(|(id, _)| *id).collect(),
             noise_next_id: 0,
@@ -292,10 +304,16 @@ impl DstHarness {
         let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
 
         let mat_namer = Arc::new(CounterMaterializerNamer::new("s3://table"));
+        let audited = Arc::new(AuditedCatalog {
+            inner: catalog.clone(),
+            blob: blob_store.clone(),
+            db: db.clone(),
+            violations: Mutex::new(Vec::new()),
+        });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
             blob_store.clone(),
-            catalog.clone(),
+            audited.clone(),
             mat_namer,
             "default",
             MAT_BATCH,
@@ -312,6 +330,7 @@ impl DstHarness {
             namer,
             pipeline,
             materializer,
+            audited,
             stream,
             live: BTreeSet::new(),
             noise_next_id: 0,
@@ -432,6 +451,13 @@ impl DstHarness {
                     tx.insert(&ident(), row(self.next_bulk_id, *qty));
                     fresh.push(self.next_bulk_id);
                 }
+                // Touch every row again, now in a later chunk — including
+                // the ones this transaction just inserted: the materializer
+                // must hide their first version within the same atomic
+                // commit.
+                for id in self.live.iter().chain(&fresh) {
+                    tx.update(&ident(), row(*id, *qty + 1));
+                }
                 tx.commit(Timestamp(0)).unwrap();
                 self.live.extend(fresh);
             }
@@ -498,21 +524,35 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
         }
     }
 
-    // 10. Atomic visibility per table: Iceberg matches PG as of some
-    //     transaction boundary. Lagging behind is fine; a partly applied
-    //     transaction is not.
-    let mut iceberg = block_on(read_materialized_state(
-        h.catalog.as_ref(),
-        h.blob_store.as_ref(),
+    // 10. Atomic visibility per table — now, and at every commit made
+    //     since the last check (a cycle may commit several times).
+    block_on(atomic_visibility(&h.catalog, &h.blob_store, &h.db))?;
+    if let Some(v) = h.audited.violations.lock().unwrap().first() {
+        return Err(v.clone());
+    }
+    Ok(())
+}
+
+/// Invariant 10: Iceberg matches PG as of some transaction boundary.
+/// Lagging behind is fine; a partly applied transaction is not.
+async fn atomic_visibility(
+    catalog: &MemoryCatalog,
+    blob: &MemoryBlobStore,
+    db: &SimPostgres,
+) -> Result<(), String> {
+    let mut iceberg = read_materialized_state(
+        catalog,
+        blob,
         &ident(),
         &schema(),
         &[ColumnName("id".into())],
-    ))
+    )
+    .await
     .map_err(|e| format!("read_materialized_state: {e}"))?;
     sort_by_pk(&mut iceberg);
-    let events =
-        h.db.dump_change_events(PUB)
-            .map_err(|e| format!("dump_change_events: {e}"))?;
+    let events = db
+        .dump_change_events(PUB)
+        .map_err(|e| format!("dump_change_events: {e}"))?;
     let pk = |r: &Row| match r.get(&ColumnName("id".into())) {
         Some(PgValue::Int4(n)) => *n,
         _ => i32::MAX,
@@ -544,6 +584,88 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The materializer's catalog in the DST: delegates to the in-memory
+/// catalog and checks invariant 10 after every commit — the moments a
+/// reader could observe the table — since one materializer cycle can
+/// commit several times between two DST steps.
+struct AuditedCatalog {
+    inner: Arc<MemoryCatalog>,
+    blob: Arc<MemoryBlobStore>,
+    db: SimPostgres,
+    violations: Mutex<Vec<String>>,
+}
+
+impl AuditedCatalog {
+    async fn audit(&self) {
+        if let Err(e) = atomic_visibility(&self.inner, &self.blob, &self.db).await {
+            self.violations
+                .lock()
+                .unwrap()
+                .push(format!("after a commit: {e}"));
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Catalog for AuditedCatalog {
+    async fn ensure_namespace(&self, ns: &Namespace) -> pg2iceberg_iceberg::Result<()> {
+        self.inner.ensure_namespace(ns).await
+    }
+    async fn load_table(
+        &self,
+        ident: &TableIdent,
+    ) -> pg2iceberg_iceberg::Result<Option<TableMetadata>> {
+        self.inner.load_table(ident).await
+    }
+    async fn create_table(
+        &self,
+        schema: &TableSchema,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.inner.create_table(schema).await
+    }
+    async fn commit_snapshot(
+        &self,
+        prepared: PreparedCommit,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        let meta = self.inner.commit_snapshot(prepared).await?;
+        self.audit().await;
+        Ok(meta)
+    }
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<PreparedCommit>,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        let meta = self.inner.commit_snapshots(steps).await?;
+        self.audit().await;
+        Ok(meta)
+    }
+    async fn commit_compaction(
+        &self,
+        prepared: PreparedCompaction,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        let meta = self.inner.commit_compaction(prepared).await?;
+        self.audit().await;
+        Ok(meta)
+    }
+    async fn evolve_schema(
+        &self,
+        ident: &TableIdent,
+        changes: Vec<SchemaChange>,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.inner.evolve_schema(ident, changes).await
+    }
+    async fn expire_snapshots(
+        &self,
+        ident: &TableIdent,
+        retention_ms: i64,
+    ) -> pg2iceberg_iceberg::Result<usize> {
+        self.inner.expire_snapshots(ident, retention_ms).await
+    }
+    async fn snapshots(&self, ident: &TableIdent) -> pg2iceberg_iceberg::Result<Vec<Snapshot>> {
+        self.inner.snapshots(ident).await
+    }
 }
 
 fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
@@ -853,6 +975,44 @@ fn large_transaction_becomes_visible_atomically() {
         check_step_invariants(&h).unwrap();
     }
     check_invariants(&mut h).unwrap();
+}
+
+/// A transaction that inserts rows, truncates, then inserts more, spread
+/// over several materializer steps. The TRUNCATE becomes deletes for
+/// every row the materializer knows about — which must include rows this
+/// same, not-yet-committed unit wrote in earlier steps.
+#[test]
+fn truncate_inside_large_transaction_hides_its_earlier_inserts() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 1 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    let mut tx = h.db.begin_tx();
+    for id in 100..106 {
+        tx.insert(&ident(), row(id, 1));
+    }
+    tx.truncate(&ident());
+    for id in 200..202 {
+        tx.insert(&ident(), row(id, 2));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    h.run_step(&Step::DriveFlush);
+    for _ in 0..100 {
+        h.run_step(&Step::MaterializerCycle);
+        check_step_invariants(&h).unwrap();
+    }
+    let mut iceberg = block_on(read_materialized_state(
+        h.catalog.as_ref(),
+        h.blob_store.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    ))
+    .unwrap();
+    sort_by_pk(&mut iceberg);
+    let mut pg = h.db.read_table(&ident()).unwrap();
+    sort_by_pk(&mut pg);
+    assert_eq!(iceberg, pg);
 }
 
 /// A flush that runs mid-transaction — here on a keepalive received just

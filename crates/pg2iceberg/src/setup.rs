@@ -139,7 +139,7 @@ where
             None
         },
         flush_rows: cfg.sink.flush_rows,
-        mat_cycle_limit: 64,
+        mat_batch_rows: cfg.sink.materializer_batch_rows,
         snapshot_source_factory,
         materializer_namer: Arc::new(CounterMaterializerNamer::new(format!(
             "{}/materialized",
