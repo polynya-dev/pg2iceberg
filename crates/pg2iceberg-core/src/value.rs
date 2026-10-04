@@ -33,7 +33,7 @@ impl Decimal {
     /// ahead of a negative byte). Postgres emits zero-padded unscaled
     /// bytes while Parquet emits the minimal form, so the same value
     /// arrives with different padding on the two sides.
-    fn normalized_be_bytes(&self) -> &[u8] {
+    pub fn normalized_be_bytes(&self) -> &[u8] {
         let b = self.unscaled_be_bytes.as_slice();
         let mut i = 0;
         while i + 1 < b.len() {

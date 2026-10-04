@@ -53,6 +53,9 @@ pg2iceberg-snapshot.workspace = true
 pg2iceberg-stream.workspace = true
 pg2iceberg-validate.workspace = true
 bytes = "1"
+# Counting global allocator for `tests/file_index_memory.rs` (the
+# workspace forbids the `unsafe` a hand-rolled one would need).
+peak_alloc = "0.3"
 pollster = "0.4"
 proptest.workspace = true
 # `test-util` activates `tokio::time::pause` / `advance` for the

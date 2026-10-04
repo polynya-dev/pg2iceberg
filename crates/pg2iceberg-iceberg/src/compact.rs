@@ -59,7 +59,7 @@
 
 use crate::reader::RowBatches;
 use crate::writer::{StreamingDataFile, TableWriter, WriterError};
-use crate::{Catalog, DataFile, FileIndex, IcebergError, PreparedCompaction, Snapshot};
+use crate::{Catalog, DataFile, FileIndex, IcebergError, PkKey, PreparedCompaction, Snapshot};
 use pg2iceberg_core::{ColumnName, ColumnSchema, PartitionLiteral, Row, TableIdent, TableSchema};
 use pg2iceberg_stream::{BlobStore, StreamError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -136,7 +136,7 @@ pub struct CompactionOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactedFile {
     pub path: String,
-    pub pk_keys: Vec<String>,
+    pub pk_keys: Vec<PkKey>,
     pub partition_values: Vec<PartitionLiteral>,
 }
 
@@ -252,7 +252,7 @@ where
         .cloned()
         .collect();
     let oldest_input = plan.inputs.iter().map(|(_, f)| f.seq).min();
-    let mut delete_pks: HashMap<String, i64> = HashMap::new();
+    let mut delete_pks: HashMap<PkKey, i64> = HashMap::new();
     for (path, meta) in &live_deletes {
         if !oldest_input.is_some_and(|s| meta.seq > s) {
             continue;
@@ -264,7 +264,7 @@ where
             for row in rows {
                 // Highest seq wins — covers re-deletes of the same PK.
                 let seq = delete_pks
-                    .entry(crate::fold::pk_key(&row, pk_cols))
+                    .entry(PkKey::from_row(&row, pk_cols))
                     .or_insert(meta.seq);
                 *seq = (*seq).max(meta.seq);
             }
@@ -290,7 +290,7 @@ where
                 .iter()
                 .filter(|r| {
                     delete_pks
-                        .get(&crate::fold::pk_key(r, pk_cols))
+                        .get(&PkKey::from_row(r, pk_cols))
                         .is_none_or(|del_seq| *del_seq <= meta.seq)
                 })
                 .collect();
@@ -370,10 +370,10 @@ where
 struct OutputFiles {
     open: Option<(Vec<PartitionLiteral>, StreamingDataFile)>,
     /// PK keys of the rows in the open file.
-    open_pks: Vec<String>,
+    open_pks: Vec<PkKey>,
     added: Vec<DataFile>,
     /// PK keys of each added file, parallel to `added`.
-    added_pks: Vec<Vec<String>>,
+    added_pks: Vec<Vec<PkKey>>,
 }
 
 impl OutputFiles {
@@ -392,7 +392,7 @@ impl OutputFiles {
         let (_, file) = self.open.as_mut().expect("opened above");
         file.write(rows)?;
         self.open_pks
-            .extend(rows.iter().map(|r| crate::fold::pk_key(r, pk_cols)));
+            .extend(rows.iter().map(|r| PkKey::from_row(r, pk_cols)));
         Ok(())
     }
 

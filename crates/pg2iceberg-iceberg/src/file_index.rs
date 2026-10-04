@@ -14,27 +14,43 @@
 //!    data file must be downgraded to `Update` so the writer emits an
 //!    equality delete; otherwise readers would see two rows for that PK.
 //!
-//! On materializer restart, the index is rebuilt by reading manifest
-//! entries for the current snapshot — see
-//! [`Materializer::rebuild_file_index_from_catalog`].
+//! Keys are [`PkKey`]s, which compare stored values: a key built from a
+//! WAL event equals the key read back from a data file.
+//!
+//! On materializer restart, the index is rebuilt from the catalog's
+//! snapshot history — see [`rebuild_from_catalog`].
 
+use crate::pk::PkKey;
 use pg2iceberg_core::PartitionLiteral;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 
-#[derive(Default, Debug, Clone, PartialEq)]
+/// A data file's slot in [`FileIndex::files`].
+type FileId = u32;
+
+/// Live PK → data file map. One entry per live row, so it is kept
+/// compact: a [`PkKey`] (inline for typical keys) plus a 4-byte file
+/// number, with each file's path stored once.
+#[derive(Default, Clone)]
 pub struct FileIndex {
-    /// pk_key → file path. Single source of truth for "which file contains
-    /// this PK."
-    pk_to_file: BTreeMap<String, String>,
-    /// path → set of pk_keys it contains. Used to GC empty files when every
-    /// PK in a file has been deleted.
-    file_pks: BTreeMap<String, BTreeSet<String>>,
-    /// path → partition values (one literal per partition spec field). Empty
-    /// for unpartitioned tables. Populated when the materializer commits a
-    /// new data file and on rebuild from catalog snapshots, so cross-batch
-    /// `Delete` rows on partitioned tables can recover the partition tuple
-    /// of their PK's prior data file.
-    file_partition_values: BTreeMap<String, Vec<PartitionLiteral>>,
+    /// Live PK → the data file holding its current row.
+    keys: HashMap<PkKey, FileId>,
+    /// Data files holding at least one live row; `None` slots are free.
+    files: Vec<Option<IndexedFile>>,
+    free: Vec<FileId>,
+    ids: HashMap<String, FileId>,
+}
+
+#[derive(Clone)]
+struct IndexedFile {
+    path: String,
+    /// One literal per partition spec field; empty for unpartitioned
+    /// tables. Lets a cross-batch `Delete` on a partitioned table recover
+    /// the partition tuple of its PK's prior data file.
+    partition_values: Vec<PartitionLiteral>,
+    /// Keys in `keys` pointing at this file. The file leaves the index
+    /// when it reaches zero.
+    live: u64,
 }
 
 impl FileIndex {
@@ -49,29 +65,39 @@ impl FileIndex {
     pub fn add_file(
         &mut self,
         path: String,
-        pk_keys: Vec<String>,
+        pk_keys: impl IntoIterator<Item = PkKey>,
         partition_values: Vec<PartitionLiteral>,
     ) {
-        let mut set = BTreeSet::new();
+        let id = match self.ids.get(&path) {
+            Some(&id) => {
+                if !partition_values.is_empty() {
+                    self.file_mut(id).partition_values = partition_values;
+                }
+                id
+            }
+            None => self.insert_file(path, partition_values),
+        };
         for pk in pk_keys {
-            // If this PK was previously associated with another file, leave
-            // the old `file_pks` entry alone — that file will GC when its
-            // last live PK is removed.
-            self.pk_to_file.insert(pk.clone(), path.clone());
-            set.insert(pk);
+            match self.keys.insert(pk, id) {
+                Some(prev) if prev == id => {}
+                Some(prev) => {
+                    self.file_mut(id).live += 1;
+                    self.release(prev);
+                }
+                None => self.file_mut(id).live += 1,
+            }
         }
-        self.file_pks.entry(path.clone()).or_default().extend(set);
-        if !partition_values.is_empty() {
-            self.file_partition_values.insert(path, partition_values);
+        if self.file(id).live == 0 {
+            self.drop_file(id);
         }
     }
 
-    pub fn lookup(&self, pk_key: &str) -> Option<&str> {
-        self.pk_to_file.get(pk_key).map(String::as_str)
+    pub fn lookup(&self, pk_key: &PkKey) -> Option<&str> {
+        self.keys.get(pk_key).map(|&id| self.file(id).path.as_str())
     }
 
-    pub fn contains_pk(&self, pk_key: &str) -> bool {
-        self.pk_to_file.contains_key(pk_key)
+    pub fn contains_pk(&self, pk_key: &PkKey) -> bool {
+        self.keys.contains_key(pk_key)
     }
 
     /// Resolve the partition tuple of the data file currently holding `pk_key`.
@@ -81,36 +107,30 @@ impl FileIndex {
     /// partition source columns (see Go's `ExtractPartBucketKey` /
     /// `ParsePartitionPath` in `iceberg/partition.go` — same intent, but
     /// we carry structured values per file instead of parsing hive paths).
-    pub fn partition_values_for_pk(&self, pk_key: &str) -> Option<&[PartitionLiteral]> {
-        let path = self.pk_to_file.get(pk_key)?;
-        self.file_partition_values.get(path).map(|v| v.as_slice())
+    pub fn partition_values_for_pk(&self, pk_key: &PkKey) -> Option<&[PartitionLiteral]> {
+        let file = self.file(*self.keys.get(pk_key)?);
+        (!file.partition_values.is_empty()).then_some(file.partition_values.as_slice())
     }
 
-    /// Mark these PKs as deleted. The PK→file mapping is cleared. The file
-    /// path is also dropped from `file_pks` once all its PKs are gone.
     /// Forget `path` (rewritten by compaction) and every PK still pointing
-    /// at it; the compaction outputs are added back with [`Self::add_file`].
+    /// at it. Add the compaction outputs with [`Self::add_file`] first:
+    /// that moves the surviving PKs off `path`, leaving nothing to scan.
     pub fn remove_file(&mut self, path: &str) {
-        if let Some(pks) = self.file_pks.remove(path) {
-            for pk in pks {
-                if self.pk_to_file.get(&pk).is_some_and(|p| p == path) {
-                    self.pk_to_file.remove(&pk);
-                }
-            }
+        let Some(&id) = self.ids.get(path) else {
+            return;
+        };
+        if self.file(id).live > 0 {
+            self.keys.retain(|_, f| *f != id);
         }
-        self.file_partition_values.remove(path);
+        self.drop_file(id);
     }
 
-    pub fn remove_pks(&mut self, pk_keys: &[String]) {
+    /// Mark these PKs as deleted. A file leaves the index once none of
+    /// its PKs are live.
+    pub fn remove_pks<'a>(&mut self, pk_keys: impl IntoIterator<Item = &'a PkKey>) {
         for pk in pk_keys {
-            if let Some(path) = self.pk_to_file.remove(pk) {
-                if let Some(set) = self.file_pks.get_mut(&path) {
-                    set.remove(pk);
-                    if set.is_empty() {
-                        self.file_pks.remove(&path);
-                        self.file_partition_values.remove(&path);
-                    }
-                }
+            if let Some(id) = self.keys.remove(pk) {
+                self.release(id);
             }
         }
     }
@@ -118,58 +138,135 @@ impl FileIndex {
     /// Returns the set of file paths that contain at least one of the given
     /// PKs. Used by the materializer to know which files to fetch for TOAST
     /// resolution.
-    pub fn affected_files(&self, pk_keys: &[String]) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        for pk in pk_keys {
-            if let Some(path) = self.pk_to_file.get(pk) {
-                out.insert(path.clone());
-            }
-        }
-        out
+    pub fn affected_files(&self, pk_keys: &[PkKey]) -> BTreeSet<String> {
+        pk_keys
+            .iter()
+            .filter_map(|pk| self.lookup(pk))
+            .map(str::to_string)
+            .collect()
     }
 
+    /// Data files holding at least one live PK, sorted.
     pub fn live_files(&self) -> Vec<&str> {
-        self.file_pks.keys().map(String::as_str).collect()
+        let mut out: Vec<&str> = self.live().map(|f| f.path.as_str()).collect();
+        out.sort_unstable();
+        out
     }
 
     pub fn live_pk_count(&self) -> usize {
-        self.pk_to_file.len()
+        self.keys.len()
     }
 
-    /// Live rows per data file. Counted from `pk_to_file` because
-    /// `file_pks` keeps a PK under its old file after an update moves it,
-    /// so its set sizes over-count — and an over-count would make a file
-    /// with dead rows look clean to compaction.
+    /// Live rows per data file. A file whose live rows are fewer than its
+    /// records holds dead rows, which compaction can drop.
     pub fn live_rows_per_file(&self) -> BTreeMap<&str, u64> {
-        let mut out: BTreeMap<&str, u64> = BTreeMap::new();
-        for path in self.pk_to_file.values() {
-            *out.entry(path.as_str()).or_default() += 1;
-        }
-        out
+        self.live().map(|f| (f.path.as_str(), f.live)).collect()
     }
 
-    /// Iterate every currently-live PK key. Used by the
-    /// materializer's TRUNCATE expansion: a `TRUNCATE` event has no
-    /// per-row payload, so we materialize it by emitting one
+    /// Iterate every currently-live PK key, in no particular order. Used
+    /// by the materializer's TRUNCATE expansion: a `TRUNCATE` event has
+    /// no per-row payload, so we materialize it by emitting one
     /// equality-delete per known PK before continuing the cycle.
-    pub fn all_pks(&self) -> impl Iterator<Item = &str> {
-        self.pk_to_file.keys().map(String::as_str)
+    pub fn all_pks(&self) -> impl Iterator<Item = &PkKey> {
+        self.keys.keys()
+    }
+
+    fn live(&self) -> impl Iterator<Item = &IndexedFile> {
+        self.files.iter().flatten()
+    }
+
+    fn file(&self, id: FileId) -> &IndexedFile {
+        self.files[id as usize].as_ref().expect("live file id")
+    }
+
+    fn file_mut(&mut self, id: FileId) -> &mut IndexedFile {
+        self.files[id as usize].as_mut().expect("live file id")
+    }
+
+    fn insert_file(&mut self, path: String, partition_values: Vec<PartitionLiteral>) -> FileId {
+        let file = IndexedFile {
+            path: path.clone(),
+            partition_values,
+            live: 0,
+        };
+        let id = match self.free.pop() {
+            Some(id) => {
+                self.files[id as usize] = Some(file);
+                id
+            }
+            None => {
+                let id = FileId::try_from(self.files.len()).expect("under 2^32 live data files");
+                self.files.push(Some(file));
+                id
+            }
+        };
+        self.ids.insert(path, id);
+        id
+    }
+
+    /// One fewer PK points at `id`.
+    fn release(&mut self, id: FileId) {
+        let file = self.file_mut(id);
+        file.live -= 1;
+        if file.live == 0 {
+            self.drop_file(id);
+        }
+    }
+
+    fn drop_file(&mut self, id: FileId) {
+        if let Some(file) = self.files[id as usize].take() {
+            self.ids.remove(&file.path);
+            self.free.push(id);
+        }
+    }
+
+    /// PK → path, and path → partition tuple: what the index means,
+    /// independent of file numbering.
+    #[allow(clippy::type_complexity)]
+    fn view(&self) -> (BTreeMap<&PkKey, &str>, BTreeMap<&str, &[PartitionLiteral]>) {
+        let pks = self
+            .keys
+            .iter()
+            .map(|(pk, &id)| (pk, self.file(id).path.as_str()))
+            .collect();
+        let partitions = self
+            .live()
+            .map(|f| (f.path.as_str(), f.partition_values.as_slice()))
+            .collect();
+        (pks, partitions)
+    }
+}
+
+impl PartialEq for FileIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys.len() == other.keys.len() && self.view() == other.view()
+    }
+}
+
+impl fmt::Debug for FileIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (pks, partitions) = self.view();
+        f.debug_struct("FileIndex")
+            .field("pks", &pks)
+            .field("partitions", &partitions)
+            .finish()
     }
 }
 
 /// Rebuild a `FileIndex` for `ident` from the catalog's snapshot history.
 ///
-/// Used on materializer / query-pipeline restart so re-insert promotion
-/// keeps working — without this, a freshly-booted process has an empty
-/// FileIndex and a re-insert of a previously-materialized PK won't emit
-/// the equality delete that's needed to void the prior data file row,
-/// producing duplicate rows in MoR readers.
+/// Used on materializer restart so re-insert promotion keeps working —
+/// without this, a freshly-booted process has an empty FileIndex and a
+/// re-insert of a previously-materialized PK won't emit the equality
+/// delete that's needed to void the prior data file row, producing
+/// duplicate rows in MoR readers.
 ///
 /// MoR semantics: an equality-delete file at snapshot `N` voids data file
-/// rows whose PK matches at snapshots `< N`. So a PK is "live" iff it's
-/// in some data file at snap `S` AND no equality-delete at snap `> S`
-/// targets it. This walks the snapshots in order and tracks the latest
-/// data file each live PK lives in.
+/// rows whose PK matches at snapshots `< N`. Replaying the snapshots in
+/// order — each one's deletes, then its data files — therefore leaves
+/// exactly the live PKs, as the materializer's own updates do. Files
+/// are streamed a batch at a time and only their PK columns decoded, so
+/// the rebuild holds little beyond the index itself.
 pub async fn rebuild_from_catalog(
     catalog: &dyn pg2iceberg_iceberg_dyn::DynCatalog,
     blob_store: &dyn pg2iceberg_stream::BlobStore,
@@ -177,7 +274,6 @@ pub async fn rebuild_from_catalog(
     schema: &pg2iceberg_core::TableSchema,
     pk_cols: &[pg2iceberg_core::ColumnName],
 ) -> std::result::Result<FileIndex, crate::verify::VerifyError> {
-    use crate::reader::read_data_file;
     use crate::verify::VerifyError;
 
     let snapshots = catalog
@@ -194,52 +290,51 @@ pub async fn rebuild_from_catalog(
 
     // Same compaction-aware skipping as the verifier — files superseded
     // by a Replace snapshot don't contribute to the FileIndex.
-    let removed_paths: BTreeSet<String> = snapshots
+    let removed_paths: BTreeSet<&str> = snapshots
         .iter()
-        .flat_map(|s| s.removed_paths.iter().cloned())
+        .flat_map(|s| s.removed_paths.iter().map(String::as_str))
         .collect();
-
-    // Per-snapshot deleted-PK sets, ordered by snap id.
-    let mut deletes_per_snap: Vec<(i64, BTreeSet<String>)> = Vec::with_capacity(snapshots.len());
-    for snap in &snapshots {
-        let mut snap_deleted = BTreeSet::new();
-        for df in &snap.delete_files {
-            if removed_paths.contains(&df.path) {
-                continue;
-            }
-            let bytes = blob_store.get(&df.path).await.map_err(VerifyError::Blob)?;
-            let rows = read_data_file(&bytes, &pk_schema).map_err(VerifyError::Decode)?;
-            for row in rows {
-                snap_deleted.insert(crate::fold::pk_key(&row, pk_cols));
-            }
-        }
-        deletes_per_snap.push((snap.id, snap_deleted));
-    }
 
     let mut fi = FileIndex::new();
     for snap in &snapshots {
+        for df in &snap.delete_files {
+            if !removed_paths.contains(df.path.as_str()) {
+                for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
+                    fi.remove_pks(&pks)
+                })
+                .await?;
+            }
+        }
         for df in &snap.data_files {
-            if removed_paths.contains(&df.path) {
-                continue;
-            }
-            let bytes = blob_store.get(&df.path).await.map_err(VerifyError::Blob)?;
-            let rows = read_data_file(&bytes, &schema.columns).map_err(VerifyError::Decode)?;
-            let mut live_in_file = Vec::new();
-            for row in rows {
-                let key = crate::fold::pk_key(&row, pk_cols);
-                let deleted_later = deletes_per_snap
-                    .iter()
-                    .any(|(sid, set)| *sid > snap.id && set.contains(&key));
-                if !deleted_later {
-                    live_in_file.push(key);
-                }
-            }
-            if !live_in_file.is_empty() {
-                fi.add_file(df.path.clone(), live_in_file, df.partition_values.clone());
+            if !removed_paths.contains(df.path.as_str()) {
+                for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
+                    fi.add_file(df.path.clone(), pks, df.partition_values.clone())
+                })
+                .await?;
             }
         }
     }
     Ok(fi)
+}
+
+/// Calls `f` with the PKs of each batch of rows in the file at `path`.
+async fn for_each_pk_batch(
+    blob_store: &dyn pg2iceberg_stream::BlobStore,
+    path: &str,
+    pk_schema: &[pg2iceberg_core::ColumnSchema],
+    pk_cols: &[pg2iceberg_core::ColumnName],
+    mut f: impl FnMut(Vec<PkKey>),
+) -> std::result::Result<(), crate::verify::VerifyError> {
+    use crate::verify::VerifyError;
+    let bytes = blob_store.get(path).await.map_err(VerifyError::Blob)?;
+    let batches =
+        crate::reader::RowBatches::new(bytes, pk_schema, crate::compact::DECODE_BATCH_ROWS)
+            .map_err(VerifyError::Decode)?;
+    for batch in batches {
+        let rows = batch.map_err(VerifyError::Decode)?;
+        f(rows.iter().map(|r| PkKey::from_row(r, pk_cols)).collect());
+    }
+    Ok(())
 }
 
 /// Avoid a circular module reference by re-exporting `DynCatalog` through a
@@ -251,28 +346,38 @@ mod pg2iceberg_iceberg_dyn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pg2iceberg_core::{ColumnName, PgValue, Row};
+
+    fn k(id: &str) -> PkKey {
+        let row: Row = [(ColumnName("id".into()), PgValue::Text(id.into()))].into();
+        PkKey::from_row(&row, &[ColumnName("id".into())])
+    }
+
+    fn ks(ids: &[&str]) -> Vec<PkKey> {
+        ids.iter().map(|id| k(id)).collect()
+    }
 
     #[test]
     fn add_then_lookup() {
         let mut fi = FileIndex::new();
-        fi.add_file("p0".into(), vec!["k1".into(), "k2".into()], Vec::new());
-        assert_eq!(fi.lookup("k1"), Some("p0"));
-        assert_eq!(fi.lookup("k2"), Some("p0"));
-        assert_eq!(fi.lookup("missing"), None);
-        assert!(fi.contains_pk("k1"));
-        assert!(!fi.contains_pk("missing"));
+        fi.add_file("p0".into(), ks(&["k1", "k2"]), Vec::new());
+        assert_eq!(fi.lookup(&k("k1")), Some("p0"));
+        assert_eq!(fi.lookup(&k("k2")), Some("p0"));
+        assert_eq!(fi.lookup(&k("missing")), None);
+        assert!(fi.contains_pk(&k("k1")));
+        assert!(!fi.contains_pk(&k("missing")));
     }
 
     #[test]
     fn remove_pks_clears_mapping_and_drops_empty_files() {
         let mut fi = FileIndex::new();
-        fi.add_file("p0".into(), vec!["k1".into(), "k2".into()], Vec::new());
-        fi.remove_pks(&["k1".into()]);
-        assert_eq!(fi.lookup("k1"), None);
-        assert_eq!(fi.lookup("k2"), Some("p0"));
+        fi.add_file("p0".into(), ks(&["k1", "k2"]), Vec::new());
+        fi.remove_pks(&ks(&["k1"]));
+        assert_eq!(fi.lookup(&k("k1")), None);
+        assert_eq!(fi.lookup(&k("k2")), Some("p0"));
         assert_eq!(fi.live_pk_count(), 1);
 
-        fi.remove_pks(&["k2".into()]);
+        fi.remove_pks(&ks(&["k2"]));
         assert!(fi.live_files().is_empty());
         assert_eq!(fi.live_pk_count(), 0);
     }
@@ -281,21 +386,24 @@ mod tests {
     fn add_file_with_overlapping_pk_remaps_to_new_file() {
         // Re-insert flow: a PK lives in p0, then a new file p1 covers it.
         let mut fi = FileIndex::new();
-        fi.add_file("p0".into(), vec!["k1".into()], Vec::new());
-        fi.add_file("p1".into(), vec!["k1".into()], Vec::new());
-        // The PK now points to p1.
-        assert_eq!(fi.lookup("k1"), Some("p1"));
-        // p0 still appears in live_files (it has the stale entry); it'll be
-        // GC'd when the materializer's equality delete removes that PK.
-        // What matters is the lookup is fresh.
+        fi.add_file("p0".into(), ks(&["k1", "k2"]), Vec::new());
+        fi.add_file("p1".into(), ks(&["k1"]), Vec::new());
+        assert_eq!(fi.lookup(&k("k1")), Some("p1"));
+        assert_eq!(
+            fi.live_rows_per_file(),
+            BTreeMap::from([("p0", 1), ("p1", 1)])
+        );
+        // p0's last live PK moves too: p0 leaves the index.
+        fi.add_file("p2".into(), ks(&["k2"]), Vec::new());
+        assert_eq!(fi.live_files(), vec!["p1", "p2"]);
     }
 
     #[test]
     fn affected_files_collects_distinct_paths() {
         let mut fi = FileIndex::new();
-        fi.add_file("p0".into(), vec!["k1".into(), "k2".into()], Vec::new());
-        fi.add_file("p1".into(), vec!["k3".into()], Vec::new());
-        let s = fi.affected_files(&["k1".into(), "k3".into(), "missing".into()]);
+        fi.add_file("p0".into(), ks(&["k1", "k2"]), Vec::new());
+        fi.add_file("p1".into(), ks(&["k3"]), Vec::new());
+        let s = fi.affected_files(&ks(&["k1", "k3", "missing"]));
         let v: Vec<&String> = s.iter().collect();
         assert_eq!(v, vec![&"p0".to_string(), &"p1".to_string()]);
     }
@@ -305,24 +413,24 @@ mod tests {
         let mut fi = FileIndex::new();
         fi.add_file(
             "p0".into(),
-            vec!["k1".into()],
+            ks(&["k1"]),
             vec![PartitionLiteral::String("us".into())],
         );
         fi.add_file(
             "p1".into(),
-            vec!["k2".into()],
+            ks(&["k2"]),
             vec![PartitionLiteral::String("eu".into())],
         );
         assert_eq!(
-            fi.partition_values_for_pk("k1"),
+            fi.partition_values_for_pk(&k("k1")),
             Some(&[PartitionLiteral::String("us".into())][..])
         );
         assert_eq!(
-            fi.partition_values_for_pk("k2"),
+            fi.partition_values_for_pk(&k("k2")),
             Some(&[PartitionLiteral::String("eu".into())][..])
         );
         // Missing PK → None.
-        assert_eq!(fi.partition_values_for_pk("missing"), None);
+        assert_eq!(fi.partition_values_for_pk(&k("missing")), None);
     }
 
     #[test]
@@ -331,8 +439,56 @@ mod tests {
         // None even though the PK is indexed. Callers should only consult
         // this for partitioned schemas.
         let mut fi = FileIndex::new();
-        fi.add_file("p0".into(), vec!["k1".into()], Vec::new());
-        assert_eq!(fi.partition_values_for_pk("k1"), None);
-        assert!(fi.contains_pk("k1"));
+        fi.add_file("p0".into(), ks(&["k1"]), Vec::new());
+        assert_eq!(fi.partition_values_for_pk(&k("k1")), None);
+        assert!(fi.contains_pk(&k("k1")));
+    }
+
+    #[test]
+    fn remove_file_after_its_pks_moved_needs_no_scan_and_forgets_it() {
+        let mut fi = FileIndex::new();
+        fi.add_file("in".into(), ks(&["k1", "k2"]), Vec::new());
+        fi.add_file("out".into(), ks(&["k1", "k2"]), Vec::new());
+        fi.remove_file("in");
+        assert_eq!(fi.live_files(), vec!["out"]);
+        assert_eq!(fi.live_pk_count(), 2);
+    }
+
+    #[test]
+    fn remove_file_drops_pks_still_pointing_at_it() {
+        let mut fi = FileIndex::new();
+        fi.add_file("a".into(), ks(&["k1", "k2"]), Vec::new());
+        fi.add_file("b".into(), ks(&["k3"]), Vec::new());
+        fi.remove_file("a");
+        assert_eq!(fi.live_pk_count(), 1);
+        assert_eq!(fi.lookup(&k("k3")), Some("b"));
+        assert_eq!(fi.live_files(), vec!["b"]);
+    }
+
+    #[test]
+    fn file_slots_are_reused() {
+        let mut fi = FileIndex::new();
+        for i in 0..100 {
+            fi.add_file(format!("p{i}"), ks(&["k"]), Vec::new());
+        }
+        assert_eq!(fi.live_files(), vec!["p99"]);
+        assert!(
+            fi.files.len() <= 2,
+            "{} slots for one live file",
+            fi.files.len()
+        );
+    }
+
+    #[test]
+    fn equality_ignores_file_numbering() {
+        let mut a = FileIndex::new();
+        a.add_file("p0".into(), ks(&["k1"]), Vec::new());
+        a.add_file("p1".into(), ks(&["k2"]), Vec::new());
+        let mut b = FileIndex::new();
+        b.add_file("p1".into(), ks(&["k2"]), Vec::new());
+        b.add_file("p0".into(), ks(&["k1"]), Vec::new());
+        assert_eq!(a, b);
+        b.add_file("p1".into(), ks(&["k1"]), Vec::new());
+        assert_ne!(a, b);
     }
 }

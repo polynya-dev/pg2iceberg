@@ -10,6 +10,7 @@
 //! file output. Folding upfront cuts both Parquet rows written and PG
 //! coord-update churn.
 
+use crate::pk::PkKey;
 use pg2iceberg_core::{ColumnName, Op, PgValue, Row};
 use pg2iceberg_stream::MatEvent;
 use std::collections::BTreeMap;
@@ -23,8 +24,10 @@ pub struct MaterializedRow {
     pub unchanged_cols: Vec<ColumnName>,
 }
 
-/// Build a canonical PK key from a row given the PK column list.
-/// Used for grouping during the fold and as the FileIndex key.
+/// The JSON text form of a row's PK: a stable string for keys that are
+/// persisted or compared as text (snapshot resume cursors, `verify`
+/// paging). Materialization keys rows by [`PkKey`], which unlike this
+/// treats a value the same whichever `PgValue` variant carries it.
 pub fn pk_key(row: &Row, pk_cols: &[ColumnName]) -> String {
     let parts: Vec<&PgValue> = pk_cols.iter().filter_map(|c| row.get(c)).collect();
     serde_json::to_string(&parts).expect("PgValue is Serializable")
@@ -46,9 +49,9 @@ pub fn pk_key(row: &Row, pk_cols: &[ColumnName]) -> String {
 /// applies an equality-delete that's a no-op if no prior data exists, so this
 /// is safe even when the row was never persisted to a data file.
 pub fn fold_events(events: Vec<MatEvent>, pk_cols: &[ColumnName]) -> Vec<MaterializedRow> {
-    let mut by_pk: BTreeMap<String, MaterializedRow> = BTreeMap::new();
+    let mut by_pk: BTreeMap<PkKey, MaterializedRow> = BTreeMap::new();
     for evt in events {
-        let key = pk_key(&evt.row, pk_cols);
+        let key = PkKey::from_row(&evt.row, pk_cols);
         let mut new_row = evt.row;
         let mut unchanged = evt.unchanged_cols;
         // Inherit unchanged-TOAST values from the prior event for the

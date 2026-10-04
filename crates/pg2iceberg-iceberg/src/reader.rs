@@ -13,6 +13,7 @@ use arrow_array::{
 };
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::ProjectionMask;
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimestampMicros};
 use pg2iceberg_core::{ColumnName, ColumnSchema, IcebergType, PgValue, Row};
 use std::collections::BTreeMap;
@@ -37,7 +38,8 @@ const DEFAULT_BATCH_ROWS: usize = 1024;
 /// Decodes a data file one record batch at a time, so a caller that
 /// processes rows as they come holds at most `batch_rows` decoded rows
 /// (plus the encoded file) instead of the whole file — a decoded `Row`
-/// is many times larger than its Parquet encoding.
+/// is many times larger than its Parquet encoding. Only the columns in
+/// `cols` are decoded, so reading just the PK of a wide row is cheap.
 pub struct RowBatches {
     reader: ParquetRecordBatchReader,
     cols: Vec<ColumnSchema>,
@@ -45,8 +47,16 @@ pub struct RowBatches {
 
 impl RowBatches {
     pub fn new(bytes: Bytes, cols: &[ColumnSchema], batch_rows: usize) -> Result<Self> {
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?
+        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?;
+        let parquet_schema = builder.parquet_schema();
+        let wanted = (0..parquet_schema.num_columns()).filter(|&i| {
+            let name = parquet_schema.column(i).path().string();
+            cols.iter().any(|c| c.name == name)
+        });
+        let projection = ProjectionMask::leaves(parquet_schema, wanted);
+        let reader = builder
+            .with_projection(projection)
             .with_batch_size(batch_rows.max(1))
             .build()
             .map_err(|e| WriterError::Encode(format!("parquet reader build: {e}")))?;

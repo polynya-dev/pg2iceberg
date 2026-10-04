@@ -104,9 +104,40 @@ fn schema() -> TableSchema {
     }
 }
 
+thread_local! {
+    /// Whether this case's `id` column is a Postgres `smallint`. Its
+    /// events carry `Int2`, but Iceberg stores it as `int`, so rows read
+    /// back from data files carry `Int4`: anything keyed by PK must treat
+    /// the two as the same key.
+    static SMALLINT_PK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn id_value(id: i32) -> PgValue {
+    if SMALLINT_PK.get() {
+        PgValue::Int2(id.try_into().expect("DST ids fit in smallint"))
+    } else {
+        PgValue::Int4(id)
+    }
+}
+
+/// A source row as Iceberg stores it (`smallint` → `int`), for
+/// comparing PG state with materialized state.
+fn stored(row: Row) -> Row {
+    row.into_iter()
+        .map(|(c, v)| match v {
+            PgValue::Int2(n) => (c, PgValue::Int4(n.into())),
+            v => (c, v),
+        })
+        .collect()
+}
+
+fn stored_rows(rows: Vec<Row>) -> Vec<Row> {
+    rows.into_iter().map(stored).collect()
+}
+
 fn row(id: i32, qty: i32) -> Row {
     let mut r = BTreeMap::new();
-    r.insert(ColumnName("id".into()), PgValue::Int4(id));
+    r.insert(ColumnName("id".into()), id_value(id));
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
     r
 }
@@ -131,7 +162,7 @@ fn noise_schema() -> TableSchema {
 
 fn pk_only(id: i32) -> Row {
     let mut r = BTreeMap::new();
-    r.insert(ColumnName("id".into()), PgValue::Int4(id));
+    r.insert(ColumnName("id".into()), id_value(id));
     r
 }
 
@@ -625,6 +656,43 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     if let Some(v) = h.audited.violations.lock().unwrap().first() {
         return Err(v.clone());
     }
+
+    // 11. The materializer's FileIndex is what the catalog holds.
+    file_index_matches_catalog(h)
+}
+
+/// Invariant 11: the materializer's FileIndex equals a rebuild from the
+/// catalog, and each file's live count equals the PKs pointing at it —
+/// compaction picks dirty files by those counts, and a file's count
+/// running high would make a dirty file look clean.
+fn file_index_matches_catalog(h: &DstHarness) -> Result<(), String> {
+    let Some(index) = h.materializer.file_index(&ident()) else {
+        return Ok(());
+    };
+    let mut pks_per_file: BTreeMap<&str, u64> = BTreeMap::new();
+    for pk in index.all_pks() {
+        let path = index.lookup(pk).expect("an indexed PK has a file");
+        *pks_per_file.entry(path).or_default() += 1;
+    }
+    if index.live_rows_per_file() != pks_per_file {
+        return Err(format!(
+            "invariant 11: FileIndex live counts {:?} != PKs per file {pks_per_file:?}",
+            index.live_rows_per_file()
+        ));
+    }
+    let rebuilt = block_on(pg2iceberg_iceberg::rebuild_from_catalog(
+        h.catalog.as_ref(),
+        h.blob_store.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    ))
+    .map_err(|e| format!("rebuild_from_catalog: {e}"))?;
+    if *index != rebuilt {
+        return Err(format!(
+            "invariant 11: FileIndex drifted from the catalog:\n  materializer={index:?}\n  rebuilt={rebuilt:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -661,11 +729,12 @@ async fn atomic_visibility(
             let e = &events[i];
             match e.op {
                 Op::Insert | Op::Update => {
-                    let after = e.after.clone().expect("insert/update carries after");
+                    let after = stored(e.after.clone().expect("insert/update carries after"));
                     state.insert(pk(&after), after);
                 }
                 Op::Delete => {
-                    state.remove(&pk(e.before.as_ref().expect("delete carries before")));
+                    let before = stored(e.before.clone().expect("delete carries before"));
+                    state.remove(&pk(&before));
                 }
                 _ => state.clear(),
             }
@@ -922,6 +991,7 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
 
     let mut pg_rows =
         h.db.read_table(&ident())
+            .map(stored_rows)
             .map_err(|e| format!("read_table: {e}"))?;
     sort_by_pk(&mut pg_rows);
 
@@ -1005,6 +1075,7 @@ fn check_invariants_with_snapshot(h: &mut DstHarness) -> Result<(), String> {
     sort_by_pk(&mut iceberg_rows);
     let mut pg_rows =
         h.db.read_table(&ident())
+            .map(stored_rows)
             .map_err(|e| format!("read_table: {e}"))?;
     sort_by_pk(&mut pg_rows);
     if iceberg_rows != pg_rows {
@@ -1021,9 +1092,14 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     /// Random workloads (including rollbacks and pipeline crashes) preserve
-    /// every checked invariant at quiescence.
+    /// every checked invariant at quiescence, with an `int` or a
+    /// `smallint` primary key.
     #[test]
-    fn pipeline_preserves_invariants_under_random_workload(steps in workload()) {
+    fn pipeline_preserves_invariants_under_random_workload(
+        steps in workload(),
+        smallint_pk in any::<bool>(),
+    ) {
+        SMALLINT_PK.set(smallint_pk);
         let mut h = DstHarness::boot();
         for (i, step) in steps.iter().enumerate() {
             h.run_step(step);
@@ -1055,6 +1131,39 @@ fn materializer_restart_never_overwrites_committed_files() {
     h.run_step(&Step::Insert { id: 2, qty: 20 });
     h.run_step(&Step::DriveFlush);
     h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
+/// A `smallint` key reads back from Iceberg as `int`. After a restart
+/// the FileIndex is rebuilt from data files, and a delete + re-insert of
+/// the key that folds into one `Insert` must still find the old row, or
+/// it survives next to the new one.
+#[test]
+fn smallint_pk_reinsert_after_restart_replaces_the_row() {
+    SMALLINT_PK.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::RestartMaterializer);
+    h.run_step(&Step::Delete { id: 1 });
+    h.run_step(&Step::Insert { id: 1, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
+/// Compaction feeds FileIndex keys read back from data files; for a
+/// `smallint` key they must match the keys of incoming events.
+#[test]
+fn smallint_pk_file_index_survives_compaction() {
+    SMALLINT_PK.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::Insert { id: 2, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Compact);
     check_invariants(&mut h).unwrap();
 }
 
@@ -1136,7 +1245,7 @@ fn truncate_inside_large_transaction_hides_its_earlier_inserts() {
     ))
     .unwrap();
     sort_by_pk(&mut iceberg);
-    let mut pg = h.db.read_table(&ident()).unwrap();
+    let mut pg = stored_rows(h.db.read_table(&ident()).unwrap());
     sort_by_pk(&mut pg);
     assert_eq!(iceberg, pg);
 }
