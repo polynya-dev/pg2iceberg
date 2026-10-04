@@ -49,15 +49,14 @@ pub struct StartupValidation {
     pub coord_flushed_lsn: Lsn,
     /// Source PG `server_version_num` (e.g. `160004` for 16.4).
     /// `0` means "skip the check" (DST sims always set 0; production
-    /// always reads a real value). pg2iceberg requires 13+ because
-    /// older PGs lack `pg_replication_slots.wal_status`.
+    /// always reads a real value). See [`MIN_PG_VERSION_NUM`].
     pub server_version_num: i32,
 }
 
-/// Minimum supported PostgreSQL `server_version_num`. PG 13.0 is
-/// `130000`; anything lower lacks `pg_replication_slots.wal_status`,
-/// which we depend on for the `SlotLost` startup invariant.
-pub const MIN_PG_VERSION_NUM: i32 = 130000;
+/// Minimum supported PostgreSQL `server_version_num`: PG 14.0. PG 13 is
+/// end-of-life (November 2025), and 14 is the first release whose
+/// pgoutput can stream in-progress transactions (protocol v2).
+pub const MIN_PG_VERSION_NUM: i32 = 140000;
 
 impl StartupValidation {
     /// `true` when no registered table has a stored snapshot state in
@@ -106,8 +105,8 @@ pub struct SlotState {
     /// read by another consumer).
     pub wal_status: Option<pg2iceberg_pg::WalStatus>,
     /// `true` indicates the slot was killed by physical-replication
-    /// conflict during recovery — unrecoverable. PG 14+ only; on PG
-    /// 13 this surfaces as `false`.
+    /// conflict during recovery — unrecoverable. PG 16+ only; on older
+    /// versions this surfaces as `false`.
     pub conflicting: bool,
 }
 
@@ -226,10 +225,8 @@ pub enum Violation {
 
     #[error(
         "PostgreSQL server_version_num is {found}, but pg2iceberg requires \
-         {required} or higher (PG 13+). Older versions lack the \
-         `pg_replication_slots.wal_status` column required for safe slot \
-         health checks. Upgrade the source PG cluster, or pin a different \
-         pg2iceberg version that supports your PG."
+         {required} or higher (PG 14+). Upgrade the source PG cluster, or \
+         pin an older pg2iceberg release that supports your PG."
     )]
     PgVersionTooOld { found: i32, required: i32 },
 }
@@ -245,7 +242,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     let mut violations = Vec::new();
     let fresh = v.fresh();
 
-    // 0. Refuse to start on PG < 13. Sim leaves this as 0 (skip).
+    // 0. Refuse to start on PG < 14. Sim leaves this as 0 (skip).
     if v.server_version_num != 0 && v.server_version_num < MIN_PG_VERSION_NUM {
         violations.push(Violation::PgVersionTooOld {
             found: v.server_version_num,
@@ -348,7 +345,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
     //  `TableIdentityChanged` — a recreate produces a new pg_oid.)
 
     // 8. Slot is `lost` — WAL recycled past `max_slot_wal_keep_size`.
-    //    `wal_status = None` (pre-PG-13) skips this check.
+    //    `wal_status = None` (transient SQL NULL) skips this check.
     if v.slot.exists && matches!(v.slot.wal_status, Some(pg2iceberg_pg::WalStatus::Lost)) {
         violations.push(Violation::SlotLost {
             slot_name: v.slot_name.clone(),
@@ -356,7 +353,7 @@ pub fn validate_startup(v: &StartupValidation) -> std::result::Result<(), Valida
         });
     }
 
-    // 9. Slot is `conflicting` (PG 14+) — killed by physical-rep conflict.
+    // 9. Slot is `conflicting` (PG 16+) — killed by physical-rep conflict.
     if v.slot.exists && v.slot.conflicting {
         violations.push(Violation::SlotConflicting {
             slot_name: v.slot_name.clone(),

@@ -135,7 +135,7 @@ pub struct WatcherInputs {
     /// message so the operator can correlate against PG's WAL
     /// retention.
     pub slot_restart_lsn: Lsn,
-    /// Slot's `conflicting` flag (PG 14+). `true` triggers the
+    /// Slot's `conflicting` flag (PG 16+). `true` triggers the
     /// `SlotConflicting` fatal violation.
     pub slot_conflicting: bool,
 }

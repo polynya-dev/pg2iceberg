@@ -6,13 +6,13 @@
 
 use crate::sink::{FlushOutput, Sink, SinkError, TableChunk};
 use async_trait::async_trait;
-use bytes::Bytes;
 use pg2iceberg_coord::{
     CommitBatch, CoordCommitReceipt, CoordError, Coordinator, MarkerInfo, OffsetClaim,
 };
 use pg2iceberg_core::metrics::{names, Labels};
 use pg2iceberg_core::{ColumnName, Lsn, Metrics, NoopMetrics, Op, PgValue, TableIdent};
 use pg2iceberg_pg::DecodedMessage;
+use pg2iceberg_stream::codec::EncodedChunk;
 use pg2iceberg_stream::{BlobStore, StreamError};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,6 +69,15 @@ impl BlobNamer for CounterBlobNamer {
 /// it without re-parameterizing.
 pub struct Pipeline<C: Coordinator + ?Sized> {
     sink: Sink,
+    /// Change events the pipeline may hold in memory before it stages
+    /// them (`sink.flush_rows`).
+    flush_threshold: usize,
+    /// Chunks of still-open transactions, staged but not yet claimed —
+    /// invisible to the materializer until their transaction commits.
+    spilled: BTreeMap<u32, Vec<OffsetClaim>>,
+    /// Spilled chunks whose transaction has committed; claimed by the
+    /// next flush, ahead of the sink's chunks.
+    committed_spills: Vec<OffsetClaim>,
     coord: Arc<C>,
     blob_store: Arc<dyn BlobStore>,
     namer: Arc<dyn BlobNamer>,
@@ -144,6 +153,9 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     ) -> Self {
         Self {
             sink: Sink::new(flush_threshold),
+            flush_threshold,
+            spilled: BTreeMap::new(),
+            committed_spills: Vec::new(),
             coord,
             blob_store,
             namer,
@@ -205,6 +217,11 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         Lsn(self.flushed_lsn.load(Ordering::SeqCst))
     }
 
+    /// Change events currently held in memory (see [`Sink::buffered_rows`]).
+    pub fn buffered_rows(&self) -> usize {
+        self.sink.buffered_rows()
+    }
+
     pub async fn process(&mut self, msg: DecodedMessage) -> Result<()> {
         if self.shut_down {
             // Refuse new events after shutdown. Caller bug if this fires.
@@ -222,8 +239,20 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                     }
                 }
                 self.sink.commit_tx(xid, commit_lsn);
+                // A transaction staged in chunks is claimed as soon as it
+                // commits, keeping the log in commit order (see
+                // `spill_if_full`). Otherwise flush once enough rows are
+                // waiting, so memory stays bounded however fast
+                // transactions arrive.
+                if let Some(chunks) = self.spilled.remove(&xid) {
+                    self.committed_spills.extend(chunks);
+                    self.flush().await?;
+                } else if self.sink.committed_rows() >= self.flush_threshold {
+                    self.flush().await?;
+                }
             }
             DecodedMessage::Change(mut evt) => {
+                let xid = evt.xid;
                 // Translate the PG-side ident from the pgoutput stream
                 // into the Iceberg-side ident the rest of the
                 // pipeline (staging path, log_index keys, coord
@@ -287,11 +316,13 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                             // doesn't carry duplicate data.
                             upd.before = None;
                             self.sink.record_change(upd)?;
+                            self.spill_if_full(xid).await?;
                             return Ok(());
                         }
                     }
                 }
                 self.sink.record_change(evt)?;
+                self.spill_if_full(xid).await?;
             }
             DecodedMessage::Relation { .. } => {
                 // Schema evolution is applied via
@@ -354,30 +385,11 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             // so the receipt is the single LSN-advance code path.
         }
 
-        let mut claims = Vec::with_capacity(chunks.len());
-        let mut total_records = 0u64;
+        // A committed transaction's spilled chunks precede its remainder.
+        let mut claims = self.committed_spills.clone();
         for TableChunk { table, chunk } in chunks {
-            let path = self.namer.next_blob_path(&table.name).await;
-            let byte_size = chunk.bytes.len() as u64;
-            self.blob_store
-                .put(&path, Bytes::clone(&chunk.bytes))
-                .await?;
-            let mut labels = Labels::new();
-            labels.insert("table".into(), table.name.clone());
-            self.metrics.counter(
-                names::PIPELINE_ROWS_STAGED_TOTAL,
-                &labels,
-                chunk.record_count,
-            );
-            total_records += chunk.record_count;
-            claims.push(OffsetClaim {
-                table,
-                record_count: chunk.record_count,
-                byte_size,
-                s3_path: path,
-            });
+            claims.push(self.stage(table, chunk).await?);
         }
-        let _ = total_records;
 
         // Drain ready markers into the batch. claim_offsets writes
         // them atomically with the log_index rows so a crash
@@ -394,6 +406,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         };
         let receipt = self.coord.claim_offsets(&batch).await?;
         self.ready_markers.clear();
+        self.committed_spills.clear();
         self.advance_flushed_lsn(receipt);
 
         // Emit per-flush counters + the flushed_lsn gauge.
@@ -408,6 +421,53 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             flushable_lsn.0 as f64,
         );
         Ok(Some(flushable_lsn))
+    }
+
+    /// Stage the open transaction `xid` in chunks once it buffers
+    /// `flush_threshold` rows, so transaction size never bounds memory.
+    /// The chunks stay unclaimed — invisible to the materializer — until
+    /// the transaction commits.
+    ///
+    /// Relies on pgoutput (protocol v1) delivering transactions whole and
+    /// in commit order: at most one is open, and nothing else commits
+    /// before it does. Claiming everything already committed first
+    /// therefore keeps the log in commit order. A crash before the commit
+    /// orphans the chunks; the slot replays the whole transaction.
+    async fn spill_if_full(&mut self, xid: Option<u32>) -> Result<()> {
+        let Some(xid) = xid else {
+            return Ok(());
+        };
+        if self.sink.open_tx_rows(xid) < self.flush_threshold {
+            return Ok(());
+        }
+        if self.sink.has_committed() {
+            self.flush().await?;
+        }
+        for TableChunk { table, chunk } in self.sink.spill_open_tx(xid)? {
+            let claim = self.stage(table, chunk).await?;
+            self.spilled.entry(xid).or_default().push(claim);
+        }
+        Ok(())
+    }
+
+    /// Upload one encoded chunk; returns the claim that registers it.
+    async fn stage(&self, table: TableIdent, chunk: EncodedChunk) -> Result<OffsetClaim> {
+        let path = self.namer.next_blob_path(&table.name).await;
+        let byte_size = chunk.bytes.len() as u64;
+        self.blob_store.put(&path, chunk.bytes).await?;
+        let mut labels = Labels::new();
+        labels.insert("table".into(), table.name.clone());
+        self.metrics.counter(
+            names::PIPELINE_ROWS_STAGED_TOTAL,
+            &labels,
+            chunk.record_count,
+        );
+        Ok(OffsetClaim {
+            table,
+            record_count: chunk.record_count,
+            byte_size,
+            s3_path: path,
+        })
     }
 
     /// Graceful shutdown: drain whatever's already buffered into committed

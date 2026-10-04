@@ -309,7 +309,7 @@ async fn slot_health_query_works_against_real_pg() {
         Some(pg2iceberg_pg::WalStatus::Reserved),
         "fresh slot should be Reserved under default settings"
     );
-    // PG 14+ has the `conflicting` column and reports false on a
+    // PG 16+ has the `conflicting` column and reports false on a
     // healthy non-physical slot.
     assert!(!h.conflicting);
 

@@ -46,6 +46,8 @@ Not yet published.
 
 ### PostgreSQL
 
+PostgreSQL 14 or newer is required; pg2iceberg refuses to start against an older server.
+
 Logical replication must be enabled. Set the following in `postgresql.conf`:
 
 ```ini

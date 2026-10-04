@@ -108,7 +108,7 @@ pub struct SlotState {
     /// via [`SimPostgres::set_slot_wal_status`] to model a slot
     /// transitioning toward `lost`.
     pub wal_status: SimWalStatus,
-    /// Mirrors `pg_replication_slots.conflicting` (PG 14+). Tests
+    /// Mirrors `pg_replication_slots.conflicting` (PG 16+). Tests
     /// can flip to `true` via
     /// [`SimPostgres::set_slot_conflicting`] to model a slot killed
     /// by physical-replication conflict.
@@ -516,7 +516,7 @@ impl SimPostgres {
         Ok(())
     }
 
-    /// Test hook: flip a slot's `conflicting` flag. Models PG 14+'s
+    /// Test hook: flip a slot's `conflicting` flag. Models PG 16+'s
     /// physical-replication-conflict slot kill.
     pub fn set_slot_conflicting(&self, name: &str, conflicting: bool) -> Result<()> {
         let mut s = self.state.lock().unwrap();
