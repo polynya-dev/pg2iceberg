@@ -263,7 +263,6 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
             name: "public.placeholder".into(),
             skip_snapshot: false,
             primary_key: vec![],
-            watermark_column: String::new(),
             columns: vec![],
             iceberg: Default::default(),
         }],
@@ -271,7 +270,6 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
             mode: "logical".into(),
             postgres: PostgresConfig::default(),
             logical: LogicalConfig::default(),
-            query: Default::default(),
         },
         sink: SinkConfig {
             catalog_uri: stack.catalog_url.clone(),

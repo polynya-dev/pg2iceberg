@@ -25,14 +25,14 @@ To disable: leave `meta_namespace` empty.
 
 ### `commits`
 
-One row per materialization or query-mode flush, per table. Partitioned by `day(ts)`.
+One row per materialization, per table. Partitioned by `day(ts)`.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `ts` | `timestamptz` | Commit timestamp |
 | `worker_id` | `text` | Worker ID (distributed mode) |
 | `table_name` | `text` | Source table (e.g. `public.orders`) |
-| `mode` | `text` | `materialize` or `query` |
+| `mode` | `text` | Always `logical` |
 | `snapshot_id` | `bigint` | Iceberg snapshot ID |
 | `sequence_number` | `bigint` | Monotonic sequence per table |
 | `lsn` | `bigint` | PostgreSQL WAL LSN at commit |

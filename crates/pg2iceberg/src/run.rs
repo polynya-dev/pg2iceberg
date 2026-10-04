@@ -72,11 +72,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let blob = build_blob_for_run(&cfg, &catalog)
         .await
         .context("build blob store")?;
-    match cfg.source.mode.as_str() {
-        "" | "logical" => run_inner(cfg, catalog, blob).await,
-        "query" => run_query(cfg, catalog, blob).await,
-        other => anyhow::bail!("unknown source.mode {other:?}; expected one of: logical, query"),
-    }
+    run_inner(cfg, catalog, blob).await
 }
 
 /// Build a REST `iceberg::Catalog` from sink config. We default to the
@@ -121,7 +117,7 @@ fn build_blob(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
     }
 }
 
-/// Async blob-store builder used by [`run`] (logical + query modes).
+/// Async blob-store builder used by [`run`].
 /// Routes to [`build_blob`] for `static` / `iam` modes, and to the
 /// vended-credentials path for `vended`. The latter requires the
 /// catalog because it has to load each registered table to obtain
@@ -269,12 +265,6 @@ pub async fn run_stream_only(cfg: Config) -> Result<()> {
     let blob = build_blob_for_run(&cfg, &catalog)
         .await
         .context("build blob store")?;
-    if !cfg.source.mode.is_empty() && cfg.source.mode != "logical" {
-        anyhow::bail!(
-            "stream-only is logical-mode only; got source.mode={:?}",
-            cfg.source.mode
-        );
-    }
     run_inner_with_schedule(
         cfg,
         catalog,
@@ -422,47 +412,6 @@ where
     pg2iceberg_validate::run_logical_lifecycle(lifecycle, Box::pin(shutdown))
         .await
         .context("logical lifecycle")?;
-    Ok(())
-}
-
-/// Query-mode driver. Polls each table for rows whose watermark
-/// column has advanced past the stored cursor, dedups by PK, writes
-/// directly to the materialized Iceberg table — no replication slot,
-/// no staging Parquet, no coord log_seq/log_index. Persistence of the
-/// per-table watermark goes into the same `_pg2iceberg.checkpoints`
-/// table (`Checkpoint::query_watermarks`) so a restarted process
-/// resumes from where the prior left off.
-///
-/// Each table needs `watermark_column` set in YAML. Watermark column
-/// must be int/long/date/timestamp/timestamptz; other types are
-/// rejected at startup.
-async fn run_query<C>(
-    cfg: Config,
-    catalog: IcebergRustCatalog<C>,
-    blob: Arc<dyn BlobStore>,
-) -> Result<()>
-where
-    C: iceberg::Catalog + Send + Sync + 'static,
-{
-    // Build prod components, then hand off to
-    // `pg2iceberg_query::run_query_lifecycle`. Same pattern as
-    // logical mode: construction here, lifecycle orchestration in
-    // library code so the fault-DST exercises the same path.
-    let lifecycle = crate::setup::build_query_lifecycle(&cfg, catalog, blob).await?;
-
-    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
-    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
-    let shutdown = async move {
-        tokio::select! {
-            biased;
-            _ = sigint.recv() => tracing::info!("SIGINT received, query-mode shutting down"),
-            _ = sigterm.recv() => tracing::info!("SIGTERM received, query-mode shutting down"),
-        }
-    };
-
-    pg2iceberg_query::run_query_lifecycle(lifecycle, Box::pin(shutdown))
-        .await
-        .context("query lifecycle")?;
     Ok(())
 }
 

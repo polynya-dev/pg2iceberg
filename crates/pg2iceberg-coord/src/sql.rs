@@ -27,12 +27,11 @@ pub fn drop_schema(schema: &CoordSchema) -> String {
 ///
 /// Mirrors `stream/coordinator_pg.go:73-104` for the WAL/cursor
 /// tables, and replaces Go's single-row `_pg2iceberg.checkpoints`
-/// blob with four narrower per-concern tables:
+/// blob with three narrower per-concern tables:
 ///
 /// - `pipeline_meta` — single-row cluster fingerprint
 /// - `tables` — per-table snapshot status
 /// - `snapshot_progress` — per-table mid-snapshot resume cursor
-/// - `query_watermarks` — per-table watermark for query mode
 ///
 /// Each is an idempotent UPSERT in its hot path; no OCC, no
 /// SHA-256 sealing, no schema versioning. Multi-writer becomes
@@ -149,17 +148,6 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
                 updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
             )",
             schema.qualify("snapshot_progress")
-        ),
-        // Per-table watermark for query mode. JSONB so any PgValue
-        // (timestamp, bigint, uuid, text) round-trips without a
-        // wire-format change.
-        format!(
-            "CREATE TABLE IF NOT EXISTS {} (
-                table_name TEXT PRIMARY KEY,
-                watermark  JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )",
-            schema.qualify("query_watermarks")
         ),
         // Blue-green marker bookkeeping. Populated by
         // `claim_offsets` when the pipeline observed a
@@ -481,25 +469,6 @@ pub fn delete_snapshot_progress(schema: &CoordSchema) -> String {
     )
 }
 
-// ── Per-table query-mode watermark ────────────────────────────────────
-
-pub fn select_query_watermark(schema: &CoordSchema) -> String {
-    format!(
-        "SELECT watermark FROM {} WHERE table_name = $1",
-        schema.qualify("query_watermarks")
-    )
-}
-
-pub fn upsert_query_watermark(schema: &CoordSchema) -> String {
-    format!(
-        "INSERT INTO {} (table_name, watermark, updated_at) \
-         VALUES ($1, $2, now()) \
-         ON CONFLICT (table_name) DO UPDATE \
-         SET watermark = $2, updated_at = now()",
-        schema.qualify("query_watermarks")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,11 +480,11 @@ mod tests {
         // 6 base CREATE TABLEs (log_seq, log_index, mat_cursor, lock,
         // consumer, pending_markers, marker_emissions)
         // + 1 ALTER TABLE (log_index.flushable_lsn)
-        // + 5 new per-concern tables (pipeline_meta, flushed_lsn,
-        //   tables, snapshot_progress, query_watermarks)
-        // = 13. Each statement is idempotent (CREATE TABLE IF NOT
+        // + 4 new per-concern tables (pipeline_meta, flushed_lsn,
+        //   tables, snapshot_progress)
+        // = 12. Each statement is idempotent (CREATE TABLE IF NOT
         // EXISTS or ADD COLUMN IF NOT EXISTS).
-        assert_eq!(stmts.len(), 13);
+        assert_eq!(stmts.len(), 12);
         for stmt in &stmts {
             assert!(
                 stmt.contains("IF NOT EXISTS"),
@@ -523,13 +492,12 @@ mod tests {
             );
             assert!(stmt.contains("_pg2iceberg."));
         }
-        // Check that the five new per-concern tables are present.
+        // Check that the four new per-concern tables are present.
         for name in [
             "pipeline_meta",
             "flushed_lsn",
             "tables",
             "snapshot_progress",
-            "query_watermarks",
         ] {
             assert!(
                 stmts
@@ -573,7 +541,6 @@ mod tests {
             upsert_pipeline_meta(&s),
             mark_table_complete(&s),
             upsert_snapshot_progress(&s),
-            upsert_query_watermark(&s),
         ] {
             assert!(
                 q.contains("ON CONFLICT"),

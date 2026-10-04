@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use pg2iceberg_coord::TableSnapshotState;
-use pg2iceberg_core::{ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema};
+use pg2iceberg_core::{ColumnSchema, IcebergType, Lsn, Namespace, TableIdent, TableSchema};
 use pg2iceberg_pg::WalStatus;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
@@ -77,20 +77,20 @@ async fn build_startup_validation(db: &SimPostgres, slot_name: &str) -> StartupV
 
     let health = pg_arc.slot_health(slot_name).await.unwrap();
     let slot = match health {
-        Some(h) => Some(SlotState {
+        Some(h) => SlotState {
             exists: true,
             restart_lsn: h.restart_lsn,
             confirmed_flush_lsn: h.confirmed_flush_lsn,
             wal_status: h.wal_status,
             conflicting: h.conflicting,
-        }),
-        None => Some(SlotState {
+        },
+        None => SlotState {
             exists: false,
             restart_lsn: Lsn::ZERO,
             confirmed_flush_lsn: Lsn::ZERO,
             wal_status: None,
             conflicting: false,
-        }),
+        },
     };
 
     // Stage per-table snapshot state so the irrelevant invariants
@@ -114,7 +114,6 @@ async fn build_startup_validation(db: &SimPostgres, slot_name: &str) -> StartupV
             stored_state: stored,
         }],
         slot,
-        config_mode: Mode::Logical,
         slot_name: slot_name.into(),
         publication_name: PUB.into(),
         // Match the slot's confirmed_flush_lsn so the tamper-detection

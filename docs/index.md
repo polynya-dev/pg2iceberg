@@ -8,12 +8,7 @@ Replicate PostgreSQL tables to Apache Iceberg in real time using logical replica
 
 ## What is pg2iceberg?
 
-pg2iceberg captures row-level changes from PostgreSQL and writes them to Apache Iceberg tables. It supports two replication modes:
-
-- **Logical replication** (recommended) — full CDC via PostgreSQL's `pgoutput` plugin, including deletes and schema changes
-- **Query mode** — watermark-based polling for simpler setups where full CDC is not required
-
-Both modes support an initial snapshot so your Iceberg tables are seeded before streaming begins.
+pg2iceberg captures row-level changes from PostgreSQL via logical replication — full CDC through PostgreSQL's `pgoutput` plugin, including deletes and schema changes — and writes them to Apache Iceberg tables. An initial snapshot seeds your Iceberg tables before streaming begins.
 
 ## Key features
 

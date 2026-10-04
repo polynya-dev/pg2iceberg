@@ -26,7 +26,7 @@
 use std::sync::Arc;
 
 use pg2iceberg_coord::TableSnapshotState;
-use pg2iceberg_core::{ColumnSchema, IcebergType, Lsn, Mode, Namespace, TableIdent, TableSchema};
+use pg2iceberg_core::{ColumnSchema, IcebergType, Lsn, Namespace, TableIdent, TableSchema};
 use pg2iceberg_sim::postgres::{SimPgClient, SimPostgres};
 use pg2iceberg_validate::{
     validate_startup, SlotState, StartupValidation, TableExistence, Violation,
@@ -81,20 +81,20 @@ async fn build_startup(
 
     let health = pg.slot_health(SLOT).await.unwrap();
     let slot = match health {
-        Some(h) => Some(SlotState {
+        Some(h) => SlotState {
             exists: true,
             restart_lsn: h.restart_lsn,
             confirmed_flush_lsn: h.confirmed_flush_lsn,
             wal_status: h.wal_status,
             conflicting: h.conflicting,
-        }),
-        None => Some(SlotState {
+        },
+        None => SlotState {
             exists: false,
             restart_lsn: Lsn::ZERO,
             confirmed_flush_lsn: Lsn::ZERO,
             wal_status: None,
             conflicting: false,
-        }),
+        },
     };
 
     StartupValidation {
@@ -108,7 +108,6 @@ async fn build_startup(
             stored_state,
         }],
         slot,
-        config_mode: Mode::Logical,
         slot_name: SLOT.into(),
         publication_name: PUB.into(),
         // Match the slot's confirmed_flush_lsn so tamper detection

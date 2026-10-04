@@ -11,7 +11,7 @@ pg2iceberg is configured via a YAML file passed with `--config`. Environment var
 ```yaml
 # Replication source
 source:
-  mode: logical                  # "logical" (default) or "query"
+  mode: logical                  # the only mode (default); may be omitted
   postgres:
     host: ""                     # required
     port: 5432
@@ -23,15 +23,11 @@ source:
                                  #   webpki-roots verification; finer-grained
                                  #   modes (mTLS, custom CA) are follow-ons.
 
-  # Logical replication mode settings
+  # Logical replication settings
   logical:
     publication_name: pg2iceberg_pub
     slot_name: pg2iceberg_slot
     standby_interval: 10s        # how often the standby_status ack is sent
-
-  # Query mode settings
-  query:
-    poll_interval: 30s
 
 # Tables to replicate
 tables:
@@ -54,9 +50,6 @@ tables:
     # Skip the initial snapshot for this table (already populated by some
     # other process). Default: false.
     # skip_snapshot: false
-
-    # Query mode only
-    # watermark_column: updated_at
 
 # Iceberg sink
 sink:

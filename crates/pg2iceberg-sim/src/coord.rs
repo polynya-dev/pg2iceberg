@@ -49,8 +49,6 @@ struct State {
     table_states: BTreeMap<TableIdent, TableSnapshotState>,
     /// Per-table mid-snapshot resume cursor (`snapshot_progress`).
     snapshot_progress: BTreeMap<TableIdent, String>,
-    /// Per-table query-mode watermark (`query_watermarks`).
-    query_watermarks: BTreeMap<TableIdent, pg2iceberg_core::PgValue>,
     /// Pending marker UUIDs observed by `claim_offsets`. Persisted
     /// alongside the log_index rows so the materializer can read
     /// them post-cycle (see [`Coordinator::pending_markers_for_table`]).
@@ -398,32 +396,6 @@ impl Coordinator for MemoryCoordinator {
 
     async fn clear_snapshot_progress(&self, ident: &TableIdent) -> Result<()> {
         self.state.lock().unwrap().snapshot_progress.remove(ident);
-        Ok(())
-    }
-
-    async fn query_watermark(
-        &self,
-        ident: &TableIdent,
-    ) -> Result<Option<pg2iceberg_core::PgValue>> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .query_watermarks
-            .get(ident)
-            .cloned())
-    }
-
-    async fn set_query_watermark(
-        &self,
-        ident: &TableIdent,
-        watermark: &pg2iceberg_core::PgValue,
-    ) -> Result<()> {
-        self.state
-            .lock()
-            .unwrap()
-            .query_watermarks
-            .insert(ident.clone(), watermark.clone());
         Ok(())
     }
 

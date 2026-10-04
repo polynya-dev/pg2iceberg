@@ -27,7 +27,6 @@ use pg2iceberg_core::{
 use pg2iceberg_pg::{
     DecodedMessage, PgClient, PgError, ReplicationStream, SlotMonitor, SnapshotId,
 };
-use pg2iceberg_query::{watermark_compare, QueryError, WatermarkSource};
 use pg2iceberg_snapshot::{SnapshotError, SnapshotSource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -1175,50 +1174,6 @@ impl SnapshotSource for SimPostgres {
             .collect();
 
         Ok(chunk)
-    }
-}
-
-#[async_trait]
-impl WatermarkSource for SimPostgres {
-    async fn read_after(
-        &self,
-        ident: &TableIdent,
-        watermark_col: &str,
-        after: Option<&PgValue>,
-        limit: Option<usize>,
-    ) -> std::result::Result<Vec<Row>, QueryError> {
-        let mut rows =
-            SimPostgres::read_table(self, ident).map_err(|e| QueryError::Source(e.to_string()))?;
-        let key = ColumnName(watermark_col.to_string());
-
-        // Filter rows whose watermark > `after`. Rows missing the column are
-        // skipped (matches PG behavior of `wm > NULL` excluding the row).
-        if let Some(threshold) = after {
-            rows.retain(|r| {
-                r.get(&key)
-                    .and_then(|v| watermark_compare(v, threshold).ok())
-                    .is_some_and(|ord| ord == std::cmp::Ordering::Greater)
-            });
-        } else {
-            rows.retain(|r| r.get(&key).is_some());
-        }
-
-        // Sort ASC by watermark. Rows with mismatched types fail the
-        // comparison; we treat them as Equal (preserves stability without
-        // panicking).
-        rows.sort_by(|a, b| {
-            let av = a.get(&key);
-            let bv = b.get(&key);
-            match (av, bv) {
-                (Some(x), Some(y)) => watermark_compare(x, y).unwrap_or(std::cmp::Ordering::Equal),
-                _ => std::cmp::Ordering::Equal,
-            }
-        });
-
-        if let Some(n) = limit {
-            rows.truncate(n);
-        }
-        Ok(rows)
     }
 }
 

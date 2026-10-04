@@ -16,7 +16,7 @@ use pg2iceberg_coord::{
     schema::CoordSchema,
     Coordinator,
 };
-use pg2iceberg_core::{InMemoryMetrics, Mode, TableIdent, TableSchema};
+use pg2iceberg_core::{InMemoryMetrics, TableIdent, TableSchema};
 use pg2iceberg_iceberg::prod::IcebergRustCatalog;
 use pg2iceberg_logical::{materializer::CounterMaterializerNamer, pipeline::BlobNamer};
 use pg2iceberg_pg::{
@@ -26,7 +26,6 @@ use pg2iceberg_pg::{
 use pg2iceberg_stream::BlobStore;
 use pg2iceberg_validate::{LifecycleError, LogicalLifecycle, SnapshotSourceFactoryFut};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Build the [`LogicalLifecycle`] inputs from a YAML config and
 /// already-opened catalog/blob handles. After this returns, the
@@ -148,7 +147,6 @@ where
         ))),
         blob_namer,
         metrics: Arc::new(InMemoryMetrics::new()),
-        mode: Mode::Logical,
         // Blue-green marker mode. Operators set
         // `sink.meta_namespace: "_pg2iceberg_<env>"` in YAML to
         // opt in.
@@ -157,133 +155,6 @@ where
         } else {
             Some(cfg.sink.meta_namespace.clone())
         },
-    })
-}
-
-/// Query-mode equivalent of [`build_logical_lifecycle`]. Builds the
-/// prod components and packs them into a [`QueryLifecycle`] for the
-/// library helper to drive.
-#[allow(clippy::type_complexity)]
-pub async fn build_query_lifecycle<C>(
-    cfg: &Config,
-    catalog: IcebergRustCatalog<C>,
-    blob: Arc<dyn BlobStore>,
-) -> Result<pg2iceberg_query::QueryLifecycle<IcebergRustCatalog<C>>>
-where
-    C: iceberg::Catalog + Send + Sync + 'static,
-{
-    use pg2iceberg_query::{QueryLifecycle, QueryLifecycleError};
-
-    let coord_dsn = cfg.coord_dsn();
-    let coord_tls = match cfg.source.postgres.tls_label() {
-        "webpki" => CoordTls::Webpki,
-        _ => CoordTls::Disable,
-    };
-    let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
-        .await
-        .context("coord connect")?;
-    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
-    let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
-    coord_concrete.migrate().await.context("coord migrate")?;
-    let coord: Arc<dyn Coordinator> = coord_concrete;
-
-    let pg_tls = match cfg.source.postgres.tls_label() {
-        "webpki" => PgTls::Webpki,
-        _ => PgTls::Disable,
-    };
-    let pg = PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
-        .await
-        .context("PG connect")?;
-
-    // Resolve schemas + watermark column per table.
-    let mut tables: Vec<(TableSchema, String)> = Vec::with_capacity(cfg.tables.len());
-    for t in &cfg.tables {
-        if t.watermark_column.is_empty() {
-            anyhow::bail!(
-                "query mode requires `watermark_column` on every table; missing on {}",
-                t.name
-            );
-        }
-        let schema = if t.has_explicit_columns() {
-            t.to_table_schema()?
-        } else {
-            let (ns, name) = t.qualified()?;
-            tracing::info!(table = %t.name, "discovering schema from PG");
-            let mut s = pg
-                .discover_schema(&ns, &name)
-                .await
-                .with_context(|| format!("discover schema for {}", t.name))?;
-            if !t.primary_key.is_empty() {
-                let pk_set: std::collections::BTreeSet<&str> =
-                    t.primary_key.iter().map(String::as_str).collect();
-                for col in &mut s.columns {
-                    let now_pk = pk_set.contains(col.name.as_str());
-                    col.is_primary_key = now_pk;
-                    if now_pk {
-                        col.nullable = false;
-                    }
-                }
-            }
-            s.partition_spec = pg2iceberg_core::parse_partition_spec(&t.iceberg.partition)
-                .map_err(|e| anyhow::anyhow!("partition spec for {}: {e}", t.name))?;
-            s
-        };
-        if !schema.columns.iter().any(|c| c.is_primary_key) {
-            anyhow::bail!(
-                "table {} has no primary key; query mode requires PKs for dedup",
-                t.name
-            );
-        }
-        tables.push((schema, t.watermark_column.clone()));
-    }
-
-    let pg_cfg = cfg.source.postgres.clone();
-    let source_factory: Box<
-        dyn FnOnce(
-                &[(TableSchema, String)],
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = std::result::Result<
-                                Box<dyn pg2iceberg_query::WatermarkSource>,
-                                QueryLifecycleError,
-                            >,
-                        > + Send,
-                >,
-            > + Send,
-    > = Box::new(move |tables| {
-        let pg_cfg = pg_cfg.clone();
-        let tables = tables.to_vec();
-        Box::pin(async move {
-            let source = crate::snapshot_src::PgWatermarkSource::open(&pg_cfg, &tables)
-                .await
-                .map_err(|e| QueryLifecycleError::Config(format!("{e:#}")))?;
-            Ok::<Box<dyn pg2iceberg_query::WatermarkSource>, QueryLifecycleError>(Box::new(source))
-        })
-    });
-
-    let poll_interval = if cfg.source.query.poll_interval.is_empty() {
-        Duration::from_secs(30)
-    } else {
-        humantime::parse_duration(&cfg.source.query.poll_interval).with_context(|| {
-            format!(
-                "parse query.poll_interval `{}`",
-                cfg.source.query.poll_interval
-            )
-        })?
-    };
-
-    Ok(QueryLifecycle {
-        coord,
-        catalog: Arc::new(catalog),
-        blob,
-        materializer_namer: Arc::new(CounterMaterializerNamer::new(format!(
-            "{}/materialized",
-            cfg.sink.warehouse.trim_end_matches('/')
-        ))),
-        tables,
-        source_factory,
-        poll_interval,
     })
 }
 

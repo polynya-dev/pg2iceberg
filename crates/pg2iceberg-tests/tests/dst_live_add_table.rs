@@ -33,8 +33,8 @@ use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
-    ColumnName, ColumnSchema, IdGen, Mode, Namespace, PgValue, Row, TableIdent, TableSchema,
-    Timestamp, WorkerId,
+    ColumnName, ColumnSchema, IdGen, Namespace, PgValue, Row, TableIdent, TableSchema, Timestamp,
+    WorkerId,
 };
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{CounterMaterializerNamer, Materializer, Pipeline, Schedule};
@@ -239,7 +239,6 @@ async fn live_add_table_backfills_via_background_snapshot() {
         materializer_namer: Arc::new(CounterMaterializerNamer::new("s3://table")),
         blob_namer: Arc::new(CounterBlobNamer::new("s3://stage")),
         metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
-        mode: Mode::Logical,
         meta_namespace: None,
     };
 

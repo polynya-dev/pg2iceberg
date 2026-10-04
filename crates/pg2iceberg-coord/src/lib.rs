@@ -22,7 +22,7 @@ pub mod sql;
 pub mod prod;
 
 use async_trait::async_trait;
-use pg2iceberg_core::{Lsn, PgValue, TableIdent, WorkerId};
+use pg2iceberg_core::{Lsn, TableIdent, WorkerId};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -312,16 +312,6 @@ pub trait Coordinator: Send + Sync {
     /// completes — saves a row vs leaving stale state behind).
     /// Idempotent — safe to call when no row exists.
     async fn clear_snapshot_progress(&self, ident: &TableIdent) -> Result<()>;
-
-    // ── Per-table query-mode watermark ──────────────────────
-    /// Read the watermark for a query-mode table. `None` means no
-    /// watermark recorded yet — caller treats as "start from
-    /// beginning" or whatever the source-side default is.
-    async fn query_watermark(&self, ident: &TableIdent) -> Result<Option<PgValue>>;
-
-    /// Stamp the watermark for a query-mode table. Idempotent
-    /// UPSERT. Called after each query-flush cycle commits.
-    async fn set_query_watermark(&self, ident: &TableIdent, watermark: &PgValue) -> Result<()>;
 
     /// Read pending [`MarkerInfo`]s eligible for emission as
     /// meta-marker rows for `table`. A marker is *eligible* iff:

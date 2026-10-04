@@ -37,7 +37,7 @@ use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::value::TimestampMicros;
 use pg2iceberg_core::{
-    Clock, ColumnName, ColumnSchema, IdGen, Mode, Namespace, PgValue, Row, TableIdent, TableSchema,
+    Clock, ColumnName, ColumnSchema, IdGen, Namespace, PgValue, Row, TableIdent, TableSchema,
     Timestamp, WorkerId,
 };
 use pg2iceberg_iceberg::read_materialized_state;
@@ -437,7 +437,6 @@ impl ChaosHarness {
             blob_namer: Arc::clone(&self.blob_namer)
                 as Arc<dyn pg2iceberg_logical::pipeline::BlobNamer>,
             metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
-            mode: Mode::Logical,
             meta_namespace: None,
         }
     }

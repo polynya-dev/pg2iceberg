@@ -869,7 +869,7 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
     // Without the fence, the materializer's PK-keyed equality-delete
     // dedup would handle correctness, but produce extra delete files
     // per duplicate row. The fence avoids that overhead entirely.
-    use pg2iceberg_core::{Mode, WorkerId};
+    use pg2iceberg_core::WorkerId;
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
     use pg2iceberg_validate::LogicalLifecycle;
@@ -948,7 +948,6 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
             "s3://fence-stage",
         )),
         metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
-        mode: Mode::Logical,
         meta_namespace: None,
     };
 
@@ -1010,7 +1009,7 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
     // through both). The materializer's PK-keyed
     // equality-delete dedup must collapse them so PG ↔ Iceberg
     // stays at parity.
-    use pg2iceberg_core::{IdGen, Mode, WorkerId};
+    use pg2iceberg_core::{IdGen, WorkerId};
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
     use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
@@ -1098,7 +1097,6 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
             "s3://fence-conc-stage",
         )),
         metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
-        mode: Mode::Logical,
         meta_namespace: None,
     };
 
@@ -1142,7 +1140,7 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
     // loop, drain. This is the test the
     // user asked for: every step the binary does is now part of
     // the fault-DST coverage surface.
-    use pg2iceberg_core::{InMemoryMetrics, Mode};
+    use pg2iceberg_core::InMemoryMetrics;
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
     use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
@@ -1218,7 +1216,6 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
             "s3://stage",
         )),
         metrics: Arc::new(InMemoryMetrics::new()),
-        mode: Mode::Logical,
         meta_namespace: None,
     };
 
@@ -1276,7 +1273,6 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
     //   - slot creation
     //   - snapshot phase (slot was not fresh)
     // Just opens replication, registers tables, runs main loop.
-    use pg2iceberg_core::Mode;
     use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
     use pg2iceberg_validate::{run_logical_lifecycle, LogicalLifecycle};
@@ -1369,7 +1365,6 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
             "s3://stage",
         )),
         metrics: Arc::new(pg2iceberg_core::InMemoryMetrics::new()),
-        mode: Mode::Logical,
         meta_namespace: None,
     };
 

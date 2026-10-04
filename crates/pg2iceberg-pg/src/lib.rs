@@ -153,7 +153,7 @@ pub trait ReplicationStream: Send {
 }
 
 /// Read-only slot inspection. Smaller than [`PgClient`] so non-PG
-/// sources (sim, query-mode reads) can supply confirmed_flush_lsn to
+/// sources (the sim) can supply confirmed_flush_lsn to
 /// the invariant watcher without needing to fake the whole replication
 /// surface. Blanket-impl'd for any `PgClient`.
 #[async_trait]

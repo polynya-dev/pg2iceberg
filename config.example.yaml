@@ -1,8 +1,8 @@
 # pg2iceberg config example. Mirrors the Go reference's YAML shape;
 # operators can drop their existing pg2iceberg.yaml in unchanged.
-# Fields that the Rust port doesn't yet consume (query mode,
-# control-plane metadata, materializer cycle knobs, etc.) are still
-# parsed cleanly and ignored.
+# Fields that the Rust port doesn't yet consume (control-plane
+# metadata, materializer cycle knobs, etc.) are still parsed cleanly
+# and ignored.
 
 tables:
   # Schema is discovered from `information_schema.columns` +
@@ -35,7 +35,7 @@ tables:
     # partitioned tables error with `partition column missing`.
 
 source:
-  mode: logical                # "logical" or "query"
+  mode: logical                # the only mode (default); may be omitted
   postgres:
     host: db.example.com
     port: 5432

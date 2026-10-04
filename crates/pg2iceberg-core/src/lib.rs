@@ -12,8 +12,6 @@ pub mod schema;
 pub mod typemap;
 pub mod value;
 
-use serde::{Deserialize, Serialize};
-
 pub use metrics::{InMemoryMetrics, Labels, Metrics, NoopMetrics};
 
 pub use event::{ChangeEvent, ColumnName, Op, Row};
@@ -26,27 +24,3 @@ pub use partition::{
 pub use schema::{ColumnSchema, Namespace, TableIdent, TableSchema};
 pub use typemap::{map_pg_to_iceberg, IcebergType, MapError, PgType};
 pub use value::{IcebergValue, PgValue};
-
-/// The pipeline-mode tag. Configured per-deployment from
-/// `source.mode` in YAML; not persisted (the coord doesn't store it
-/// and `pg2iceberg cleanup` doesn't need to know about it).
-///
-/// Used at runtime by:
-/// - `pg2iceberg-validate::validate_startup` to gate logical-only
-///   invariants (e.g. `SnapshotCompleteButLsnZero`).
-/// - The CLI dispatcher in `pg2iceberg-rust/crates/pg2iceberg/src/run.rs`.
-#[derive(Copy, Clone, Default, Eq, PartialEq, Debug, Serialize, Deserialize)]
-pub enum Mode {
-    #[default]
-    Logical,
-    Query,
-}
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Logical => "logical",
-            Mode::Query => "query",
-        }
-    }
-}
