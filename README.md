@@ -1,9 +1,10 @@
 # pg2iceberg
 
-pg2iceberg replicates data from Postgres directly to Iceberg, no Kafka needed. Opinionated by design:
-- Specifically replicates Postgres → Iceberg, nothing else.
+pg2iceberg mirrors data from Postgres directly to Iceberg, no Kafka needed. Opinionated by design:
+- Only supports Postgres as source and Iceberg as destination, nothing else.
+- Mirrors data, i.e. source and target contain the same data. So no such thing as skipping snapshot.
+- Stateless, all state lives in Postgres and S3. This makes operation simple.
 - Assumes pg2iceberg is the sole writer of the Iceberg tables it manages, including compaction.
-- Captures changes via logical replication only, so the source needs `wal_level=logical`.
 
 ```mermaid
 graph LR
@@ -44,7 +45,7 @@ graph LR
   StagedB -.->|offset index| Coord
 ```
 
-pg2iceberg captures WAL change events via PostgreSQL logical replication and stages them as Parquet files in S3. A lightweight coordination layer in the source Postgres database (`_pg2iceberg` schema) tracks offsets and materializer progress. Since the write path only involves S3 uploads + a small PG transaction (no Iceberg catalog on the hot path), the replication slot LSN can be advanced quickly, minimizing WAL retention on the source.
+pg2iceberg captures WAL change events via PostgreSQL logical replication and stages them as Parquet files in S3 via [leaderless log protocol](https://github.com/lakestream-io/leaderless-log-protocol/). A lightweight coordination layer in the source Postgres database (`_pg2iceberg` schema) tracks offsets and materializer progress. Since the write path only involves S3 uploads + a small PG transaction (no Iceberg catalog on the hot path), the replication slot LSN can be advanced quickly, minimizing WAL retention on the source.
 
 A materializer, which runs at a separate interval, reads the staged Parquet files and merges them into the corresponding Iceberg tables using merge-on-read (equality deletes for updates/deletes, data files for inserts).
 
