@@ -67,8 +67,9 @@ sink:
   s3_secret_key: ""              # required for credential_mode=static
   s3_region: us-east-1
 
-  # Flush thresholds (logical mode) — flush when any threshold is reached
-  flush_rows: 1000
+  # Flush thresholds — flush when any threshold is reached
+  flush_rows: 10000              # also caps change events held in memory
+  materializer_batch_rows: 50000 # change events per materializer step
   flush_interval: 10s            # default standby cadence
 
   # Materializer cycle (only consulted by `pg2iceberg materializer-only`)
@@ -111,6 +112,8 @@ snapshot_only: false             # legacy field; prefer the `snapshot` subcomman
 ## Notes on individual fields
 
 - **`source.logical.snapshot_concurrency` / `snapshot_chunk_pages` / `snapshot_target_file_size`** — not yet exposed; snapshot uses fixed defaults.
+- **`sink.flush_rows`** — the most change events pg2iceberg holds in memory before staging them. A transaction bigger than this is staged in chunks of this size as it streams in, and claimed in one step when it commits, so readers never see part of it. Larger values mean fewer, larger staged files.
+- **`sink.materializer_batch_rows`** — the most change events the materializer folds into one Iceberg snapshot, which bounds its memory. A transaction larger than this is written as several snapshots committed in one atomic catalog update, so readers of the table never see part of it.
 - **`sink.flush_bytes`** — not yet exposed; flush threshold is `flush_rows` + `flush_interval` only.
 - **`sink.materializer_target_file_size` / `materializer_concurrency`** — not yet exposed; uses `target_file_size` + a fixed concurrency.
 - **`sink.materializer_worker_id`** — replaced by the `--worker-id` flag on `pg2iceberg materializer-only`.

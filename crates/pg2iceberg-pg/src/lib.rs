@@ -68,8 +68,8 @@ pub struct SlotHealth {
     /// replication client is mid-read of the slot.
     pub wal_status: Option<WalStatus>,
     /// `true` indicates the slot was killed by a physical-replication
-    /// conflict during recovery — unrecoverable. PG 14+ only; on PG
-    /// 13 this surfaces as `false`.
+    /// conflict during recovery — unrecoverable. PG 16+ only; on older
+    /// versions this surfaces as `false`.
     pub conflicting: bool,
     /// Bytes until the slot crosses into `unreserved`. Negative when
     /// already past. `None` when SQL NULL. Useful for metrics /
@@ -228,9 +228,9 @@ pub trait PgClient: Send + Sync {
     /// `safe_wal_size` columns of `pg_replication_slots` in a single
     /// round-trip. Returns `None` when the slot doesn't exist.
     ///
-    /// pg2iceberg requires PG 13+, so `wal_status` and
+    /// pg2iceberg requires PG 14+, so `wal_status` and
     /// `safe_wal_size` are always available. `conflicting` was added
-    /// in PG 14; on PG 13 it surfaces as `false`.
+    /// in PG 16; on older versions it surfaces as `false`.
     async fn slot_health(&self, slot: &str) -> Result<Option<SlotHealth>>;
 
     /// PostgreSQL cluster system identifier — unique per `initdb`,
@@ -245,9 +245,8 @@ pub trait PgClient: Send + Sync {
 
     /// PostgreSQL `server_version_num` — encoded as `MMmm00` where
     /// `MM` is the major version and `mm` the minor. PG 13.0 is
-    /// `130000`, PG 16.4 is `160004`. pg2iceberg requires PG 13+
-    /// (anything older lacks the `pg_replication_slots.wal_status`
-    /// column we depend on for startup validation). Returns `0` from
+    /// `130000`, PG 16.4 is `160004`. pg2iceberg requires PG 14+
+    /// (see `pg2iceberg_validate::MIN_PG_VERSION_NUM`). Returns `0` from
     /// the sim impl, which the version check treats as
     /// "skip" — production callers always read a real value.
     async fn server_version_num(&self) -> Result<i32>;

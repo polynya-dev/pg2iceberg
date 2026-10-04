@@ -10,7 +10,7 @@
 //!    drop+recreate would silently skip data.
 //!
 //! 2. `conflicting_slot_fails_startup_validation` — slot's
-//!    `conflicting = true` (PG 14+ physical-replication-conflict
+//!    `conflicting = true` (PG 16+ physical-replication-conflict
 //!    kill). Same fail-fast contract as `lost`.
 //!
 //! 3. `unreserved_slot_emits_watcher_warning` — slot's

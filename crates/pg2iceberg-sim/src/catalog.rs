@@ -137,6 +137,40 @@ impl Catalog for MemoryCatalog {
         Ok(table.metadata.clone())
     }
 
+    async fn commit_snapshots(&self, steps: Vec<PreparedCommit>) -> Result<TableMetadata> {
+        let ident = steps
+            .first()
+            .map(|s| s.ident.clone())
+            .ok_or_else(|| IcebergError::Other("commit_snapshots: no steps".into()))?;
+        if steps.iter().any(|s| s.ident != ident) {
+            return Err(IcebergError::Other(
+                "commit_snapshots: steps span several tables".into(),
+            ));
+        }
+        // One lock for every step: readers observe all or none of them.
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(&ident)
+            .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
+        for step in steps {
+            if step.data_files.is_empty() && step.equality_deletes.is_empty() {
+                continue;
+            }
+            let id = table.next_snapshot_id;
+            table.next_snapshot_id += 1;
+            table.snapshots.push(Snapshot {
+                id,
+                data_files: step.data_files,
+                delete_files: step.equality_deletes,
+                removed_paths: Vec::new(),
+                timestamp_ms: id * 1000,
+            });
+            table.metadata.current_snapshot_id = Some(id);
+        }
+        Ok(table.metadata.clone())
+    }
+
     async fn commit_compaction(
         &self,
         prepared: pg2iceberg_iceberg::PreparedCompaction,

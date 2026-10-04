@@ -238,7 +238,11 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             // 1000 is a reasonable default. Sink::new asserts
             // `flush_threshold > 0`, so 0 would crash the pipeline on
             // startup.
-            flush_rows: 1000,
+            // Tiny, so the 3-row seed snapshot spans two staged chunks and
+            // two materializer steps: exercises the atomic multi-snapshot
+            // commit against a real REST catalog.
+            flush_rows: 2,
+            materializer_batch_rows: 1,
             materializer_interval: String::new(),
             compaction_data_files: 8,
             compaction_delete_files: 4,

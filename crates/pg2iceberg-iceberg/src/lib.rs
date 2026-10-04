@@ -261,6 +261,30 @@ pub trait Catalog: Send + Sync {
     async fn load_table(&self, ident: &TableIdent) -> Result<Option<TableMetadata>>;
     async fn create_table(&self, schema: &TableSchema) -> Result<TableMetadata>;
     async fn commit_snapshot(&self, prepared: PreparedCommit) -> Result<TableMetadata>;
+    /// Commit several steps of one table as a single atomic update. Each
+    /// non-empty step becomes its own snapshot with the next sequence
+    /// number — so a step's equality deletes hide rows written by earlier
+    /// steps — but readers of the table see none of them or all of them.
+    /// Lets one source transaction be written in bounded-memory pieces
+    /// and still become visible at once. Steps must share one table.
+    ///
+    /// The default handles a single step; a catalog that can't make
+    /// several atomic must error rather than commit them one by one.
+    async fn commit_snapshots(&self, steps: Vec<PreparedCommit>) -> Result<TableMetadata> {
+        let mut steps: Vec<PreparedCommit> = steps
+            .into_iter()
+            .filter(|s| !s.data_files.is_empty() || !s.equality_deletes.is_empty())
+            .collect();
+        match steps.len() {
+            0 => Err(IcebergError::Other(
+                "commit_snapshots: no non-empty steps".into(),
+            )),
+            1 => self.commit_snapshot(steps.remove(0)).await,
+            n => Err(IcebergError::Other(format!(
+                "commit_snapshots: this catalog can't commit {n} steps atomically"
+            ))),
+        }
+    }
     /// Commit a compaction snapshot (Operation::Replace): drop the listed
     /// files, add the new ones, atomically. Default impl errors so impls
     /// that don't yet support compaction surface a clear error rather

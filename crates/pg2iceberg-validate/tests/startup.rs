@@ -296,7 +296,7 @@ fn slot_unreserved_does_not_fail_startup() {
     assert!(validate_startup(&v).is_ok());
 }
 
-// 9. Slot conflicting (PG 14+) — physical-rep conflict killed the slot.
+// 9. Slot conflicting (PG 16+) — physical-rep conflict killed the slot.
 #[test]
 fn slot_conflicting_violation() {
     let mut v = fresh_logical();
@@ -494,4 +494,22 @@ fn multiple_violations_all_reported() {
     };
     let err = validate_startup(&v).unwrap_err();
     assert_eq!(err.violations.len(), 2, "got: {:?}", err.violations);
+}
+
+// 0. Source PG older than the supported floor.
+#[test]
+fn pg_older_than_14_is_refused() {
+    let mut v = fresh_logical();
+    v.server_version_num = 130_018; // 13.18
+    let err = validate_startup(&v).unwrap_err();
+    assert_one_violation(
+        &err,
+        &Violation::PgVersionTooOld {
+            found: 130_018,
+            required: 140_000,
+        },
+    );
+
+    v.server_version_num = 140_000;
+    assert!(validate_startup(&v).is_ok());
 }

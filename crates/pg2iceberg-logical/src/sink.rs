@@ -6,12 +6,15 @@
 //!   go directly into the per-table writer.
 //! - `Commit` moves the buffer to the committed list; a flush then drains all
 //!   committed buffers into the per-table writers and produces chunks.
+//! - An open tx that grows too large is spilled: its buffered events are
+//!   encoded into chunks for the pipeline to stage, so tx size never bounds
+//!   memory (see [`Sink::spill_open_tx`]).
 //! - `Rollback`-equivalent: a tx that never receives Commit but is replaced
 //!   by a new Begin with the same xid is silently dropped. Real PG can't
 //!   reuse an xid, so this only happens on testing fault paths.
 
 use pg2iceberg_core::{ChangeEvent, Lsn, Op, TableIdent, Timestamp};
-use pg2iceberg_stream::codec::EncodedChunk;
+use pg2iceberg_stream::codec::{encode_chunk, EncodedChunk};
 use pg2iceberg_stream::rolling::RollingWriter;
 use pg2iceberg_stream::StreamError;
 use std::collections::{BTreeMap, VecDeque};
@@ -123,6 +126,49 @@ impl Sink {
     /// `true` while a transaction has begun but not yet committed.
     pub fn has_open_tx(&self) -> bool {
         !self.open_txns.is_empty()
+    }
+
+    /// Change events buffered for the open transaction `xid`.
+    pub fn open_tx_rows(&self, xid: u32) -> usize {
+        self.open_txns.get(&xid).map_or(0, |t| t.events.len())
+    }
+
+    /// Change events in committed-but-unflushed transactions.
+    pub fn committed_rows(&self) -> usize {
+        self.committed.iter().map(|t| t.events.len()).sum()
+    }
+
+    /// Encode the open transaction `xid`'s buffered events into one chunk
+    /// per table and drop them from memory. The transaction stays open;
+    /// the caller stages the chunks and claims them once it commits.
+    pub fn spill_open_tx(&mut self, xid: u32) -> Result<Vec<TableChunk>> {
+        let Some(tx) = self.open_txns.get_mut(&xid) else {
+            return Ok(Vec::new());
+        };
+        let mut by_table: BTreeMap<TableIdent, Vec<ChangeEvent>> = BTreeMap::new();
+        for evt in tx.events.drain(..) {
+            by_table.entry(evt.table.clone()).or_default().push(evt);
+        }
+        by_table
+            .into_iter()
+            .map(|(table, events)| {
+                Ok(TableChunk {
+                    table,
+                    chunk: encode_chunk(&events)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Change events currently held in memory: open transactions,
+    /// committed-but-unflushed transactions, and per-table writers.
+    pub fn buffered_rows(&self) -> usize {
+        self.open_txns
+            .values()
+            .map(|t| t.events.len())
+            .sum::<usize>()
+            + self.committed.iter().map(|t| t.events.len()).sum::<usize>()
+            + self.table_writers.values().map(|w| w.len()).sum::<usize>()
     }
 
     /// Drains every committed tx into per-table writers, flushes them, and

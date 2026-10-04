@@ -108,7 +108,7 @@ pub struct SlotState {
     /// via [`SimPostgres::set_slot_wal_status`] to model a slot
     /// transitioning toward `lost`.
     pub wal_status: SimWalStatus,
-    /// Mirrors `pg_replication_slots.conflicting` (PG 14+). Tests
+    /// Mirrors `pg_replication_slots.conflicting` (PG 16+). Tests
     /// can flip to `true` via
     /// [`SimPostgres::set_slot_conflicting`] to model a slot killed
     /// by physical-replication conflict.
@@ -516,7 +516,7 @@ impl SimPostgres {
         Ok(())
     }
 
-    /// Test hook: flip a slot's `conflicting` flag. Models PG 14+'s
+    /// Test hook: flip a slot's `conflicting` flag. Models PG 16+'s
     /// physical-replication-conflict slot kill.
     pub fn set_slot_conflicting(&self, name: &str, conflicting: bool) -> Result<()> {
         let mut s = self.state.lock().unwrap();
@@ -718,43 +718,47 @@ impl TxHandle {
         self.done = true;
         let mut s = self.db.state.lock().unwrap();
 
-        // Pre-validate ops against table state so we either fully apply or
-        // fully bail. PG's transaction semantics demand atomic-or-nothing.
+        // Pre-validate ops — in order, against a scratch copy of each
+        // touched table's keys — so we either fully apply or fully bail
+        // (PG's transaction semantics), and so later ops see earlier ones,
+        // as in PG: a row this transaction inserted can be updated or
+        // deleted by it.
+        let mut keys: BTreeMap<TableIdent, BTreeSet<String>> = BTreeMap::new();
         for op in &self.ops {
+            let table = match op {
+                TxOp::Insert { table, .. }
+                | TxOp::Update { table, .. }
+                | TxOp::Delete { table, .. }
+                | TxOp::UpdatePkChange { table, .. }
+                | TxOp::Truncate { table } => table,
+            };
+            let t = s
+                .tables
+                .get(table)
+                .ok_or_else(|| SimError::UnknownTable(table.clone()))?;
+            let live = keys
+                .entry(table.clone())
+                .or_insert_with(|| t.rows.keys().cloned().collect());
             match op {
-                TxOp::Insert { table, row } => {
-                    let t = s
-                        .tables
-                        .get(table)
-                        .ok_or_else(|| SimError::UnknownTable(table.clone()))?;
+                TxOp::Insert { row, .. } => {
                     let key = t.pk_key(row)?;
-                    if t.rows.contains_key(&key) {
+                    if !live.insert(key.clone()) {
                         return Err(SimError::PkConflict {
                             table: table.clone(),
                             detail: format!("duplicate pk {key}"),
                         });
                     }
                 }
-                TxOp::Update { table, new_row, .. } => {
-                    let t = s
-                        .tables
-                        .get(table)
-                        .ok_or_else(|| SimError::UnknownTable(table.clone()))?;
-                    let key = t.pk_key(new_row)?;
-                    if !t.rows.contains_key(&key) {
+                TxOp::Update { new_row, .. } => {
+                    if !live.contains(&t.pk_key(new_row)?) {
                         return Err(SimError::RowNotFound {
                             table: table.clone(),
                             op: "update",
                         });
                     }
                 }
-                TxOp::Delete { table, pk_row } => {
-                    let t = s
-                        .tables
-                        .get(table)
-                        .ok_or_else(|| SimError::UnknownTable(table.clone()))?;
-                    let key = t.pk_key(pk_row)?;
-                    if !t.rows.contains_key(&key) {
+                TxOp::Delete { pk_row, .. } => {
+                    if !live.remove(&t.pk_key(pk_row)?) {
                         return Err(SimError::RowNotFound {
                             table: table.clone(),
                             op: "delete",
@@ -762,35 +766,25 @@ impl TxHandle {
                     }
                 }
                 TxOp::UpdatePkChange {
-                    table,
                     before_row,
                     new_row,
                     ..
                 } => {
-                    let t = s
-                        .tables
-                        .get(table)
-                        .ok_or_else(|| SimError::UnknownTable(table.clone()))?;
-                    let old_key = t.pk_key(before_row)?;
-                    if !t.rows.contains_key(&old_key) {
+                    if !live.remove(&t.pk_key(before_row)?) {
                         return Err(SimError::RowNotFound {
                             table: table.clone(),
                             op: "update-pk-change(before)",
                         });
                     }
                     let new_key = t.pk_key(new_row)?;
-                    if t.rows.contains_key(&new_key) {
+                    if !live.insert(new_key.clone()) {
                         return Err(SimError::PkConflict {
                             table: table.clone(),
                             detail: format!("update-pk-change collides at {new_key}"),
                         });
                     }
                 }
-                TxOp::Truncate { table } => {
-                    if !s.tables.contains_key(table) {
-                        return Err(SimError::UnknownTable(table.clone()));
-                    }
-                }
+                TxOp::Truncate { .. } => live.clear(),
             }
         }
 

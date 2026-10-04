@@ -153,8 +153,8 @@ impl PgClient for PgClientImpl {
         // Relation/Insert/Update/Delete against the child relid — so
         // the consumer would see N untracked tables (`<parent>_2024`,
         // `<parent>_2025`, …) instead of the one configured `<parent>`.
-        // PG 13+ supports this option (we require 13+ already, so no
-        // version gate here). Mirrors `pg2iceberg/logical/logical.go`
+        // PG 13+ supports this option (we require 14+, so no version
+        // gate here). Mirrors `pg2iceberg/logical/logical.go`
         // `ensurePublication`.
         let q = format!(
             "CREATE PUBLICATION {} FOR TABLE {} WITH (publish_via_partition_root = true)",
@@ -261,11 +261,11 @@ impl PgClient for PgClientImpl {
         // One query covering every slot field we use: restart_lsn,
         // confirmed_flush_lsn, wal_status, safe_wal_size, conflicting.
         //
-        // pg2iceberg requires PG 13+ (validated at startup via
+        // pg2iceberg requires PG 14+ (validated at startup via
         // `server_version_num`), so `wal_status` and `safe_wal_size`
         // are always direct columns. `conflicting` was added in PG
-        // 14, so we read it via `to_jsonb` and degrade to `false` on
-        // PG 13.
+        // 16, so we read it via `to_jsonb` and degrade to `false` on
+        // older versions.
         let q = format!(
             "SELECT \
                 restart_lsn::text AS restart_lsn, \

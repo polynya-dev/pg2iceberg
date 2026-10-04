@@ -38,6 +38,9 @@ use pg2iceberg_core::{
     ColumnName, ColumnSchema, Namespace, Op, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
 use pg2iceberg_iceberg::read_materialized_state;
+use pg2iceberg_iceberg::{
+    Catalog, PreparedCommit, PreparedCompaction, SchemaChange, Snapshot, TableMetadata,
+};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{CounterMaterializerNamer, Materializer, Pipeline};
 use pg2iceberg_sim::blob::MemoryBlobStore;
@@ -51,11 +54,21 @@ use pg2iceberg_stream::BlobStore;
 use pollster::block_on;
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const TABLE_NAME: &str = "orders";
 const PUB: &str = "pub1";
 const SLOT: &str = "slot1";
+/// Rows the pipeline may buffer before it must stage them. Tiny so
+/// ordinary workloads produce transactions that span many chunks.
+const FLUSH_ROWS: usize = 3;
+/// Bound on change events held in memory, and on rows per staged
+/// object: a not-yet-staged transaction tail plus committed rows
+/// awaiting a flush, each below `FLUSH_ROWS`.
+const MAX_BUFFERED_ROWS: usize = 2 * FLUSH_ROWS;
+/// Materializer batch limit. Tiny so a large transaction spans several
+/// batches — it must still become visible in one step (invariant 10).
+const MAT_BATCH: usize = 2;
 
 fn ident() -> TableIdent {
     TableIdent {
@@ -135,6 +148,18 @@ enum Step {
     /// the publication. pgoutput skips the whole transaction, so only a
     /// keepalive tells the pipeline it can ack past it.
     UnpublishedWrite { qty: i32 },
+    /// One transaction that updates every live row and inserts `inserts`
+    /// fresh ones — routinely bigger than `FLUSH_ROWS`, so it must be
+    /// staged in chunks.
+    BigTx { inserts: usize, qty: i32 },
+    /// Process at most `n` replication messages; may stop mid-transaction.
+    DrivePartial { n: usize },
+    /// A flush tick + ack without draining the stream first.
+    FlushTick,
+    /// Hard crash: no drain, flush, or ack. Pipeline memory and any
+    /// staged-but-unclaimed objects are lost; the slot replays from
+    /// `restart_lsn`.
+    CrashMidStream,
     /// Drive replication + flush + ack: a complete pipeline cycle.
     DriveFlush,
     /// Run one materializer cycle for every registered table.
@@ -157,6 +182,10 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         2 => id.clone().prop_map(|id| Step::Delete { id }),
         1 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::RollbackInsert { id, qty }),
         3 => qty.clone().prop_map(|qty| Step::UnpublishedWrite { qty }),
+        2 => (1usize..=8, qty.clone()).prop_map(|(inserts, qty)| Step::BigTx { inserts, qty }),
+        2 => (1usize..=6).prop_map(|n| Step::DrivePartial { n }),
+        1 => Just(Step::FlushTick),
+        1 => Just(Step::CrashMidStream),
         3 => Just(Step::DriveFlush),
         2 => Just(Step::MaterializerCycle),
         1 => Just(Step::CrashAndRestart),
@@ -176,7 +205,9 @@ struct DstHarness {
     catalog: Arc<MemoryCatalog>,
     namer: Arc<CounterBlobNamer>,
     pipeline: Pipeline<MemoryCoordinator>,
-    materializer: Materializer<MemoryCatalog>,
+    materializer: Materializer<AuditedCatalog>,
+    /// The materializer's catalog: checks invariant 10 after every commit.
+    audited: Arc<AuditedCatalog>,
     stream: SimReplicationStream,
     /// Mirror of which PK ids are currently live in the source DB. Used by
     /// the workload runner to pre-filter ops the proptest generator can't
@@ -184,6 +215,8 @@ struct DstHarness {
     live: BTreeSet<i32>,
     /// Next PK for `noise` inserts (always fresh, so they never conflict).
     noise_next_id: i32,
+    /// Last PK handed out by `BigTx` inserts (kept clear of `1..=6`).
+    next_bulk_id: i32,
 }
 
 impl DstHarness {
@@ -215,16 +248,23 @@ impl DstHarness {
         let blob_store = Arc::new(MemoryBlobStore::new());
         let catalog = Arc::new(MemoryCatalog::new());
         let namer = Arc::new(CounterBlobNamer::new("s3://stage"));
-        let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), 64);
+        let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
 
         let mat_namer = Arc::new(CounterMaterializerNamer::new("s3://table"));
+        let audited = Arc::new(AuditedCatalog {
+            inner: catalog.clone(),
+            blob: blob_store.clone(),
+            db: db.clone(),
+            violations: Mutex::new(Vec::new()),
+            fail_next_commit: Default::default(),
+        });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
             blob_store.clone(),
-            catalog.clone(),
+            audited.clone(),
             mat_namer,
             "default",
-            128,
+            MAT_BATCH,
         );
         block_on(materializer.register_table(schema())).unwrap();
 
@@ -238,9 +278,11 @@ impl DstHarness {
             namer,
             pipeline,
             materializer,
+            audited,
             stream,
             live: seeds.iter().map(|(id, _)| *id).collect(),
             noise_next_id: 0,
+            next_bulk_id: 1000,
         }
     }
 
@@ -260,16 +302,23 @@ impl DstHarness {
         let blob_store = Arc::new(MemoryBlobStore::new());
         let catalog = Arc::new(MemoryCatalog::new());
         let namer = Arc::new(CounterBlobNamer::new("s3://stage"));
-        let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), 64);
+        let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
 
         let mat_namer = Arc::new(CounterMaterializerNamer::new("s3://table"));
+        let audited = Arc::new(AuditedCatalog {
+            inner: catalog.clone(),
+            blob: blob_store.clone(),
+            db: db.clone(),
+            violations: Mutex::new(Vec::new()),
+            fail_next_commit: Default::default(),
+        });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
             blob_store.clone(),
-            catalog.clone(),
+            audited.clone(),
             mat_namer,
             "default",
-            128,
+            MAT_BATCH,
         );
         block_on(materializer.register_table(schema())).unwrap();
 
@@ -283,15 +332,27 @@ impl DstHarness {
             namer,
             pipeline,
             materializer,
+            audited,
             stream,
             live: BTreeSet::new(),
             noise_next_id: 0,
+            next_bulk_id: 1000,
         }
     }
 
     fn drive(&mut self) {
         while let Some(msg) = self.stream.recv() {
             block_on(self.pipeline.process(msg)).unwrap();
+        }
+    }
+
+    /// Process at most `n` messages — may stop mid-transaction.
+    fn drive_partial(&mut self, n: usize) {
+        for _ in 0..n {
+            match self.stream.recv() {
+                Some(msg) => block_on(self.pipeline.process(msg)).unwrap(),
+                None => break,
+            }
         }
     }
 
@@ -321,16 +382,18 @@ impl DstHarness {
         // are a tracked follow-up.
         self.drive();
         self.flush_and_ack();
+        self.crash_mid_stream();
+    }
 
-        let pipeline = Pipeline::new(
+    /// Drop the pipeline + stream as-is and rebuild from the slot.
+    fn crash_mid_stream(&mut self) {
+        self.pipeline = Pipeline::new(
             self.coord.clone(),
             self.blob_store.clone(),
             self.namer.clone(),
-            64,
+            FLUSH_ROWS,
         );
-        let stream = self.db.start_replication(SLOT).unwrap();
-        self.pipeline = pipeline;
-        self.stream = stream;
+        self.stream = self.db.start_replication(SLOT).unwrap();
     }
 
     fn run_step(&mut self, step: &Step) {
@@ -379,11 +442,243 @@ impl DstHarness {
                 let _ = self.materialize();
             }
             Step::CrashAndRestart => self.crash_and_restart(),
+            Step::BigTx { inserts, qty } => {
+                let mut tx = self.db.begin_tx();
+                for id in &self.live {
+                    tx.update(&ident(), row(*id, *qty));
+                }
+                let mut fresh = Vec::with_capacity(*inserts);
+                for _ in 0..*inserts {
+                    self.next_bulk_id += 1;
+                    tx.insert(&ident(), row(self.next_bulk_id, *qty));
+                    fresh.push(self.next_bulk_id);
+                }
+                // Touch every row again, now in a later chunk — including
+                // the ones this transaction just inserted: the materializer
+                // must hide their first version within the same atomic
+                // commit.
+                for id in self.live.iter().chain(&fresh) {
+                    tx.update(&ident(), row(*id, *qty + 1));
+                }
+                tx.commit(Timestamp(0)).unwrap();
+                self.live.extend(fresh);
+            }
+            Step::DrivePartial { n } => self.drive_partial(*n),
+            Step::FlushTick => self.flush_and_ack(),
+            Step::CrashMidStream => self.crash_mid_stream(),
         }
     }
 }
 
 // ---------- invariant checks ----------
+
+/// Invariants that must hold after *every* step, not just at quiescence.
+fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
+    // 7. Bounded memory: no transaction, however large, makes the
+    //    pipeline hold more than MAX_BUFFERED_ROWS change events.
+    let buffered = h.pipeline.buffered_rows();
+    if buffered > MAX_BUFFERED_ROWS {
+        return Err(format!(
+            "invariant 7 (bounded memory): pipeline buffers {buffered} rows > {MAX_BUFFERED_ROWS}"
+        ));
+    }
+
+    let entries = block_on(h.coord.read_log(&ident(), 0, 1_000_000))
+        .map_err(|e| format!("read_log failed: {e}"))?;
+
+    // 8. Bounded staged objects, so the materializer never has to load
+    //    one huge file either.
+    if let Some(e) = entries
+        .iter()
+        .find(|e| e.record_count as usize > MAX_BUFFERED_ROWS)
+    {
+        return Err(format!(
+            "invariant 8 (bounded staged object): {} holds {} rows > {MAX_BUFFERED_ROWS}",
+            e.s3_path, e.record_count
+        ));
+    }
+
+    // 9. No torn transactions: each transaction is either entirely in the
+    //    claimed log or absent. Staged-but-unclaimed objects don't count —
+    //    only claims are visible to the materializer.
+    let mut staged = BTreeSet::new();
+    for entry in &entries {
+        let bytes = block_on(h.blob_store.get(&entry.s3_path))
+            .map_err(|e| format!("blob_store.get({}): {e}", entry.s3_path))?;
+        let chunk =
+            decode_chunk(&bytes).map_err(|e| format!("decode_chunk({}): {e}", entry.s3_path))?;
+        staged.extend(chunk.into_iter().map(|m| m.lsn));
+    }
+    let mut by_xid: BTreeMap<u32, Vec<_>> = BTreeMap::new();
+    for c in
+        h.db.dump_change_events(PUB)
+            .map_err(|e| format!("dump_change_events: {e}"))?
+    {
+        by_xid.entry(c.xid.unwrap_or(0)).or_default().push(c.lsn);
+    }
+    for (xid, lsns) in &by_xid {
+        let claimed = lsns.iter().filter(|l| staged.contains(*l)).count();
+        if claimed != 0 && claimed != lsns.len() {
+            return Err(format!(
+                "invariant 9 (torn transaction): xid {xid} has {claimed} of {} events claimed",
+                lsns.len()
+            ));
+        }
+    }
+
+    // 10. Atomic visibility per table — now, and at every commit made
+    //     since the last check (a cycle may commit several times).
+    block_on(atomic_visibility(&h.catalog, &h.blob_store, &h.db))?;
+    if let Some(v) = h.audited.violations.lock().unwrap().first() {
+        return Err(v.clone());
+    }
+    Ok(())
+}
+
+/// Invariant 10: Iceberg matches PG as of some transaction boundary.
+/// Lagging behind is fine; a partly applied transaction is not.
+async fn atomic_visibility(
+    catalog: &MemoryCatalog,
+    blob: &MemoryBlobStore,
+    db: &SimPostgres,
+) -> Result<(), String> {
+    let mut iceberg = read_materialized_state(
+        catalog,
+        blob,
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .map_err(|e| format!("read_materialized_state: {e}"))?;
+    sort_by_pk(&mut iceberg);
+    let events = db
+        .dump_change_events(PUB)
+        .map_err(|e| format!("dump_change_events: {e}"))?;
+    let pk = |r: &Row| match r.get(&ColumnName("id".into())) {
+        Some(PgValue::Int4(n)) => *n,
+        _ => i32::MAX,
+    };
+    let mut state: BTreeMap<i32, Row> = BTreeMap::new();
+    let mut boundaries: Vec<Vec<Row>> = vec![Vec::new()];
+    let mut i = 0;
+    while i < events.len() {
+        let xid = events[i].xid;
+        while i < events.len() && events[i].xid == xid {
+            let e = &events[i];
+            match e.op {
+                Op::Insert | Op::Update => {
+                    let after = e.after.clone().expect("insert/update carries after");
+                    state.insert(pk(&after), after);
+                }
+                Op::Delete => {
+                    state.remove(&pk(e.before.as_ref().expect("delete carries before")));
+                }
+                _ => state.clear(),
+            }
+            i += 1;
+        }
+        boundaries.push(state.values().cloned().collect());
+    }
+    if !boundaries.contains(&iceberg) {
+        return Err(format!(
+            "invariant 10 (atomic visibility): Iceberg state matches no transaction boundary: {iceberg:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The materializer's catalog in the DST: delegates to the in-memory
+/// catalog and checks invariant 10 after every commit — the moments a
+/// reader could observe the table — since one materializer cycle can
+/// commit several times between two DST steps.
+struct AuditedCatalog {
+    inner: Arc<MemoryCatalog>,
+    blob: Arc<MemoryBlobStore>,
+    db: SimPostgres,
+    violations: Mutex<Vec<String>>,
+    /// When set, the next multi-step commit fails without committing.
+    fail_next_commit: std::sync::atomic::AtomicBool,
+}
+
+impl AuditedCatalog {
+    async fn audit(&self) {
+        if let Err(e) = atomic_visibility(&self.inner, &self.blob, &self.db).await {
+            self.violations
+                .lock()
+                .unwrap()
+                .push(format!("after a commit: {e}"));
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Catalog for AuditedCatalog {
+    async fn ensure_namespace(&self, ns: &Namespace) -> pg2iceberg_iceberg::Result<()> {
+        self.inner.ensure_namespace(ns).await
+    }
+    async fn load_table(
+        &self,
+        ident: &TableIdent,
+    ) -> pg2iceberg_iceberg::Result<Option<TableMetadata>> {
+        self.inner.load_table(ident).await
+    }
+    async fn create_table(
+        &self,
+        schema: &TableSchema,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.inner.create_table(schema).await
+    }
+    async fn commit_snapshot(
+        &self,
+        prepared: PreparedCommit,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        let meta = self.inner.commit_snapshot(prepared).await?;
+        self.audit().await;
+        Ok(meta)
+    }
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<PreparedCommit>,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        if self
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(pg2iceberg_iceberg::IcebergError::Other(
+                "injected: commit_snapshots".into(),
+            ));
+        }
+        let meta = self.inner.commit_snapshots(steps).await?;
+        self.audit().await;
+        Ok(meta)
+    }
+    async fn commit_compaction(
+        &self,
+        prepared: PreparedCompaction,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        let meta = self.inner.commit_compaction(prepared).await?;
+        self.audit().await;
+        Ok(meta)
+    }
+    async fn evolve_schema(
+        &self,
+        ident: &TableIdent,
+        changes: Vec<SchemaChange>,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.inner.evolve_schema(ident, changes).await
+    }
+    async fn expire_snapshots(
+        &self,
+        ident: &TableIdent,
+        retention_ms: i64,
+    ) -> pg2iceberg_iceberg::Result<usize> {
+        self.inner.expire_snapshots(ident, retention_ms).await
+    }
+    async fn snapshots(&self, ident: &TableIdent) -> pg2iceberg_iceberg::Result<Vec<Snapshot>> {
+        self.inner.snapshots(ident).await
+    }
+}
 
 fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     // Reach quiescence: drain WAL, flush, ack, then materialize until idle.
@@ -391,7 +686,7 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     h.drive();
     h.flush_and_ack();
     // Drain materializer; safety bound to catch infinite loops.
-    for _ in 0..16 {
+    for _ in 0..1000 {
         if h.materialize() == 0 {
             break;
         }
@@ -467,7 +762,12 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
             decode_chunk(&bytes).map_err(|e| format!("decode_chunk({}): {e}", entry.s3_path))?;
         staged_events.append(&mut chunk);
     }
+    // A crash between a claim and the slot ack replays the transaction,
+    // so it's staged twice: staging is at-least-once and the fold absorbs
+    // the repeat (invariant 5). Compare distinct events; a repeat that
+    // differs from the original still shows up as a mismatch.
     staged_events.sort_by_key(|m| m.lsn);
+    staged_events.dedup_by(|a, b| a.lsn == b.lsn && a.op == b.op && a.row == b.row);
 
     let mut wal_events =
         h.db.dump_change_events(PUB)
@@ -626,8 +926,11 @@ proptest! {
     #[test]
     fn pipeline_preserves_invariants_under_random_workload(steps in workload()) {
         let mut h = DstHarness::boot();
-        for step in &steps {
+        for (i, step) in steps.iter().enumerate() {
             h.run_step(step);
+            if let Err(e) = check_step_invariants(&h) {
+                panic!("workload {:?}\nfailed after step {i}: {}", steps, e);
+            }
         }
         if let Err(e) = check_invariants(&mut h) {
             // proptest will shrink and re-print this as needed.
@@ -646,6 +949,144 @@ fn happy_path_one_insert_one_flush() {
     let mut h = DstHarness::boot();
     h.run_step(&Step::Insert { id: 1, qty: 10 });
     h.run_step(&Step::DriveFlush);
+    check_invariants(&mut h).unwrap();
+}
+
+/// One transaction far bigger than `FLUSH_ROWS`: staged in bounded
+/// chunks, never partly visible while it streams in (invariants 7-9),
+/// and intact once it lands.
+#[test]
+fn large_transaction_is_staged_in_bounded_chunks() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::BigTx {
+        inserts: 20,
+        qty: 1,
+    });
+    for _ in 0..8 {
+        h.run_step(&Step::DrivePartial { n: 3 });
+        check_step_invariants(&h).unwrap();
+        h.run_step(&Step::FlushTick);
+        check_step_invariants(&h).unwrap();
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A transaction spanning many staged chunks, materialized in batches
+/// far smaller than it: readers must still see all of it or none of it.
+#[test]
+fn large_transaction_becomes_visible_atomically() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 1 });
+    h.run_step(&Step::BigTx {
+        inserts: 20,
+        qty: 2,
+    });
+    h.run_step(&Step::DriveFlush);
+    for _ in 0..100 {
+        h.run_step(&Step::MaterializerCycle);
+        check_step_invariants(&h).unwrap();
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A transaction that inserts rows, truncates, then inserts more, spread
+/// over several materializer steps. The TRUNCATE becomes deletes for
+/// every row the materializer knows about — which must include rows this
+/// same, not-yet-committed unit wrote in earlier steps.
+#[test]
+fn truncate_inside_large_transaction_hides_its_earlier_inserts() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 1 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    let mut tx = h.db.begin_tx();
+    for id in 100..106 {
+        tx.insert(&ident(), row(id, 1));
+    }
+    tx.truncate(&ident());
+    for id in 200..202 {
+        tx.insert(&ident(), row(id, 2));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    h.run_step(&Step::DriveFlush);
+    for _ in 0..100 {
+        h.run_step(&Step::MaterializerCycle);
+        check_step_invariants(&h).unwrap();
+    }
+    let mut iceberg = block_on(read_materialized_state(
+        h.catalog.as_ref(),
+        h.blob_store.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    ))
+    .unwrap();
+    sort_by_pk(&mut iceberg);
+    let mut pg = h.db.read_table(&ident()).unwrap();
+    sort_by_pk(&mut pg);
+    assert_eq!(iceberg, pg);
+}
+
+/// The atomic commit of a multi-step transaction fails: nothing may
+/// become visible, and the next cycle must land the whole transaction
+/// intact — despite FileIndex having been updated for the lost steps.
+#[test]
+fn failed_multi_step_commit_leaves_nothing_and_retry_lands_it() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 1 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::BigTx {
+        inserts: 20,
+        qty: 2,
+    });
+    h.run_step(&Step::DriveFlush);
+    h.audited
+        .fail_next_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(block_on(h.materializer.cycle()).is_err());
+    check_step_invariants(&h).unwrap();
+    for _ in 0..100 {
+        h.run_step(&Step::MaterializerCycle);
+        check_step_invariants(&h).unwrap();
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A flush that runs mid-transaction — here on a keepalive received just
+/// before the transaction began — must not claim the chunks already
+/// staged for it.
+#[test]
+fn flush_mid_transaction_never_claims_its_chunks() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::UnpublishedWrite { qty: 0 });
+    h.run_step(&Step::DrivePartial { n: 1 }); // just the caught-up keepalive
+    h.run_step(&Step::BigTx {
+        inserts: 20,
+        qty: 1,
+    });
+    h.run_step(&Step::DrivePartial { n: 10 }); // spills, stays open
+    h.run_step(&Step::FlushTick);
+    check_step_invariants(&h).unwrap();
+    check_invariants(&mut h).unwrap();
+}
+
+/// Crash partway through a large transaction: chunks staged so far are
+/// never claimed, the slot replays the whole transaction, and nothing is
+/// lost or torn.
+#[test]
+fn crash_mid_large_transaction_replays_cleanly() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::BigTx {
+        inserts: 20,
+        qty: 1,
+    });
+    h.run_step(&Step::DrivePartial { n: 10 });
+    check_step_invariants(&h).unwrap();
+    h.run_step(&Step::CrashMidStream);
+    h.run_step(&Step::BigTx { inserts: 5, qty: 2 });
+    h.run_step(&Step::DriveFlush);
+    check_step_invariants(&h).unwrap();
     check_invariants(&mut h).unwrap();
 }
 

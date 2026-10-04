@@ -208,8 +208,15 @@ pub struct SinkConfig {
 
     #[serde(default)]
     pub flush_interval: String,
+    /// Most change events the WAL writer holds in memory before staging
+    /// them; also the staged chunk size for larger transactions.
     #[serde(default = "default_flush_rows")]
     pub flush_rows: usize,
+    /// Most change events the materializer folds into one snapshot step —
+    /// the bound on its memory. A transaction spanning several steps is
+    /// still committed atomically.
+    #[serde(default = "default_materializer_batch_rows")]
+    pub materializer_batch_rows: usize,
     /// Materializer cycle interval. Matches Go's `materializer_interval`.
     /// Empty = use the lifecycle's default (10s). Only consulted by the
     /// `materializer-only` subcommand; the integrated `run` mode uses
@@ -293,6 +300,7 @@ impl Default for SinkConfig {
             s3_region: default_region(),
             flush_interval: String::new(),
             flush_rows: default_flush_rows(),
+            materializer_batch_rows: default_materializer_batch_rows(),
             materializer_interval: String::new(),
             compaction_data_files: default_compaction_data_files(),
             compaction_delete_files: default_compaction_delete_files(),
@@ -342,7 +350,11 @@ fn default_region() -> String {
 }
 
 fn default_flush_rows() -> usize {
-    1000
+    10_000
+}
+
+fn default_materializer_batch_rows() -> usize {
+    50_000
 }
 
 fn default_compaction_data_files() -> usize {
@@ -858,7 +870,8 @@ sink:
         assert_eq!(cfg.source.logical.publication_name, "pg2iceberg_pub");
         assert_eq!(cfg.sink.credential_mode, "static");
         assert_eq!(cfg.sink.s3_region, "us-east-1");
-        assert_eq!(cfg.sink.flush_rows, 1000);
+        assert_eq!(cfg.sink.flush_rows, 10_000);
+        assert_eq!(cfg.sink.materializer_batch_rows, 50_000);
         assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
         assert_eq!(cfg.state.group, "default");
     }
