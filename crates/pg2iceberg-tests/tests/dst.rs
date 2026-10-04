@@ -256,6 +256,7 @@ impl DstHarness {
             blob: blob_store.clone(),
             db: db.clone(),
             violations: Mutex::new(Vec::new()),
+            fail_next_commit: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -309,6 +310,7 @@ impl DstHarness {
             blob: blob_store.clone(),
             db: db.clone(),
             violations: Mutex::new(Vec::new()),
+            fail_next_commit: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -595,6 +597,8 @@ struct AuditedCatalog {
     blob: Arc<MemoryBlobStore>,
     db: SimPostgres,
     violations: Mutex<Vec<String>>,
+    /// When set, the next multi-step commit fails without committing.
+    fail_next_commit: std::sync::atomic::AtomicBool,
 }
 
 impl AuditedCatalog {
@@ -637,6 +641,14 @@ impl Catalog for AuditedCatalog {
         &self,
         steps: Vec<PreparedCommit>,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        if self
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(pg2iceberg_iceberg::IcebergError::Other(
+                "injected: commit_snapshots".into(),
+            ));
+        }
         let meta = self.inner.commit_snapshots(steps).await?;
         self.audit().await;
         Ok(meta)
@@ -1013,6 +1025,32 @@ fn truncate_inside_large_transaction_hides_its_earlier_inserts() {
     let mut pg = h.db.read_table(&ident()).unwrap();
     sort_by_pk(&mut pg);
     assert_eq!(iceberg, pg);
+}
+
+/// The atomic commit of a multi-step transaction fails: nothing may
+/// become visible, and the next cycle must land the whole transaction
+/// intact — despite FileIndex having been updated for the lost steps.
+#[test]
+fn failed_multi_step_commit_leaves_nothing_and_retry_lands_it() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 1 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::BigTx {
+        inserts: 20,
+        qty: 2,
+    });
+    h.run_step(&Step::DriveFlush);
+    h.audited
+        .fail_next_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(block_on(h.materializer.cycle()).is_err());
+    check_step_invariants(&h).unwrap();
+    for _ in 0..100 {
+        h.run_step(&Step::MaterializerCycle);
+        check_step_invariants(&h).unwrap();
+    }
+    check_invariants(&mut h).unwrap();
 }
 
 /// A flush that runs mid-transaction — here on a keepalive received just
