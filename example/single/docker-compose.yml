@@ -19,7 +19,9 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio
+    # minio/minio + minio/mc are no longer on Docker Hub; pgsty/* is a
+    # community-maintained drop-in fork (same binaries and entrypoints).
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: admin
@@ -34,7 +36,7 @@ services:
       retries: 5
 
   create-bucket:
-    image: minio/mc
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
       minio:
         condition: service_healthy
