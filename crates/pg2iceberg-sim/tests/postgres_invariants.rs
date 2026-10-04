@@ -66,7 +66,16 @@ fn row(pairs: &[(&str, PgValue)]) -> Row {
     r
 }
 
+/// Drain the stream's data messages. Drops the trailing caught-up
+/// keepalive; [`drain_all`] keeps it for the tests that check it.
 fn drain(stream: &mut pg2iceberg_sim::postgres::SimReplicationStream) -> Vec<DecodedMessage> {
+    drain_all(stream)
+        .into_iter()
+        .filter(|m| !matches!(m, DecodedMessage::Keepalive { .. }))
+        .collect()
+}
+
+fn drain_all(stream: &mut pg2iceberg_sim::postgres::SimReplicationStream) -> Vec<DecodedMessage> {
     let mut out = Vec::new();
     while let Some(msg) = stream.recv() {
         out.push(msg);
@@ -223,6 +232,53 @@ fn changes_to_unpublished_tables_are_skipped() {
         _ => panic!(),
     };
     assert_eq!(change.table, ident("orders"));
+}
+
+#[test]
+fn tx_touching_only_unpublished_tables_is_skipped_entirely() {
+    // pgoutput (PG 15+) sends no Begin/Commit for a transaction with
+    // nothing for the publication; only the caught-up keepalive
+    // reveals that WAL moved past it.
+    let db = boot();
+    let mut tx = db.begin_tx();
+    tx.insert(&ident("ledger"), row(&[("id", PgValue::Int4(1))]));
+    let commit = tx.commit(Timestamp(0)).unwrap();
+
+    let mut stream = db.start_replication("slot1").unwrap();
+    let msgs = drain_all(&mut stream);
+    assert!(
+        matches!(msgs.as_slice(), [DecodedMessage::Keepalive { wal_end, .. }] if *wal_end == commit),
+        "expected only a keepalive at {commit:?}, got {msgs:?}"
+    );
+}
+
+#[test]
+fn caught_up_keepalive_is_sent_once_per_unconfirmed_position() {
+    let db = boot();
+    let mut tx = db.begin_tx();
+    tx.insert(
+        &ident("orders"),
+        row(&[("id", PgValue::Int4(1)), ("qty", PgValue::Int4(10))]),
+    );
+    let commit = tx.commit(Timestamp(0)).unwrap();
+
+    let mut stream = db.start_replication("slot1").unwrap();
+    let msgs = drain_all(&mut stream);
+    assert!(
+        matches!(msgs.last(), Some(DecodedMessage::Keepalive { wal_end, .. }) if *wal_end == commit),
+        "expected a trailing keepalive at {commit:?}, got {msgs:?}"
+    );
+    // Idle at the same position: no repeat, so callers can poll to `None`.
+    assert!(stream.recv().is_none());
+
+    // Once the slot confirms the position, a reconnect has nothing to say.
+    stream.send_standby(commit);
+    let mut stream = db.start_replication("slot1").unwrap();
+    let msgs = drain_all(&mut stream);
+    assert!(
+        msgs.is_empty(),
+        "expected nothing after the ack, got {msgs:?}"
+    );
 }
 
 // ---------- reconnect / replay from restart_lsn ----------

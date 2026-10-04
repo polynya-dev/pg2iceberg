@@ -73,6 +73,15 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     blob_store: Arc<dyn BlobStore>,
     namer: Arc<dyn BlobNamer>,
     flushed_lsn: AtomicU64,
+    /// `wal_end` of the latest keepalive received outside a
+    /// transaction. Every transaction that arrived before it has
+    /// committed (so it's buffered in the sink or already flushed), and
+    /// the WAL after those commits carried nothing for the publication —
+    /// so once the next flush lands, the slot can be acked up to here.
+    /// Without this, WAL that only touched unpublished tables (or other
+    /// databases) never moves `flushed_lsn`, and the slot pins it until
+    /// the next published change.
+    keepalive_lsn: Lsn,
     metrics: Arc<dyn Metrics>,
     /// True after `shutdown` runs; further `process` calls become no-ops.
     /// Tested for in flush so a forgotten shutdown sequence stays correct.
@@ -139,6 +148,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             blob_store,
             namer,
             flushed_lsn: AtomicU64::new(0),
+            keepalive_lsn: Lsn::ZERO,
             metrics,
             shut_down: false,
             markers_table: None,
@@ -288,8 +298,14 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                 // `Materializer::apply_relation`, which the lifecycle
                 // calls *before* this dispatch. Nothing to do here.
             }
-            DecodedMessage::Keepalive { .. } => {
-                // The standby ticker reads `flushed_lsn()` directly.
+            DecodedMessage::Keepalive { wal_end, .. } => {
+                // Only trustworthy between transactions: pgoutput sends a
+                // transaction once its commit is decoded, so a keepalive
+                // arriving mid-transaction can carry a `wal_end` past that
+                // not-yet-flushed commit.
+                if !self.sink.has_open_tx() && wal_end > self.keepalive_lsn {
+                    self.keepalive_lsn = wal_end;
+                }
             }
         }
         Ok(())
@@ -297,8 +313,8 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
 
     /// Drain all committed-but-unflushed transactions: encode → upload →
     /// `claim_offsets` → advance `flushedLSN` via the receipt. No-op if
-    /// nothing is ready (no staged events AND no markers awaiting
-    /// emission).
+    /// nothing is ready (no staged events, no markers awaiting emission,
+    /// and no keepalive past `flushedLSN`).
     pub async fn flush(&mut self) -> Result<Option<Lsn>> {
         let sink_output = self.sink.flush()?;
         // Markers can ride alone in an otherwise-empty flush — a tx
@@ -306,7 +322,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         // still needs to write the marker into coord. Use the
         // marker's commit LSN as the batch's flushable_lsn in that
         // case.
-        let (chunks, flushable_lsn) = match sink_output {
+        let (chunks, data_lsn) = match sink_output {
             Some(FlushOutput {
                 chunks,
                 flushable_lsn,
@@ -320,8 +336,16 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                     .expect("non-empty checked above");
                 (Vec::new(), max_marker_lsn)
             }
+            // Nothing to stage, but a keepalive showed the WAL moved past
+            // what we've flushed without anything for us: flush an empty
+            // batch so the receipt advances `flushedLSN` over it.
+            None if self.keepalive_lsn > self.flushed_lsn() => (Vec::new(), Lsn::ZERO),
             None => return Ok(None),
         };
+        // Every transaction that arrived before the last out-of-transaction
+        // keepalive is in this batch or already flushed, so the batch also
+        // covers the WAL up to that keepalive's `wal_end`.
+        let flushable_lsn = data_lsn.max(self.keepalive_lsn);
         if chunks.is_empty() {
             // Possible if every committed tx was empty. Still advance the LSN
             // (we know all tx commits up to this point are durable in PG, but

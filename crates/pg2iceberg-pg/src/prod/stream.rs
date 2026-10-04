@@ -177,23 +177,18 @@ struct ReaderState {
 impl ReaderState {
     fn handle(&mut self, env: PgEnv<PgMsg>) -> Result<Option<DecodedMessage>> {
         match env {
-            // Keepalives are absorbed by the reader task — they're
-            // protocol heartbeats, not consumer events. Forwarding them
-            // through the bounded `events` channel is what created the
-            // case-24 bug: under heavy WAL chatter on tables OUTSIDE the
-            // publication, walsender emits one keepalive per skipped
-            // record (we observed ~1500/s). At that rate the channel
-            // fills, the reader blocks on `events_tx.send`, the inner
-            // tokio-postgres CopyBoth channel backs up, and walsender
-            // suspends decoding for our connection — so subsequent DML
-            // for the publication's actual tables never reaches us.
-            //
-            // No downstream consumer uses `DecodedMessage::Keepalive`
-            // (the pipeline's match arm is a noop, the sim impl doesn't
-            // emit it), so dropping at the reader is purely an
-            // optimization with no behavioural change. If we ever need
-            // `reply_requested` handling we'll respond inline here
-            // rather than forwarding.
+            // Keepalives never reach here: `ReplicationWire::next`
+            // turns them into `WireItem::Keepalive`, which the reader
+            // task handles itself (replies + `forward_keepalive`).
+            // Blocking on the bounded `events` channel for each one is
+            // what created the case-24 bug: under heavy WAL chatter on
+            // tables OUTSIDE the publication, walsender emits one
+            // keepalive per skipped record (we observed ~1500/s). At
+            // that rate the channel fills, the reader blocks on
+            // `events_tx.send`, the inner tokio-postgres CopyBoth channel
+            // backs up, and walsender suspends decoding for our
+            // connection — so subsequent DML for the publication's
+            // actual tables never reaches us.
             PgEnv::PrimaryKeepAlive(_) => Ok(None),
             PgEnv::XLogData(xlog) => self.handle_logical(xlog.into_data()),
             // The ReplicationMessage enum is `#[non_exhaustive]`; future
@@ -394,12 +389,16 @@ impl ReaderState {
 enum Branch {
     Event(Option<Result<DecodedMessage>>),
     Cmd(Option<Cmd>),
-    /// PG sent a `PrimaryKeepAlive` with `reply_requested=1`. We must
-    /// respond with a `standby_status_update` carrying any LSN —
-    /// resending `last_ack` confirms liveness without advancing the
-    /// slot beyond what the main loop has durably persisted via the
+    /// PG sent a `PrimaryKeepAlive`. Its `wal_end` is forwarded to the
+    /// main loop (see [`forward_keepalive`]). With `reply_requested=1`
+    /// we must also respond with a `standby_status_update` carrying any
+    /// LSN — resending `last_ack` confirms liveness without advancing
+    /// the slot beyond what the main loop has durably persisted via the
     /// cmd-channel ack path. Mirrors pgx's `pglogrepl` behaviour.
-    KeepaliveReplyRequested,
+    Keepalive {
+        wal_end: PgLsn,
+        reply_requested: bool,
+    },
 }
 
 /// One item read off the replication wire. Mirrors the subset of
@@ -408,9 +407,12 @@ enum Branch {
 /// so abstracting at this level is what lets [`reader_task`] be driven by
 /// a mock in tests.
 pub(crate) enum WireItem {
-    /// Server heartbeat. `reply_requested` mirrors PG's
-    /// `PrimaryKeepAlive.reply()`.
-    Keepalive { reply_requested: bool },
+    /// Server heartbeat. `wal_end` and `reply_requested` mirror PG's
+    /// `PrimaryKeepAlive.wal_end()` / `.reply()`.
+    Keepalive {
+        wal_end: PgLsn,
+        reply_requested: bool,
+    },
     /// A logical-replication message to decode via [`ReaderState::handle`].
     Logical(PgEnv<PgMsg>),
     /// Stream ended cleanly.
@@ -437,6 +439,7 @@ impl ReplicationWire for Pin<Box<LogicalReplicationStream>> {
             None => WireItem::Closed,
             Some(Err(e)) => WireItem::Error(e.to_string()),
             Some(Ok(PgEnv::PrimaryKeepAlive(ka))) => WireItem::Keepalive {
+                wal_end: ka.wal_end().into(),
                 reply_requested: ka.reply() != 0,
             },
             Some(Ok(env)) => WireItem::Logical(env),
@@ -529,6 +532,37 @@ async fn send_servicing_cmds<W: ReplicationWire>(
     }
 }
 
+/// Forward a keepalive's `wal_end` to the main loop, so the pipeline can
+/// ack the slot past WAL that carried nothing for the publication
+/// (writes to other tables or databases). pgoutput sends no message for
+/// that WAL, so without this the slot pins it until the next published
+/// change.
+///
+/// Goes through the events channel so it stays ordered behind every
+/// message decoded before it — the pipeline only trusts it when no
+/// transaction is open at that point. Coalesced (only when `wal_end`
+/// moved forward) and non-blocking: blocking on a full channel per
+/// keepalive is the case-24 stall described in [`ReaderState::handle`].
+/// Dropping one is harmless — a full channel means events are flowing,
+/// and a later keepalive carries a later `wal_end`.
+fn forward_keepalive(
+    events_tx: &mpsc::Sender<Result<DecodedMessage>>,
+    last_forwarded: &mut PgLsn,
+    wal_end: PgLsn,
+    reply_requested: bool,
+) {
+    if wal_end <= *last_forwarded {
+        return;
+    }
+    let msg = DecodedMessage::Keepalive {
+        wal_end: Lsn(u64::from(wal_end)),
+        reply_requested,
+    };
+    if events_tx.try_send(Ok(msg)).is_ok() {
+        *last_forwarded = wal_end;
+    }
+}
+
 /// Reader task: sole owner of the replication [`ReplicationWire`]. Drains
 /// decoded events into `events_tx` and serves ack requests from
 /// `cmd_rx`. Exits cleanly when either channel side is dropped, the
@@ -546,6 +580,8 @@ async fn reader_task<W: ReplicationWire>(
     // initial ack) lands; PG accepts that as "consumer is alive but at
     // unknown position".
     let mut last_ack: PgLsn = PgLsn::from(0u64);
+    // `wal_end` of the last keepalive forwarded to the main loop.
+    let mut last_forwarded: PgLsn = PgLsn::from(0u64);
 
     loop {
         // Drain queued events first (e.g. a Truncate that exploded into
@@ -569,8 +605,7 @@ async fn reader_task<W: ReplicationWire>(
             // (which blocks on a oneshot until we ack here). If `wire.next()`
             // were biased ahead of this, a keepalive flood — exactly what PG
             // emits when the slot is pinned and there's heavy WAL churn on
-            // tables OUTSIDE the publication (e.g. the `_pg2iceberg` coord
-            // schema, written every main-loop iteration) — keeps `next`
+            // tables OUTSIDE the publication — keeps `next`
             // perpetually ready, starves this arm, and `send_standby`
             // deadlocks: the ack that would advance the slot and stop the
             // flood can never be processed. Standby cmds are rare (~every
@@ -583,14 +618,13 @@ async fn reader_task<W: ReplicationWire>(
                     "replication stream closed".into(),
                 )))),
                 WireItem::Error(e) => Branch::Event(Some(Err(PgError::Protocol(e)))),
-                // Keepalives never go through the events channel.
-                WireItem::Keepalive { reply_requested } => {
-                    if reply_requested {
-                        Branch::KeepaliveReplyRequested
-                    } else {
-                        Branch::Event(None)
-                    }
-                }
+                WireItem::Keepalive {
+                    wal_end,
+                    reply_requested,
+                } => Branch::Keepalive {
+                    wal_end,
+                    reply_requested,
+                },
                 WireItem::Logical(env) => Branch::Event(state.handle(env).transpose()),
             },
         };
@@ -598,8 +632,7 @@ async fn reader_task<W: ReplicationWire>(
         match branch {
             Branch::Event(None) => {
                 // state.handle returned Ok(None) — Origin/Type/Message
-                // protocol metadata, or a dropped keepalive. Loop and
-                // read more.
+                // protocol metadata. Loop and read more.
             }
             Branch::Event(Some(Ok(msg))) => {
                 if !send_servicing_cmds(&mut wire, &events_tx, &mut cmd_rx, &mut last_ack, Ok(msg))
@@ -616,10 +649,16 @@ async fn reader_task<W: ReplicationWire>(
                         .await;
                 return;
             }
-            Branch::KeepaliveReplyRequested => {
-                if let Err(e) = wire.standby(last_ack, last_ack, last_ack).await {
-                    let _ = events_tx.send(Err(e)).await;
-                    return;
+            Branch::Keepalive {
+                wal_end,
+                reply_requested,
+            } => {
+                forward_keepalive(&events_tx, &mut last_forwarded, wal_end, reply_requested);
+                if reply_requested {
+                    if let Err(e) = wire.standby(last_ack, last_ack, last_ack).await {
+                        let _ = events_tx.send(Err(e)).await;
+                        return;
+                    }
                 }
             }
             Branch::Cmd(cmd) => {
@@ -642,10 +681,13 @@ mod reader_tests {
     /// closed so the reader exits. Records standby acks. Models PG
     /// emitting a continuous keepalive stream (slot pinned + heavy
     /// non-published WAL): every `next()` poll is ready, so a reader
-    /// biased to the stream would never poll `cmd_rx`.
+    /// biased to the stream would never poll `cmd_rx`. Each keepalive
+    /// carries a later `wal_end`, so the reader also forwards them until
+    /// the events channel fills — which must not block it either.
     struct FloodWire {
         standbys: Arc<Mutex<Vec<(PgLsn, PgLsn, PgLsn)>>>,
         stop: Arc<AtomicBool>,
+        wal_end: u64,
     }
 
     #[async_trait]
@@ -654,7 +696,9 @@ mod reader_tests {
             if self.stop.load(Ordering::Relaxed) {
                 WireItem::Closed
             } else {
+                self.wal_end += 1;
                 WireItem::Keepalive {
+                    wal_end: PgLsn::from(self.wal_end),
                     reply_requested: false,
                 }
             }
@@ -678,6 +722,7 @@ mod reader_tests {
         let wire = FloodWire {
             standbys: standbys.clone(),
             stop: stop.clone(),
+            wal_end: 0,
         };
         let (events_tx, _events_rx) =
             mpsc::channel::<Result<DecodedMessage>>(EVENTS_CHANNEL_CAPACITY);
@@ -729,6 +774,7 @@ mod reader_tests {
         let mut wire = FloodWire {
             standbys: standbys.clone(),
             stop: Arc::new(AtomicBool::new(true)),
+            wal_end: 0,
         };
         // Capacity-1 events channel, pre-filled → the next send must wait.
         let (events_tx, mut events_rx) = mpsc::channel::<Result<DecodedMessage>>(1);
@@ -781,6 +827,129 @@ mod reader_tests {
             &[(PgLsn::from(42u64), PgLsn::from(42u64), PgLsn::from(42u64))],
             "standby LSN should have reached the wire while the channel was full",
         );
+    }
+
+    /// A wire that yields whatever the test pushes, parking when there's
+    /// nothing queued (like an idle stream). Records standby writes.
+    struct ScriptWire {
+        items: mpsc::UnboundedReceiver<WireItem>,
+        standbys: Arc<Mutex<Vec<(PgLsn, PgLsn, PgLsn)>>>,
+    }
+
+    #[async_trait]
+    impl ReplicationWire for ScriptWire {
+        async fn next(&mut self) -> WireItem {
+            self.items.recv().await.unwrap_or(WireItem::Closed)
+        }
+        async fn standby(&mut self, w: PgLsn, f: PgLsn, a: PgLsn) -> Result<()> {
+            self.standbys.lock().unwrap().push((w, f, a));
+            Ok(())
+        }
+    }
+
+    fn keepalive(wal_end: u64, reply_requested: bool) -> WireItem {
+        WireItem::Keepalive {
+            wal_end: PgLsn::from(wal_end),
+            reply_requested,
+        }
+    }
+
+    const NOTHING_MORE: std::time::Duration = std::time::Duration::from_millis(100);
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Keepalives reach the main loop so the pipeline can ack the slot
+    /// past WAL with nothing for the publication — once per new
+    /// `wal_end`, and replies still go out.
+    #[tokio::test]
+    async fn keepalive_wal_end_is_forwarded_once_per_advance() {
+        let standbys = Arc::new(Mutex::new(Vec::new()));
+        let (items_tx, items) = mpsc::unbounded_channel();
+        for item in [
+            keepalive(10, false),
+            keepalive(10, false),
+            keepalive(5, false),
+            keepalive(20, true),
+        ] {
+            items_tx.send(item).unwrap();
+        }
+        let wire = ScriptWire {
+            items,
+            standbys: standbys.clone(),
+        };
+        let (events_tx, mut events_rx) =
+            mpsc::channel::<Result<DecodedMessage>>(EVENTS_CHANNEL_CAPACITY);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
+        let reader = tokio::spawn(reader_task(wire, events_tx, cmd_rx));
+
+        let mut forwarded = Vec::new();
+        for _ in 0..2 {
+            match tokio::time::timeout(PATIENCE, events_rx.recv()).await {
+                Ok(Some(Ok(DecodedMessage::Keepalive { wal_end, .. }))) => forwarded.push(wal_end),
+                other => panic!("expected a forwarded keepalive, got {other:?}"),
+            }
+        }
+        assert_eq!(forwarded, vec![Lsn(10), Lsn(20)]);
+        // The repeat and the stale one were coalesced away.
+        assert!(tokio::time::timeout(NOTHING_MORE, events_rx.recv())
+            .await
+            .is_err());
+        assert_eq!(
+            standbys.lock().unwrap().as_slice(),
+            &[(PgLsn::from(0u64), PgLsn::from(0u64), PgLsn::from(0u64))],
+            "reply_requested keepalive answered with last_ack",
+        );
+        reader.abort();
+    }
+
+    /// Forwarding must never block the reader: with the events channel
+    /// full, the keepalive is dropped (blocking is the case-24 stall) and
+    /// its reply still goes out. A later keepalive at the same position
+    /// is forwarded once there's room.
+    #[tokio::test]
+    async fn keepalive_dropped_not_blocking_when_events_channel_full() {
+        let standbys = Arc::new(Mutex::new(Vec::new()));
+        let (items_tx, items) = mpsc::unbounded_channel();
+        items_tx.send(keepalive(10, true)).unwrap();
+        let wire = ScriptWire {
+            items,
+            standbys: standbys.clone(),
+        };
+        let (events_tx, mut events_rx) = mpsc::channel::<Result<DecodedMessage>>(1);
+        events_tx
+            .send(Ok(DecodedMessage::Begin {
+                final_lsn: Lsn(1),
+                xid: 1,
+            }))
+            .await
+            .expect("prime the channel");
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
+        let reader = tokio::spawn(reader_task(wire, events_tx, cmd_rx));
+
+        tokio::time::timeout(PATIENCE, async {
+            while standbys.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("reader blocked forwarding a keepalive into a full channel");
+        // Only the primer is queued: the keepalive was dropped.
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(Ok(DecodedMessage::Begin { .. }))
+        ));
+        assert!(tokio::time::timeout(NOTHING_MORE, events_rx.recv())
+            .await
+            .is_err());
+
+        // Room now: the same position is still unforwarded, so it goes.
+        items_tx.send(keepalive(10, false)).unwrap();
+        match tokio::time::timeout(PATIENCE, events_rx.recv()).await {
+            Ok(Some(Ok(DecodedMessage::Keepalive { wal_end, .. }))) => {
+                assert_eq!(wal_end, Lsn(10))
+            }
+            other => panic!("expected the keepalive once there was room, got {other:?}"),
+        }
+        reader.abort();
     }
 }
 
