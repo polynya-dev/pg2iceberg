@@ -277,6 +277,45 @@ impl TableWriter {
         Ok(out)
     }
 
+    /// Partition tuple of a full data row (every partition source column
+    /// present). Used by compaction, which re-derives each rewritten
+    /// row's partition exactly as [`Self::prepare`] would.
+    pub fn partition_tuple(&self, row: &Row) -> Result<Vec<PartitionLiteral>> {
+        let mut tuple: Vec<PartitionLiteral> = Vec::with_capacity(self.schema.partition_spec.len());
+        for f in &self.schema.partition_spec {
+            let value = row
+                .get(&ColumnName(f.source_column.clone()))
+                .ok_or_else(|| WriterError::PartitionColumnMissing {
+                    column: f.source_column.clone(),
+                    op: Op::Insert,
+                })?;
+            tuple.push(apply_transform(value, f.transform).map_err(|e| {
+                WriterError::PartitionTransform {
+                    column: f.source_column.clone(),
+                    source: e,
+                }
+            })?);
+        }
+        Ok(tuple)
+    }
+
+    /// Start a data file that rows are appended to incrementally — see
+    /// [`StreamingDataFile`].
+    pub fn start_data_file(&self) -> Result<StreamingDataFile> {
+        let writer = ArrowWriter::try_new(
+            Vec::new(),
+            self.full_arrow_schema.clone(),
+            Some(WriterProperties::builder().build()),
+        )
+        .map_err(|e| WriterError::Encode(format!("parquet writer: {e}")))?;
+        Ok(StreamingDataFile {
+            writer,
+            arrow_schema: self.full_arrow_schema.clone(),
+            cols: self.schema.columns.clone(),
+            record_count: 0,
+        })
+    }
+
     /// Compute the partition tuple for one row. Tier-1: read partition
     /// source columns from the row. Tier-2 (Delete only): consult FileIndex.
     /// Tier-3 (Delete only): error.
@@ -336,6 +375,54 @@ impl TableWriter {
         // a dropped delete is a correctness bug that's invisible in normal
         // operation (Go's behavior); we'd rather fail loudly.
         Err(WriterError::DeletePartitionUnresolved { pk_key: key_str })
+    }
+}
+
+/// A data file under construction. Rows are encoded as they are written,
+/// so the caller never holds the file's rows — only their Parquet
+/// encoding, which [`Self::estimated_size`] tracks so the caller can roll
+/// to a new file at a target size.
+pub struct StreamingDataFile {
+    writer: ArrowWriter<Vec<u8>>,
+    arrow_schema: Arc<Schema>,
+    cols: Vec<ColumnSchema>,
+    record_count: u64,
+}
+
+impl StreamingDataFile {
+    pub fn write(&mut self, rows: &[&Row]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let arrays = build_arrays(&self.cols, rows)?;
+        let batch = RecordBatch::try_new(self.arrow_schema.clone(), arrays)
+            .map_err(|e| WriterError::Encode(format!("build record batch: {e}")))?;
+        self.writer
+            .write(&batch)
+            .map_err(|e| WriterError::Encode(format!("parquet write: {e}")))?;
+        self.record_count += rows.len() as u64;
+        Ok(())
+    }
+
+    /// Encoded bytes so far: flushed row groups plus the buffered one.
+    pub fn estimated_size(&self) -> u64 {
+        (self.writer.bytes_written() + self.writer.in_progress_size()) as u64
+    }
+
+    pub fn record_count(&self) -> u64 {
+        self.record_count
+    }
+
+    pub fn finish(self) -> Result<DataChunk> {
+        let record_count = self.record_count;
+        let buf = self
+            .writer
+            .into_inner()
+            .map_err(|e| WriterError::Encode(format!("parquet close: {e}")))?;
+        Ok(DataChunk {
+            bytes: Bytes::from(buf),
+            record_count,
+        })
     }
 }
 

@@ -322,6 +322,9 @@ impl SinkConfig {
             data_file_threshold: self.compaction_data_files,
             delete_file_threshold: self.compaction_delete_files,
             target_size_bytes: self.target_file_size,
+            max_input_bytes_per_pass: self
+                .target_file_size
+                .saturating_mul(pg2iceberg_iceberg::CompactionConfig::DEFAULT_PASS_TARGET_FILES),
         }
     }
 

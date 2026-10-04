@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 7a6d9f9068793aeb59e94e1d2dc689c3f2f96c92d1f913f1c538b690a10fb4c2 # shrinks to steps = [UnpublishedWrite { qty: 0 }]
 cc f4004e88b64de3768c2445a6cbe938954df146915f87ee4743a5ecabfc77fdec # shrinks to steps = [Insert { id: 1, qty: 0 }, DriveFlush, MaterializerCycle, RestartMaterializer, Insert { id: 2, qty: 0 }]
+cc 99fe1595dd1f5288f853c319e3e08cc43d2fe4ea6f13cdd25ef483e7ada1ebf9 # shrinks to steps = [BigTx { inserts: 4, qty: 0 }, DriveFlush, MaterializerCycle, Compact]

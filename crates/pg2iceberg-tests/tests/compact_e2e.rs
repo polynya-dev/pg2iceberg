@@ -20,8 +20,8 @@ use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::value::PgValue;
 use pg2iceberg_core::{ColumnName, ColumnSchema, Namespace, Op, Row, TableIdent, TableSchema};
 use pg2iceberg_iceberg::{
-    compact_table, fold::MaterializedRow, read_materialized_state, Catalog, CompactionConfig,
-    DataFile, FileIndex, PreparedCommit, TableWriter,
+    compact_table, fold::MaterializedRow, read_materialized_state, rebuild_from_catalog, Catalog,
+    CompactionConfig, DataFile, FileIndex, PreparedCommit, TableWriter,
 };
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
@@ -175,6 +175,7 @@ impl Harness {
         schema: &TableSchema,
         config: &CompactionConfig,
     ) -> Option<pg2iceberg_iceberg::CompactionOutcome> {
+        let live_pks = self.file_index(schema);
         let counter = &self.counter;
         block_on(compact_table(
             &self.cat,
@@ -187,7 +188,20 @@ impl Harness {
             &schema.ident,
             schema,
             &pk_cols(),
+            Some(&live_pks),
             config,
+        ))
+        .unwrap()
+    }
+
+    /// The PK → file index the materializer would hold for this table.
+    fn file_index(&self, schema: &TableSchema) -> FileIndex {
+        block_on(rebuild_from_catalog(
+            &self.cat,
+            self.blob.as_ref(),
+            &schema.ident,
+            schema,
+            &pk_cols(),
         ))
         .unwrap()
     }
@@ -230,6 +244,7 @@ fn below_threshold_returns_none() {
         data_file_threshold: 8,
         delete_file_threshold: 4,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     assert!(h.run_compaction(&s, &cfg).is_none());
 }
@@ -246,6 +261,7 @@ fn small_files_are_compacted_into_one() {
         data_file_threshold: 3,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let out = h.run_compaction(&s, &cfg).expect("compaction should run");
     assert_eq!(out.input_data_files, 5);
@@ -277,6 +293,7 @@ fn equality_deletes_are_applied_inline() {
         data_file_threshold: 1,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let out = h.run_compaction(&s, &cfg).expect("compaction should run");
     assert_eq!(out.input_delete_files, 1);
@@ -317,6 +334,7 @@ fn partitioned_table_compacted_output_has_correct_partition_values() {
         data_file_threshold: 3,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let out = h.run_compaction(&s, &cfg).expect("compaction should run");
     assert!(
@@ -379,6 +397,7 @@ fn second_compaction_is_noop_after_first() {
         data_file_threshold: 3,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let first = h.run_compaction(&s, &cfg).expect("first compaction runs");
     assert_eq!(first.output_data_files, 1);
@@ -410,10 +429,12 @@ fn delete_at_seq_5_does_not_drop_row_inserted_at_seq_7() {
         data_file_threshold: 1,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let out = h.run_compaction(&s, &cfg).expect("compaction should run");
-    // The delete at seq 2 cannot drop the snap-3 insert.
-    assert_eq!(out.rows_removed_by_deletes, 0);
+    // The delete at seq 2 drops the snap-1 row but cannot drop the snap-3
+    // insert.
+    assert_eq!(out.rows_removed_by_deletes, 1);
 
     let visible = block_on(read_materialized_state(
         &h.cat,
@@ -500,6 +521,7 @@ fn compact_cycle_independently_handles_multiple_registered_tables() {
         data_file_threshold: 3,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
 
     let counter = &h.counter;
@@ -514,6 +536,7 @@ fn compact_cycle_independently_handles_multiple_registered_tables() {
         &s_hot.ident,
         &s_hot,
         &pk_cols(),
+        None,
         &cfg,
     ))
     .unwrap();
@@ -528,6 +551,7 @@ fn compact_cycle_independently_handles_multiple_registered_tables() {
         &s_cold.ident,
         &s_cold,
         &pk_cols(),
+        None,
         &cfg,
     ))
     .unwrap();
@@ -574,6 +598,7 @@ fn many_small_files_compact_into_few_with_deletes_applied() {
         data_file_threshold: 5,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let outcome = h.run_compaction(&s, &cfg).expect("compaction should run");
     assert!(outcome.input_data_files >= 20);
@@ -624,6 +649,7 @@ fn partitioned_table_with_deletes_compacts_per_partition() {
         data_file_threshold: 3,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let outcome = h.run_compaction(&s, &cfg).expect("compaction should run");
     assert!(outcome.output_data_files >= 2, "expected ≥2 partitions");
@@ -668,6 +694,7 @@ fn repeated_compaction_cycles_keep_state_correct() {
         data_file_threshold: 3,
         delete_file_threshold: 1,
         target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
     };
     let r1 = h.run_compaction(&s, &cfg).expect("round 1 compacts");
     assert_eq!(r1.output_data_files, 1);
@@ -688,4 +715,243 @@ fn repeated_compaction_cycles_keep_state_correct() {
     ))
     .unwrap();
     assert_eq!(visible.len(), 9);
+}
+
+// ── Bounded memory ──────────────────────────────────────────────────
+
+/// Records every path compaction fetches, so tests can assert which
+/// files a pass actually read.
+struct CountingBlob {
+    inner: Arc<MemoryBlobStore>,
+    gets: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for CountingBlob {
+    async fn put(&self, path: &str, bytes: Bytes) -> pg2iceberg_stream::Result<()> {
+        self.inner.put(path, bytes).await
+    }
+    async fn get(&self, path: &str) -> pg2iceberg_stream::Result<Bytes> {
+        self.gets.lock().unwrap().push(path.to_string());
+        self.inner.get(path).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> pg2iceberg_stream::Result<Vec<pg2iceberg_stream::BlobInfo>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, path: &str) -> pg2iceberg_stream::Result<()> {
+        self.inner.delete(path).await
+    }
+}
+
+impl Harness {
+    /// Like `run_compaction`, but also returns every path the pass read.
+    fn run_compaction_counting(
+        &self,
+        schema: &TableSchema,
+        config: &CompactionConfig,
+    ) -> (Option<pg2iceberg_iceberg::CompactionOutcome>, Vec<String>) {
+        let live_pks = self.file_index(schema);
+        let blob = CountingBlob {
+            inner: self.blob.clone(),
+            gets: std::sync::Mutex::new(Vec::new()),
+        };
+        let counter = &self.counter;
+        let out = block_on(compact_table(
+            &self.cat,
+            &blob,
+            move |_ident, idx| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let path = format!("test/compact-{n}-{idx}.parquet");
+                async move { path }
+            },
+            &schema.ident,
+            schema,
+            &pk_cols(),
+            Some(&live_pks),
+            config,
+        ))
+        .unwrap();
+        (out, blob.gets.into_inner().unwrap())
+    }
+}
+
+fn op_row(op: Op, row: Row) -> MaterializedRow {
+    MaterializedRow {
+        op,
+        row,
+        unchanged_cols: vec![],
+    }
+}
+
+/// Visible `id → qty` per `read_materialized_state`; panics on a
+/// duplicate PK, which no correct table may expose.
+fn visible_id_qty(h: &Harness, s: &TableSchema) -> BTreeMap<i32, i32> {
+    let rows = block_on(read_materialized_state(
+        &h.cat,
+        h.blob.as_ref(),
+        &s.ident,
+        s,
+        &pk_cols(),
+    ))
+    .unwrap();
+    let mut out = BTreeMap::new();
+    for r in rows {
+        let (Some(PgValue::Int4(id)), Some(PgValue::Int4(qty))) = (
+            r.get(&ColumnName("id".into())),
+            r.get(&ColumnName("qty".into())),
+        ) else {
+            panic!("unexpected row shape: {r:?}");
+        };
+        assert!(out.insert(*id, *qty).is_none(), "duplicate visible pk {id}");
+    }
+    out
+}
+
+fn live_data_files(h: &Harness, s: &TableSchema) -> Vec<DataFile> {
+    let snaps = block_on(h.cat.snapshots(&s.ident)).unwrap();
+    let removed: std::collections::BTreeSet<String> = snaps
+        .iter()
+        .flat_map(|s| s.removed_paths.iter().cloned())
+        .collect();
+    snaps
+        .into_iter()
+        .flat_map(|s| s.data_files)
+        .filter(|f| !removed.contains(&f.path))
+        .collect()
+}
+
+/// 12 files × 250 rows, then one commit that updates and deletes a row
+/// in every file, so the whole table must be rewritten. The pass must
+/// stream it: never more than one input file's rows decoded at once,
+/// output rolled at the target size, and contents unchanged.
+#[test]
+fn compaction_holds_at_most_one_input_file_of_rows() {
+    let h = Harness::new();
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    const FILES: i32 = 12;
+    const PER_FILE: i32 = 250;
+    for f in 0..FILES {
+        let rows = (0..PER_FILE)
+            .map(|i| op_row(Op::Insert, row_id_qty(f * PER_FILE + i, f * PER_FILE + i)))
+            .collect();
+        h.commit(&s, rows);
+    }
+    let mut churn = Vec::new();
+    for f in 0..FILES {
+        churn.push(op_row(Op::Update, row_id_qty(f * PER_FILE + 7, -1)));
+        churn.push(op_row(Op::Delete, pk_only(f * PER_FILE + 13)));
+    }
+    h.commit(&s, churn);
+
+    let before = visible_id_qty(&h, &s);
+    assert_eq!(before.len(), (FILES * PER_FILE - FILES) as usize);
+    let largest_input = live_data_files(&h, &s)
+        .iter()
+        .map(|f| f.record_count)
+        .max()
+        .unwrap();
+    assert_eq!(largest_input, PER_FILE as u64);
+
+    let target = 4 * 1024;
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        target_size_bytes: target,
+        ..Default::default()
+    };
+    let out = h.run_compaction(&s, &cfg).expect("compaction should run");
+    assert!(out.rows_rewritten >= (FILES * PER_FILE) as u64 - 1);
+    assert!(
+        out.peak_rows_in_memory <= largest_input,
+        "held {} rows at once; one input file has {largest_input}",
+        out.peak_rows_in_memory
+    );
+    assert!(
+        out.output_data_files > 1,
+        "output must roll at target_size_bytes, got one file of {} bytes",
+        out.bytes_after
+    );
+    assert_eq!(visible_id_qty(&h, &s), before);
+}
+
+/// One file far larger than a decode batch: the pass decodes it batch
+/// by batch instead of all at once.
+#[test]
+fn compaction_decodes_a_large_file_in_batches() {
+    let h = Harness::new();
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    let rows = (0..5000)
+        .map(|i| op_row(Op::Insert, row_id_qty(i, i)))
+        .collect();
+    h.commit(&s, rows);
+    h.commit(
+        &s,
+        (0..10)
+            .map(|i| op_row(Op::Delete, pk_only(i * 400)))
+            .collect(),
+    );
+    let before = visible_id_qty(&h, &s);
+
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let out = h.run_compaction(&s, &cfg).expect("compaction should run");
+    assert_eq!(out.rows_removed_by_deletes, 10);
+    // A fixed bound, not `DECODE_BATCH_ROWS`: the point is that the
+    // 5,000-row file is never decoded whole, whatever the constant says.
+    assert!(
+        out.peak_rows_in_memory <= 1024,
+        "held {} rows at once",
+        out.peak_rows_in_memory
+    );
+    assert_eq!(visible_id_qty(&h, &s), before);
+}
+
+/// Six large, clean files and one delete that hits a single one of them.
+/// Finding the affected file must not decode the other five.
+#[test]
+fn compaction_reads_only_the_files_it_rewrites() {
+    let h = Harness::new();
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    let mut files = Vec::new();
+    for f in 0..6 {
+        let rows = (0..200)
+            .map(|i| op_row(Op::Insert, row_id_qty(f * 200 + i, i)))
+            .collect();
+        files.extend(h.commit(&s, rows));
+    }
+    h.commit(&s, vec![op_row(Op::Delete, pk_only(3 * 200 + 5))]);
+    let before = visible_id_qty(&h, &s);
+
+    // Every data file is far above `target / 2`, so only the delete
+    // makes one of them worth rewriting.
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        target_size_bytes: 64,
+        ..Default::default()
+    };
+    let (out, gets) = h.run_compaction_counting(&s, &cfg);
+    let out = out.expect("compaction should run");
+    assert_eq!(out.input_data_files, 1);
+    assert_eq!(out.rows_removed_by_deletes, 1);
+    let data_reads: Vec<&String> = gets
+        .iter()
+        .filter(|p| files.iter().any(|f| &f.path == *p))
+        .collect();
+    assert_eq!(
+        data_reads,
+        vec![&files[3].path],
+        "only the file holding the deleted row should be read"
+    );
+    assert_eq!(visible_id_qty(&h, &s), before);
 }

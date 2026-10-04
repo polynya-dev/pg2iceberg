@@ -391,8 +391,15 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
 
                     // Match the sim's "files added in this commit"
                     // semantics: only surface entries first introduced
-                    // by this snapshot.
-                    if entry.added_snapshot_id != snap_id {
+                    // by this snapshot. Judge by the entry's own snapshot
+                    // id, not its manifest's: a Replace that drops part
+                    // of a manifest rewrites the survivors into a new
+                    // manifest it owns, as `Existing` entries that keep
+                    // their original snapshot and sequence number.
+                    // Surfacing them here would list them twice, the
+                    // second time at the Replace's sequence number —
+                    // above deletes that still apply to them.
+                    if me.snapshot_id() != Some(snap_id) {
                         continue;
                     }
                     let partition_values = iceberg_struct_to_partition_literals(df.partition());

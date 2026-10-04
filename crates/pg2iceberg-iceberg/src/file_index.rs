@@ -21,7 +21,7 @@
 use pg2iceberg_core::PartitionLiteral;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub struct FileIndex {
     /// pk_key → file path. Single source of truth for "which file contains
     /// this PK."
@@ -88,6 +88,19 @@ impl FileIndex {
 
     /// Mark these PKs as deleted. The PK→file mapping is cleared. The file
     /// path is also dropped from `file_pks` once all its PKs are gone.
+    /// Forget `path` (rewritten by compaction) and every PK still pointing
+    /// at it; the compaction outputs are added back with [`Self::add_file`].
+    pub fn remove_file(&mut self, path: &str) {
+        if let Some(pks) = self.file_pks.remove(path) {
+            for pk in pks {
+                if self.pk_to_file.get(&pk).is_some_and(|p| p == path) {
+                    self.pk_to_file.remove(&pk);
+                }
+            }
+        }
+        self.file_partition_values.remove(path);
+    }
+
     pub fn remove_pks(&mut self, pk_keys: &[String]) {
         for pk in pk_keys {
             if let Some(path) = self.pk_to_file.remove(pk) {
@@ -121,6 +134,18 @@ impl FileIndex {
 
     pub fn live_pk_count(&self) -> usize {
         self.pk_to_file.len()
+    }
+
+    /// Live rows per data file. Counted from `pk_to_file` because
+    /// `file_pks` keeps a PK under its old file after an update moves it,
+    /// so its set sizes over-count — and an over-count would make a file
+    /// with dead rows look clean to compaction.
+    pub fn live_rows_per_file(&self) -> BTreeMap<&str, u64> {
+        let mut out: BTreeMap<&str, u64> = BTreeMap::new();
+        for path in self.pk_to_file.values() {
+            *out.entry(path.as_str()).or_default() += 1;
+        }
+        out
     }
 
     /// Iterate every currently-live PK key. Used by the
