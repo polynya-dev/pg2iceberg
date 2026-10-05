@@ -19,7 +19,10 @@
 //! shows we need any of them, add behind a feature, not by rewriting the
 //! happy path.
 
+use crate::pgoutput::{self, OldTuple, RelationCol, ReplicaIdentity, TupleValue};
 use async_trait::async_trait;
+use bytes::Bytes;
+use pg2iceberg_core::typemap::PgType;
 use pg2iceberg_core::{
     ChangeEvent, ColumnName, ColumnSchema, Lsn, Op, PgValue, Row, TableIdent, TableSchema,
     Timestamp,
@@ -28,7 +31,7 @@ use pg2iceberg_pg::{
     DecodedMessage, PgClient, PgError, ReplicationStream, SlotMonitor, SnapshotId,
 };
 use pg2iceberg_snapshot::{SnapshotError, SnapshotSource};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -69,6 +72,44 @@ struct TableData {
     /// [`SimPostgres::table_oid`] so DST can model `DROP TABLE` +
     /// recreate (which yields a fresh oid).
     pg_oid: u32,
+    /// `REPLICA IDENTITY`: what an UPDATE's or DELETE's old row carries.
+    /// `Full` unless a test sets it, so a change always carries the
+    /// whole old row by default.
+    replica_identity: ReplicaIdentity,
+    /// Postgres types of columns that don't have the default type for
+    /// their Iceberg type ([`pgoutput::default_pg_type`]).
+    pg_types: BTreeMap<String, PgType>,
+}
+
+impl TableData {
+    /// `evt` as a walsender sends it given the table's replica identity:
+    /// under `Default`, a DELETE's old row and a key-changing UPDATE's
+    /// carry only the key (other columns `NULL`), and any other UPDATE
+    /// carries none.
+    fn shape_old_row(&self, mut evt: ChangeEvent) -> ChangeEvent {
+        if self.replica_identity == ReplicaIdentity::Full {
+            return evt;
+        }
+        let key_only = |row: &Row| -> Row {
+            row.iter()
+                .map(|(c, v)| {
+                    let key = self
+                        .schema
+                        .columns
+                        .iter()
+                        .any(|s| s.name == c.0 && s.is_primary_key);
+                    (c.clone(), if key { v.clone() } else { PgValue::Null })
+                })
+                .collect()
+        };
+        evt.before = match (evt.op, evt.before.as_ref(), evt.after.as_ref()) {
+            (Op::Delete, Some(b), _) => Some(key_only(b)),
+            (Op::Update, Some(b), Some(a)) if key_only(b) != key_only(a) => Some(key_only(b)),
+            (Op::Update, _, _) => None,
+            _ => evt.before,
+        };
+        evt
+    }
 }
 
 impl TableData {
@@ -167,6 +208,36 @@ struct DbState {
     publications: BTreeMap<String, Publication>,
     slots: BTreeMap<String, SlotState>,
     wal: Vec<WalEntry>,
+    /// Each table's rows after every change to them (commit, ALTER), so a
+    /// snapshot can read the table as of an earlier LSN.
+    versions: BTreeMap<TableIdent, Vec<(Lsn, Rows)>>,
+    /// The LSN an open snapshot reads at (see [`SimPostgres::begin_snapshot`]).
+    snapshot_at: Option<Lsn>,
+}
+
+/// A table's rows, keyed by canonical PK.
+type Rows = BTreeMap<String, Row>;
+
+impl DbState {
+    /// Record `ident`'s current rows as of `lsn`.
+    fn record_version(&mut self, ident: &TableIdent, lsn: Lsn) {
+        if let Some(t) = self.tables.get(ident) {
+            let rows = t.rows.clone();
+            self.versions
+                .entry(ident.clone())
+                .or_default()
+                .push((lsn, rows));
+        }
+    }
+
+    /// `ident`'s rows as of `lsn`.
+    fn rows_at(&self, ident: &TableIdent, lsn: Lsn) -> Rows {
+        self.versions
+            .get(ident)
+            .and_then(|v| v.iter().rev().find(|(at, _)| *at <= lsn))
+            .map(|(_, rows)| rows.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for DbState {
@@ -179,6 +250,8 @@ impl Default for DbState {
             publications: BTreeMap::new(),
             slots: BTreeMap::new(),
             wal: Vec::new(),
+            versions: BTreeMap::new(),
+            snapshot_at: None,
         }
     }
 }
@@ -224,6 +297,156 @@ pub struct SimPostgres {
     state: Arc<Mutex<DbState>>,
 }
 
+/// A table's relation as a walsender describes it at some WAL position.
+struct WireRelation {
+    rel_id: u32,
+    namespace: String,
+    name: String,
+    identity: ReplicaIdentity,
+    cols: Vec<RelationCol>,
+}
+
+impl WireRelation {
+    fn message(&self) -> Bytes {
+        pgoutput::relation(
+            self.rel_id,
+            &self.namespace,
+            &self.name,
+            self.identity,
+            &self.cols,
+        )
+    }
+
+    fn tuple(&self, row: &Row, unchanged: &[ColumnName]) -> Vec<TupleValue> {
+        self.cols
+            .iter()
+            .map(|c| {
+                let name = ColumnName(c.name.clone());
+                if unchanged.contains(&name) {
+                    return TupleValue::Unchanged;
+                }
+                match row.get(&name).and_then(pgoutput::pg_text) {
+                    Some(text) => TupleValue::Text(text),
+                    None => TupleValue::Null,
+                }
+            })
+            .collect()
+    }
+
+    /// `old`, as the old-tuple kind the table's replica identity sends.
+    fn old<'a>(&self, old: &'a [TupleValue]) -> OldTuple<'a> {
+        match self.identity {
+            ReplicaIdentity::Full => OldTuple::Full(old),
+            ReplicaIdentity::Default => OldTuple::Key(old),
+        }
+    }
+
+    /// `evt`, whose old row is already shaped by replica identity.
+    fn change(&self, evt: &ChangeEvent) -> Bytes {
+        let row = |r: &Option<Row>| r.clone().unwrap_or_default();
+        match evt.op {
+            Op::Insert => pgoutput::insert(self.rel_id, &self.tuple(&row(&evt.after), &[])),
+            Op::Update => {
+                let new = self.tuple(&row(&evt.after), &evt.unchanged_cols);
+                let old = evt.before.as_ref().map(|b| self.tuple(b, &[]));
+                pgoutput::update(self.rel_id, old.as_deref().map(|t| self.old(t)), &new)
+            }
+            Op::Delete => {
+                let old = self.tuple(&row(&evt.before), &[]);
+                pgoutput::delete(self.rel_id, self.old(&old))
+            }
+            Op::Truncate => pgoutput::truncate(&[self.rel_id]),
+            // Schema changes travel as WAL Relation records, not changes.
+            Op::Relation => self.message(),
+        }
+    }
+}
+
+impl DbState {
+    /// The commit LSN and timestamp of transaction `xid`, whose WAL
+    /// starts at or after `from`.
+    fn commit_of(&self, xid: u32, from: Lsn) -> (Lsn, Timestamp) {
+        let tx = self
+            .wal
+            .iter()
+            .filter(|e| e.lsn >= from && e.xid == Some(xid));
+        let ts = tx
+            .clone()
+            .find_map(|e| match &e.kind {
+                WalKind::Change(c) => Some(c.commit_ts),
+                _ => None,
+            })
+            .unwrap_or(Timestamp(0));
+        let commit = tx
+            .clone()
+            .find(|e| matches!(e.kind, WalKind::Commit))
+            .map_or(from, |e| e.lsn);
+        (commit, ts)
+    }
+
+    /// `ident`'s columns from the latest Relation record at or before
+    /// WAL position `at`.
+    fn columns_at(&self, ident: &TableIdent, at: Lsn) -> Option<&[pg2iceberg_pg::RelationColumn]> {
+        self.wal.iter().rev().find_map(|e| match &e.kind {
+            WalKind::Relation { ident: i, columns } if i == ident && e.lsn <= at => {
+                Some(columns.as_slice())
+            }
+            _ => None,
+        })
+    }
+
+    /// `ident`'s Relation message as of `at`, as production decodes it:
+    /// pgoutput's key flag marks replica-identity columns, which
+    /// production reads as primary key.
+    fn relation_columns(
+        &self,
+        ident: &TableIdent,
+        at: Lsn,
+    ) -> Option<Vec<pg2iceberg_pg::RelationColumn>> {
+        let full = self.tables.get(ident)?.replica_identity == ReplicaIdentity::Full;
+        let columns = self.columns_at(ident, at)?;
+        Some(
+            columns
+                .iter()
+                .map(|c| {
+                    let key = full || c.is_primary_key;
+                    pg2iceberg_pg::RelationColumn {
+                        name: c.name.clone(),
+                        ty: c.ty,
+                        is_primary_key: key,
+                        nullable: !key,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// `ident`'s relation as of WAL position `at`.
+    fn relation(&self, ident: &TableIdent, at: Lsn) -> Option<WireRelation> {
+        let t = self.tables.get(ident)?;
+        let columns = self.columns_at(ident, at)?;
+        Some(WireRelation {
+            rel_id: t.pg_oid,
+            namespace: ident.namespace.0.join("."),
+            name: ident.name.clone(),
+            identity: t.replica_identity,
+            cols: columns
+                .iter()
+                .map(|c| RelationCol {
+                    name: c.name.clone(),
+                    // Every column is part of a FULL replica identity.
+                    key: t.replica_identity == ReplicaIdentity::Full || c.is_primary_key,
+                    pg_type: t
+                        .pg_types
+                        .get(&c.name)
+                        .copied()
+                        .unwrap_or_else(|| pgoutput::default_pg_type(c.ty)),
+                })
+                .collect(),
+        })
+    }
+}
+
 impl SimPostgres {
     pub fn new() -> Self {
         Self::default()
@@ -248,6 +471,8 @@ impl SimPostgres {
                 schema,
                 rows: BTreeMap::new(),
                 pg_oid,
+                replica_identity: ReplicaIdentity::Full,
+                pg_types: BTreeMap::new(),
             },
         );
         let lsn = s.alloc_lsn();
@@ -286,6 +511,10 @@ impl SimPostgres {
             + 1;
         let mut new_col = col;
         new_col.field_id = next_id;
+        // Existing rows read the new column as NULL (no DEFAULT).
+        for row in table.rows.values_mut() {
+            row.insert(ColumnName(new_col.name.clone()), PgValue::Null);
+        }
         table.schema.columns.push(new_col);
         let columns = relation_columns_from_schema(&table.schema);
         let lsn = s.alloc_lsn();
@@ -297,6 +526,7 @@ impl SimPostgres {
                 columns,
             },
         });
+        s.record_version(ident, lsn);
         Ok(())
     }
 
@@ -312,6 +542,34 @@ impl SimPostgres {
             .get_mut(ident)
             .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
         table.schema.columns.retain(|c| c.name != col_name);
+        // The column's data goes with it.
+        for row in table.rows.values_mut() {
+            row.remove(&ColumnName(col_name.to_string()));
+        }
+        let columns = relation_columns_from_schema(&table.schema);
+        let lsn = s.alloc_lsn();
+        s.wal.push(WalEntry {
+            lsn,
+            xid: None,
+            kind: WalKind::Relation {
+                ident: ident.clone(),
+                columns,
+            },
+        });
+        s.record_version(ident, lsn);
+        Ok(())
+    }
+
+    /// Something that invalidates the table's relation cache entry
+    /// without changing its columns — `CREATE INDEX`, `ANALYZE`,
+    /// `ALTER PUBLICATION`, a `VACUUM` that updates `pg_class`. pgoutput
+    /// resends the table's Relation, unchanged, before its next change.
+    pub fn invalidate_relation(&self, ident: &TableIdent) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get(ident)
+            .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
         let columns = relation_columns_from_schema(&table.schema);
         let lsn = s.alloc_lsn();
         s.wal.push(WalEntry {
@@ -361,6 +619,7 @@ impl SimPostgres {
                 columns,
             },
         });
+        s.record_version(ident, lsn);
         Ok(())
     }
 
@@ -379,6 +638,8 @@ impl SimPostgres {
                 schema,
                 rows: BTreeMap::new(),
                 pg_oid,
+                replica_identity: ReplicaIdentity::Full,
+                pg_types: BTreeMap::new(),
             },
         );
         Ok(())
@@ -387,6 +648,46 @@ impl SimPostgres {
     /// Test hook: peek at a table's current oid. Real PG users get
     /// this from `pg_class.oid`; the sim mirrors it via
     /// [`SimPgClient::table_oid`].
+    /// The table's current columns, as `information_schema` lists them.
+    pub fn table_schema(&self, ident: &TableIdent) -> Option<TableSchema> {
+        self.state
+            .lock()
+            .unwrap()
+            .tables
+            .get(ident)
+            .map(|t| t.schema.clone())
+    }
+
+    /// Open a snapshot at the current LSN: until [`Self::end_snapshot`],
+    /// snapshot reads see the tables as of now, however they change —
+    /// one REPEATABLE READ transaction across every chunk, as production
+    /// reads them.
+    pub fn begin_snapshot(&self) -> Lsn {
+        let mut s = self.state.lock().unwrap();
+        let lsn = s.current_lsn();
+        s.snapshot_at = Some(lsn);
+        lsn
+    }
+
+    pub fn end_snapshot(&self) {
+        self.state.lock().unwrap().snapshot_at = None;
+    }
+
+    /// `ALTER TABLE … REPLICA IDENTITY`.
+    pub fn set_replica_identity(&self, ident: &TableIdent, identity: ReplicaIdentity) {
+        if let Some(t) = self.state.lock().unwrap().tables.get_mut(ident) {
+            t.replica_identity = identity;
+        }
+    }
+
+    /// Declare `column`'s Postgres type, where it isn't the default for
+    /// its Iceberg type (e.g. `smallint` for an Iceberg `int`).
+    pub fn set_pg_type(&self, ident: &TableIdent, column: &str, ty: PgType) {
+        if let Some(t) = self.state.lock().unwrap().tables.get_mut(ident) {
+            t.pg_types.insert(column.to_string(), ty);
+        }
+    }
+
     pub fn table_oid(&self, ident: &TableIdent) -> Option<u32> {
         self.state
             .lock()
@@ -562,6 +863,25 @@ impl SimPostgres {
     /// Test-only: returns every committed change event for tables in the
     /// given publication, ordered by LSN. Used by DST invariant checks to
     /// compare the WAL "ground truth" against staged Parquet contents.
+    /// [`Self::dump_change_events`] as a walsender sends them: old rows
+    /// shaped by each table's replica identity.
+    pub fn dump_change_events_as_sent(&self, publication: &str) -> Result<Vec<ChangeEvent>> {
+        let events = self.dump_change_events(publication)?;
+        let s = self.state.lock().unwrap();
+        Ok(events
+            .into_iter()
+            .map(|e| match s.tables.get(&e.table) {
+                Some(t) => t.shape_old_row(e),
+                None => e,
+            })
+            .collect())
+    }
+
+    /// The LSN of transaction `xid`'s commit record.
+    pub fn commit_lsn(&self, xid: u32) -> Lsn {
+        self.state.lock().unwrap().commit_of(xid, Lsn::ZERO).0
+    }
+
     pub fn dump_change_events(&self, publication: &str) -> Result<Vec<ChangeEvent>> {
         let s = self.state.lock().unwrap();
         let pub_tables = &s
@@ -595,6 +915,9 @@ impl SimPostgres {
             publication: slot_state.publication,
             cursor_lsn: slot_state.restart_lsn,
             keepalive_sent: Lsn::ZERO,
+            pending: VecDeque::new(),
+            wire_queue: VecDeque::new(),
+            relations_sent: BTreeSet::new(),
         })
     }
 }
@@ -637,7 +960,27 @@ enum TxOp {
     /// behavior.
     Truncate {
         table: TableIdent,
+        /// Part of the previous op's `TRUNCATE` statement: one WAL
+        /// record, so one LSN and one pgoutput message for all of them.
+        same_statement: bool,
     },
+}
+
+/// An UPDATE's `new_row` as the table stores it and as pgoutput sends
+/// it, given the TOASTed columns it leaves `unchanged`: the table keeps
+/// their `old` values; the WAL carries `NULL` in their place (the
+/// unchanged marker decodes to `NULL` plus an `unchanged_cols` entry).
+fn toast(new_row: Row, old: Option<&Row>, unchanged: &[ColumnName]) -> (Row, Row) {
+    let mut stored = new_row.clone();
+    let mut sent = new_row;
+    for col in unchanged {
+        match old.and_then(|o| o.get(col)) {
+            Some(v) => stored.insert(col.clone(), v.clone()),
+            None => stored.remove(col),
+        };
+        sent.insert(col.clone(), PgValue::Null);
+    }
+    (stored, sent)
 }
 
 impl TxHandle {
@@ -662,6 +1005,10 @@ impl TxHandle {
         self
     }
 
+    /// `UPDATE` that leaves TOASTed columns `unchanged`, as pgoutput
+    /// reports it: the table keeps their old values (whatever `new_row`
+    /// holds for them is ignored), and the WAL row carries `NULL` plus an
+    /// `unchanged_cols` marker in their place.
     pub fn update_with_unchanged(
         &mut self,
         table: &TableIdent,
@@ -694,11 +1041,24 @@ impl TxHandle {
         before_row: Row,
         new_row: Row,
     ) -> &mut Self {
+        self.update_with_pk_change_unchanged(table, before_row, new_row, Vec::new())
+    }
+
+    /// [`Self::update_with_pk_change`] that leaves TOASTed columns
+    /// `unchanged`: pgoutput still sends them as unchanged markers when
+    /// the key moves (see [`Self::update_with_unchanged`]).
+    pub fn update_with_pk_change_unchanged(
+        &mut self,
+        table: &TableIdent,
+        before_row: Row,
+        new_row: Row,
+        unchanged: Vec<ColumnName>,
+    ) -> &mut Self {
         self.ops.push(TxOp::UpdatePkChange {
             table: table.clone(),
             before_row,
             new_row,
-            unchanged_cols: Vec::new(),
+            unchanged_cols: unchanged,
         });
         self
     }
@@ -706,9 +1066,18 @@ impl TxHandle {
     /// `TRUNCATE` the table. Drops every row and emits a single
     /// `Op::Truncate` event with no payload, matching pgoutput.
     pub fn truncate(&mut self, table: &TableIdent) -> &mut Self {
-        self.ops.push(TxOp::Truncate {
-            table: table.clone(),
-        });
+        self.truncate_all(std::slice::from_ref(table))
+    }
+
+    /// One `TRUNCATE` statement naming several tables: one WAL record,
+    /// which pgoutput sends as one Truncate message.
+    pub fn truncate_all(&mut self, tables: &[TableIdent]) -> &mut Self {
+        for (i, table) in tables.iter().enumerate() {
+            self.ops.push(TxOp::Truncate {
+                table: table.clone(),
+                same_statement: i > 0,
+            });
+        }
         self
     }
 
@@ -730,7 +1099,7 @@ impl TxHandle {
                 | TxOp::Update { table, .. }
                 | TxOp::Delete { table, .. }
                 | TxOp::UpdatePkChange { table, .. }
-                | TxOp::Truncate { table } => table,
+                | TxOp::Truncate { table, .. } => table,
             };
             let t = s
                 .tables
@@ -827,7 +1196,8 @@ impl TxHandle {
                     let t = s.tables.get_mut(&table).expect("validated above");
                     let key = t.pk_key(&new_row)?;
                     let before = t.rows.get(&key).cloned();
-                    t.rows.insert(key, new_row.clone());
+                    let (stored, sent) = toast(new_row, before.as_ref(), &unchanged_cols);
+                    t.rows.insert(key, stored);
                     s.wal.push(WalEntry {
                         lsn,
                         xid: Some(self.xid),
@@ -838,7 +1208,7 @@ impl TxHandle {
                             commit_ts,
                             xid: Some(self.xid),
                             before,
-                            after: Some(new_row),
+                            after: Some(sent),
                             unchanged_cols,
                         }),
                     });
@@ -873,8 +1243,9 @@ impl TxHandle {
                     let t = s.tables.get_mut(&table).expect("validated above");
                     let old_key = t.pk_key(&before_row)?;
                     let new_key = t.pk_key(&new_row)?;
-                    t.rows.remove(&old_key);
-                    t.rows.insert(new_key, new_row.clone());
+                    let old_row = t.rows.remove(&old_key);
+                    let (stored, sent) = toast(new_row, old_row.as_ref(), &unchanged_cols);
+                    t.rows.insert(new_key, stored);
                     s.wal.push(WalEntry {
                         lsn,
                         xid: Some(self.xid),
@@ -885,13 +1256,19 @@ impl TxHandle {
                             commit_ts,
                             xid: Some(self.xid),
                             before: Some(before_row),
-                            after: Some(new_row),
+                            after: Some(sent),
                             unchanged_cols,
                         }),
                     });
                 }
-                TxOp::Truncate { table } => {
-                    let lsn = s.alloc_lsn();
+                TxOp::Truncate {
+                    table,
+                    same_statement,
+                } => {
+                    let lsn = match s.wal.last() {
+                        Some(prev) if same_statement => prev.lsn,
+                        _ => s.alloc_lsn(),
+                    };
                     let t = s.tables.get_mut(&table).expect("validated above");
                     t.rows.clear();
                     s.wal.push(WalEntry {
@@ -918,6 +1295,19 @@ impl TxHandle {
             xid: Some(self.xid),
             kind: WalKind::Commit,
         });
+        let touched: BTreeSet<TableIdent> = s
+            .wal
+            .iter()
+            .rev()
+            .take_while(|e| e.xid == Some(self.xid))
+            .filter_map(|e| match &e.kind {
+                WalKind::Change(c) => Some(c.table.clone()),
+                _ => None,
+            })
+            .collect();
+        for t in touched {
+            s.record_version(&t, commit_lsn);
+        }
 
         Ok(commit_lsn)
     }
@@ -961,6 +1351,21 @@ pub struct SimReplicationStream {
     /// `wal_end` of the last keepalive sent, so a caught-up stream
     /// sends one per new position instead of on every `recv`.
     keepalive_sent: Lsn,
+    /// Decoded messages [`Self::recv`] still has to hand out.
+    pending: VecDeque<DecodedMessage>,
+    /// Encoded messages [`Self::recv_wire`] still has to hand out.
+    wire_queue: VecDeque<WireMessage>,
+    /// Tables whose Relation message this session has sent since their
+    /// relation cache entry was last invalidated.
+    relations_sent: BTreeSet<TableIdent>,
+}
+
+/// What a walsender sends: a pgoutput message (an `XLogData` payload),
+/// or a keepalive.
+#[derive(Clone, Debug)]
+pub enum WireMessage {
+    Pgoutput(Bytes),
+    Keepalive { wal_end: Lsn, reply_requested: bool },
 }
 
 impl SimReplicationStream {
@@ -968,9 +1373,86 @@ impl SimReplicationStream {
         &self.slot
     }
 
+    /// [`Self::recv`], encoded as a walsender sends it: pgoutput bytes,
+    /// with values in Postgres text format, unchanged TOAST columns as
+    /// markers, old rows shaped by replica identity, `Begin` carrying the
+    /// commit record's LSN, and a multi-table TRUNCATE as one message.
+    pub fn recv_wire(&mut self) -> Option<WireMessage> {
+        if let Some(m) = self.wire_queue.pop_front() {
+            return Some(m);
+        }
+        let record: Vec<DecodedMessage> = if self.pending.is_empty() {
+            self.next_record()?
+        } else {
+            self.pending.drain(..).collect()
+        };
+        let s = self.db.state.lock().unwrap();
+        let mut out: Vec<WireMessage> = Vec::new();
+        // The tables of the record's TRUNCATE statement, sent last.
+        let mut truncated = Vec::new();
+        for msg in record {
+            match msg {
+                DecodedMessage::Begin { final_lsn, xid } => {
+                    let (commit_lsn, ts) = s.commit_of(xid, final_lsn);
+                    out.push(WireMessage::Pgoutput(pgoutput::begin(commit_lsn, ts, xid)));
+                }
+                DecodedMessage::Commit { commit_lsn, xid } => {
+                    let (_, ts) = s.commit_of(xid, Lsn::ZERO);
+                    out.push(WireMessage::Pgoutput(pgoutput::commit(
+                        commit_lsn, commit_lsn, ts,
+                    )));
+                }
+                DecodedMessage::Relation { ident, .. } => {
+                    if let Some(rel) = s.relation(&ident, self.cursor_lsn) {
+                        out.push(WireMessage::Pgoutput(rel.message()));
+                    }
+                }
+                DecodedMessage::Change(evt) => {
+                    let rel = s.relation(&evt.table, evt.lsn)?;
+                    if matches!(evt.op, Op::Truncate) {
+                        truncated.push(rel.rel_id);
+                    } else {
+                        out.push(WireMessage::Pgoutput(rel.change(&evt)));
+                    }
+                }
+                DecodedMessage::Keepalive {
+                    wal_end,
+                    reply_requested,
+                } => out.push(WireMessage::Keepalive {
+                    wal_end,
+                    reply_requested,
+                }),
+            }
+        }
+        if !truncated.is_empty() {
+            out.push(WireMessage::Pgoutput(pgoutput::truncate(&truncated)));
+        }
+        drop(s);
+        self.wire_queue.extend(out);
+        self.wire_queue.pop_front()
+    }
+
     /// Returns the next message at or after the cursor that's allowed by the
     /// publication. Cursor advances past whatever is returned.
+    ///
+    /// Like pgoutput, it sends a table's Relation message just before the
+    /// first change to it since the session started or since its
+    /// relation cache entry was last invalidated: by DDL (or anything
+    /// else that invalidates it, such as `CREATE INDEX`), or by a
+    /// TRUNCATE, which invalidates it before its own message and again
+    /// at commit. Columns are flagged as key the way pgoutput flags
+    /// them, which under `REPLICA IDENTITY FULL` is every column.
     pub fn recv(&mut self) -> Option<DecodedMessage> {
+        if self.pending.is_empty() {
+            let record = self.next_record()?;
+            self.pending.extend(record);
+        }
+        self.pending.pop_front()
+    }
+
+    /// The messages for the next WAL record at or after the cursor that
+    /// the publication sends; the cursor advances past it.
+    fn next_record(&mut self) -> Option<Vec<DecodedMessage>> {
         let s = self.db.state.lock().unwrap();
         let pub_tables = &s
             .publications
@@ -1001,36 +1483,76 @@ impl SimReplicationStream {
                         continue;
                     }
                     self.cursor_lsn = entry.lsn;
-                    return Some(DecodedMessage::Begin {
+                    return Some(vec![DecodedMessage::Begin {
                         final_lsn: entry.lsn,
                         xid: entry.xid.unwrap_or(0),
-                    });
+                    }]);
                 }
                 WalKind::Commit => {
                     self.cursor_lsn = entry.lsn;
-                    return Some(DecodedMessage::Commit {
+                    // The transaction's own invalidations take effect at
+                    // its commit: a table it truncated gets a fresh
+                    // Relation before its next change.
+                    for e in s.wal[..i].iter().rev().take_while(|e| e.xid == entry.xid) {
+                        if let WalKind::Change(evt) = &e.kind {
+                            if matches!(evt.op, Op::Truncate) {
+                                self.relations_sent.remove(&evt.table);
+                            }
+                        }
+                    }
+                    return Some(vec![DecodedMessage::Commit {
                         commit_lsn: entry.lsn,
                         xid: entry.xid.unwrap_or(0),
-                    });
+                    }]);
                 }
-                WalKind::Relation { ident, columns } => {
-                    if !pub_tables.contains(ident) {
-                        self.cursor_lsn = entry.lsn;
+                WalKind::Relation { ident, .. } => {
+                    // DDL changes no rows; it invalidates the table's
+                    // relation cache entry, so the next change to it
+                    // brings a fresh Relation.
+                    self.relations_sent.remove(ident);
+                    self.cursor_lsn = entry.lsn;
+                }
+                WalKind::Change(_) => {
+                    // One WAL record: a multi-table TRUNCATE is several
+                    // entries at one LSN.
+                    let changes: Vec<&ChangeEvent> = s.wal[i..]
+                        .iter()
+                        .take_while(|e| e.lsn == entry.lsn)
+                        .filter_map(|e| match &e.kind {
+                            WalKind::Change(evt) if pub_tables.contains(&evt.table) => Some(evt),
+                            _ => None,
+                        })
+                        .collect();
+                    self.cursor_lsn = entry.lsn;
+                    if changes.is_empty() {
                         continue;
                     }
-                    self.cursor_lsn = entry.lsn;
-                    return Some(DecodedMessage::Relation {
-                        ident: ident.clone(),
-                        columns: columns.clone(),
-                    });
-                }
-                WalKind::Change(evt) => {
-                    if !pub_tables.contains(&evt.table) {
-                        self.cursor_lsn = entry.lsn;
-                        continue;
+                    for evt in &changes {
+                        if matches!(evt.op, Op::Truncate) {
+                            self.relations_sent.remove(&evt.table);
+                        }
                     }
-                    self.cursor_lsn = entry.lsn;
-                    return Some(DecodedMessage::Change(evt.clone()));
+                    let mut out = Vec::new();
+                    for evt in &changes {
+                        if self.relations_sent.contains(&evt.table) {
+                            continue;
+                        }
+                        if let Some(columns) = s.relation_columns(&evt.table, entry.lsn) {
+                            self.relations_sent.insert(evt.table.clone());
+                            out.push(DecodedMessage::Relation {
+                                ident: evt.table.clone(),
+                                columns,
+                            });
+                        }
+                    }
+                    for evt in changes {
+                        let evt = match s.tables.get(&evt.table) {
+                            Some(t) => t.shape_old_row(evt.clone()),
+                            None => evt.clone(),
+                        };
+                        out.push(DecodedMessage::Change(evt));
+                    }
+                    return Some(out);
                 }
             }
         }
@@ -1046,10 +1568,10 @@ impl SimReplicationStream {
             .unwrap_or(Lsn::ZERO);
         if self.cursor_lsn > confirmed && self.cursor_lsn > self.keepalive_sent {
             self.keepalive_sent = self.cursor_lsn;
-            return Some(DecodedMessage::Keepalive {
+            return Some(vec![DecodedMessage::Keepalive {
                 wal_end: self.cursor_lsn,
                 reply_requested: false,
-            });
+            }]);
         }
         None
     }
@@ -1138,7 +1660,8 @@ impl pg2iceberg_pg::ReplicationStream for AsyncSimStream {
 #[async_trait]
 impl SnapshotSource for SimPostgres {
     async fn snapshot_lsn(&self) -> std::result::Result<Lsn, SnapshotError> {
-        Ok(self.current_lsn())
+        let s = self.state.lock().unwrap();
+        Ok(s.snapshot_at.unwrap_or_else(|| s.current_lsn()))
     }
 
     async fn read_chunk(
@@ -1153,11 +1676,20 @@ impl SnapshotSource for SimPostgres {
             .get(ident)
             .ok_or_else(|| SnapshotError::Source(format!("unknown table: {ident}")))?;
 
+        // An open snapshot reads the table as of its LSN, like the
+        // REPEATABLE READ transaction production's snapshot reads in.
+        let at_snapshot;
+        let rows = match s.snapshot_at {
+            Some(lsn) => {
+                at_snapshot = s.rows_at(ident, lsn);
+                &at_snapshot
+            }
+            None => &table.rows,
+        };
         // SimPostgres stores rows keyed by canonical PK in a BTreeMap, so
         // iteration is already sorted ASC by PK. Filter strictly above the
         // bound, then truncate.
-        let chunk: Vec<Row> = table
-            .rows
+        let chunk: Vec<Row> = rows
             .iter()
             .filter(|(k, _)| match after_pk_key {
                 Some(after) => k.as_str() > after,

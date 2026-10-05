@@ -176,6 +176,18 @@ impl Harness {
         None
     }
 
+    /// Insert a row into `ident`. pgoutput sends a table's Relation only
+    /// before a change to it, so an ALTER reaches pg2iceberg with the
+    /// table's next write, never on its own.
+    fn write(&self, ident: &TableIdent, cols: &[(&str, PgValue)]) {
+        let mut tx = self.db.begin_tx();
+        tx.insert(
+            ident,
+            cols.iter().map(|(c, v)| (col(c), v.clone())).collect(),
+        );
+        tx.commit(Timestamp(0)).unwrap();
+    }
+
     fn iceberg_schema(&self, ident: &TableIdent) -> TableSchema {
         let meta = block_on(self.catalog.load_table(ident)).unwrap().unwrap();
         meta.schema
@@ -268,6 +280,10 @@ fn type_narrowing_long_to_int_fails_loudly() {
 
     h.db.alter_column_type(&s.ident, "qty", IcebergType::Int)
         .unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(1)), ("qty", PgValue::Int4(1))],
+    );
 
     let err = h
         .drive_capturing_relation_error()
@@ -300,6 +316,10 @@ fn type_change_cross_family_text_to_int_fails_loudly() {
 
     h.db.alter_column_type(&s.ident, "note", IcebergType::Int)
         .unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(1)), ("note", PgValue::Int4(1))],
+    );
 
     let err = h
         .drive_capturing_relation_error()
@@ -319,6 +339,10 @@ fn pk_type_change_rejected_even_for_legal_promotion() {
 
     h.db.alter_column_type(&s.ident, "id", IcebergType::Long)
         .unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int8(1)), ("qty", PgValue::Int4(1))],
+    );
 
     let err = h
         .drive_capturing_relation_error()
@@ -345,10 +369,8 @@ fn single_relation_with_multiple_new_columns_adds_all() {
     // Drain the initial Relation (from create_table).
     h.drive_then_materialize();
 
-    // Two ALTERs back-to-back — sim emits one Relation per call,
-    // but the materializer's diff is the same shape as a real
-    // multi-column-add Relation: multiple new names compared to
-    // current schema. We verify both end up in the Iceberg schema.
+    // Two ALTERs back-to-back, then a write: like pgoutput, the sim
+    // sends one Relation, before the write, carrying both new columns.
     h.db.alter_add_column(
         &s.ident,
         ColumnSchema {
@@ -371,6 +393,10 @@ fn single_relation_with_multiple_new_columns_adds_all() {
         },
     )
     .unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(1)), ("qty", PgValue::Int4(1))],
+    );
 
     h.drive_then_materialize();
 
@@ -418,6 +444,10 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
 
     h.db.alter_add_column(&s.ident, add("a", IcebergType::Int))
         .unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(1)), ("qty", PgValue::Int4(1))],
+    );
     h.drive_then_materialize();
     let a_id = h
         .iceberg_schema(&s.ident)
@@ -429,6 +459,10 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
 
     h.db.alter_add_column(&s.ident, add("b", IcebergType::String))
         .unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(2)), ("qty", PgValue::Int4(2))],
+    );
     h.drive_then_materialize();
     let b_id = h
         .iceberg_schema(&s.ident)
@@ -439,6 +473,10 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
         .field_id;
 
     h.db.alter_drop_column(&s.ident, "a").unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(3)), ("qty", PgValue::Int4(3))],
+    );
     h.drive_then_materialize();
     let after_drop = h.iceberg_schema(&s.ident);
     let a_after = after_drop.columns.iter().find(|c| c.name == "a").unwrap();
@@ -447,6 +485,10 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
 
     h.db.alter_add_column(&s.ident, add("c", IcebergType::Long))
         .unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(4)), ("qty", PgValue::Int4(4))],
+    );
     h.drive_then_materialize();
     let final_schema = h.iceberg_schema(&s.ident);
     let c_id = final_schema
@@ -463,37 +505,67 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
     assert!(b_id < c_id, "c allocated after b (no reuse of a's id)");
 }
 
-// ── ADD then DROP without intermediate INSERT ────────────────────────
+// ── ADD then DROP without values ─────────────────────────────────────
+
+fn tmp_column() -> ColumnSchema {
+    ColumnSchema {
+        name: "tmp".into(),
+        field_id: 0,
+        ty: IcebergType::String,
+        nullable: true,
+        is_primary_key: false,
+    }
+}
 
 #[test]
-fn add_then_drop_without_data_leaves_soft_dropped_column() {
-    // ALTER ADD COLUMN tmp + ALTER DROP COLUMN tmp without any
-    // INSERTs in between. The column should end up in the Iceberg
-    // schema as soft-dropped (nullable=true) with no data ever
-    // written for it. This mirrors what PG would do: the column
-    // existed for a moment, then was removed with no writes.
+fn add_then_drop_with_no_values_leaves_soft_dropped_column() {
+    // ALTER ADD COLUMN tmp, a write that leaves it NULL, ALTER DROP
+    // COLUMN tmp, another write. The write after the ADD brings a
+    // Relation with tmp, the one after the DROP a Relation without it:
+    // tmp ends up soft-dropped (nullable=true) with no value ever
+    // written for it.
     let s = schema_with("orders", "qty", IcebergType::Int);
     let mut h = Harness::boot(std::slice::from_ref(&s));
     h.drive_then_materialize();
 
-    h.db.alter_add_column(
+    h.db.alter_add_column(&s.ident, tmp_column()).unwrap();
+    h.write(
         &s.ident,
-        ColumnSchema {
-            name: "tmp".into(),
-            field_id: 0,
-            ty: IcebergType::String,
-            nullable: true,
-            is_primary_key: false,
-        },
-    )
-    .unwrap();
+        &[("id", PgValue::Int4(1)), ("qty", PgValue::Int4(1))],
+    );
+    h.drive_then_materialize();
     h.db.alter_drop_column(&s.ident, "tmp").unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(2)), ("qty", PgValue::Int4(2))],
+    );
     h.drive_then_materialize();
 
     let evolved = h.iceberg_schema(&s.ident);
     let tmp = evolved.columns.iter().find(|c| c.name == "tmp").unwrap();
     assert!(tmp.nullable, "tmp should be soft-dropped to nullable");
     assert!(!tmp.is_primary_key);
+}
+
+#[test]
+fn add_then_drop_with_no_write_between_never_reaches_iceberg() {
+    // ALTER ADD COLUMN tmp then ALTER DROP COLUMN tmp with no change to
+    // the table in between: pgoutput never sends a Relation with tmp,
+    // so the Iceberg schema never has it.
+    let s = schema_with("orders", "qty", IcebergType::Int);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
+    h.drive_then_materialize();
+
+    h.db.alter_add_column(&s.ident, tmp_column()).unwrap();
+    h.db.alter_drop_column(&s.ident, "tmp").unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(1)), ("qty", PgValue::Int4(1))],
+    );
+    h.drive_then_materialize();
+
+    let evolved = h.iceberg_schema(&s.ident);
+    assert!(evolved.columns.iter().all(|c| c.name != "tmp"));
 }
 
 // ── Multi-table evolution ────────────────────────────────────────────
@@ -521,6 +593,11 @@ fn schema_evolution_across_two_tables_is_independent() {
     )
     .unwrap();
     h.db.alter_drop_column(&s_b.ident, "email").unwrap();
+    h.write(
+        &s_a.ident,
+        &[("id", PgValue::Int4(1)), ("qty", PgValue::Int4(1))],
+    );
+    h.write(&s_b.ident, &[("id", PgValue::Int4(1))]);
     h.drive_then_materialize();
 
     let a = h.iceberg_schema(&s_a.ident);
@@ -544,30 +621,34 @@ fn schema_evolution_across_two_tables_is_independent() {
 
 #[test]
 fn repeated_relation_with_same_schema_is_no_op() {
-    // pgoutput re-emits Relation messages liberally — every cache
-    // invalidation, even when no schema change happened. The
-    // materializer's diff must produce zero SchemaChanges in that
-    // case, so we don't churn snapshot history with empty schema
-    // updates.
+    // pgoutput re-emits Relation messages liberally — after every
+    // cache invalidation (CREATE INDEX, ANALYZE, …), even when no
+    // schema change happened. The materializer's diff must produce
+    // zero SchemaChanges in that case, so we don't churn snapshot
+    // history with empty schema updates.
     let s = schema_with("orders", "qty", IcebergType::Int);
     let mut h = Harness::boot(std::slice::from_ref(&s));
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(1)), ("qty", PgValue::Int4(1))],
+    );
     h.drive_then_materialize();
 
     let snapshots_before = block_on(h.catalog.snapshots(&s.ident)).unwrap().len();
 
-    // Re-ALTER with a no-op: drop a non-existent column would error,
-    // but we can re-emit the same schema by calling
-    // alter_column_type with the *current* type — sim emits a
-    // Relation but the columns are unchanged so apply_relation
-    // produces zero changes.
-    h.db.alter_column_type(&s.ident, "qty", IcebergType::Int)
-        .unwrap();
+    // The write after the invalidation brings an unchanged Relation.
+    h.db.invalidate_relation(&s.ident).unwrap();
+    h.write(
+        &s.ident,
+        &[("id", PgValue::Int4(2)), ("qty", PgValue::Int4(2))],
+    );
     h.drive_then_materialize();
 
     let snapshots_after = block_on(h.catalog.snapshots(&s.ident)).unwrap().len();
     assert_eq!(
-        snapshots_before, snapshots_after,
-        "no-op Relation must not commit a snapshot"
+        snapshots_after,
+        snapshots_before + 1,
+        "only the write commits a snapshot, not the no-op Relation"
     );
 }
 

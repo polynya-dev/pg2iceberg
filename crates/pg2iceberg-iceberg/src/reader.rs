@@ -32,6 +32,48 @@ pub fn read_data_file(bytes: &[u8], cols: &[ColumnSchema]) -> Result<Vec<Row>> {
     Ok(out)
 }
 
+/// Decode a Parquet data file the way the Iceberg spec reads one:
+/// each of `cols` is matched to the file's column carrying the same
+/// `PARQUET:field_id`, not the same name, and a column the file doesn't
+/// have reads as `NULL`. A query engine reading the table resolves
+/// columns this way; [`read_data_file`] matches by name.
+pub fn read_data_file_by_field_id(bytes: Bytes, cols: &[ColumnSchema]) -> Result<Vec<Row>> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?
+        .with_batch_size(DEFAULT_BATCH_ROWS)
+        .build()
+        .map_err(|e| WriterError::Encode(format!("parquet reader build: {e}")))?;
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|e| WriterError::Encode(format!("read batch: {e}")))?;
+        let schema = batch.schema();
+        let by_id: BTreeMap<i32, usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let id = f.metadata().get("PARQUET:field_id")?.parse().ok()?;
+                Some((id, i))
+            })
+            .collect();
+        for row_idx in 0..batch.num_rows() {
+            let mut row: Row = BTreeMap::new();
+            for col in cols {
+                let key = ColumnName(col.name.clone());
+                let value = match by_id.get(&col.field_id).map(|&i| batch.column(i)) {
+                    Some(arr) if !arr.is_null(row_idx) => {
+                        decode_value(col.ty, arr.as_ref(), row_idx)?
+                    }
+                    _ => PgValue::Null,
+                };
+                row.insert(key, value);
+            }
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
 /// Rows per batch when the caller doesn't care.
 const DEFAULT_BATCH_ROWS: usize = 1024;
 

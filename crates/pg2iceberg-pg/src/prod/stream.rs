@@ -185,6 +185,31 @@ struct ReaderState {
     pending: VecDeque<DecodedMessage>,
 }
 
+/// Production's pgoutput decoding without a connection: give it each
+/// `XLogData` payload a walsender would send and it returns what the
+/// replication stream would. Lets a simulated Postgres that encodes real
+/// pgoutput exercise the same decoding — relation cache, tuple and text
+/// value decoding, LSN tagging, TOAST markers — as production.
+#[derive(Default)]
+pub struct PgoutputDecoder {
+    state: ReaderState,
+}
+
+impl PgoutputDecoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode one pgoutput message. A TRUNCATE of several relations
+    /// decodes to one change per relation.
+    pub fn decode(&mut self, pgoutput: &bytes::Bytes) -> Result<Vec<DecodedMessage>> {
+        let msg = PgMsg::parse(pgoutput).map_err(io_to_pg)?;
+        let mut out: Vec<DecodedMessage> = self.state.handle_logical(msg)?.into_iter().collect();
+        out.extend(self.state.pending.drain(..));
+        Ok(out)
+    }
+}
+
 impl ReaderState {
     fn handle(&mut self, env: PgEnv<PgMsg>) -> Result<Option<DecodedMessage>> {
         match env {

@@ -119,18 +119,20 @@ fn tx_commit_produces_begin_changes_commit_in_order_with_consecutive_lsns() {
 
     let mut stream = db.start_replication("slot1").unwrap();
     let msgs = drain(&mut stream);
-    // Relation events from create_table predate the slot, so they're not in
-    // its WAL window. The slot sees just Begin + 2 Change + Commit.
-    assert_eq!(msgs.len(), 4, "got: {msgs:?}");
+    // Like pgoutput, the session sends the table's Relation inside the
+    // transaction, just before its first change to the table.
+    assert_eq!(msgs.len(), 5, "got: {msgs:?}");
     assert!(matches!(msgs[0], DecodedMessage::Begin { .. }));
-    assert!(matches!(msgs[1], DecodedMessage::Change(_)));
+    assert!(matches!(msgs[1], DecodedMessage::Relation { .. }));
     assert!(matches!(msgs[2], DecodedMessage::Change(_)));
-    assert!(matches!(msgs[3], DecodedMessage::Commit { .. }));
+    assert!(matches!(msgs[3], DecodedMessage::Change(_)));
+    assert!(matches!(msgs[4], DecodedMessage::Commit { .. }));
 
     // LSNs are strictly monotonic and the Commit LSN matches the value
     // returned from `commit()` (i.e. what the pipeline will hand to the coord).
     let lsns: Vec<Lsn> = msgs
         .iter()
+        .filter(|m| !matches!(m, DecodedMessage::Relation { .. }))
         .map(|m| match m {
             DecodedMessage::Begin { final_lsn, .. } => *final_lsn,
             DecodedMessage::Commit { commit_lsn, .. } => *commit_lsn,
@@ -225,9 +227,9 @@ fn changes_to_unpublished_tables_are_skipped() {
 
     let mut stream = db.start_replication("slot1").unwrap();
     let msgs = drain(&mut stream);
-    // Begin, one Change (orders only), Commit.
-    assert_eq!(msgs.len(), 3);
-    let change = match &msgs[1] {
+    // Begin, Relation and one Change (orders only), Commit.
+    assert_eq!(msgs.len(), 4);
+    let change = match &msgs[2] {
         DecodedMessage::Change(c) => c,
         _ => panic!(),
     };
@@ -314,8 +316,13 @@ fn reconnect_at_restart_lsn_yields_messages_after_last_ack() {
     // Reconnect: should replay everything strictly after commit1, i.e. tx2.
     let mut s = db.start_replication("slot1").unwrap();
     let msgs = drain(&mut s);
-    assert_eq!(msgs.len(), 3, "Begin, Change, Commit for tx2 only");
-    if let DecodedMessage::Change(c) = &msgs[1] {
+    // A new session sends the Relation again.
+    assert_eq!(
+        msgs.len(),
+        4,
+        "Begin, Relation, Change, Commit for tx2 only"
+    );
+    if let DecodedMessage::Change(c) = &msgs[2] {
         let id = c
             .after
             .as_ref()
@@ -379,8 +386,8 @@ fn slot_created_after_existing_data_does_not_replay_history() {
 
     let mut s = db.start_replication("late").unwrap();
     let msgs = drain(&mut s);
-    assert_eq!(msgs.len(), 3, "only the post-slot tx is visible");
-    if let DecodedMessage::Change(c) = &msgs[1] {
+    assert_eq!(msgs.len(), 4, "only the post-slot tx is visible");
+    if let DecodedMessage::Change(c) = &msgs[2] {
         let id = c
             .after
             .as_ref()

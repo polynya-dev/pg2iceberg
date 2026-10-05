@@ -25,5 +25,5 @@ pub mod typemap;
 pub mod value_decode;
 
 pub use client::PgClientImpl;
-pub use stream::ReplicationStreamImpl;
+pub use stream::{PgoutputDecoder, ReplicationStreamImpl};
 pub use tls::TlsMode;

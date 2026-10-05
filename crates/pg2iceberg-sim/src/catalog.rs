@@ -44,6 +44,16 @@ impl MemoryCatalog {
         Self::default()
     }
 
+    /// Every snapshot ever committed to `ident`, expired or not: the
+    /// history a reader of the current snapshot effectively sees.
+    pub fn history(&self, ident: &TableIdent) -> Vec<Snapshot> {
+        let s = self.state.lock().unwrap();
+        s.tables
+            .get(ident)
+            .map(|t| t.snapshots.clone())
+            .unwrap_or_default()
+    }
+
     /// Test hook: stamp a config map onto a table's metadata. The
     /// vended-credentials router consumes
     /// [`TableMetadata::config`] to extract S3 creds, but
