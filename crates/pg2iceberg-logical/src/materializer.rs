@@ -1951,7 +1951,9 @@ fn now_micros() -> i64 {
 /// Expand `Op::Truncate` events into per-PK `Op::Delete` events
 /// against the current FileIndex. Mirrors PG's TRUNCATE semantics:
 /// every row known to Iceberg right now is wiped, so the materializer
-/// emits an equality-delete for each.
+/// emits an equality-delete for each — and the events before it in this
+/// step, rows the FileIndex doesn't hold yet, are dropped. (Earlier
+/// steps of the unit are in the FileIndex already.)
 ///
 /// Subsequent post-truncate Insert/Update events for the same PK
 /// will overwrite the synthetic Delete during the fold (last-write-
@@ -1974,6 +1976,7 @@ fn expand_truncates(
             out.push(evt);
             continue;
         }
+        out.clear();
         // Decode each PK key back into a PK-only Row, over the PK
         // columns in the order every key was built from (`pk_cols`).
         // Keys that don't fit (shouldn't happen — FileIndex stores what
@@ -2019,7 +2022,7 @@ fn collect_toast_paths(
 ) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for r in rows {
-        if r.unchanged_cols.is_empty() {
+        if r.unchanged_cols.is_empty() || r.op == Op::Delete {
             continue;
         }
         let key = r

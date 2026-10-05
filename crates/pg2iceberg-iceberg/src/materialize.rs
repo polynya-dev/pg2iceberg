@@ -63,7 +63,8 @@ pub fn resolve_unchanged_cols(
     prior_rows_by_path: &BTreeMap<String, Vec<Row>>,
 ) -> Result<()> {
     for r in rows {
-        if r.unchanged_cols.is_empty() {
+        // A delete writes only its key: nothing to resolve.
+        if r.unchanged_cols.is_empty() || r.op == Op::Delete {
             continue;
         }
         let key = r
