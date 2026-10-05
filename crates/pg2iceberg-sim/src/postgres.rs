@@ -208,6 +208,36 @@ struct DbState {
     publications: BTreeMap<String, Publication>,
     slots: BTreeMap<String, SlotState>,
     wal: Vec<WalEntry>,
+    /// Each table's rows after every change to them (commit, ALTER), so a
+    /// snapshot can read the table as of an earlier LSN.
+    versions: BTreeMap<TableIdent, Vec<(Lsn, Rows)>>,
+    /// The LSN an open snapshot reads at (see [`SimPostgres::begin_snapshot`]).
+    snapshot_at: Option<Lsn>,
+}
+
+/// A table's rows, keyed by canonical PK.
+type Rows = BTreeMap<String, Row>;
+
+impl DbState {
+    /// Record `ident`'s current rows as of `lsn`.
+    fn record_version(&mut self, ident: &TableIdent, lsn: Lsn) {
+        if let Some(t) = self.tables.get(ident) {
+            let rows = t.rows.clone();
+            self.versions
+                .entry(ident.clone())
+                .or_default()
+                .push((lsn, rows));
+        }
+    }
+
+    /// `ident`'s rows as of `lsn`.
+    fn rows_at(&self, ident: &TableIdent, lsn: Lsn) -> Rows {
+        self.versions
+            .get(ident)
+            .and_then(|v| v.iter().rev().find(|(at, _)| *at <= lsn))
+            .map(|(_, rows)| rows.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for DbState {
@@ -220,6 +250,8 @@ impl Default for DbState {
             publications: BTreeMap::new(),
             slots: BTreeMap::new(),
             wal: Vec::new(),
+            versions: BTreeMap::new(),
+            snapshot_at: None,
         }
     }
 }
@@ -445,6 +477,10 @@ impl SimPostgres {
             + 1;
         let mut new_col = col;
         new_col.field_id = next_id;
+        // Existing rows read the new column as NULL (no DEFAULT).
+        for row in table.rows.values_mut() {
+            row.insert(ColumnName(new_col.name.clone()), PgValue::Null);
+        }
         table.schema.columns.push(new_col);
         let columns = relation_columns_from_schema(&table.schema);
         let lsn = s.alloc_lsn();
@@ -456,6 +492,7 @@ impl SimPostgres {
                 columns,
             },
         });
+        s.record_version(ident, lsn);
         Ok(())
     }
 
@@ -471,6 +508,10 @@ impl SimPostgres {
             .get_mut(ident)
             .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
         table.schema.columns.retain(|c| c.name != col_name);
+        // The column's data goes with it.
+        for row in table.rows.values_mut() {
+            row.remove(&ColumnName(col_name.to_string()));
+        }
         let columns = relation_columns_from_schema(&table.schema);
         let lsn = s.alloc_lsn();
         s.wal.push(WalEntry {
@@ -481,6 +522,7 @@ impl SimPostgres {
                 columns,
             },
         });
+        s.record_version(ident, lsn);
         Ok(())
     }
 
@@ -520,6 +562,7 @@ impl SimPostgres {
                 columns,
             },
         });
+        s.record_version(ident, lsn);
         Ok(())
     }
 
@@ -548,6 +591,31 @@ impl SimPostgres {
     /// Test hook: peek at a table's current oid. Real PG users get
     /// this from `pg_class.oid`; the sim mirrors it via
     /// [`SimPgClient::table_oid`].
+    /// The table's current columns, as `information_schema` lists them.
+    pub fn table_schema(&self, ident: &TableIdent) -> Option<TableSchema> {
+        self.state
+            .lock()
+            .unwrap()
+            .tables
+            .get(ident)
+            .map(|t| t.schema.clone())
+    }
+
+    /// Open a snapshot at the current LSN: until [`Self::end_snapshot`],
+    /// snapshot reads see the tables as of now, however they change —
+    /// one REPEATABLE READ transaction across every chunk, as production
+    /// reads them.
+    pub fn begin_snapshot(&self) -> Lsn {
+        let mut s = self.state.lock().unwrap();
+        let lsn = s.current_lsn();
+        s.snapshot_at = Some(lsn);
+        lsn
+    }
+
+    pub fn end_snapshot(&self) {
+        self.state.lock().unwrap().snapshot_at = None;
+    }
+
     /// `ALTER TABLE … REPLICA IDENTITY`.
     pub fn set_replica_identity(&self, ident: &TableIdent, identity: ReplicaIdentity) {
         if let Some(t) = self.state.lock().unwrap().tables.get_mut(ident) {
@@ -1151,6 +1219,19 @@ impl TxHandle {
             xid: Some(self.xid),
             kind: WalKind::Commit,
         });
+        let touched: BTreeSet<TableIdent> = s
+            .wal
+            .iter()
+            .rev()
+            .take_while(|e| e.xid == Some(self.xid))
+            .filter_map(|e| match &e.kind {
+                WalKind::Change(c) => Some(c.table.clone()),
+                _ => None,
+            })
+            .collect();
+        for t in touched {
+            s.record_version(&t, commit_lsn);
+        }
 
         Ok(commit_lsn)
     }
@@ -1436,7 +1517,8 @@ impl pg2iceberg_pg::ReplicationStream for AsyncSimStream {
 #[async_trait]
 impl SnapshotSource for SimPostgres {
     async fn snapshot_lsn(&self) -> std::result::Result<Lsn, SnapshotError> {
-        Ok(self.current_lsn())
+        let s = self.state.lock().unwrap();
+        Ok(s.snapshot_at.unwrap_or_else(|| s.current_lsn()))
     }
 
     async fn read_chunk(
@@ -1451,11 +1533,20 @@ impl SnapshotSource for SimPostgres {
             .get(ident)
             .ok_or_else(|| SnapshotError::Source(format!("unknown table: {ident}")))?;
 
+        // An open snapshot reads the table as of its LSN, like the
+        // REPEATABLE READ transaction production's snapshot reads in.
+        let at_snapshot;
+        let rows = match s.snapshot_at {
+            Some(lsn) => {
+                at_snapshot = s.rows_at(ident, lsn);
+                &at_snapshot
+            }
+            None => &table.rows,
+        };
         // SimPostgres stores rows keyed by canonical PK in a BTreeMap, so
         // iteration is already sorted ASC by PK. Filter strictly above the
         // bound, then truncate.
-        let chunk: Vec<Row> = table
-            .rows
+        let chunk: Vec<Row> = rows
             .iter()
             .filter(|(k, _)| match after_pk_key {
                 Some(after) => k.as_str() > after,

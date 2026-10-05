@@ -109,20 +109,22 @@ fn schema() -> TableSchema {
                 nullable: false,
                 is_primary_key: true,
             },
-            ColumnSchema {
-                name: "qty".into(),
-                field_id: 2,
-                ty: IcebergType::Int,
-                nullable: false,
-                is_primary_key: false,
-            },
             // Stands in for a TOASTed column: `ToastUpdate` and `ChangePk`
             // leave it unchanged, so pgoutput sends a marker, not a value.
+            // Ahead of `qty`, so dropping it renumbers `qty` for anything
+            // that numbers columns by position.
             ColumnSchema {
                 name: "note".into(),
-                field_id: 3,
+                field_id: 2,
                 ty: IcebergType::String,
                 nullable: true,
+                is_primary_key: false,
+            },
+            ColumnSchema {
+                name: "qty".into(),
+                field_id: 3,
+                ty: IcebergType::Int,
+                nullable: false,
                 is_primary_key: false,
             },
         ],
@@ -176,8 +178,113 @@ fn row(id: i32, qty: i32) -> Row {
     let mut r = BTreeMap::new();
     r.insert(ColumnName("id".into()), id_value(id));
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
-    r.insert(note(), PgValue::Text(format!("note-{id}-{qty}")));
+    if NOTE_PRESENT.get() {
+        r.insert(note(), PgValue::Text(format!("note-{id}-{qty}")));
+    }
     r
+}
+
+/// The table's schema as production discovers it at startup: the source
+/// table's current columns, field ids numbered by position
+/// (`discover.rs`), plus the configured partition spec.
+fn discovered_schema(db: &SimPostgres) -> TableSchema {
+    let current = db.table_schema(&ident()).expect("source table");
+    TableSchema {
+        columns: current
+            .columns
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| ColumnSchema {
+                field_id: i as i32 + 1,
+                ..c
+            })
+            .collect(),
+        ..schema()
+    }
+}
+
+/// `rows` restricted to the source table's current columns (a column
+/// a row lacks reads as NULL): Iceberg keeps dropped columns, and a row
+/// written before a column existed doesn't carry it.
+fn on_source_columns(db: &SimPostgres, rows: Vec<Row>) -> Vec<Row> {
+    let cols: Vec<ColumnName> = db
+        .table_schema(&ident())
+        .expect("source table")
+        .columns
+        .into_iter()
+        .map(|c| ColumnName(c.name))
+        .collect();
+    rows.into_iter()
+        .map(|r| {
+            cols.iter()
+                .map(|c| (c.clone(), r.get(c).cloned().unwrap_or(PgValue::Null)))
+                .collect()
+        })
+        .collect()
+}
+
+fn other_pg_ident() -> TableIdent {
+    TableIdent {
+        namespace: Namespace(vec!["sales".into()]),
+        name: TABLE_NAME.into(),
+    }
+}
+
+/// The second table's Iceberg name, mapped the way `discover_schemas`
+/// (setup.rs) maps it: with `sink.namespace` set, the PG schema is
+/// dropped and the table name kept.
+fn other_ident() -> TableIdent {
+    if SECOND_TABLE.get() == 2 {
+        TableIdent {
+            namespace: Namespace(vec!["public".into()]),
+            name: TABLE_NAME.into(),
+        }
+    } else {
+        other_pg_ident()
+    }
+}
+
+fn other_pg_schema() -> TableSchema {
+    TableSchema {
+        ident: other_pg_ident(),
+        partition_spec: Vec::new(),
+        ..schema()
+    }
+}
+
+fn other_schema() -> TableSchema {
+    TableSchema {
+        ident: other_ident(),
+        pg_schema: Some("sales".into()),
+        partition_spec: Vec::new(),
+        ..schema()
+    }
+}
+
+fn other_row(id: i32, qty: i32) -> Row {
+    BTreeMap::from([
+        (ColumnName("id".into()), PgValue::Int4(id)),
+        (ColumnName("qty".into()), PgValue::Int4(qty)),
+        (note(), PgValue::Text(format!("sales-{id}-{qty}"))),
+    ])
+}
+
+/// The publication's tables.
+fn published() -> Vec<TableIdent> {
+    let mut t = vec![ident()];
+    if SECOND_TABLE.get() > 0 {
+        t.push(other_pg_ident());
+    }
+    t
+}
+
+/// Register the second table with a materializer, as the lifecycle
+/// does: its Iceberg schema, and its PG name's translation.
+fn register_other(m: &mut Materializer<AuditedCatalog>) {
+    if SECOND_TABLE.get() > 0 {
+        block_on(m.register_table(other_schema())).unwrap();
+        m.register_table_translation(other_pg_ident(), other_ident());
+    }
 }
 
 fn note() -> ColumnName {
@@ -213,33 +320,60 @@ fn pk_only(id: i32) -> Row {
 #[derive(Clone, Debug)]
 enum Step {
     /// `BEGIN; INSERT id, qty; COMMIT` — skipped if `id` already exists.
-    Insert { id: i32, qty: i32 },
+    Insert {
+        id: i32,
+        qty: i32,
+    },
     /// `BEGIN; UPDATE id SET qty=N; COMMIT` — skipped if `id` is missing.
-    Update { id: i32, qty: i32 },
+    Update {
+        id: i32,
+        qty: i32,
+    },
     /// `UPDATE id SET qty=N` leaving the TOASTed `note` alone, so pgoutput
     /// sends an unchanged marker for it — skipped if `id` is missing.
-    ToastUpdate { id: i32, qty: i32 },
+    ToastUpdate {
+        id: i32,
+        qty: i32,
+    },
     /// `UPDATE SET id=to WHERE id=from`, optionally with `note` TOASTed
     /// (unchanged marker) — skipped unless `from` exists and `to` doesn't.
-    ChangePk { from: i32, to: i32, toast: bool },
+    ChangePk {
+        from: i32,
+        to: i32,
+        toast: bool,
+    },
     /// `BEGIN; DELETE id; COMMIT` — skipped if `id` is missing.
-    Delete { id: i32 },
+    Delete {
+        id: i32,
+    },
     /// `BEGIN; INSERT id, qty; ROLLBACK`. Exercises the rollback path.
-    RollbackInsert { id: i32, qty: i32 },
+    RollbackInsert {
+        id: i32,
+        qty: i32,
+    },
     /// `BEGIN; TRUNCATE; [INSERT id, qty;] COMMIT` — with the insert, the
     /// full-reload pattern. Rows written since the last materializer
     /// cycle share a fold step with the TRUNCATE.
-    Truncate { reinsert: Option<(i32, i32)> },
+    Truncate {
+        reinsert: Option<(i32, i32)>,
+    },
     /// `BEGIN; INSERT INTO noise ...; COMMIT` — WAL for a table outside
     /// the publication. pgoutput skips the whole transaction, so only a
     /// keepalive tells the pipeline it can ack past it.
-    UnpublishedWrite { qty: i32 },
+    UnpublishedWrite {
+        qty: i32,
+    },
     /// One transaction that updates every live row and inserts `inserts`
     /// fresh ones — routinely bigger than `FLUSH_ROWS`, so it must be
     /// staged in chunks.
-    BigTx { inserts: usize, qty: i32 },
+    BigTx {
+        inserts: usize,
+        qty: i32,
+    },
     /// Process at most `n` replication messages; may stop mid-transaction.
-    DrivePartial { n: usize },
+    DrivePartial {
+        n: usize,
+    },
     /// A flush tick + ack without draining the stream first.
     FlushTick,
     /// Hard crash: no drain, flush, or ack. Pipeline memory and any
@@ -264,6 +398,31 @@ enum Step {
     /// single dirty file (or two clean ones) at a time, leaving older
     /// deletes and the rest of the table for later passes.
     Compact,
+    /// `INSERT INTO sales.orders`: a same-named table in another schema.
+    OtherInsert {
+        id: i32,
+        qty: i32,
+    },
+    OtherUpdate {
+        id: i32,
+        qty: i32,
+    },
+    OtherDelete {
+        id: i32,
+    },
+    /// Worker "b" runs a cycle (distributed mode).
+    OtherWorkerCycle,
+    /// Time moves past the heartbeat TTL: a worker that doesn't cycle
+    /// next loses its tables to the one that does.
+    ClockTick,
+    /// Backfill one chunk (one row) of the initial snapshot, read as of
+    /// the snapshot's LSN — rows may have changed since.
+    BackfillChunk,
+    /// `ALTER TABLE DROP COLUMN note` — Iceberg keeps it, soft-dropped.
+    DropNote,
+    /// `ALTER TABLE ADD COLUMN note text` — a new column that happens to
+    /// reuse a dropped one's name; its old values must not come back.
+    AddNote,
     /// Another process (a `pg2iceberg compact` job) plans a compaction
     /// pass and writes its output files, but doesn't commit yet.
     ExternalCompactPlan,
@@ -309,6 +468,14 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         2 => Just(Step::Compact),
         1 => Just(Step::Expire),
         1 => Just(Step::LoseCommitResponse),
+        2 => Just(Step::BackfillChunk),
+        2 => Just(Step::OtherWorkerCycle),
+        2 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::OtherInsert { id, qty }),
+        1 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::OtherUpdate { id, qty }),
+        1 => id.clone().prop_map(|id| Step::OtherDelete { id }),
+        1 => Just(Step::ClockTick),
+        1 => Just(Step::DropNote),
+        1 => Just(Step::AddNote),
         2 => Just(Step::ExternalCompactPlan),
         2 => Just(Step::ExternalCompactCommit),
         1 => Just(Step::CleanupOrphans),
@@ -349,6 +516,20 @@ thread_local! {
     /// Whether this case's replication stream goes over the wire: the sim
     /// encodes pgoutput and production's decoder decodes it.
     static WIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the source table has its `note` column right now (the
+    /// workload can drop and re-add it).
+    static NOTE_PRESENT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Whether this case starts with rows only an initial snapshot can
+    /// deliver, backfilled chunk by chunk while changes stream in.
+    static BACKFILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this case materializes with two distributed workers that
+    /// hand the table back and forth as their heartbeats lapse.
+    static DISTRIBUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A second table with the same name, `sales.orders`: 0 = none,
+    /// 1 = with `sink.namespace` unset (its Iceberg namespace is its PG
+    /// schema), 2 = with `sink.namespace = "public"`, which maps it onto
+    /// the same Iceberg name as `public.orders`.
+    static SECOND_TABLE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// Whether this case's table is partitioned (by a non-key column).
     static PARTITIONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether this case's table has Postgres's default replica identity
@@ -596,6 +777,23 @@ mod prod_backend {
     }
 }
 
+/// How long a distributed worker's heartbeat keeps its tables.
+const WORKER_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn worker(name: &str) -> pg2iceberg_core::WorkerId {
+    pg2iceberg_core::WorkerId(format!("worker-{name}"))
+}
+
+/// One materializer cycle; `None` if it failed because a commit's
+/// response was lost — the lifecycle just runs the next cycle.
+fn cycle(m: &mut Materializer<AuditedCatalog>) -> Option<usize> {
+    match block_on(m.cycle()) {
+        Ok(n) => Some(n),
+        Err(e) if e.to_string().contains("response lost") => None,
+        Err(e) => panic!("materializer cycle: {e}"),
+    }
+}
+
 /// A pipeline set up the way production sets one up — including the
 /// table's primary key, without which it can't split a key-changing
 /// UPDATE into a Delete of the old key and an Update of the new one.
@@ -606,6 +804,10 @@ fn new_pipeline(
 ) -> Pipeline<MemoryCoordinator> {
     let mut pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
     pipeline.register_primary_keys(ident(), vec![ColumnName("id".into())]);
+    if SECOND_TABLE.get() > 0 {
+        pipeline.register_primary_keys(other_ident(), vec![ColumnName("id".into())]);
+        pipeline.register_table_translation(other_pg_ident(), other_ident());
+    }
     pipeline
 }
 
@@ -636,6 +838,17 @@ struct DstHarness {
     /// UUID source for materializer file names, shared by every
     /// materializer incarnation — like real UUIDs, never repeating.
     id_gen: Arc<SeqIdGen>,
+    /// Whether the initial snapshot is still being backfilled.
+    backfilling: bool,
+    /// Ids live in the second table.
+    other_live: BTreeSet<i32>,
+    /// The coordinator's clock: heartbeats lapse when it moves on.
+    clock: TestClock,
+    /// In distributed mode, worker "b"; `materializer` is worker "a".
+    other: Option<Materializer<AuditedCatalog>>,
+    /// The WAL position when the slot was created: transactions committed
+    /// before it reach Iceberg only through the snapshot.
+    slot_start: pg2iceberg_core::Lsn,
     /// A compaction pass another process (a `pg2iceberg compact` job)
     /// has planned and written but not yet committed.
     pending_external: Option<PreparedCompaction>,
@@ -649,6 +862,8 @@ impl DstHarness {
     /// the publication + slot are created, so logical replication won't see
     /// them — they have to come in via the snapshot phase.
     fn boot_with_seeds(seeds: &[(i32, i32)]) -> Self {
+        // A fresh table has its `note` column (proptest reuses the thread).
+        NOTE_PRESENT.set(true);
         let db = SimPostgres::new();
         db.create_table(schema()).unwrap();
         db.create_table(noise_schema()).unwrap();
@@ -661,11 +876,15 @@ impl DstHarness {
             tx.commit(Timestamp(0)).unwrap();
         }
 
-        db.create_publication(PUB, &[ident()]).unwrap();
+        if SECOND_TABLE.get() > 0 {
+            db.create_table(other_pg_schema()).unwrap();
+        }
+        db.create_publication(PUB, &published()).unwrap();
         db.create_slot(SLOT, PUB).unwrap();
+        let slot_start = db.current_lsn();
 
         let clock = TestClock::at(0);
-        let arc_clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(clock);
+        let arc_clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(clock.clone());
         let coord = Arc::new(MemoryCoordinator::new(
             CoordSchema::default_name(),
             arc_clock,
@@ -696,6 +915,22 @@ impl DstHarness {
             MAT_BATCH,
         );
         block_on(materializer.register_table(schema())).unwrap();
+        register_other(&mut materializer);
+        let other = DISTRIBUTED.get().then(|| {
+            materializer.enable_distributed_mode(worker("a"), WORKER_TTL);
+            let mut b = Materializer::new(
+                coord.clone() as Arc<dyn Coordinator>,
+                blob_store.clone(),
+                audited.clone(),
+                self::mat_namer(&id_gen),
+                "default",
+                MAT_BATCH,
+            );
+            block_on(b.register_table(schema())).unwrap();
+            register_other(&mut b);
+            b.enable_distributed_mode(worker("b"), WORKER_TTL);
+            b
+        });
 
         if SMALLINT_PK.get() {
             db.set_pg_type(&ident(), "id", PgType::Int2);
@@ -723,18 +958,42 @@ impl DstHarness {
             id_gen,
             pending_external: None,
             external_compaction_seen: false,
+            backfilling: false,
+            other_live: BTreeSet::new(),
+            slot_start,
+            clock,
+            other,
         }
     }
 
     fn boot() -> Self {
+        if BACKFILL.get() {
+            // Rows written before the slot existed; the snapshot reads
+            // them as of now while the workload keeps changing them.
+            let mut h = Self::boot_with_seeds(&[(1, 10), (2, 20), (3, 30), (4, 40)]);
+            h.db.begin_snapshot();
+            h.backfilling = true;
+            // A half-loaded table matches no transaction boundary; that's
+            // expected of a backfill, so audits wait until it's done.
+            h.audited
+                .audit_paused
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return h;
+        }
+        // A fresh table has its `note` column (proptest reuses the thread).
+        NOTE_PRESENT.set(true);
         let db = SimPostgres::new();
         db.create_table(schema()).unwrap();
         db.create_table(noise_schema()).unwrap();
-        db.create_publication(PUB, &[ident()]).unwrap();
+        if SECOND_TABLE.get() > 0 {
+            db.create_table(other_pg_schema()).unwrap();
+        }
+        db.create_publication(PUB, &published()).unwrap();
         db.create_slot(SLOT, PUB).unwrap();
+        let slot_start = db.current_lsn();
 
         let clock = TestClock::at(0);
-        let arc_clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(clock);
+        let arc_clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(clock.clone());
         let coord = Arc::new(MemoryCoordinator::new(
             CoordSchema::default_name(),
             arc_clock,
@@ -765,6 +1024,22 @@ impl DstHarness {
             MAT_BATCH,
         );
         block_on(materializer.register_table(schema())).unwrap();
+        register_other(&mut materializer);
+        let other = DISTRIBUTED.get().then(|| {
+            materializer.enable_distributed_mode(worker("a"), WORKER_TTL);
+            let mut b = Materializer::new(
+                coord.clone() as Arc<dyn Coordinator>,
+                blob_store.clone(),
+                audited.clone(),
+                self::mat_namer(&id_gen),
+                "default",
+                MAT_BATCH,
+            );
+            block_on(b.register_table(schema())).unwrap();
+            register_other(&mut b);
+            b.enable_distributed_mode(worker("b"), WORKER_TTL);
+            b
+        });
 
         if SMALLINT_PK.get() {
             db.set_pg_type(&ident(), "id", PgType::Int2);
@@ -792,6 +1067,11 @@ impl DstHarness {
             id_gen,
             pending_external: None,
             external_compaction_seen: false,
+            backfilling: false,
+            other_live: BTreeSet::new(),
+            slot_start,
+            clock,
+            other,
         }
     }
 
@@ -836,10 +1116,43 @@ impl DstHarness {
     /// One materializer cycle; `None` if it failed because a commit's
     /// response was lost — the lifecycle just runs the next cycle.
     fn materialize(&mut self) -> Option<usize> {
-        match block_on(self.materializer.cycle()) {
-            Ok(n) => Some(n),
-            Err(e) if e.to_string().contains("response lost") => None,
-            Err(e) => panic!("materializer cycle: {e}"),
+        let n = cycle(&mut self.materializer);
+        if DISTRIBUTED.get() && n.is_some_and(|n| n > 0) {
+            if let Err(e) = file_index_matches_catalog(self, &self.materializer) {
+                panic!("worker a: {e}");
+            }
+        }
+        n
+    }
+
+    /// Worker "b"'s cycle, in distributed mode.
+    fn materialize_other(&mut self) -> Option<usize> {
+        let mut other = self.other.take()?;
+        let n = cycle(&mut other);
+        if n.is_some_and(|n| n > 0) {
+            if let Err(e) = file_index_matches_catalog(self, &other) {
+                panic!("worker b: {e}");
+            }
+        }
+        self.other = Some(other);
+        n
+    }
+
+    fn backfill_chunk(&mut self) {
+        if !self.backfilling {
+            return;
+        }
+        let s = Snapshotter::new(self.coord.clone() as Arc<dyn Coordinator>).with_chunk_size(1);
+        block_on(s.run_chunks(&self.db, &[schema()], &mut self.pipeline, Some(1))).unwrap();
+        let done = block_on(self.coord.table_state(&ident()))
+            .unwrap()
+            .is_some_and(|t| t.snapshot_complete);
+        if done {
+            self.db.end_snapshot();
+            self.backfilling = false;
+            self.audited
+                .audit_paused
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -916,8 +1229,10 @@ impl DstHarness {
         }
         // The materializer updates its FileIndex from what the pass
         // rewrote; it must match a rebuild from catalog history.
-        if let Err(e) = file_index_matches_catalog(self) {
-            panic!("after compaction: {e}");
+        if !DISTRIBUTED.get() {
+            if let Err(e) = file_index_matches_catalog(self, &self.materializer) {
+                panic!("after compaction: {e}");
+            }
         }
         let after = state(self);
         if before != after {
@@ -947,7 +1262,11 @@ impl DstHarness {
             "default",
             MAT_BATCH,
         );
-        block_on(materializer.register_table(schema())).unwrap();
+        block_on(materializer.register_table(discovered_schema(&self.db))).unwrap();
+        register_other(&mut materializer);
+        if DISTRIBUTED.get() {
+            materializer.enable_distributed_mode(worker("a"), WORKER_TTL);
+        }
         self.materializer = materializer;
     }
 
@@ -982,7 +1301,7 @@ impl DstHarness {
                 }
             }
             Step::ToastUpdate { id, qty } => {
-                if self.live.contains(id) {
+                if self.live.contains(id) && NOTE_PRESENT.get() {
                     let mut tx = self.db.begin_tx();
                     tx.update_with_unchanged(&ident(), row(*id, *qty), vec![note()]);
                     let _ = tx.commit(Timestamp(0));
@@ -1000,7 +1319,11 @@ impl DstHarness {
                         .expect("live row");
                     let mut after = before.clone();
                     after.insert(id, id_value(*to));
-                    let unchanged = if *toast { vec![note()] } else { Vec::new() };
+                    let unchanged = if *toast && NOTE_PRESENT.get() {
+                        vec![note()]
+                    } else {
+                        Vec::new()
+                    };
                     let mut tx = self.db.begin_tx();
                     tx.update_with_pk_change_unchanged(&ident(), before, after, unchanged);
                     if tx.commit(Timestamp(0)).is_ok() {
@@ -1081,6 +1404,52 @@ impl DstHarness {
             Step::CrashMidStream => self.crash_mid_stream(),
             Step::RestartMaterializer => self.restart_materializer(),
             Step::Compact => self.compact(),
+            Step::BackfillChunk => self.backfill_chunk(),
+            Step::OtherInsert { id, qty } => {
+                if SECOND_TABLE.get() > 0 && !self.other_live.contains(id) {
+                    let mut tx = self.db.begin_tx();
+                    tx.insert(&other_pg_ident(), other_row(*id, *qty));
+                    if tx.commit(Timestamp(0)).is_ok() {
+                        self.other_live.insert(*id);
+                    }
+                }
+            }
+            Step::OtherUpdate { id, qty } => {
+                if self.other_live.contains(id) {
+                    let mut tx = self.db.begin_tx();
+                    tx.update(&other_pg_ident(), other_row(*id, *qty));
+                    let _ = tx.commit(Timestamp(0));
+                }
+            }
+            Step::OtherDelete { id } => {
+                if self.other_live.contains(id) {
+                    let mut tx = self.db.begin_tx();
+                    let pk = BTreeMap::from([(ColumnName("id".into()), PgValue::Int4(*id))]);
+                    tx.delete(&other_pg_ident(), pk);
+                    if tx.commit(Timestamp(0)).is_ok() {
+                        self.other_live.remove(id);
+                    }
+                }
+            }
+            Step::OtherWorkerCycle => {
+                let _ = self.materialize_other();
+            }
+            Step::ClockTick => self
+                .clock
+                .advance(WORKER_TTL + std::time::Duration::from_secs(1)),
+            Step::DropNote => {
+                if NOTE_PRESENT.get() {
+                    self.db.alter_drop_column(&ident(), "note").unwrap();
+                    NOTE_PRESENT.set(false);
+                }
+            }
+            Step::AddNote => {
+                if !NOTE_PRESENT.get() {
+                    let col = schema().columns.into_iter().find(|c| c.name == "note");
+                    self.db.alter_add_column(&ident(), col.unwrap()).unwrap();
+                    NOTE_PRESENT.set(true);
+                }
+            }
             Step::ExternalCompactPlan => self.external_compact_plan(),
             Step::ExternalCompactCommit => {
                 if let Some(pass) = self.pending_external.take() {
@@ -1149,6 +1518,8 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     for c in
         h.db.dump_change_events(PUB)
             .map_err(|e| format!("dump_change_events: {e}"))?
+            .into_iter()
+            .filter(|c| c.table == ident())
     {
         by_xid.entry(c.xid.unwrap_or(0)).or_default().push(c.lsn);
     }
@@ -1163,34 +1534,52 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     }
 
     // 10. Atomic visibility per table — now, and at every commit made
+    //     (not while a backfill has the table half loaded)
     //     since the last check (a cycle may commit several times).
-    block_on(atomic_visibility(&h.storage, &h.db))?;
+    if !h.backfilling {
+        block_on(atomic_visibility(&h.storage, &h.db))?;
+    }
     if let Some(v) = h.audited.violations.lock().unwrap().first() {
         return Err(v.clone());
     }
 
-    // 11. The materializer's FileIndex is what the catalog holds.
-    file_index_matches_catalog(h)?;
+    // 11. The materializer's FileIndex is what the catalog holds. (A
+    //     distributed worker's is checked after each cycle it does work
+    //     in: a worker that doesn't own the table can't know its files.)
+    if !DISTRIBUTED.get() {
+        file_index_matches_catalog(h, &h.materializer)?;
+    }
 
     // 12. The catalog's history replays to the table readers see —
     //     before and after snapshot expiry. The FileIndex rebuild,
     //     compaction, orphan cleanup and `verify` all read it.
-    let read = |catalog: &dyn pg2iceberg_iceberg::verify::DynCatalog| {
-        block_on(read_materialized_state(
-            catalog,
-            h.blob_store.as_ref(),
-            &ident(),
-            &schema(),
-            &[ColumnName("id".into())],
-        ))
-        .map(|mut rows| {
-            sort_by_pk(&mut rows);
-            rows
-        })
-    };
+    //     Both sides are read the same way (by field id, deletes scoped),
+    //     so this checks the history alone.
     let readers = block_on(h.storage.engine_rows(&ident()))
         .map_err(|e| format!("invariant 12: readers' view: {e}"))?;
-    let history = read(h.audited.as_ref()).map_err(|e| format!("invariant 12: history: {e}"))?;
+    let history = block_on(async {
+        let snapshots = h
+            .audited
+            .snapshots(&ident())
+            .await
+            .map_err(|e| e.to_string())?;
+        let schema = h
+            .audited
+            .load_table(&ident())
+            .await
+            .map_err(|e| e.to_string())?
+            .expect("table exists")
+            .schema;
+        let mut rows = engine_read(
+            h.blob_store.as_ref(),
+            &schema,
+            &live_files_from_history(&snapshots),
+        )
+        .await?;
+        sort_by_pk(&mut rows);
+        Ok::<_, String>(rows)
+    })
+    .map_err(|e| format!("invariant 12: history: {e}"))?;
     if history != readers {
         return Err(format!(
             "invariant 12: Catalog::snapshots replays to {history:?}, readers see {readers:?}"
@@ -1203,8 +1592,11 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
 /// catalog, and each file's live count equals the PKs pointing at it —
 /// compaction picks dirty files by those counts, and a file's count
 /// running high would make a dirty file look clean.
-fn file_index_matches_catalog(h: &DstHarness) -> Result<(), String> {
-    let Some(index) = h.materializer.file_index(&ident()) else {
+fn file_index_matches_catalog(
+    h: &DstHarness,
+    m: &Materializer<AuditedCatalog>,
+) -> Result<(), String> {
+    let Some(index) = m.file_index(&ident()) else {
         return Ok(());
     };
     let mut pks_per_file: BTreeMap<&str, u64> = BTreeMap::new();
@@ -1256,9 +1648,12 @@ fn file_index_matches_catalog(h: &DstHarness) -> Result<(), String> {
 async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), String> {
     let mut iceberg = storage.engine_rows(&ident()).await?;
     sort_by_pk(&mut iceberg);
-    let events = db
+    let events: Vec<_> = db
         .dump_change_events(PUB)
-        .map_err(|e| format!("dump_change_events: {e}"))?;
+        .map_err(|e| format!("dump_change_events: {e}"))?
+        .into_iter()
+        .filter(|c| c.table == ident())
+        .collect();
     let pk = |r: &Row| match r.get(&ColumnName("id".into())) {
         Some(PgValue::Int4(n)) => *n,
         _ => i32::MAX,
@@ -1297,6 +1692,13 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
         }
         boundaries.push(state.values().cloned().collect());
     }
+    // Compare on the source's current columns: Iceberg keeps dropped
+    // ones, and older boundaries predate added ones.
+    let iceberg = on_source_columns(db, iceberg);
+    let boundaries: Vec<Vec<Row>> = boundaries
+        .into_iter()
+        .map(|b| on_source_columns(db, b))
+        .collect();
     if !boundaries.contains(&iceberg) {
         return Err(format!(
             "invariant 10 (atomic visibility): Iceberg state matches no transaction boundary: {iceberg:?}"
@@ -1477,13 +1879,18 @@ impl Catalog for AuditedCatalog {
 }
 
 fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
+    while h.backfilling {
+        h.backfill_chunk();
+    }
     // Reach quiescence: drain WAL, flush, ack, then materialize until idle.
     // Loop because a flush may produce events the materializer hasn't seen.
     h.drive();
     h.flush_and_ack();
     // Drain materializer; safety bound to catch infinite loops.
     for _ in 0..1000 {
-        if h.materialize() == Some(0) {
+        let a = h.materialize();
+        let b = h.materialize_other().unwrap_or(0);
+        if a == Some(0) && b == 0 {
             break;
         }
     }
@@ -1575,8 +1982,14 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     for c in
         h.db.dump_change_events_as_sent(PUB)
             .map_err(|e| format!("dump_change_events: {e}"))?
+            .into_iter()
+            .filter(|c| c.table == ident())
     {
         let xid = c.xid.unwrap_or(0);
+        if h.db.commit_lsn(xid) <= h.slot_start {
+            // Before the slot: only the snapshot carries it.
+            continue;
+        }
         let lsn = if WIRE.get() {
             h.db.commit_lsn(xid)
         } else {
@@ -1603,6 +2016,8 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
             _ => return Err(format!("invariant 4: unexpected op in WAL: {:?}", c.op)),
         }
     }
+    // The snapshot stages its chunks as synthetic transactions.
+    staged.retain(|xid, _| expected.contains_key(xid) || !BACKFILL.get());
     if staged.keys().ne(expected.keys()) {
         return Err(format!(
             "invariant 4 (WAL == staged): staged transactions {:?}, WAL transactions {:?}",
@@ -1640,9 +2055,60 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
             .map_err(|e| format!("read_table: {e}"))?;
     sort_by_pk(&mut pg_rows);
 
+    let iceberg_rows = on_source_columns(&h.db, iceberg_rows);
+    let pg_rows = on_source_columns(&h.db, pg_rows);
     if iceberg_rows != pg_rows {
         return Err(format!(
             "invariant 5 (PG == Iceberg) violated:\n  pg={pg_rows:?}\n  iceberg={iceberg_rows:?}"
+        ));
+    }
+
+    // 5b. The second table: PG == Iceberg, apart from the first.
+    if SECOND_TABLE.get() > 0 {
+        let iceberg = block_on(h.storage.engine_rows(&other_ident()))
+            .map_err(|e| format!("read {}: {e}", other_ident()))?;
+        let mut pg =
+            h.db.read_table(&other_pg_ident())
+                .map_err(|e| e.to_string())?;
+        sort_by_pk(&mut pg);
+        let cols = [ColumnName("id".into()), note(), ColumnName("qty".into())];
+        let keep = |rows: Vec<Row>| -> Vec<Row> {
+            rows.into_iter()
+                .map(|r| {
+                    cols.iter()
+                        .map(|c| (c.clone(), r.get(c).cloned().unwrap_or(PgValue::Null)))
+                        .collect()
+                })
+                .collect()
+        };
+        let (iceberg, pg) = (keep(iceberg), keep(pg));
+        if iceberg != pg {
+            return Err(format!(
+                "invariant 5 ({} → {}): pg={pg:?}\n  iceberg={iceberg:?}",
+                other_pg_ident(),
+                other_ident()
+            ));
+        }
+    }
+
+    // 13. `pg2iceberg verify` reads what a query engine reads — or it
+    //     reports false mismatches, and misses real ones.
+    let mut verify_rows = block_on(read_materialized_state(
+        h.audited.as_ref(),
+        h.blob_store.as_ref(),
+        &ident(),
+        &block_on(h.audited.load_table(&ident()))
+            .map_err(|e| e.to_string())?
+            .expect("table exists")
+            .schema,
+        &[ColumnName("id".into())],
+    ))
+    .map_err(|e| format!("invariant 13: verify's read: {e}"))?;
+    sort_by_pk(&mut verify_rows);
+    let verify_rows = on_source_columns(&h.db, verify_rows);
+    if verify_rows != iceberg_rows {
+        return Err(format!(
+            "invariant 13 (verify == engine): verify reads {verify_rows:?}\n  engines read {iceberg_rows:?}"
         ));
     }
 
@@ -1717,6 +2183,8 @@ fn check_invariants_with_snapshot(h: &mut DstHarness) -> Result<(), String> {
             .map(stored_rows)
             .map_err(|e| format!("read_table: {e}"))?;
     sort_by_pk(&mut pg_rows);
+    let iceberg_rows = on_source_columns(&h.db, iceberg_rows);
+    let pg_rows = on_source_columns(&h.db, pg_rows);
     if iceberg_rows != pg_rows {
         return Err(format!(
             "invariant 5: pg={pg_rows:?}\n  iceberg={iceberg_rows:?}"
@@ -1741,7 +2209,13 @@ proptest! {
         wire in integration_only(),
         partitioned in any::<bool>(),
         default_identity in any::<bool>(),
+        backfill in any::<bool>(),
+        distributed in any::<bool>(),
+        second_table in 0u8..3,
     ) {
+        SECOND_TABLE.set(second_table);
+        DISTRIBUTED.set(distributed);
+        BACKFILL.set(backfill);
         SMALLINT_PK.set(smallint_pk);
         PROD_BACKEND.set(prod_backend);
         WIRE.set(wire);
@@ -2017,6 +2491,77 @@ fn external_compaction_racing_an_update_keeps_the_new_row() {
     check_invariants(&mut h).unwrap();
 }
 
+/// Dropping a column and adding one with the same name gives a new,
+/// empty column: the dropped column's values must not come back.
+#[test]
+fn re_added_column_does_not_bring_back_dropped_values() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::DropNote);
+    h.run_step(&Step::AddNote);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// After a column ahead of others is dropped, a restarted materializer
+/// discovers the remaining columns at new positions; it must keep
+/// writing each value under its column's Iceberg field id.
+#[test]
+fn restart_after_dropping_a_column_keeps_field_ids() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::DropNote);
+    h.run_step(&Step::RestartMaterializer);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// A backfill reads rows as of its snapshot; a change streamed (and
+/// staged) before the backfill reaches that row is newer, and must win.
+#[test]
+fn backfill_does_not_overwrite_newer_changes() {
+    BACKFILL.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Update { id: 1, qty: 99 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
+/// When a table changes owner between distributed workers, the new owner
+/// must know the rows the previous one wrote — or a delete + re-insert
+/// leaves the old row, and TOAST updates fail.
+#[test]
+fn worker_taking_over_a_table_knows_its_rows() {
+    DISTRIBUTED.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    // Worker "b" cycles first, alone: it owns the table and writes row 1.
+    h.run_step(&Step::OtherWorkerCycle);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    // Worker "a" joins and takes the table over.
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
+/// `public.orders` and `sales.orders` are different tables. With
+/// `sink.namespace` set, both map to `<namespace>.orders` — they must not
+/// end up mixed in one Iceberg table (or startup must refuse).
+#[test]
+fn same_named_tables_under_one_sink_namespace_stay_apart() {
+    SECOND_TABLE.set(2);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::OtherInsert { id: 1, qty: 99 });
+    check_invariants(&mut h).unwrap();
+}
+
 #[test]
 fn happy_path_one_insert_one_flush() {
     let mut h = DstHarness::boot();
@@ -2090,7 +2635,10 @@ fn truncate_inside_large_transaction_hides_its_earlier_inserts() {
     sort_by_pk(&mut iceberg);
     let mut pg = stored_rows(h.db.read_table(&ident()).unwrap());
     sort_by_pk(&mut pg);
-    assert_eq!(iceberg, pg);
+    assert_eq!(
+        on_source_columns(&h.db, iceberg),
+        on_source_columns(&h.db, pg)
+    );
 }
 
 /// The atomic commit of a multi-step transaction fails: nothing may
