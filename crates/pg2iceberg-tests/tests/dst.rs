@@ -235,18 +235,23 @@ fn on_columns(cols: &[String], rows: Vec<Row>) -> Vec<Row> {
 fn other_pg_ident() -> TableIdent {
     TableIdent {
         namespace: Namespace(vec!["sales".into()]),
-        name: TABLE_NAME.into(),
+        name: if SECOND_TABLE.get() == 2 {
+            "returns".into()
+        } else {
+            TABLE_NAME.into()
+        },
     }
 }
 
-/// The second table's Iceberg name, mapped the way `discover_schemas`
-/// (setup.rs) maps it: with `sink.namespace` set, the PG schema is
-/// dropped and the table name kept.
+/// The second table's Iceberg name, mapped the way
+/// `TableConfig::iceberg_ident` maps it: with `sink.namespace` set, the
+/// PG schema is replaced and the table name kept. (Two tables mapped to
+/// one name is a config error.)
 fn other_ident() -> TableIdent {
     if SECOND_TABLE.get() == 2 {
         TableIdent {
             namespace: Namespace(vec!["public".into()]),
-            name: TABLE_NAME.into(),
+            name: "returns".into(),
         }
     } else {
         other_pg_ident()
@@ -417,7 +422,7 @@ enum Step {
     /// single dirty file (or two clean ones) at a time, leaving older
     /// deletes and the rest of the table for later passes.
     Compact,
-    /// `INSERT INTO sales.orders`: a same-named table in another schema.
+    /// An insert into the second table (`SECOND_TABLE`).
     OtherInsert {
         id: i32,
         qty: i32,
@@ -547,10 +552,11 @@ thread_local! {
     /// Whether this case materializes with two distributed workers that
     /// hand the table back and forth as their heartbeats lapse.
     static DISTRIBUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// A second table with the same name, `sales.orders`: 0 = none,
-    /// 1 = with `sink.namespace` unset (its Iceberg namespace is its PG
-    /// schema), 2 = with `sink.namespace = "public"`, which maps it onto
-    /// the same Iceberg name as `public.orders`.
+    /// A second table: 0 = none; 1 = `sales.orders`, the same name in
+    /// another namespace, with `sink.namespace` unset (its Iceberg
+    /// namespace is its PG schema); 2 = `sales.returns` with
+    /// `sink.namespace = "public"`, which materializes it as
+    /// `public.returns`.
     static SECOND_TABLE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// Whether this case's table is partitioned (by a non-key column).
     static PARTITIONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2946,11 +2952,12 @@ fn worker_taking_over_a_table_knows_its_rows() {
     check_invariants(&mut h).unwrap();
 }
 
-/// `public.orders` and `sales.orders` are different tables. With
-/// `sink.namespace` set, both map to `<namespace>.orders` — they must not
-/// end up mixed in one Iceberg table (or startup must refuse).
+/// With `sink.namespace` set, `sales.returns` materializes as
+/// `public.returns`: its changes are staged under the Iceberg name.
+/// (`public.orders` and `sales.orders` would collide there; config
+/// loading refuses that.)
 #[test]
-fn same_named_tables_under_one_sink_namespace_stay_apart() {
+fn table_mapped_into_the_sink_namespace_replicates() {
     SECOND_TABLE.set(2);
     let mut h = DstHarness::boot();
     h.run_step(&Step::Insert { id: 1, qty: 10 });

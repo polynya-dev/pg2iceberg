@@ -597,9 +597,7 @@ async fn build_one_shot_materializer(
             // (e.g. `public.riders`) instead of the materialized
             // `<sink.namespace>.riders` and fail with "table does not
             // exist" against every catalog.
-            if !cfg.sink.namespace.is_empty() {
-                s.ident.namespace = pg2iceberg_core::Namespace(vec![cfg.sink.namespace.clone()]);
-            }
+            s.ident = t.iceberg_ident(&cfg.sink.namespace)?;
             if !t.primary_key.is_empty() {
                 let pk_set: std::collections::BTreeSet<&str> =
                     t.primary_key.iter().map(String::as_str).collect();
@@ -692,9 +690,7 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
             // (e.g. `public.riders`) instead of the materialized
             // `<sink.namespace>.riders` and fail with "table does not
             // exist" against every catalog.
-            if !cfg.sink.namespace.is_empty() {
-                s.ident.namespace = pg2iceberg_core::Namespace(vec![cfg.sink.namespace.clone()]);
-            }
+            s.ident = t.iceberg_ident(&cfg.sink.namespace)?;
             if !t.primary_key.is_empty() {
                 let pk_set: std::collections::BTreeSet<&str> =
                     t.primary_key.iter().map(String::as_str).collect();
