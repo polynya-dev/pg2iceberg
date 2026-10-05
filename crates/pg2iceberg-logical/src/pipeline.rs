@@ -4,13 +4,16 @@
 //! `flush()` drains, uploads, claims, and advances `flushedLSN` — the last
 //! step gated by [`CoordCommitReceipt`].
 
+use crate::relation_event;
 use crate::sink::{FlushOutput, Sink, SinkError, TableChunk};
 use async_trait::async_trait;
 use pg2iceberg_coord::{
     CommitBatch, CoordCommitReceipt, CoordError, Coordinator, MarkerInfo, OffsetClaim,
 };
 use pg2iceberg_core::metrics::{names, Labels};
-use pg2iceberg_core::{ColumnName, Lsn, Metrics, NoopMetrics, Op, PgValue, TableIdent};
+use pg2iceberg_core::{
+    ChangeEvent, ColumnName, Lsn, Metrics, NoopMetrics, Op, PgValue, TableIdent, Timestamp,
+};
 use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_stream::codec::EncodedChunk;
 use pg2iceberg_stream::{BlobStore, StreamError};
@@ -149,6 +152,10 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     /// This pipeline consumes the replication stream (see
     /// [`Self::track_replication`]).
     replication: bool,
+    /// The open transaction: xid and `Begin`'s LSN.
+    open_tx: Option<(u32, Lsn)>,
+    /// Each table's columns as last staged (see [`Self::stage_relation`]).
+    relations: BTreeMap<TableIdent, relation_event::Columns>,
 }
 
 impl<C: Coordinator + ?Sized> Pipeline<C> {
@@ -192,6 +199,8 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             primary_keys: BTreeMap::new(),
             table_translation: BTreeMap::new(),
             replication: false,
+            open_tx: None,
+            relations: BTreeMap::new(),
         }
     }
 
@@ -262,8 +271,12 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             return Ok(());
         }
         match msg {
-            DecodedMessage::Begin { xid, .. } => self.sink.begin_tx(xid),
+            DecodedMessage::Begin { xid, final_lsn } => {
+                self.open_tx = Some((xid, final_lsn));
+                self.sink.begin_tx(xid);
+            }
             DecodedMessage::Commit { xid, commit_lsn } => {
+                self.open_tx = None;
                 // Drain any markers observed in this tx before
                 // committing. Flushed atomically with the rest of
                 // the tx via the next claim_offsets call.
@@ -386,10 +399,8 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                 self.sink.record_change(evt)?;
                 self.spill_if_full(xid).await?;
             }
-            DecodedMessage::Relation { .. } => {
-                // Schema evolution is applied via
-                // `Materializer::apply_relation`, which the lifecycle
-                // calls *before* this dispatch. Nothing to do here.
+            DecodedMessage::Relation { ident, columns } => {
+                self.stage_relation(ident, &columns)?;
             }
             DecodedMessage::Keepalive { wal_end, .. } => {
                 // Only trustworthy between transactions: pgoutput sends a
@@ -401,6 +412,47 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Stage the table's columns, if they changed, as a relation event
+    /// where the stream put the Relation message — before the
+    /// transaction's changes to the table — so the materializer applies
+    /// the schema change between the rows staged before and after it.
+    /// Applied when the message arrived instead, ahead of rows already
+    /// staged under the old schema, a dropped and re-added column would
+    /// take those rows' values for the dropped one.
+    fn stage_relation(
+        &mut self,
+        ident: TableIdent,
+        columns: &[pg2iceberg_pg::RelationColumn],
+    ) -> Result<()> {
+        let table = self.table_translation.get(&ident).cloned().unwrap_or(ident);
+        if self.markers_table.as_ref() == Some(&table) {
+            return Ok(());
+        }
+        let columns: relation_event::Columns =
+            columns.iter().map(|c| (c.name.clone(), c.ty)).collect();
+        // pgoutput resends a table's Relation, unchanged, at every new
+        // session and cache invalidation; those say nothing new.
+        if self.relations.get(&table) == Some(&columns) {
+            return Ok(());
+        }
+        let (xid, lsn) = match self.open_tx {
+            Some((xid, lsn)) => (Some(xid), lsn),
+            None => (None, Lsn::ZERO),
+        };
+        self.sink.record_change(ChangeEvent {
+            table: table.clone(),
+            op: Op::Relation,
+            lsn,
+            commit_ts: Timestamp(0),
+            xid,
+            before: None,
+            after: Some(relation_event::encode(&columns)),
+            unchanged_cols: Vec::new(),
+        })?;
+        self.relations.insert(table, columns);
         Ok(())
     }
 
@@ -520,11 +572,8 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         self.blob_store.put(&path, chunk.bytes).await?;
         let mut labels = Labels::new();
         labels.insert("table".into(), table.name.clone());
-        self.metrics.counter(
-            names::PIPELINE_ROWS_STAGED_TOTAL,
-            &labels,
-            chunk.record_count,
-        );
+        self.metrics
+            .counter(names::PIPELINE_ROWS_STAGED_TOTAL, &labels, chunk.row_count);
         Ok(OffsetClaim {
             table,
             record_count: chunk.record_count,

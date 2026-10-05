@@ -22,7 +22,6 @@ use pg2iceberg_core::{
 use pg2iceberg_iceberg::read_materialized_state;
 use pg2iceberg_logical::materializer::{CounterMaterializerNamer, Materializer};
 use pg2iceberg_logical::pipeline::{CounterBlobNamer, Pipeline};
-use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
@@ -134,13 +133,9 @@ impl Harness {
         // Drain replication stream → pipeline → flush → materialize.
         // SimReplicationStream::recv is sync and returns None when
         // there are no more events to deliver. Mirrors the
-        // lifecycle's main loop: Relation messages drive schema
-        // evolution via `materializer.apply_relation` BEFORE the
-        // pipeline forwards them onward.
+        // lifecycle's main loop: every message goes to the pipeline,
+        // which stages schema changes in order with the rows.
         while let Some(msg) = self.stream.recv() {
-            if let DecodedMessage::Relation { ident, columns } = &msg {
-                block_on(self.materializer.apply_relation(ident, columns)).unwrap();
-            }
             block_on(self.pipeline.process(msg)).unwrap();
         }
         block_on(self.pipeline.flush()).unwrap();
@@ -275,7 +270,7 @@ fn update_with_pk_change_deletes_old_pk_in_iceberg() {
 fn alter_table_add_column_mid_stream_propagates_to_iceberg() {
     // Operator runs `ALTER TABLE orders ADD COLUMN note TEXT`,
     // followed by an INSERT carrying the new column.
-    // Goes through `materializer.apply_relation` →
+    // Goes through the staged relation event →
     // `Catalog::evolve_schema` → updated `entry.schema` + writer
     // rebuild. The post-evolve INSERT must persist the new
     // column's value in Iceberg.

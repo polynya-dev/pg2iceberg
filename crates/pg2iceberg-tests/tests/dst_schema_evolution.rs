@@ -1,7 +1,8 @@
 //! DST coverage for the full surface of schema-evolution scenarios that
-//! pgoutput can produce. Each test seeds a sim PG, drives ALTERs through
-//! `materializer.apply_relation`, and asserts the Iceberg-side schema /
-//! data state.
+//! pgoutput can produce. Each test seeds a sim PG, runs ALTERs, streams
+//! the resulting Relation messages through the pipeline (which stages
+//! them in the log) and the materializer (which applies them in order),
+//! and asserts the Iceberg-side schema / data state.
 //!
 //! Companion to `dst_dml_correctness.rs` (which covers DML correctness,
 //! including the basic ADD/DROP COLUMN happy paths). This file focuses
@@ -21,7 +22,6 @@ use pg2iceberg_iceberg::{read_materialized_state, Catalog};
 use pg2iceberg_logical::materializer::{CounterMaterializerNamer, Materializer};
 use pg2iceberg_logical::pipeline::{CounterBlobNamer, Pipeline};
 use pg2iceberg_logical::MaterializerError;
-use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
@@ -151,29 +151,21 @@ impl Harness {
     /// asserting every step succeeded. Use this for the happy path.
     fn drive_then_materialize(&mut self) {
         while let Some(msg) = self.stream.recv() {
-            if let DecodedMessage::Relation { ident, columns } = &msg {
-                block_on(self.materializer.apply_relation(ident, columns)).unwrap();
-            }
             block_on(self.pipeline.process(msg)).unwrap();
         }
         block_on(self.pipeline.flush()).unwrap();
         block_on(self.materializer.cycle()).unwrap();
     }
 
-    /// Drain the replication stream, but capture the first
-    /// `apply_relation` error and return it instead of panicking.
-    /// Used by the illegal-type-change tests to assert that the
-    /// lifecycle fails loudly rather than silently coercing.
+    /// Drain the replication stream and run a materialize cycle,
+    /// returning the cycle's error: an illegal schema change fails the
+    /// cycle that reaches it, rather than silently coercing.
     fn drive_capturing_relation_error(&mut self) -> Option<MaterializerError> {
         while let Some(msg) = self.stream.recv() {
-            if let DecodedMessage::Relation { ident, columns } = &msg {
-                if let Err(e) = block_on(self.materializer.apply_relation(ident, columns)) {
-                    return Some(e);
-                }
-            }
             block_on(self.pipeline.process(msg)).unwrap();
         }
-        None
+        block_on(self.pipeline.flush()).unwrap();
+        block_on(self.materializer.cycle()).err()
     }
 
     /// Insert a row into `ident`. pgoutput sends a table's Relation only
@@ -360,7 +352,7 @@ fn pk_type_change_rejected_even_for_legal_promotion() {
 fn single_relation_with_multiple_new_columns_adds_all() {
     // PG can run `ALTER TABLE … ADD COLUMN a TEXT, ADD COLUMN b INT`
     // in one statement, producing a single Relation message that
-    // adds two columns at once. apply_relation must emit two
+    // adds two columns at once. The materializer must emit two
     // AddColumn changes and apply them atomically (both succeed or
     // neither does).
     let s = schema_with("orders", "qty", IcebergType::Int);
@@ -568,6 +560,68 @@ fn add_then_drop_with_no_write_between_never_reaches_iceberg() {
     assert!(evolved.columns.iter().all(|c| c.name != "tmp"));
 }
 
+#[test]
+fn rows_before_a_re_add_keep_their_values_out_of_the_new_column() {
+    // A row written, `note` dropped (seen: a write follows), re-added
+    // (seen: a write follows), all materialized in one cycle. The first
+    // row's value belongs to the dropped column, now renamed; the new
+    // `note` is empty for it.
+    let s = schema_with("orders", "note", IcebergType::String);
+    let mut h = Harness::boot(std::slice::from_ref(&s));
+    h.write(
+        &s.ident,
+        &[
+            ("id", PgValue::Int4(1)),
+            ("note", PgValue::Text("a".into())),
+        ],
+    );
+    h.db.alter_drop_column(&s.ident, "note").unwrap();
+    h.write(&s.ident, &[("id", PgValue::Int4(2))]);
+    h.db.alter_add_column(
+        &s.ident,
+        ColumnSchema {
+            name: "note".into(),
+            field_id: 0,
+            ty: IcebergType::String,
+            nullable: true,
+            is_primary_key: false,
+        },
+    )
+    .unwrap();
+    h.write(
+        &s.ident,
+        &[
+            ("id", PgValue::Int4(3)),
+            ("note", PgValue::Text("c".into())),
+        ],
+    );
+    h.drive_then_materialize();
+
+    let schema = h.iceberg_schema(&s.ident);
+    let mut rows = block_on(read_materialized_state(
+        h.catalog.as_ref(),
+        h.blob.as_ref(),
+        &s.ident,
+        &schema,
+        &[col("id")],
+    ))
+    .unwrap();
+    rows.sort_by_key(|r| format!("{:?}", r[&col("id")]));
+    let notes: Vec<(PgValue, PgValue)> = rows
+        .iter()
+        .map(|r| (r[&col("note__dropped_2")].clone(), r[&col("note")].clone()))
+        .collect();
+    let text = |v: &str| PgValue::Text(v.into());
+    assert_eq!(
+        notes,
+        vec![
+            (text("a"), PgValue::Null),
+            (PgValue::Null, PgValue::Null),
+            (PgValue::Null, text("c")),
+        ]
+    );
+}
+
 // ── Multi-table evolution ────────────────────────────────────────────
 
 #[test]
@@ -656,11 +710,10 @@ fn repeated_relation_with_same_schema_is_no_op() {
 
 #[test]
 fn add_column_then_insert_uses_new_column() {
-    // The lifecycle's main loop routes Relation → apply_relation
-    // before pipeline.process. So even if a Relation arrives
-    // immediately before an Insert (e.g. mid-transaction in real
-    // PG), the Iceberg schema is updated in time for the staged
-    // Insert to encode the new column.
+    // The pipeline stages a Relation in order with the rows, so a
+    // Relation arriving immediately before an Insert (e.g.
+    // mid-transaction in real PG) is applied in time for that Insert
+    // to encode the new column.
     let s = schema_with("orders", "qty", IcebergType::Int);
     let mut h = Harness::boot(std::slice::from_ref(&s));
     h.drive_then_materialize();

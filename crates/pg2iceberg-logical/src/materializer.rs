@@ -23,6 +23,7 @@
 //! 7. `Coordinator::set_cursor` to the highest end_offset processed.
 //! 8. Update FileIndex with the new data file + removed PKs.
 
+use crate::relation_event;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pg2iceberg_coord::{Coordinator, LogEntry};
@@ -461,15 +462,6 @@ pub struct Materializer<C: Catalog> {
     /// controls how long a missed heartbeat survives before the
     /// worker drops out of the active list.
     distributed: Option<DistributedMode>,
-    /// PG → Iceberg ident translation, mirroring `Pipeline`'s map.
-    /// `apply_relation` is called with the PG-side ident (the
-    /// pgoutput stream's view), but `tables` is keyed by the
-    /// Iceberg-side ident the lifecycle registered with. Without
-    /// this translation, schema-evolution messages
-    /// (`ALTER TABLE ... ADD COLUMN`, type promotions, drops) would
-    /// silently no-op, and post-ALTER inserts would write to the
-    /// pre-ALTER iceberg schema.
-    table_translation: BTreeMap<TableIdent, TableIdent>,
 }
 
 /// Distributed-mode parameters. Built by
@@ -589,19 +581,6 @@ impl<C: Catalog> Materializer<C> {
             meta_marker: None,
             meta_recorder: None,
             distributed: None,
-            table_translation: BTreeMap::new(),
-        }
-    }
-
-    /// Register a translation from the PG-side ident (carried in
-    /// pgoutput Relation messages) to the Iceberg-side ident this
-    /// materializer's `tables` map is keyed by. Lets schema-
-    /// evolution events from the WAL stream find their target
-    /// table even when `sink.namespace` differs from the PG schema.
-    /// No-op when the two idents are equal.
-    pub fn register_table_translation(&mut self, pg_ident: TableIdent, iceberg_ident: TableIdent) {
-        if pg_ident != iceberg_ident {
-            self.table_translation.insert(pg_ident, iceberg_ident);
         }
     }
 
@@ -843,7 +822,7 @@ impl<C: Catalog> Materializer<C> {
         // land under the wrong Iceberg column. Nor does discovery's view
         // of the source's *current* columns apply yet: the stream may
         // still replay transactions from before a change. Its Relation
-        // messages evolve the schema in order ([`Self::apply_relation`]).
+        // messages, staged in the log, evolve the schema in order.
         let schema = match self.catalog.load_table(&ident).await? {
             None => {
                 self.catalog.create_table(&schema).await?;
@@ -931,71 +910,81 @@ impl<C: Catalog> Materializer<C> {
         }
     }
 
-    /// Apply a pgoutput Relation message: bring the table's Iceberg
-    /// schema in line with `incoming_columns` ([`reconcile_columns`]),
-    /// call `Catalog::evolve_schema`, and rebuild the in-memory
-    /// `TableEntry::schema` and `TableWriter` from the result, so
-    /// subsequent materialize cycles encode rows with the new shape.
+    /// Apply a staged relation event: bring the table's Iceberg schema
+    /// in line with the source columns it carries ([`reconcile_columns`]),
+    /// and rebuild the in-memory `TableEntry::schema` and `TableWriter`
+    /// from the result, so the rows after it encode with the new shape.
     ///
     /// - **AddColumn** for a new name, with a fresh field id.
-    /// - **DropColumn** (soft) for a non-PK column `incoming` lacks: it
+    /// - **DropColumn** (soft) for a non-PK column the source lacks: it
     ///   stays, nullable, so older data files keep resolving.
     /// - **PromoteColumnType** for a legal Iceberg promotion (int→long,
     ///   float→double, decimal precision increase). Illegal type
     ///   changes (e.g. long→int, text→int) are rejected with
-    ///   `MaterializerError::Catalog` so the lifecycle fails loudly
-    ///   rather than silently truncate or coerce downstream readers.
+    ///   `MaterializerError::Catalog` so the table fails loudly rather
+    ///   than silently truncate or coerce downstream readers.
     /// - **RenameColumn + AddColumn** for a column the source dropped
     ///   and re-added: Postgres gives it no values, so it's a new
     ///   column, and the dropped one keeps its values under another
     ///   name.
     ///
-    /// The incoming `is_primary_key`/`nullable` are ignored:
-    /// pgoutput's key flag means "part of REPLICA IDENTITY" (every
-    /// column under `REPLICA IDENTITY FULL`), not "is primary key".
-    ///
-    /// **No-op when the table isn't registered** (the lifecycle
-    /// only registers tables in YAML — incoming Relations for
-    /// untracked tables, e.g. `_pg2iceberg.markers`, are silently
-    /// skipped).
-    ///
-    /// **No-op when columns match.** pgoutput re-emits Relation
-    /// messages liberally (e.g. on every cache invalidation, even
-    /// for unchanged schemas); the diff just produces an empty
-    /// change list and we return without touching the catalog.
-    pub async fn apply_relation(
+    /// Reconciles against the catalog's schema, not the in-memory one:
+    /// the event may already have been applied — before a crash, whose
+    /// retry re-reads it, or by another worker — and applying it again
+    /// is then a no-op.
+    async fn apply_columns(
         &mut self,
         ident: &TableIdent,
-        incoming_columns: &[pg2iceberg_pg::RelationColumn],
+        columns: &relation_event::Columns,
     ) -> Result<()> {
-        // Pgoutput emits Relation messages keyed by PG schema +
-        // table name; our `tables` map is keyed by Iceberg-side
-        // ident. Translate when registered, otherwise fall through.
-        let lookup_ident = self.table_translation.get(ident).unwrap_or(ident).clone();
-        let entry = match self.tables.get_mut(&lookup_ident) {
-            Some(e) => e,
-            None => return Ok(()),
-        };
-        let incoming: Vec<(String, pg2iceberg_core::IcebergType)> = incoming_columns
-            .iter()
-            .map(|c| (c.name.clone(), c.ty))
-            .collect();
-        let changes = reconcile_columns(&entry.schema, &incoming, &entry.dropped)
+        let current = self
+            .catalog
+            .load_table(ident)
+            .await?
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?
+            .schema;
+        let entry = self
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        let changes = reconcile_columns(&current, columns, &entry.dropped)
             .map_err(MaterializerError::Catalog)?;
-        if !changes.is_empty() {
-            // Catalog-side first so a failure leaves the materializer's
-            // in-memory state unchanged (the next Relation re-triggers
-            // the diff). Use the Iceberg-side ident (`lookup_ident`) —
-            // `ident` is the PG-side key from the pgoutput Relation
-            // message, which the catalog wouldn't recognise.
-            self.catalog
-                .evolve_schema(&lookup_ident, changes.clone())
-                .await?;
-            pg2iceberg_iceberg::apply_schema_changes(&mut entry.schema, &changes)
-                .map_err(MaterializerError::Catalog)?;
-            entry.writer = TableWriter::new(entry.schema.clone());
+        let current = if changes.is_empty() {
+            current
+        } else {
+            self.catalog.evolve_schema(ident, changes).await?.schema
+        };
+        entry.schema.columns = current.columns;
+        entry.writer = TableWriter::new(entry.schema.clone());
+        entry.dropped = absent_from(&entry.schema, columns);
+        Ok(())
+    }
+
+    /// Buffer a log entry's events into `unit`, applying its relation
+    /// events in place: rows before one are staged under the old schema
+    /// first.
+    async fn buffer_entry(
+        &mut self,
+        ident: &TableIdent,
+        unit: &mut Unit,
+        events: Vec<MatEvent>,
+    ) -> Result<()> {
+        for evt in events {
+            if evt.op != Op::Relation {
+                unit.buf.push(evt);
+                continue;
+            }
+            if !unit.buf.is_empty() {
+                self.prepare_step(ident, unit).await?;
+            }
+            let columns = relation_event::decode(&evt.row).ok_or_else(|| {
+                MaterializerError::Blob(StreamError::Decode(format!(
+                    "malformed relation event for {ident}: {:?}",
+                    evt.row
+                )))
+            })?;
+            self.apply_columns(ident, &columns).await?;
         }
-        entry.dropped = absent_from(&entry.schema, &incoming);
         Ok(())
     }
 
@@ -1404,6 +1393,19 @@ impl<C: Catalog> Materializer<C> {
             for e in entries {
                 let bytes = self.blob_store.get(&e.s3_path).await?;
                 let events = decode_chunk(&bytes)?;
+                // A schema change starts its entry (the pipeline stages it
+                // so). Commit the rows before it — written under the old
+                // schema — before applying it: a crash in between then
+                // re-reads this entry, and applying the change again is a
+                // no-op. Within a transaction (DDL mid-transaction) the
+                // rows so far can only be staged as a step.
+                if events.first().is_some_and(|e| e.op == Op::Relation) {
+                    if is_tx_boundary(unit.buf.last(), events.first()) {
+                        folded += self.commit_unit(ident, &mut unit).await?;
+                    } else {
+                        self.prepare_step(ident, &mut unit).await?;
+                    }
+                }
                 if !unit.buf.is_empty() && unit.buf.len() + events.len() > self.batch_rows {
                     if is_tx_boundary(unit.buf.last(), events.first()) {
                         folded += self.commit_unit(ident, &mut unit).await?;
@@ -1418,7 +1420,7 @@ impl<C: Catalog> Materializer<C> {
                     }
                 }
                 events_read += events.len();
-                unit.buf.extend(events);
+                self.buffer_entry(ident, &mut unit, events).await?;
                 unit.end_offset = Some(e.end_offset);
                 after = e.end_offset;
             }

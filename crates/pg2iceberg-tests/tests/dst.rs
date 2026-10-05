@@ -207,17 +207,26 @@ fn discovered_schema(db: &SimPostgres) -> TableSchema {
 /// a row lacks reads as NULL): Iceberg keeps dropped columns, and a row
 /// written before a column existed doesn't carry it.
 fn on_source_columns(db: &SimPostgres, rows: Vec<Row>) -> Vec<Row> {
-    let cols: Vec<ColumnName> = db
+    let cols: Vec<String> = db
         .table_schema(&ident())
         .expect("source table")
         .columns
         .into_iter()
-        .map(|c| ColumnName(c.name))
+        .map(|c| c.name)
         .collect();
+    on_columns(&cols, rows)
+}
+
+/// `rows` on just `cols`, NULL where a row lacks one.
+fn on_columns(cols: &[String], rows: Vec<Row>) -> Vec<Row> {
     rows.into_iter()
         .map(|r| {
             cols.iter()
-                .map(|c| (c.clone(), r.get(c).cloned().unwrap_or(PgValue::Null)))
+                .map(|c| {
+                    let c = ColumnName(c.clone());
+                    let v = r.get(&c).cloned().unwrap_or(PgValue::Null);
+                    (c, v)
+                })
                 .collect()
         })
         .collect()
@@ -283,7 +292,6 @@ fn published() -> Vec<TableIdent> {
 fn register_other(m: &mut Materializer<AuditedCatalog>) {
     if SECOND_TABLE.get() > 0 {
         block_on(m.register_table(other_schema())).unwrap();
-        m.register_table_translation(other_pg_ident(), other_ident());
     }
 }
 
@@ -918,6 +926,7 @@ impl DstHarness {
             db: db.clone(),
             violations: Mutex::new(Vec::new()),
             fail_next_commit: Default::default(),
+            fail_commit_after_schema_change: Default::default(),
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
         });
@@ -1027,6 +1036,7 @@ impl DstHarness {
             db: db.clone(),
             violations: Mutex::new(Vec::new()),
             fail_next_commit: Default::default(),
+            fail_commit_after_schema_change: Default::default(),
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
         });
@@ -1114,12 +1124,9 @@ impl DstHarness {
         self.stream.recv()
     }
 
-    /// What the lifecycle does with a message: a schema change reaches
-    /// the materializer before the pipeline.
+    /// What the lifecycle does with a message: hand it to the pipeline,
+    /// which stages schema changes in order with the rows.
     fn process(&mut self, msg: DecodedMessage) {
-        if let DecodedMessage::Relation { ident, columns } = &msg {
-            block_on(self.materializer.apply_relation(ident, columns)).unwrap();
-        }
         block_on(self.pipeline.process(msg)).unwrap();
     }
 
@@ -1483,6 +1490,12 @@ impl DstHarness {
             }
             Step::AddNote => {
                 if !NOTE_PRESENT.get() {
+                    // A column re-added in last place can't be told from
+                    // one never dropped unless pg2iceberg saw the drop,
+                    // which pgoutput reports only with the table's next
+                    // change: make it first. (Without it — no change
+                    // between drop and re-add — the re-add is invisible.)
+                    write_after_schema_change(self);
                     let col = schema().columns.into_iter().find(|c| c.name == "note");
                     self.db.alter_add_column(&ident(), col.unwrap()).unwrap();
                     NOTE_PRESENT.set(true);
@@ -1697,10 +1710,24 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
         _ => i32::MAX,
     };
     let mut state: BTreeMap<i32, Row> = BTreeMap::new();
-    let mut boundaries: Vec<Vec<Row>> = vec![Vec::new()];
+    // Each boundary's rows, with the source's columns then.
+    let mut boundaries: Vec<(Vec<Row>, Vec<String>)> = vec![(Vec::new(), Vec::new())];
     let mut i = 0;
     while i < events.len() {
         let xid = events[i].xid;
+        // A column dropped since the last transaction takes its values
+        // with it: one re-added later starts out NULL. Iceberg can show
+        // that state too, once it has applied the drop.
+        let columns = db.columns_at(&ident(), events[i].lsn);
+        let dropped = state
+            .values()
+            .any(|r| r.keys().any(|c| !columns.contains(&c.0)));
+        if dropped {
+            for row in state.values_mut() {
+                row.retain(|c, _| columns.contains(&c.0));
+            }
+            boundaries.push((state.values().cloned().collect(), columns.clone()));
+        }
         while i < events.len() && events[i].xid == xid {
             let e = &events[i];
             match e.op {
@@ -1728,16 +1755,16 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
             }
             i += 1;
         }
-        boundaries.push(state.values().cloned().collect());
+        boundaries.push((state.values().cloned().collect(), columns));
     }
-    // Compare on the source's current columns: Iceberg keeps dropped
-    // ones, and older boundaries predate added ones.
-    let iceberg = on_source_columns(db, iceberg);
-    let boundaries: Vec<Vec<Row>> = boundaries
+    // Compare on the source's columns at each boundary: Iceberg keeps
+    // dropped columns, and learns of a schema change only with the
+    // table's next change (a column dropped then re-added still reads
+    // as the dropped one until then).
+    let matches = boundaries
         .into_iter()
-        .map(|b| on_source_columns(db, b))
-        .collect();
-    if !boundaries.contains(&iceberg) {
+        .any(|(rows, cols)| on_columns(&cols, iceberg.clone()) == on_columns(&cols, rows));
+    if !matches {
         return Err(format!(
             "invariant 10 (atomic visibility): Iceberg state matches no transaction boundary: {iceberg:?}"
         ));
@@ -1806,6 +1833,9 @@ struct AuditedCatalog {
     violations: Mutex<Vec<String>>,
     /// When set, the next multi-step commit fails without committing.
     fail_next_commit: std::sync::atomic::AtomicBool,
+    /// When set, the commit after the next schema change fails without
+    /// committing — a crash between the two.
+    fail_commit_after_schema_change: std::sync::atomic::AtomicBool,
     /// When set, commits aren't audited — for tests that count blob reads
     /// (an audit reads the whole table).
     audit_paused: std::sync::atomic::AtomicBool,
@@ -1902,7 +1932,15 @@ impl Catalog for AuditedCatalog {
         ident: &TableIdent,
         changes: Vec<SchemaChange>,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
-        self.inner.evolve_schema(ident, changes).await
+        let meta = self.inner.evolve_schema(ident, changes).await?;
+        if self
+            .fail_commit_after_schema_change
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.fail_next_commit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(meta)
     }
     async fn expire_snapshots(
         &self,
@@ -2053,7 +2091,8 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
         last = Some((xid, commit));
     }
     let mut staged: BTreeMap<u32, Vec<pg2iceberg_stream::MatEvent>> = BTreeMap::new();
-    for e in staged_events {
+    // Staged schema changes aren't WAL changes.
+    for e in staged_events.into_iter().filter(|e| e.op != Op::Relation) {
         staged.entry(e.xid.unwrap_or(0)).or_default().push(e);
     }
     // What staging should hold for each WAL event: its row as sent, except
@@ -2598,7 +2637,13 @@ fn pipeline_crash_mid_transaction_keeps_it_atomic() {
 #[test]
 fn file_index_stays_true_after_a_lost_compaction_response() {
     let mut h = DstHarness::boot();
-    h.run_step(&Step::BigTx { inserts: 2, qty: 0 });
+    // One data file holding a live row (2) and a deleted one (1): the
+    // pass rewrites it, moving row 2 to a new file.
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Update { id: 1, qty: 11 });
     h.run_step(&Step::DriveFlush);
     h.run_step(&Step::MaterializerCycle);
     h.run_step(&Step::LoseCommitResponse);
@@ -2656,6 +2701,45 @@ fn rows_staged_before_a_re_add_keep_their_values_out_of_the_new_column() {
     h.run_step(&Step::AddNote);
     h.run_step(&Step::Insert { id: 2, qty: 20 });
     check_invariants(&mut h).unwrap();
+}
+
+/// The materializer fails between applying a schema change and committing
+/// the rows after it. The retry re-reads the log from the last commit, so
+/// that commit must cover every row staged before the change: re-read
+/// under the changed schema, a dropped and re-added column would take
+/// their values.
+#[test]
+fn a_failed_commit_after_a_schema_change_retries_cleanly() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    // Drop and re-add `note` with no write between (unlike `AddNote`):
+    // seen by order, as it moves last, and staged in the same flush as
+    // row 1.
+    h.db.alter_drop_column(&ident(), "note").unwrap();
+    let note = schema().columns.into_iter().find(|c| c.name == "note");
+    h.db.alter_add_column(&ident(), note.unwrap()).unwrap();
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    h.audited
+        .fail_commit_after_schema_change
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = block_on(h.materializer.cycle()).unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+    // Nor may the retry re-apply the older schema change on top of the
+    // newer one: that renames columns that were never re-added.
+    let schema = block_on(h.audited.load_table(&ident()))
+        .unwrap()
+        .unwrap()
+        .schema;
+    let columns: Vec<(String, i32)> = schema
+        .columns
+        .into_iter()
+        .map(|c| (c.name, c.field_id))
+        .collect();
+    let want = [("id", 1), ("note__dropped_2", 2), ("qty", 3), ("note", 4)];
+    assert_eq!(columns, want.map(|(n, i)| (n.to_string(), i)));
 }
 
 /// Compaction and TOAST resolution read older data files, which hold the
@@ -3011,6 +3095,16 @@ fn crash_after_some_inserts_then_more_inserts() {
     check_invariants(&mut h).unwrap();
 }
 
+/// Row changes staged for the main table (schema events aside).
+fn staged_changes(h: &DstHarness) -> usize {
+    block_on(h.coord.read_log(&ident(), 0, 1_000_000))
+        .unwrap()
+        .iter()
+        .flat_map(|e| decode_chunk(&block_on(h.blob_store.get(&e.s3_path)).unwrap()).unwrap())
+        .filter(|e| e.op != Op::Relation)
+        .count()
+}
+
 #[test]
 fn rollback_does_not_appear_in_staged_or_coord() {
     let mut h = DstHarness::boot();
@@ -3018,10 +3112,11 @@ fn rollback_does_not_appear_in_staged_or_coord() {
     h.run_step(&Step::Insert { id: 1, qty: 10 });
     h.run_step(&Step::DriveFlush);
     check_invariants(&mut h).unwrap();
-
-    let entries = block_on(h.coord.read_log(&ident(), 0, 100)).unwrap();
-    let total: u64 = entries.iter().map(|e| e.record_count).sum();
-    assert_eq!(total, 1, "only the committed insert should be staged");
+    assert_eq!(
+        staged_changes(&h),
+        1,
+        "only the committed insert should be staged"
+    );
 }
 
 #[test]
@@ -3032,10 +3127,7 @@ fn update_then_delete_round_trips_to_staged() {
     h.run_step(&Step::Delete { id: 1 });
     h.run_step(&Step::DriveFlush);
     check_invariants(&mut h).unwrap();
-
-    let entries = block_on(h.coord.read_log(&ident(), 0, 100)).unwrap();
-    let total: u64 = entries.iter().map(|e| e.record_count).sum();
-    assert_eq!(total, 3, "I + U + D");
+    assert_eq!(staged_changes(&h), 3, "I + U + D");
 }
 
 #[test]

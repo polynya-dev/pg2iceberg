@@ -494,7 +494,6 @@ where
         // applied here so schema-evolution Relation messages from
         // pgoutput find their target table when `sink.namespace`
         // differs from the PG schema.
-        materializer.register_table_translation(schema.pg_ident(), schema.ident.clone());
     }
     if let Some(meta_ns) = &lc.meta_namespace {
         // Enable meta-marker emission. The materializer creates the
@@ -906,20 +905,9 @@ where
             }
             res = loop_state.stream.recv() => {
                 let msg = res.map_err(|e| MainLoopError::Recv(e.to_string()))?;
-                // Relation messages drive schema evolution: diff
-                // incoming columns against the materializer's
-                // registered schema, call `Catalog::evolve_schema`
-                // for any AddColumn / DropColumn, and update the
-                // materializer's in-memory schema + writer. Forward
-                // a payload-less Relation to the pipeline anyway so
-                // future hooks (metrics, etc.) keep firing.
-                if let pg2iceberg_pg::DecodedMessage::Relation { ident, columns } = &msg {
-                    loop_state
-                        .materializer
-                        .apply_relation(ident, columns)
-                        .await
-                        .map_err(|e| MainLoopError::Catalog(e.to_string()))?;
-                }
+                // Relation messages too: the pipeline stages schema
+                // changes in order with the rows, and the materializer
+                // applies them there.
                 loop_state
                     .pipeline
                     .process(msg)

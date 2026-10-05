@@ -515,8 +515,8 @@ impl SimPostgres {
     /// table's schema and emits a fresh Relation WAL event so any
     /// active replication stream picks up the change. The column
     /// auto-allocates the next field id (matching Iceberg's
-    /// monotonic-only field-id rule). Used by DST to drive
-    /// `Materializer::apply_relation` end-to-end.
+    /// monotonic-only field-id rule). Used by DST to drive schema
+    /// evolution end-to-end.
     pub fn alter_add_column(
         &self,
         ident: &TableIdent,
@@ -613,11 +613,11 @@ impl SimPostgres {
     /// Test hook: `ALTER TABLE … ALTER COLUMN … TYPE …`. Mutates the
     /// named column's `IcebergType` in place (preserving field id and
     /// nullability) and emits a fresh Relation event so the
-    /// materializer's `apply_relation` diff sees the type change. Used
+    /// materializer's schema diff sees the type change. Used
     /// by DST to drive the legal-promotion + illegal-narrowing paths.
     /// The sim doesn't validate the change itself (real PG would do its
     /// own type-cast checks); validation happens downstream in
-    /// `apply_relation` / `apply_schema_changes`.
+    /// `reconcile_columns` / `apply_schema_changes`.
     pub fn alter_column_type(
         &self,
         ident: &TableIdent,
@@ -878,6 +878,14 @@ impl SimPostgres {
     }
 
     /// Snapshot of a table's rows in PK order, for tests / verify.
+    /// `ident`'s column names as of WAL position `at`.
+    pub fn columns_at(&self, ident: &TableIdent, at: Lsn) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        s.columns_at(ident, at)
+            .map(|cols| cols.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
     /// Whether `ident`'s relation changed (DDL, or an invalidation) after
     /// its last row change. pgoutput tells a consumer about a schema
     /// change only with the table's next change, so it hasn't told one.

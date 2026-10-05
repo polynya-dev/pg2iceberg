@@ -56,6 +56,9 @@ pub struct TableChunk {
 pub struct Sink {
     /// Per-table rolling writers, lazily created on first event.
     table_writers: BTreeMap<TableIdent, RollingWriter>,
+    /// Chunks closed early, each because a relation event starts a new
+    /// one ([`Self::append_event`]); the next flush emits them first.
+    closed: Vec<TableChunk>,
     /// In-flight transactions keyed by xid.
     open_txns: BTreeMap<u32, TxBuffer>,
     /// Committed-but-unflushed transactions, in commit order.
@@ -69,6 +72,7 @@ impl Sink {
         assert!(flush_threshold > 0);
         Self {
             table_writers: BTreeMap::new(),
+            closed: Vec::new(),
             open_txns: BTreeMap::new(),
             committed: VecDeque::new(),
             flush_threshold,
@@ -101,12 +105,15 @@ impl Sink {
         match evt.xid {
             Some(xid) if self.open_txns.contains_key(&xid) => {
                 let tx = self.open_txns.get_mut(&xid).expect("checked above");
-                tx.commit_ts = Some(evt.commit_ts);
+                // A relation event carries no commit timestamp.
+                if evt.op != Op::Relation {
+                    tx.commit_ts = Some(evt.commit_ts);
+                }
                 tx.events.push(evt);
             }
             _ => {
                 // No tx: e.g. a snapshot-phase event. Stage immediately.
-                self.append_event(evt);
+                self.append_event(evt)?;
             }
         }
         Ok(())
@@ -149,15 +156,25 @@ impl Sink {
         for evt in tx.events.drain(..) {
             by_table.entry(evt.table.clone()).or_default().push(evt);
         }
-        by_table
-            .into_iter()
-            .map(|(table, events)| {
-                Ok(TableChunk {
-                    table,
-                    chunk: encode_chunk(&events)?,
-                })
-            })
-            .collect()
+        let mut out = Vec::new();
+        for (table, events) in by_table {
+            // As in `append_event`: a relation event starts a chunk.
+            let mut part: Vec<ChangeEvent> = Vec::new();
+            for evt in events {
+                if evt.op == Op::Relation && !part.is_empty() {
+                    out.push(TableChunk {
+                        table: table.clone(),
+                        chunk: encode_chunk(&std::mem::take(&mut part))?,
+                    });
+                }
+                part.push(evt);
+            }
+            out.push(TableChunk {
+                table,
+                chunk: encode_chunk(&part)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Change events currently held in memory: open transactions,
@@ -189,12 +206,13 @@ impl Sink {
                 }
             }
             for evt in tx.events {
-                self.append_event(evt);
+                self.append_event(evt)?;
             }
         }
 
-        // Flush every writer that has buffered rows.
-        let mut chunks = Vec::new();
+        // Flush every writer that has buffered rows, after the chunks
+        // closed early (which hold earlier events).
+        let mut chunks = std::mem::take(&mut self.closed);
         for (table, writer) in self.table_writers.iter_mut() {
             if let Some(chunk) = writer.flush()? {
                 chunks.push(TableChunk {
@@ -210,13 +228,22 @@ impl Sink {
         }))
     }
 
-    fn append_event(&mut self, evt: ChangeEvent) {
+    /// A relation event (a schema change) starts a new chunk: the
+    /// materializer applies it at a log entry's start, once the entries
+    /// before it — rows written under the old schema — are committed.
+    fn append_event(&mut self, evt: ChangeEvent) -> Result<()> {
         let table = evt.table.clone();
         let writer = self
             .table_writers
-            .entry(table)
+            .entry(table.clone())
             .or_insert_with(|| RollingWriter::new(self.flush_threshold));
+        if evt.op == Op::Relation {
+            if let Some(chunk) = writer.flush()? {
+                self.closed.push(TableChunk { table, chunk });
+            }
+        }
         writer.append(evt);
+        Ok(())
     }
 }
 
@@ -237,6 +264,54 @@ mod tests {
         let mut r = BTreeMap::new();
         r.insert(ColumnName("id".into()), PgValue::Int4(id));
         r
+    }
+
+    fn relation(xid: u32, lsn: u64) -> ChangeEvent {
+        ChangeEvent {
+            op: Op::Relation,
+            after: Some(crate::relation_event::encode(&vec![])),
+            ..insert(xid, lsn, 0)
+        }
+    }
+
+    /// Each chunk's ops, decoded.
+    fn ops(chunks: &[TableChunk]) -> Vec<Vec<Op>> {
+        chunks
+            .iter()
+            .map(|c| {
+                pg2iceberg_stream::codec::decode_chunk(&c.chunk.bytes)
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.op)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_relation_event_starts_a_chunk() {
+        let mut sink = Sink::new(100);
+        for (xid, lsn) in [(1, 10), (2, 20)] {
+            sink.begin_tx(xid);
+            sink.record_change(relation(xid, lsn)).unwrap();
+            sink.record_change(insert(xid, lsn, xid as i32)).unwrap();
+            sink.commit_tx(xid, Lsn(lsn));
+        }
+        let out = sink.flush().unwrap().unwrap();
+        assert_eq!(
+            ops(&out.chunks),
+            [[Op::Relation, Op::Insert], [Op::Relation, Op::Insert]]
+        );
+
+        // Likewise when an open transaction is spilled.
+        sink.begin_tx(3);
+        sink.record_change(insert(3, 30, 3)).unwrap();
+        sink.record_change(relation(3, 30)).unwrap();
+        sink.record_change(insert(3, 30, 4)).unwrap();
+        assert_eq!(
+            ops(&sink.spill_open_tx(3).unwrap()),
+            vec![vec![Op::Insert], vec![Op::Relation, Op::Insert]]
+        );
     }
 
     fn insert(xid: u32, lsn: u64, id: i32) -> ChangeEvent {
