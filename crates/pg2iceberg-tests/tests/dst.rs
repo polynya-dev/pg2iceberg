@@ -357,6 +357,13 @@ enum Step {
     Truncate {
         reinsert: Option<(i32, i32)>,
     },
+    /// `TRUNCATE orders, other` — one statement, so one WAL record and
+    /// one pgoutput message naming both tables. Needs the second table.
+    TruncateBoth,
+    /// Something that invalidates the tables' relation cache entries
+    /// without changing them (`CREATE INDEX`, `ANALYZE`): pgoutput resends
+    /// each table's Relation, unchanged, before its next change.
+    Invalidate,
     /// `BEGIN; INSERT INTO noise ...; COMMIT` — WAL for a table outside
     /// the publication. pgoutput skips the whole transaction, so only a
     /// keepalive tells the pipeline it can ack past it.
@@ -456,6 +463,8 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::RollbackInsert { id, qty }),
         1 => prop::option::of((id.clone(), qty.clone()))
             .prop_map(|reinsert| Step::Truncate { reinsert }),
+        1 => Just(Step::TruncateBoth),
+        1 => Just(Step::Invalidate),
         3 => qty.clone().prop_map(|qty| Step::UnpublishedWrite { qty }),
         2 => (1usize..=8, qty.clone()).prop_map(|(inserts, qty)| Step::BigTx { inserts, qty }),
         2 => (1usize..=6).prop_map(|n| Step::DrivePartial { n }),
@@ -1429,6 +1438,22 @@ impl DstHarness {
                     if tx.commit(Timestamp(0)).is_ok() {
                         self.other_live.remove(id);
                     }
+                }
+            }
+            Step::TruncateBoth => {
+                if SECOND_TABLE.get() > 0 {
+                    let mut tx = self.db.begin_tx();
+                    tx.truncate_all(&[ident(), other_pg_ident()]);
+                    if tx.commit(Timestamp(0)).is_ok() {
+                        self.live.clear();
+                        self.other_live.clear();
+                    }
+                }
+            }
+            Step::Invalidate => {
+                self.db.invalidate_relation(&ident()).unwrap();
+                if SECOND_TABLE.get() > 0 {
+                    self.db.invalidate_relation(&other_pg_ident()).unwrap();
                 }
             }
             Step::OtherWorkerCycle => {
@@ -2441,7 +2466,8 @@ fn pipeline_crash_mid_transaction_keeps_it_atomic() {
     for step in [
         Step::Insert { id: 1, qty: 0 },
         Step::BigTx { inserts: 1, qty: 0 },
-        Step::DrivePartial { n: 6 },
+        // Begin, Relation, Insert, Commit, then into the big transaction.
+        Step::DrivePartial { n: 7 },
         Step::DrivePartial { n: 3 },
         Step::CrashMidStream,
         Step::DriveFlush,
@@ -2559,6 +2585,52 @@ fn same_named_tables_under_one_sink_namespace_stay_apart() {
     let mut h = DstHarness::boot();
     h.run_step(&Step::Insert { id: 1, qty: 10 });
     h.run_step(&Step::OtherInsert { id: 1, qty: 99 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// One TRUNCATE naming both tables empties both, in the sim's decoded
+/// stream and, with `wire`, through production's decoder, which splits
+/// pgoutput's single message per table.
+fn truncate_both_tables(wire: bool) {
+    SECOND_TABLE.set(1);
+    WIRE.set(wire);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::OtherInsert { id: 1, qty: 10 });
+    // Materialized first: rows sharing a fold step with a TRUNCATE are
+    // `truncate_removes_rows_not_yet_materialized`.
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::TruncateBoth);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    check_invariants(&mut h).unwrap();
+}
+
+#[test]
+fn truncating_two_tables_in_one_statement_empties_both() {
+    truncate_both_tables(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn truncating_two_tables_in_one_statement_empties_both_on_the_wire() {
+    truncate_both_tables(true);
+}
+
+/// pgoutput resends a table's Relation after anything that invalidates
+/// its cache entry, unchanged; applying it again must change nothing.
+#[test]
+fn redundant_relation_messages_change_nothing() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::Invalidate);
+    h.run_step(&Step::Update { id: 1, qty: 11 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::Invalidate);
+    h.run_step(&Step::DropNote);
+    h.run_step(&Step::Invalidate);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
     check_invariants(&mut h).unwrap();
 }
 

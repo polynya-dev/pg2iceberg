@@ -34,6 +34,8 @@ object_store = { version = "0.11", optional = true, default-features = false, fe
 # The DST's production backend reads a table's manifests directly, as
 # ground truth independent of pg2iceberg's own `snapshots()`.
 iceberg = { version = "0.9", optional = true }
+# Parses pgoutput in the sim-vs-Postgres conformance suite.
+postgres-replication = { version = "0.6", optional = true, default-features = false }
 async-trait = { workspace = true, optional = true }
 anyhow = { version = "1", optional = true }
 uuid = { version = "1", optional = true, features = ["v4"] }
@@ -86,6 +88,7 @@ integration = [
     "dep:tokio-postgres",
     "dep:object_store",
     "dep:iceberg",
+    "dep:postgres-replication",
     "dep:async-trait",
     "dep:anyhow",
     "dep:uuid",

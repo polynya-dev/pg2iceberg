@@ -3030,6 +3030,7 @@ dependencies = [
  "pg2iceberg-stream",
  "pg2iceberg-validate",
  "pollster",
+ "postgres-replication",
  "proptest",
  "reqwest",
  "serde_json",
