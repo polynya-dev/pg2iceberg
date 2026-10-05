@@ -344,6 +344,7 @@ mod tests {
                 s3_path: "p0".into(),
             }],
             flushable_lsn: Lsn(1),
+            replicated_lsn: None,
             markers: vec![],
         }))
         .unwrap();

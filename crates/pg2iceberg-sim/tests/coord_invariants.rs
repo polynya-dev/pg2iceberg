@@ -44,6 +44,7 @@ fn empty_batch_returns_receipt_with_no_grants() {
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![],
         flushable_lsn: Lsn(42),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
@@ -57,6 +58,7 @@ fn first_claim_starts_at_zero_and_grants_match() {
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![claim("a", 5, "s3://a/0.parquet")],
         flushable_lsn: Lsn(100),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
@@ -73,12 +75,14 @@ fn successive_claims_form_contiguous_offset_ranges() {
     block_on(c.claim_offsets(&CommitBatch {
         claims: vec![claim("a", 3, "p0")],
         flushable_lsn: Lsn(1),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![claim("a", 7, "p1")],
         flushable_lsn: Lsn(2),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
@@ -92,6 +96,7 @@ fn batches_with_multiple_tables_assign_independently() {
     let r = block_on(c.claim_offsets(&CommitBatch {
         claims: vec![claim("a", 4, "pa"), claim("b", 6, "pb")],
         flushable_lsn: Lsn(1),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
@@ -116,6 +121,7 @@ fn multiple_claims_for_same_table_in_one_batch_chain_offsets() {
             claim("a", 1, "p2"),
         ],
         flushable_lsn: Lsn(1),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
@@ -137,6 +143,7 @@ fn read_log_filters_by_offset_and_orders_ascending() {
             claim("a", 5, "p2"),
         ],
         flushable_lsn: Lsn(1),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
@@ -154,6 +161,7 @@ fn read_log_respects_limit() {
     block_on(c.claim_offsets(&CommitBatch {
         claims,
         flushable_lsn: Lsn(1),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
@@ -172,6 +180,7 @@ fn truncate_log_returns_paths_and_drops_rows() {
             claim("a", 3, "p2"),
         ],
         flushable_lsn: Lsn(1),
+        replicated_lsn: None,
         markers: vec![],
     }))
     .unwrap();
@@ -296,4 +305,25 @@ fn release_lock_by_non_holder_is_noop() {
     block_on(c.release_lock(&ident("a"), &w2)).unwrap();
     // Lock still held by w1.
     assert!(!block_on(c.try_lock(&ident("a"), &w2, Duration::from_secs(10))).unwrap());
+}
+
+/// `replicated_lsn` follows the highest `CommitBatch::replicated_lsn`
+/// claimed — with claims or without — and ignores batches that carry
+/// none (a backfill's). Mirrors the production coordinator's test.
+#[test]
+fn replicated_lsn_tracks_replication_claims_only() {
+    let (c, _) = coord_at_t0();
+    assert_eq!(block_on(c.replicated_lsn()).unwrap(), Lsn::ZERO);
+    let batch = |claims: Vec<OffsetClaim>, lsn: u64, replicated: Option<u64>| CommitBatch {
+        replicated_lsn: replicated.map(Lsn),
+        ..CommitBatch::without_markers(claims, Lsn(lsn))
+    };
+    block_on(c.claim_offsets(&batch(vec![claim("a", 1, "s3://a/0")], 100, Some(100)))).unwrap();
+    assert_eq!(block_on(c.replicated_lsn()).unwrap(), Lsn(100));
+    block_on(c.claim_offsets(&batch(vec![claim("a", 1, "s3://a/1")], 500, None))).unwrap();
+    assert_eq!(block_on(c.replicated_lsn()).unwrap(), Lsn(100));
+    block_on(c.claim_offsets(&batch(vec![], 150, Some(150)))).unwrap();
+    assert_eq!(block_on(c.replicated_lsn()).unwrap(), Lsn(150));
+    block_on(c.claim_offsets(&batch(vec![claim("a", 1, "s3://a/2")], 120, Some(120)))).unwrap();
+    assert_eq!(block_on(c.replicated_lsn()).unwrap(), Lsn(150));
 }

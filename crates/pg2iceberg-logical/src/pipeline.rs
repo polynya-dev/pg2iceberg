@@ -63,6 +63,26 @@ impl BlobNamer for CounterBlobNamer {
     }
 }
 
+/// Where to start replication: past every transaction already staged
+/// ([`Coordinator::replicated_lsn`]) and past the snapshot, if one just
+/// ran. Postgres skips transactions that committed before it and sends
+/// the rest, so at most the last staged transaction comes again,
+/// directly after its first copy.
+///
+/// Starting at the slot's confirmed position instead replays every
+/// transaction staged after the last slot ack — after a crash between
+/// `claim_offsets` and the ack, several. Staged again, they follow newer
+/// transactions in the log, and the materializer, applying the log in
+/// order, commits their old rows over the newer ones until the replay
+/// catches up.
+pub async fn replication_start_lsn<C: Coordinator + ?Sized>(
+    coord: &C,
+    snapshot_lsn: Option<Lsn>,
+) -> Result<Lsn> {
+    let staged = coord.replicated_lsn().await?;
+    Ok(staged.max(snapshot_lsn.unwrap_or(Lsn::ZERO)))
+}
+
 /// The pipeline. Generic over the coord impl so the type system carries the
 /// `Coordinator` choice all the way through. `?Sized` so callers that
 /// only have an `Arc<dyn Coordinator>` (the lifecycle helper) can use
@@ -126,6 +146,9 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     /// the meta-marker `_pg2iceberg.markers` table both rely on the
     /// fall-through).
     table_translation: BTreeMap<TableIdent, TableIdent>,
+    /// This pipeline consumes the replication stream (see
+    /// [`Self::track_replication`]).
+    replication: bool,
 }
 
 impl<C: Coordinator + ?Sized> Pipeline<C> {
@@ -168,7 +191,18 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             ready_markers: Vec::new(),
             primary_keys: BTreeMap::new(),
             table_translation: BTreeMap::new(),
+            replication: false,
         }
+    }
+
+    /// Mark this as the pipeline consuming the replication stream: each
+    /// flush records how far it has staged the stream
+    /// ([`CommitBatch::replicated_lsn`]), which
+    /// [`replication_start_lsn`] resumes from. A mid-stream table's
+    /// backfill pipeline stays unmarked: its snapshot LSN covers that
+    /// table only.
+    pub fn track_replication(&mut self) {
+        self.replication = true;
     }
 
     /// Register the primary-key columns for `table`. Required for
@@ -431,6 +465,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             claims,
             flushable_lsn,
             markers: markers_for_batch,
+            replicated_lsn: self.replication.then_some(flushable_lsn),
         };
         let receipt = self.coord.claim_offsets(&batch).await?;
         self.ready_markers.clear();

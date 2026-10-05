@@ -114,6 +114,52 @@ async fn migrate_is_idempotent_against_real_pg() {
     coord.migrate().await.expect("migrate thrice");
 }
 
+/// `replicated_lsn` follows the highest `CommitBatch::replicated_lsn`
+/// claimed — with claims or without — and ignores batches that carry
+/// none (a backfill's).
+#[tokio::test]
+async fn replicated_lsn_tracks_replication_claims_only() {
+    let coord = fresh_coord().await;
+    let t = ident("public", "orders");
+    assert_eq!(coord.replicated_lsn().await.unwrap(), Lsn::ZERO);
+
+    let batch = |claims: Vec<OffsetClaim>, lsn: u64, replicated: Option<u64>| CommitBatch {
+        replicated_lsn: replicated.map(Lsn),
+        ..CommitBatch::without_markers(claims, Lsn(lsn))
+    };
+    coord
+        .claim_offsets(&batch(
+            vec![claim(&t, 1, "s3://r/0.parquet")],
+            100,
+            Some(100),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(coord.replicated_lsn().await.unwrap(), Lsn(100));
+    // A backfill's claim, even at a later LSN, says nothing about replication.
+    coord
+        .claim_offsets(&batch(vec![claim(&t, 1, "s3://r/1.parquet")], 500, None))
+        .await
+        .unwrap();
+    assert_eq!(coord.replicated_lsn().await.unwrap(), Lsn(100));
+    // A claim-less batch (WAL that carried nothing for us) still counts.
+    coord
+        .claim_offsets(&batch(vec![], 150, Some(150)))
+        .await
+        .unwrap();
+    assert_eq!(coord.replicated_lsn().await.unwrap(), Lsn(150));
+    // Never moves back.
+    coord
+        .claim_offsets(&batch(
+            vec![claim(&t, 1, "s3://r/2.parquet")],
+            120,
+            Some(120),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(coord.replicated_lsn().await.unwrap(), Lsn(150));
+}
+
 #[tokio::test]
 async fn empty_claim_offsets_returns_receipt_without_grants() {
     let coord = fresh_coord().await;
@@ -385,6 +431,7 @@ async fn marker_only_flush_persists_markers_atomically() {
     let batch = CommitBatch {
         claims: vec![],
         flushable_lsn: Lsn(500),
+        replicated_lsn: None,
         markers: vec![MarkerInfo {
             uuid: uuid.clone(),
             commit_lsn: Lsn(500),
@@ -414,6 +461,7 @@ async fn marker_eligibility_blocks_until_cursor_passes_marker_lsn() {
     let batch = CommitBatch {
         claims: vec![claim(&t, 3, "s3://b/a.parquet")],
         flushable_lsn: Lsn(100),
+        replicated_lsn: None,
         markers: vec![MarkerInfo {
             uuid: uuid.clone(),
             commit_lsn: Lsn(200),
@@ -464,6 +512,7 @@ async fn marker_eligibility_per_table_independent() {
         .claim_offsets(&CommitBatch {
             claims: vec![],
             flushable_lsn: Lsn(50),
+            replicated_lsn: None,
             markers: vec![MarkerInfo {
                 uuid: uuid.clone(),
                 commit_lsn: Lsn(50),

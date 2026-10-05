@@ -162,8 +162,10 @@ fn pipeline_flush_emits_counter_and_gauge() {
     assert_eq!(
         h.metrics
             .gauge_value(names::PIPELINE_FLUSHED_LSN, &no_labels),
-        Some(commit.0 as f64)
+        // The WAL end the caught-up keepalive reported, just past the commit.
+        Some(h.db.current_lsn().0 as f64)
     );
+    assert!(h.db.current_lsn() > commit);
 }
 
 #[test]
@@ -226,7 +228,7 @@ fn shutdown_flushes_buffered_tx_then_refuses_new_events() {
 
     // Shutdown does the final flush.
     block_on(h.pipeline.shutdown()).unwrap();
-    assert_eq!(h.pipeline.flushed_lsn(), commit);
+    assert!(h.pipeline.flushed_lsn() > commit);
     assert!(h.pipeline.is_shut_down());
 
     // Materializer should now see the staged data.

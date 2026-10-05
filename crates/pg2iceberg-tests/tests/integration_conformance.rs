@@ -27,11 +27,12 @@
 use bytes::Bytes;
 use pg2iceberg_core::typemap::{IcebergType, PgType};
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimeMicros, TimestampMicros};
+use pg2iceberg_core::Lsn;
 use pg2iceberg_core::{
     ColumnName, ColumnSchema, Namespace, Op as ChangeOp, PgValue, Row, TableIdent, TableSchema,
 };
-use pg2iceberg_pg::prod::{PgClientImpl, PgoutputDecoder};
-use pg2iceberg_pg::DecodedMessage;
+use pg2iceberg_pg::prod::{PgClientImpl, PgoutputDecoder, TlsMode};
+use pg2iceberg_pg::{DecodedMessage, PgClient};
 use pg2iceberg_sim::pgoutput::{pg_text, ReplicaIdentity};
 use pg2iceberg_sim::postgres::{SimPostgres, WireMessage};
 use postgres_replication::protocol::{
@@ -340,6 +341,13 @@ fn scenarios() -> Vec<Scenario> {
 // ---------- real Postgres ----------
 
 static PG: OnceCell<(ContainerAsync<Postgres>, String)> = OnceCell::const_new();
+
+/// Held by each test for its whole run: one test at a time. Another
+/// test's publication DDL, committed while a slot decodes, invalidates
+/// every relation in pgoutput's cache, and the slot resends Relation
+/// messages mid-stream — real Postgres behavior that no scenario
+/// models.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn dsn() -> &'static str {
     let (_, dsn) = PG
@@ -991,6 +999,7 @@ async fn check(sc: &Scenario) -> Result<(), String> {
 
 #[tokio::test]
 async fn sim_matches_postgres() {
+    let _serial = SERIAL.lock().await;
     let mut failures = Vec::new();
     for sc in scenarios() {
         if let Err(e) = check(&sc).await {
@@ -1131,6 +1140,7 @@ fn random_scenario(seed: u64) -> Scenario {
 /// `CONFORMANCE_SEEDS` (default 24) random workloads.
 #[tokio::test]
 async fn sim_matches_postgres_on_random_workloads() {
+    let _serial = SERIAL.lock().await;
     let seeds: u64 = std::env::var("CONFORMANCE_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1419,11 +1429,156 @@ async fn check_probes(probes: impl IntoIterator<Item = Probe>) {
 /// replication at the first change to the table.
 #[tokio::test]
 async fn production_decodes_postgres_values() {
+    let _serial = SERIAL.lock().await;
     check_probes(probes().into_iter().filter(|p| p.name != "oid_large")).await;
 }
 
 /// An oid above `i32::MAX` must not wrap negative.
 #[tokio::test]
 async fn production_keeps_large_oids() {
+    let _serial = SERIAL.lock().await;
     check_probes(probes().into_iter().filter(|p| p.name == "oid_large")).await;
+}
+
+// ---------- where a restarted stream resumes ----------
+
+/// The ids a stream sends for its inserts, each with its transaction's
+/// commit LSN.
+fn inserted(msgs: impl IntoIterator<Item = DecodedMessage>) -> Vec<(i32, Lsn)> {
+    let mut out = Vec::new();
+    let mut id = None;
+    for m in msgs {
+        match m {
+            DecodedMessage::Change(e) => {
+                if let Some(PgValue::Int4(i)) = e
+                    .after
+                    .and_then(|r| r.get(&ColumnName("id".into())).cloned())
+                {
+                    id = Some(i);
+                }
+            }
+            DecodedMessage::Commit { commit_lsn, .. } => {
+                if let Some(i) = id.take() {
+                    out.push((i, commit_lsn));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One `START_REPLICATION` session against Postgres: everything it sends
+/// until it goes quiet, then (optionally) an ack before disconnecting.
+async fn real_session(
+    slot: &str,
+    publication: &str,
+    start: Lsn,
+    ack: Option<Lsn>,
+) -> Vec<(i32, Lsn)> {
+    let client = PgClientImpl::connect_with(dsn().await, TlsMode::Disable)
+        .await
+        .expect("replication connect");
+    let mut stream = client
+        .start_replication(slot, start, publication)
+        .await
+        .expect("start_replication");
+    let mut msgs = Vec::new();
+    while let Ok(Ok(m)) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv()).await
+    {
+        msgs.push(m);
+    }
+    if let Some(lsn) = ack {
+        stream.send_standby(lsn, lsn).await.expect("ack");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    inserted(msgs)
+}
+
+/// Which transactions a restarted stream sends, as `[ids]` for: starting
+/// at the first commit's LSN, starting just past it, and reconnecting
+/// after acking the second commit's LSN.
+type Resumes = [Vec<i32>; 3];
+
+async fn real_resumes() -> Resumes {
+    let ns = namespace("resume");
+    let (client, conn) = tokio_postgres::connect(dsn().await, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        format!("CREATE SCHEMA {ns}"),
+        format!("CREATE TABLE {ns}.t (id int4 PRIMARY KEY)"),
+        format!("CREATE PUBLICATION {ns}_pub FOR TABLE {ns}.t"),
+        format!("SELECT pg_create_logical_replication_slot('{ns}_slot', 'pgoutput')"),
+    ] {
+        client.batch_execute(&sql).await.unwrap();
+    }
+    for i in 1..=3 {
+        client
+            .batch_execute(&format!("INSERT INTO {ns}.t VALUES ({i})"))
+            .await
+            .unwrap();
+    }
+    let (slot, publication) = (format!("{ns}_slot"), format!("{ns}_pub"));
+    let all = real_session(&slot, &publication, Lsn::ZERO, None).await;
+    let (c1, c2) = (all[0].1, all[1].1);
+    let ids = |v: Vec<(i32, Lsn)>| v.into_iter().map(|(i, _)| i).collect::<Vec<_>>();
+    let at = ids(real_session(&slot, &publication, c1, None).await);
+    let past = ids(real_session(&slot, &publication, Lsn(c1.0 + 1), None).await);
+    real_session(&slot, &publication, Lsn::ZERO, Some(c2)).await;
+    let after_ack = ids(real_session(&slot, &publication, Lsn::ZERO, None).await);
+    client
+        .batch_execute(&format!("SELECT pg_drop_replication_slot('{slot}')"))
+        .await
+        .unwrap();
+    [at, past, after_ack]
+}
+
+fn sim_resumes() -> Resumes {
+    let db = SimPostgres::new();
+    let t = Table {
+        cols: vec![col("id", "int4", PgType::Int4, IcebergType::Int)],
+        ..table("t", Vec::new())
+    };
+    db.create_table(sim_schema("public", &t)).unwrap();
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: "t".into(),
+    };
+    db.create_publication("pub", std::slice::from_ref(&ident))
+        .unwrap();
+    db.create_slot("slot", "pub").unwrap();
+    for i in 1..=3 {
+        let mut tx = db.begin_tx();
+        tx.insert(&ident, [(ColumnName("id".into()), int(i))].into());
+        tx.commit(pg2iceberg_core::Timestamp(0)).unwrap();
+    }
+    let session = |start: Lsn| {
+        let mut stream = db.start_replication_at("slot", start).unwrap();
+        let msgs: Vec<DecodedMessage> = std::iter::from_fn(|| stream.recv()).collect();
+        (inserted(msgs), stream)
+    };
+    let (all, _) = session(Lsn::ZERO);
+    let (c1, c2) = (all[0].1, all[1].1);
+    let ids = |v: Vec<(i32, Lsn)>| v.into_iter().map(|(i, _)| i).collect::<Vec<_>>();
+    let at = ids(session(c1).0);
+    let past = ids(session(Lsn(c1.0 + 1)).0);
+    session(Lsn::ZERO).1.send_standby(c2);
+    let after_ack = ids(session(Lsn::ZERO).0);
+    [at, past, after_ack]
+}
+
+/// Where a restarted stream resumes. Postgres skips the transactions
+/// that committed before the start position and sends the rest — one
+/// whose commit LSN *is* the start position comes again, so a consumer
+/// acking commit LSNs sees its last acked transaction after every
+/// reconnect. The DST only sees those replays if the sim agrees.
+#[tokio::test]
+async fn sim_resumes_replication_where_postgres_does() {
+    let _serial = SERIAL.lock().await;
+    let real = real_resumes().await;
+    assert_eq!(real, [vec![1, 2, 3], vec![2, 3], vec![2, 3]], "Postgres");
+    assert_eq!(sim_resumes(), real, "sim vs Postgres");
 }

@@ -248,9 +248,12 @@ fn tx_touching_only_unpublished_tables_is_skipped_entirely() {
 
     let mut stream = db.start_replication("slot1").unwrap();
     let msgs = drain_all(&mut stream);
+    // At the end of the commit record: the WAL end.
+    let wal_end = db.current_lsn();
+    assert!(wal_end > commit);
     assert!(
-        matches!(msgs.as_slice(), [DecodedMessage::Keepalive { wal_end, .. }] if *wal_end == commit),
-        "expected only a keepalive at {commit:?}, got {msgs:?}"
+        matches!(msgs.as_slice(), [DecodedMessage::Keepalive { wal_end: w, .. }] if *w == wal_end),
+        "expected only a keepalive at {wal_end:?}, got {msgs:?}"
     );
 }
 
@@ -266,15 +269,18 @@ fn caught_up_keepalive_is_sent_once_per_unconfirmed_position() {
 
     let mut stream = db.start_replication("slot1").unwrap();
     let msgs = drain_all(&mut stream);
+    // At the end of the commit record: the WAL end.
+    let wal_end = db.current_lsn();
+    assert!(wal_end > commit);
     assert!(
-        matches!(msgs.last(), Some(DecodedMessage::Keepalive { wal_end, .. }) if *wal_end == commit),
-        "expected a trailing keepalive at {commit:?}, got {msgs:?}"
+        matches!(msgs.last(), Some(DecodedMessage::Keepalive { wal_end: w, .. }) if *w == wal_end),
+        "expected a trailing keepalive at {wal_end:?}, got {msgs:?}"
     );
     // Idle at the same position: no repeat, so callers can poll to `None`.
     assert!(stream.recv().is_none());
 
     // Once the slot confirms the position, a reconnect has nothing to say.
-    stream.send_standby(commit);
+    stream.send_standby(wal_end);
     let mut stream = db.start_replication("slot1").unwrap();
     let msgs = drain_all(&mut stream);
     assert!(
@@ -286,7 +292,7 @@ fn caught_up_keepalive_is_sent_once_per_unconfirmed_position() {
 // ---------- reconnect / replay from restart_lsn ----------
 
 #[test]
-fn reconnect_at_restart_lsn_yields_messages_after_last_ack() {
+fn reconnect_resends_from_the_transaction_committed_at_the_ack() {
     let db = boot();
 
     // Tx1.
@@ -313,26 +319,31 @@ fn reconnect_at_restart_lsn_yields_messages_after_last_ack() {
         s.send_standby(commit1);
     }
 
-    // Reconnect: should replay everything strictly after commit1, i.e. tx2.
+    // Reconnect: like Postgres, skips what committed before the acked
+    // LSN and sends the rest — including tx1, whose commit record starts
+    // at it. (A new session sends the Relation again.)
     let mut s = db.start_replication("slot1").unwrap();
-    let msgs = drain(&mut s);
-    // A new session sends the Relation again.
-    assert_eq!(
-        msgs.len(),
-        4,
-        "Begin, Relation, Change, Commit for tx2 only"
-    );
-    if let DecodedMessage::Change(c) = &msgs[2] {
-        let id = c
-            .after
-            .as_ref()
-            .unwrap()
-            .get(&ColumnName("id".into()))
-            .unwrap();
-        assert_eq!(*id, PgValue::Int4(2));
-    } else {
-        panic!("expected Change");
-    }
+    let ids: Vec<PgValue> = drain(&mut s)
+        .into_iter()
+        .filter_map(|m| match m {
+            DecodedMessage::Change(c) => c.after?.get(&ColumnName("id".into())).cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![PgValue::Int4(1), PgValue::Int4(2)]);
+
+    // Acking just past tx1's commit record skips it.
+    let mut s = db
+        .start_replication_at("slot1", Lsn(commit1.0 + 1))
+        .unwrap();
+    let ids: Vec<PgValue> = drain(&mut s)
+        .into_iter()
+        .filter_map(|m| match m {
+            DecodedMessage::Change(c) => c.after?.get(&ColumnName("id".into())).cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![PgValue::Int4(2)]);
 }
 
 #[test]
