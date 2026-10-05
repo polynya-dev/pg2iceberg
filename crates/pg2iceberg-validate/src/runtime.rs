@@ -28,6 +28,7 @@ use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
 use pg2iceberg_logical::{
     materializer::MaterializerNamer,
     pipeline::BlobNamer,
+    replication_start_lsn,
     runner::{Handler, Schedule, Ticker},
     Materializer, MaterializerError, Pipeline, PipelineError,
 };
@@ -415,6 +416,9 @@ where
         Arc::clone(&lc.blob_namer),
         lc.flush_rows,
     );
+    // It consumes the replication stream; a restart resumes past what
+    // it staged.
+    pipeline.track_replication();
     // Register per-table primary keys so the pipeline can split
     // `UPDATE` events that change the PK into `Delete(old)` +
     // `Update(new)` — otherwise the old PK would stay orphaned in
@@ -665,9 +669,10 @@ where
     //    - Fresh slot + snapshot skipped: start at consistent_point
     //      (Lsn 0 = "use confirmed_flush_lsn", which is the slot's
     //      initial position).
-    //    - Resuming slot: start at confirmed_flush_lsn (Lsn 0
-    //      semantics).
-    let start_lsn = snap_lsn.unwrap_or(Lsn::ZERO);
+    //    - Resuming slot: start past what the pipeline already
+    //      staged, which can lead the slot's confirmed_flush_lsn (see
+    //      `replication_start_lsn`).
+    let start_lsn = replication_start_lsn(&*lc.coord, snap_lsn).await?;
     let mut stream = lc
         .pg
         .start_replication(&lc.slot_name, start_lsn, &lc.publication_name)

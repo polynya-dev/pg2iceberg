@@ -287,8 +287,35 @@ impl DbState {
         self.next_oid += 1;
         self.next_oid
     }
+    /// The WAL insert position, as `pg_current_wal_lsn()` reports it:
+    /// the end of the last record, where the next one starts. Like
+    /// Postgres, positions (this, a slot's, a keepalive's `wal_end`)
+    /// are record ends, while a transaction's commit LSN is where its
+    /// commit record starts.
     fn current_lsn(&self) -> Lsn {
-        Lsn(self.next_lsn)
+        Lsn(self.next_lsn + 1)
+    }
+
+    /// The stream cursor (entries at or before it are skipped) for
+    /// decoding from position `from`, as Postgres decodes: it skips a
+    /// transaction that committed before `from` and sends one that
+    /// commits at or after it whole. Transactions sit whole in the WAL,
+    /// so only one whose commit record starts exactly at `from` begins
+    /// before it — a consumer that acks commit LSNs gets its last acked
+    /// transaction again after reconnecting.
+    fn decoding_cursor(&self, from: Lsn) -> Lsn {
+        let commit = self
+            .wal
+            .iter()
+            .find(|e| e.lsn == from && matches!(e.kind, WalKind::Commit));
+        let first = commit
+            .and_then(|c| {
+                self.wal
+                    .iter()
+                    .find(|e| e.xid == c.xid && matches!(e.kind, WalKind::Begin))
+            })
+            .map_or(from, |begin| begin.lsn);
+        Lsn(first.0.saturating_sub(1))
     }
 }
 
@@ -903,17 +930,25 @@ impl SimPostgres {
     /// Open a replication stream for the slot. Cursor starts at the slot's
     /// `restart_lsn` (so reconnects replay from that point).
     pub fn start_replication(&self, slot: &str) -> Result<SimReplicationStream> {
+        self.start_replication_at(slot, Lsn::ZERO)
+    }
+
+    /// `START_REPLICATION SLOT slot LOGICAL start`: decoding starts at
+    /// the later of `start` and the slot's `confirmed_flush_lsn` (see
+    /// [`DbState::decoding_cursor`] for which transactions that sends).
+    pub fn start_replication_at(&self, slot: &str, start: Lsn) -> Result<SimReplicationStream> {
         let s = self.state.lock().unwrap();
         let slot_state = s
             .slots
             .get(slot)
             .cloned()
             .ok_or_else(|| SimError::UnknownSlot(slot.to_string()))?;
+        let cursor_lsn = s.decoding_cursor(slot_state.confirmed_flush_lsn.max(start));
         Ok(SimReplicationStream {
             db: self.clone(),
             slot: slot.to_string(),
             publication: slot_state.publication,
-            cursor_lsn: slot_state.restart_lsn,
+            cursor_lsn,
             keepalive_sent: Lsn::ZERO,
             pending: VecDeque::new(),
             wire_queue: VecDeque::new(),
@@ -1558,18 +1593,19 @@ impl SimReplicationStream {
         }
 
         // Caught up. Like the walsender before it sleeps, send a
-        // keepalive carrying the position decoded so far if the slot
-        // hasn't confirmed it — once per position, so an idle stream
-        // still returns `None`.
+        // keepalive carrying the position decoded so far — the end of
+        // the last record decoded — if the slot hasn't confirmed it;
+        // once per position, so an idle stream still returns `None`.
         let confirmed = s
             .slots
             .get(&self.slot)
             .map(|slot| slot.confirmed_flush_lsn)
             .unwrap_or(Lsn::ZERO);
-        if self.cursor_lsn > confirmed && self.cursor_lsn > self.keepalive_sent {
-            self.keepalive_sent = self.cursor_lsn;
+        let wal_end = Lsn(self.cursor_lsn.0 + 1);
+        if wal_end > confirmed && wal_end > self.keepalive_sent {
+            self.keepalive_sent = wal_end;
             return Some(vec![DecodedMessage::Keepalive {
-                wal_end: self.cursor_lsn,
+                wal_end,
                 reply_requested: false,
             }]);
         }
@@ -1593,16 +1629,6 @@ impl SimReplicationStream {
 
     pub fn cursor_lsn(&self) -> Lsn {
         self.cursor_lsn
-    }
-
-    /// Mimic the prod server-side snapshot↔CDC fence: skip emitting
-    /// events whose LSN is at or below `lsn`. Used by
-    /// [`SimPgClient::start_replication`] when the lifecycle helper
-    /// passes `start = snap_lsn` after the snapshot phase.
-    pub fn advance_cursor_to(&mut self, lsn: Lsn) {
-        if lsn > self.cursor_lsn {
-            self.cursor_lsn = lsn;
-        }
     }
 }
 
@@ -1874,16 +1900,10 @@ impl PgClient for SimPgClient {
         start: Lsn,
         _publication: &str,
     ) -> std::result::Result<Box<dyn ReplicationStream>, PgError> {
-        // Honor the snapshot↔CDC fence: when the lifecycle passes
-        // `start = snap_lsn`, advance the stream's cursor so events
-        // committed before the snapshot view aren't re-emitted. (In
-        // prod, the server applies this fence; the sim emulates by
-        // advancing its in-memory cursor.)
-        let mut stream = self
+        let stream = self
             .db
-            .start_replication(slot)
+            .start_replication_at(slot, start)
             .map_err(|e| PgError::Other(e.to_string()))?;
-        stream.advance_cursor_to(start);
         Ok(Box::new(AsyncSimStream::new(stream)))
     }
 

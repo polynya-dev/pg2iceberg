@@ -80,6 +80,15 @@ pub struct CommitBatch {
     /// blue-green replica-alignment design.
     #[serde(default)]
     pub markers: Vec<MarkerInfo>,
+    /// For a batch from the pipeline consuming the replication stream,
+    /// how far the stream is staged: every transaction that committed
+    /// before this LSN is in this batch or an earlier one. Recorded
+    /// atomically with the claims ([`Coordinator::replicated_lsn`]) so a
+    /// restart resumes replication past them. `None` for a mid-stream
+    /// table's backfill, whose snapshot LSN says nothing about the
+    /// other tables.
+    #[serde(default)]
+    pub replicated_lsn: Option<Lsn>,
 }
 
 impl CommitBatch {
@@ -90,6 +99,7 @@ impl CommitBatch {
             claims,
             flushable_lsn,
             markers: Vec::new(),
+            replicated_lsn: None,
         }
     }
 }
@@ -278,6 +288,14 @@ pub trait Coordinator: Send + Sync {
     /// drain after a partial-flush rollback can re-stamp lower
     /// without erroring).
     async fn set_flushed_lsn(&self, lsn: Lsn) -> Result<()>;
+
+    /// How far replication is staged: the highest
+    /// [`CommitBatch::replicated_lsn`] claimed, `Lsn::ZERO` if none.
+    /// Every transaction that committed before it is staged, so a
+    /// restart starts replication there. It can lead the slot's
+    /// confirmed position: a crash between `claim_offsets` and the slot
+    /// ack leaves staged transactions the slot would replay.
+    async fn replicated_lsn(&self) -> Result<Lsn>;
 
     // ── Per-table snapshot status ───────────────────────────
     /// Get a table's snapshot state. `None` = never recorded

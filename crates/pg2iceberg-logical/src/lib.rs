@@ -20,7 +20,7 @@ pub mod sink;
 pub use materializer::{
     CounterMaterializerNamer, Materializer, MaterializerError, MaterializerNamer,
 };
-pub use pipeline::{Pipeline, PipelineError};
+pub use pipeline::{replication_start_lsn, Pipeline, PipelineError};
 pub use runner::{Handler, Schedule, Ticker};
 pub use sink::{Sink, SinkError};
 

@@ -132,7 +132,7 @@ impl Coordinator for PostgresCoordinator {
         // Marker-only flush (no log_index rows but markers to record).
         // Persists markers atomically inside its own short tx.
         if batch.claims.is_empty() {
-            if !batch.markers.is_empty() {
+            if !batch.markers.is_empty() || batch.replicated_lsn.is_some() {
                 let mut client = self.client.lock().await;
                 let tx = client.transaction().await.map_err(pg)?;
                 let insert_marker = sql::insert_pending_marker(&self.schema);
@@ -141,6 +141,14 @@ impl Coordinator for PostgresCoordinator {
                     tx.execute(&insert_marker, &[&m.uuid, &lsn_i64])
                         .await
                         .map_err(pg)?;
+                }
+                if let Some(lsn) = batch.replicated_lsn {
+                    tx.execute(
+                        &sql::advance_replicated_lsn(&self.schema),
+                        &[&lsn_to_i64(lsn)],
+                    )
+                    .await
+                    .map_err(pg)?;
                 }
                 tx.commit().await.map_err(pg)?;
             }
@@ -240,6 +248,15 @@ impl Coordinator for PostgresCoordinator {
                     .await
                     .map_err(pg)?;
             }
+        }
+        // As does how far replication is staged.
+        if let Some(lsn) = batch.replicated_lsn {
+            tx.execute(
+                &sql::advance_replicated_lsn(&self.schema),
+                &[&lsn_to_i64(lsn)],
+            )
+            .await
+            .map_err(pg)?;
         }
 
         tx.commit().await.map_err(pg)?;
@@ -486,6 +503,17 @@ impl Coordinator for PostgresCoordinator {
             }
             None => Ok(Lsn::ZERO),
         }
+    }
+
+    async fn replicated_lsn(&self) -> Result<Lsn> {
+        let client = self.client.lock().await;
+        let rows = client
+            .query(&sql::select_replicated_lsn(&self.schema), &[])
+            .await
+            .map_err(pg)?;
+        Ok(rows
+            .first()
+            .map_or(Lsn::ZERO, |r| i64_to_lsn(r.get::<_, i64>(0))))
     }
 
     async fn set_flushed_lsn(&self, lsn: Lsn) -> Result<()> {

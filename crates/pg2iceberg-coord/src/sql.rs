@@ -123,6 +123,17 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
             )",
             schema.qualify("flushed_lsn")
         ),
+        // How far the replication stream is staged: raised atomically
+        // with each claim, so a restart starts replication past what is
+        // staged even when the slot ack didn't land.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id         INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                lsn        BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+            schema.qualify("replicated_lsn")
+        ),
         // Per-table snapshot status. `pg_oid` drives the
         // TableIdentityChanged invariant (DROP+recreate detection);
         // `snapshot_complete` gates the snapshot phase on restart;
@@ -402,6 +413,24 @@ pub fn select_flushed_lsn(schema: &CoordSchema) -> String {
     )
 }
 
+pub fn select_replicated_lsn(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT lsn FROM {} WHERE id = 1",
+        schema.qualify("replicated_lsn")
+    )
+}
+
+/// Raise the recorded replicated LSN to `$1` (never lower it).
+pub fn advance_replicated_lsn(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {t} (id, lsn, updated_at) \
+         VALUES (1, $1, now()) \
+         ON CONFLICT (id) DO UPDATE \
+         SET lsn = GREATEST({t}.lsn, EXCLUDED.lsn), updated_at = now()",
+        t = schema.qualify("replicated_lsn")
+    )
+}
+
 pub fn upsert_flushed_lsn(schema: &CoordSchema) -> String {
     format!(
         "INSERT INTO {} (id, lsn, updated_at) \
@@ -480,11 +509,11 @@ mod tests {
         // 6 base CREATE TABLEs (log_seq, log_index, mat_cursor, lock,
         // consumer, pending_markers, marker_emissions)
         // + 1 ALTER TABLE (log_index.flushable_lsn)
-        // + 4 new per-concern tables (pipeline_meta, flushed_lsn,
-        //   tables, snapshot_progress)
-        // = 12. Each statement is idempotent (CREATE TABLE IF NOT
+        // + 5 new per-concern tables (pipeline_meta, flushed_lsn,
+        //   replicated_lsn, tables, snapshot_progress)
+        // = 13. Each statement is idempotent (CREATE TABLE IF NOT
         // EXISTS or ADD COLUMN IF NOT EXISTS).
-        assert_eq!(stmts.len(), 12);
+        assert_eq!(stmts.len(), 13);
         for stmt in &stmts {
             assert!(
                 stmt.contains("IF NOT EXISTS"),
@@ -496,6 +525,7 @@ mod tests {
         for name in [
             "pipeline_meta",
             "flushed_lsn",
+            "replicated_lsn",
             "tables",
             "snapshot_progress",
         ] {

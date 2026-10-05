@@ -38,7 +38,7 @@ use pg2iceberg_core::{
 use pg2iceberg_iceberg::read_materialized_state;
 use pg2iceberg_iceberg::CompactionConfig;
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
-use pg2iceberg_logical::{CounterMaterializerNamer, Materializer, Pipeline};
+use pg2iceberg_logical::{replication_start_lsn, CounterMaterializerNamer, Materializer, Pipeline};
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
@@ -147,7 +147,8 @@ impl FaultHarness {
         let catalog = Arc::new(FaultyCatalog::new(catalog_inner.clone(), plan.clone()));
 
         let namer = Arc::new(CounterBlobNamer::new("s3://stage"));
-        let pipeline = Pipeline::new(coord.clone(), blob.clone(), namer.clone(), 64);
+        let mut pipeline = Pipeline::new(coord.clone(), blob.clone(), namer.clone(), 64);
+        pipeline.track_replication();
 
         let mat_namer = Arc::new(CounterMaterializerNamer::new("s3://table"));
         let mut materializer = Materializer::new(
@@ -226,13 +227,18 @@ impl FaultHarness {
     /// crash variants; for now the materializer is a "parallel
     /// worker" we don't restart here.)
     fn crash_and_restart(&mut self) {
-        let pipeline = Pipeline::new(
+        let mut pipeline = Pipeline::new(
             self.coord.clone(),
             self.blob.clone(),
             self.namer.clone(),
             64,
         );
-        let stream = self.db.start_replication(SLOT).unwrap();
+        pipeline.track_replication();
+        // Where the lifecycle restarts replication: past what's staged.
+        // A fault-free coordinator read; the scripted faults target
+        // claims, not this.
+        let start = block_on(replication_start_lsn(&*self.coord_inner, None)).unwrap();
+        let stream = self.db.start_replication_at(SLOT, start).unwrap();
         self.pipeline = pipeline;
         self.stream = stream;
     }

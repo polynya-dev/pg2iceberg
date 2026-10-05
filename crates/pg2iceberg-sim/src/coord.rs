@@ -45,6 +45,9 @@ struct State {
     /// `slot.confirmed_flush_lsn` at startup to catch external slot
     /// advancement.
     flushed_lsn: Lsn,
+    /// `replicated_lsn.lsn` — how far replication is staged; raised by
+    /// claims that carry [`CommitBatch::replicated_lsn`].
+    replicated_lsn: Lsn,
     /// Per-table snapshot status (`tables` table in the new schema).
     table_states: BTreeMap<TableIdent, TableSnapshotState>,
     /// Per-table mid-snapshot resume cursor (`snapshot_progress`).
@@ -99,14 +102,15 @@ impl Coordinator for MemoryCoordinator {
         if batch.claims.is_empty() {
             // No log_index rows to write — but markers still need
             // to be persisted (a marker-only flush has no claims).
-            if !batch.markers.is_empty() {
-                let mut state = self.state.lock().unwrap();
-                for m in &batch.markers {
-                    state
-                        .pending_markers
-                        .entry(m.uuid.clone())
-                        .or_insert(m.commit_lsn);
-                }
+            let mut state = self.state.lock().unwrap();
+            for m in &batch.markers {
+                state
+                    .pending_markers
+                    .entry(m.uuid.clone())
+                    .or_insert(m.commit_lsn);
+            }
+            if let Some(lsn) = batch.replicated_lsn {
+                state.replicated_lsn = state.replicated_lsn.max(lsn);
             }
             return Ok(receipt::mint(batch.flushable_lsn, Vec::new()));
         }
@@ -182,6 +186,9 @@ impl Coordinator for MemoryCoordinator {
                 .pending_markers
                 .entry(m.uuid.clone())
                 .or_insert(m.commit_lsn);
+        }
+        if let Some(lsn) = batch.replicated_lsn {
+            state.replicated_lsn = state.replicated_lsn.max(lsn);
         }
 
         Ok(receipt::mint(batch.flushable_lsn, grants))
@@ -344,6 +351,10 @@ impl Coordinator for MemoryCoordinator {
 
     async fn flushed_lsn(&self) -> Result<Lsn> {
         Ok(self.state.lock().unwrap().flushed_lsn)
+    }
+
+    async fn replicated_lsn(&self) -> Result<Lsn> {
+        Ok(self.state.lock().unwrap().replicated_lsn)
     }
 
     async fn set_flushed_lsn(&self, lsn: Lsn) -> Result<()> {

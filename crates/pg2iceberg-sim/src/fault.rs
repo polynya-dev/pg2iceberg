@@ -345,6 +345,10 @@ impl Coordinator for FaultyCoordinator {
         self.inner.set_flushed_lsn(lsn).await
     }
 
+    async fn replicated_lsn(&self) -> CoordResult<Lsn> {
+        self.inner.replicated_lsn().await
+    }
+
     async fn table_state(&self, ident: &TableIdent) -> CoordResult<Option<TableSnapshotState>> {
         self.inner.table_state(ident).await
     }

@@ -59,7 +59,7 @@ use pg2iceberg_iceberg::{
 };
 use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
-use pg2iceberg_logical::{Materializer, Pipeline};
+use pg2iceberg_logical::{replication_start_lsn, Materializer, Pipeline};
 use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
@@ -383,6 +383,10 @@ enum Step {
     },
     /// A flush tick + ack without draining the stream first.
     FlushTick,
+    /// `DriveFlush` whose claim lands but whose slot ack doesn't: the
+    /// process dies in between, and the next start replays from the
+    /// slot what it already staged.
+    DriveFlushWithoutAck,
     /// Hard crash: no drain, flush, or ack. Pipeline memory and any
     /// staged-but-unclaimed objects are lost; the slot replays from
     /// `restart_lsn`.
@@ -469,6 +473,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         2 => (1usize..=8, qty.clone()).prop_map(|(inserts, qty)| Step::BigTx { inserts, qty }),
         2 => (1usize..=6).prop_map(|n| Step::DrivePartial { n }),
         1 => Just(Step::FlushTick),
+        1 => Just(Step::DriveFlushWithoutAck),
         1 => Just(Step::CrashMidStream),
         3 => Just(Step::DriveFlush),
         2 => Just(Step::MaterializerCycle),
@@ -812,6 +817,7 @@ fn new_pipeline(
     namer: &Arc<CounterBlobNamer>,
 ) -> Pipeline<MemoryCoordinator> {
     let mut pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
+    pipeline.track_replication();
     pipeline.register_primary_keys(ident(), vec![ColumnName("id".into())]);
     if SECOND_TABLE.get() > 0 {
         pipeline.register_primary_keys(other_ident(), vec![ColumnName("id".into())]);
@@ -1288,10 +1294,12 @@ impl DstHarness {
         self.crash_mid_stream();
     }
 
-    /// Drop the pipeline + stream as-is and rebuild from the slot.
+    /// Drop the pipeline + stream as-is and restart replication where
+    /// the lifecycle does.
     fn crash_mid_stream(&mut self) {
         self.pipeline = new_pipeline(&self.coord, &self.blob_store, &self.namer);
-        self.stream = self.db.start_replication(SLOT).unwrap();
+        let start = block_on(replication_start_lsn(&*self.coord, None)).unwrap();
+        self.stream = self.db.start_replication_at(SLOT, start).unwrap();
         #[cfg(feature = "integration")]
         {
             self.wire = Wire::for_case();
@@ -1410,6 +1418,11 @@ impl DstHarness {
             }
             Step::DrivePartial { n } => self.drive_partial(*n),
             Step::FlushTick => self.flush_and_ack(),
+            Step::DriveFlushWithoutAck => {
+                self.drive();
+                block_on(self.pipeline.flush()).unwrap();
+                self.crash_mid_stream();
+            }
             Step::CrashMidStream => self.crash_mid_stream(),
             Step::RestartMaterializer => self.restart_materializer(),
             Step::Compact => self.compact(),
@@ -1994,6 +2007,34 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     // replays the transaction, staging it again, and the fold absorbs the
     // repeat (invariant 5). So per transaction, staging holds its events,
     // possibly repeated.
+    // 14. Staging keeps commit order. At-least-once staging may repeat
+    //     the last transaction staged (a reconnect resends the one
+    //     committing at the acked LSN), but never stages an older one
+    //     after a newer one: the materializer applies the log in order,
+    //     so that would publish the older transaction's rows over the
+    //     newer ones. Snapshot chunks interleave with CDC by design.
+    let mut last: Option<(u32, pg2iceberg_core::Lsn)> = None;
+    for e in &staged_events {
+        let Some(xid) = e
+            .xid
+            .filter(|x| *x < pg2iceberg_snapshot::SNAPSHOT_XID_BASE)
+        else {
+            continue;
+        };
+        if last.is_some_and(|(x, _)| x == xid) {
+            continue;
+        }
+        let commit = h.db.commit_lsn(xid);
+        if let Some((prev, prev_commit)) = last {
+            if commit <= prev_commit {
+                return Err(format!(
+                    "invariant 14 (commit order): xid {xid} (commit {commit:?}) staged after \
+                     xid {prev} (commit {prev_commit:?})"
+                ));
+            }
+        }
+        last = Some((xid, commit));
+    }
     let mut staged: BTreeMap<u32, Vec<pg2iceberg_stream::MatEvent>> = BTreeMap::new();
     for e in staged_events {
         staged.entry(e.xid.unwrap_or(0)).or_default().push(e);

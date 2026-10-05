@@ -281,7 +281,8 @@ fn flushed_lsn_and_cursor_advance_independently_but_correctly() {
     let commit = tx.commit(Timestamp(0)).unwrap();
 
     drive_pipeline(&mut h);
-    assert_eq!(h.pipeline.flushed_lsn(), commit);
+    // Past the commit: to the WAL end the caught-up keepalive reported.
+    assert!(h.pipeline.flushed_lsn() > commit);
 
     // Cursor is still -1 — the materializer hasn't run yet.
     let cur_before = block_on(h.coord.get_cursor("default", &ident())).unwrap();
