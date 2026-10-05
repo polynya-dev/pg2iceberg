@@ -223,9 +223,8 @@ enum Step {
     /// one. Readers still see the whole table; the files those snapshots
     /// added stay live.
     Expire,
-    /// `maintain`'s second half: delete every blob under the
-    /// materializer's prefix that the table doesn't reference, with no
-    /// grace period.
+    /// `maintain`'s second half: delete every blob in the table's
+    /// directory that the table doesn't reference, with no grace period.
     CleanupOrphans,
 }
 
@@ -265,9 +264,11 @@ fn mat_namer(id_gen: &Arc<SeqIdGen>) -> Arc<dyn MaterializerNamer> {
     Arc::new(UuidMaterializerNamer::new(id_gen.clone(), MAT_PREFIX))
 }
 
-/// Where the materializer writes data files (`<prefix>/<table>/...`), and
-/// so where orphan cleanup looks.
-const MAT_PREFIX: &str = "s3://table";
+/// One bucket, laid out like production: staged WAL chunks and
+/// materialized data files under separate prefixes. Orphan cleanup must
+/// only ever touch the latter.
+const STAGE_PREFIX: &str = "s3://warehouse/staged";
+const MAT_PREFIX: &str = "s3://warehouse/materialized";
 
 struct DstHarness {
     db: SimPostgres,
@@ -321,7 +322,7 @@ impl DstHarness {
         ));
         let blob_store = Arc::new(MemoryBlobStore::new());
         let catalog = Arc::new(MemoryCatalog::new());
-        let namer = Arc::new(CounterBlobNamer::new("s3://stage"));
+        let namer = Arc::new(CounterBlobNamer::new(STAGE_PREFIX));
         let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
 
         let id_gen = Arc::new(SeqIdGen::new());
@@ -378,7 +379,7 @@ impl DstHarness {
         ));
         let blob_store = Arc::new(MemoryBlobStore::new());
         let catalog = Arc::new(MemoryCatalog::new());
-        let namer = Arc::new(CounterBlobNamer::new("s3://stage"));
+        let namer = Arc::new(CounterBlobNamer::new(STAGE_PREFIX));
         let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
 
         let id_gen = Arc::new(SeqIdGen::new());
@@ -615,11 +616,7 @@ impl DstHarness {
                 block_on(self.materializer.expire_cycle(0)).unwrap();
             }
             Step::CleanupOrphans => {
-                block_on(
-                    self.materializer
-                        .cleanup_orphans_cycle(MAT_PREFIX, i64::MAX, 0),
-                )
-                .unwrap();
+                block_on(self.materializer.cleanup_orphans_cycle(i64::MAX, 0)).unwrap();
             }
         }
     }
@@ -1236,6 +1233,18 @@ fn orphan_cleanup_after_expiry_keeps_live_files() {
     h.run_step(&Step::DriveFlush);
     h.run_step(&Step::MaterializerCycle);
     h.run_step(&Step::Expire);
+    h.run_step(&Step::CleanupOrphans);
+    check_invariants(&mut h).unwrap();
+}
+
+/// Orphan cleanup must keep every file the table references. The
+/// catalog holds full `s3://` URIs while object stores list keys.
+#[test]
+fn orphan_cleanup_keeps_live_files() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
     h.run_step(&Step::CleanupOrphans);
     check_invariants(&mut h).unwrap();
 }

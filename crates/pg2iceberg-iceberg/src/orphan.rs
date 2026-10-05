@@ -3,23 +3,27 @@
 //! ones older than a grace period.
 //!
 //! Mirrors `iceberg/maintain.go::cleanOrphanFiles` but scoped to data /
-//! delete files under a configured materializer prefix. Metadata-side
+//! delete files in the table's materializer directory. Metadata-side
 //! files (manifest lists, manifests, metadata.json) live elsewhere in
 //! iceberg's table location and aren't our responsibility — iceberg-rust
 //! manages them.
 //!
-//! ## Why a separate prefix?
+//! ## Why the materializer's directory?
 //!
-//! The materializer's `MaterializerNamer` writes data files under a
-//! configurable base (e.g. `materialized/<table>/`). Iceberg's table
-//! metadata is rooted at the catalog's `location` field which can be
-//! different (e.g. `s3://warehouse/public/orders/`). We only diff under
-//! the materializer's base — operators are responsible for setting it
-//! to a path they control and that nothing else writes to.
+//! The materializer's `MaterializerNamer` writes each table's files
+//! under a directory of its own (`<warehouse>/materialized/<namespace>.<table>/`).
+//! Iceberg's table metadata is rooted at the catalog's `location` field,
+//! which can be different (e.g. `s3://warehouse/public/orders/`). We only
+//! diff inside the table's own directory: anything there that the table
+//! doesn't reference is its own leftover, while a directory shared with
+//! another table would make that table's files look like orphans.
+//!
+//! Paths are compared as object keys ([`object_key`]): the catalog
+//! records full `s3://bucket/...` URIs, while object stores list keys.
 
 use crate::Snapshot;
 use pg2iceberg_core::TableIdent;
-use pg2iceberg_stream::{BlobInfo, BlobStore};
+use pg2iceberg_stream::{object_key, BlobInfo, BlobStore};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
@@ -77,7 +81,10 @@ pub async fn cleanup_orphans(
     let mut to_delete: Vec<BlobInfo> = Vec::new();
     let mut grace_protected: usize = 0;
     for blob in blobs {
-        if referenced.contains(&blob.path) {
+        // Compare object keys: the catalog holds full URIs and stores
+        // list keys (normalizing the listed path too keeps a store that
+        // lists URIs safe).
+        if referenced.contains(object_key(&blob.path)) {
             continue;
         }
         if blob.last_modified_ms > cutoff {
@@ -99,10 +106,10 @@ pub async fn cleanup_orphans(
     })
 }
 
-/// Compute the set of file paths still referenced by *any* live
-/// snapshot's data or delete files. A path is unreferenced iff it
-/// appears in some snapshot's `removed_paths` (compaction-replaced) or
-/// no snapshot ever wrote it.
+/// Compute the object keys (see [`object_key`]) of every file still
+/// referenced by *any* live snapshot's data or delete files. A file is
+/// unreferenced iff it appears in some snapshot's `removed_paths`
+/// (compaction-replaced) or no snapshot ever wrote it.
 ///
 /// We don't include manifest-list / manifest / metadata.json paths —
 /// those live in iceberg's metadata directory under the table location,
@@ -119,13 +126,13 @@ fn referenced_paths(snapshots: &[Snapshot]) -> BTreeSet<String> {
             if removed.contains(df.path.as_str()) {
                 continue;
             }
-            out.insert(df.path.clone());
+            out.insert(object_key(&df.path).to_string());
         }
         for df in &snap.delete_files {
             if removed.contains(df.path.as_str()) {
                 continue;
             }
-            out.insert(df.path.clone());
+            out.insert(object_key(&df.path).to_string());
         }
     }
     out

@@ -246,7 +246,8 @@ mod tests {
         let b = restarted.next_path(&table, "data", "").await;
         assert_ne!(a, b);
         assert!(
-            a.starts_with("s3://warehouse/materialized/t/data/data-") && a.ends_with(".parquet"),
+            a.starts_with("s3://warehouse/materialized/public.t/data/data-")
+                && a.ends_with(".parquet"),
             "{a}"
         );
     }

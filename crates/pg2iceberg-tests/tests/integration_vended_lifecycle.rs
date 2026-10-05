@@ -293,7 +293,6 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
             target_file_size: 0,
             maintenance_retention: String::new(),
             maintenance_grace: "30m".into(),
-            materialized_prefix: "materialized/".into(),
             // The `header.x-iceberg-access-delegation: vended-credentials`
             // header is auto-added by `rest_catalog_props()` when
             // credential_mode=vended; no need to repeat it here.

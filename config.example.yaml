@@ -95,15 +95,13 @@ sink:
 
   # `pg2iceberg maintain` knobs. The subcommand runs in two phases:
   # snapshot expiry (drops snapshots older than retention; never the
-  # current one) followed by orphan-file cleanup (deletes blobs under
-  # `materialized_prefix` that no live snapshot references and that
-  # are older than grace). Operators typically run it via cron or a
+  # current one) followed by orphan-file cleanup (deletes blobs in each
+  # table's directory, `<warehouse>/materialized/<namespace>.<table>/`,
+  # that no live snapshot references and that are older than grace). Operators typically run it via cron or a
   # Kubernetes CronJob; both are one-shot, no in-process scheduler.
   # Format matches Go's time.ParseDuration ("168h", "7d", "30m").
   # maintenance_retention: 168h
   # maintenance_grace: 30m
-  # materialized_prefix: materialized/   # must match the path scheme
-  #                                      # the materializer writes to
 
   # Free-form REST catalog props passthrough. Useful for
   # vendor-specific settings the Go config doesn't have a dedicated

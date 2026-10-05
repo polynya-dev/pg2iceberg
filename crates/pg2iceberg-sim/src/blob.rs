@@ -1,20 +1,28 @@
 //! In-memory `BlobStore` impl for tests and the DST harness.
+//!
+//! Like a production object store it holds one bucket: objects are
+//! addressed by [`object_key`], so `s3://bucket/a.parquet` and
+//! `a.parquet` are the same object, and `list` returns keys rather than
+//! the paths callers wrote.
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use pg2iceberg_stream::{BlobInfo, BlobStore, Result, StreamError};
+use pg2iceberg_stream::{object_key, BlobInfo, BlobStore, Result, StreamError};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 #[derive(Debug)]
 struct Entry {
+    /// The path as first written, for [`MemoryBlobStore::paths`].
+    path: String,
     bytes: Bytes,
     last_modified_ms: i64,
 }
 
 #[derive(Default)]
 pub struct MemoryBlobStore {
+    /// Object key → entry.
     inner: Mutex<BTreeMap<String, Entry>>,
     /// Monotonic counter (in milliseconds) handed out as the
     /// `last_modified_ms` for each `put`. Lets orphan-cleanup tests
@@ -35,9 +43,14 @@ impl MemoryBlobStore {
         self.gets.load(Ordering::SeqCst)
     }
 
-    /// Test-only: enumerate every stored path.
+    /// Test-only: enumerate every stored path, as written.
     pub fn paths(&self) -> Vec<String> {
-        self.inner.lock().unwrap().keys().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.path.clone())
+            .collect()
     }
 
     /// Test-only: total stored byte count.
@@ -67,14 +80,15 @@ impl BlobStore for MemoryBlobStore {
         // to be new. S3 would silently replace the object — and with it
         // data a committed snapshot may still reference — so the sim
         // refuses, turning any path reuse into a loud failure.
-        if inner.contains_key(path) {
+        if inner.contains_key(object_key(path)) {
             return Err(StreamError::Io(format!(
                 "refusing to overwrite existing blob {path}"
             )));
         }
         inner.insert(
-            path.to_string(),
+            object_key(path).to_string(),
             Entry {
+                path: path.to_string(),
                 bytes,
                 last_modified_ms: ms,
             },
@@ -87,7 +101,7 @@ impl BlobStore for MemoryBlobStore {
         self.inner
             .lock()
             .unwrap()
-            .get(path)
+            .get(object_key(path))
             .map(|e| e.bytes.clone())
             .ok_or_else(|| StreamError::Io(format!("not found: {path}")))
     }
@@ -96,7 +110,7 @@ impl BlobStore for MemoryBlobStore {
         let lock = self.inner.lock().unwrap();
         Ok(lock
             .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
+            .filter(|(k, _)| k.starts_with(object_key(prefix)))
             .map(|(k, v)| BlobInfo {
                 path: k.clone(),
                 size: v.bytes.len() as u64,
@@ -108,7 +122,7 @@ impl BlobStore for MemoryBlobStore {
     async fn delete(&self, path: &str) -> Result<()> {
         // Phantom deletes (path doesn't exist) are explicitly OK — see
         // the trait doc comment.
-        self.inner.lock().unwrap().remove(path);
+        self.inner.lock().unwrap().remove(object_key(path));
         Ok(())
     }
 }

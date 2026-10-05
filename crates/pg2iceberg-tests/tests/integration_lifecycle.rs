@@ -249,7 +249,6 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             target_file_size: 0, // disable compaction for this test
             maintenance_retention: String::new(),
             maintenance_grace: "30m".into(),
-            materialized_prefix: "materialized/".into(),
             catalog_props: BTreeMap::new(),
             meta_namespace: String::new(),
         },
