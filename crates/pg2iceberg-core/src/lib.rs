@@ -14,7 +14,7 @@ pub mod value;
 
 pub use metrics::{InMemoryMetrics, Labels, Metrics, NoopMetrics};
 
-pub use event::{ChangeEvent, ColumnName, Op, Row};
+pub use event::{is_snapshot_xid, ChangeEvent, ColumnName, Op, Row, SNAPSHOT_XID_BASE};
 pub use io::{Clock, IdGen, Spawner, Timestamp, WorkerId};
 pub use lsn::Lsn;
 pub use partition::{

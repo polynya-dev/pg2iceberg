@@ -824,8 +824,19 @@ fn new_pipeline(
     blob_store: &Arc<dyn BlobStore>,
     namer: &Arc<CounterBlobNamer>,
 ) -> Pipeline<MemoryCoordinator> {
-    let mut pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
+    let mut pipeline = backfill_pipeline(coord, blob_store, namer);
     pipeline.track_replication();
+    pipeline
+}
+
+/// A pipeline for the harness's tables that doesn't consume the
+/// replication stream: a mid-stream backfill's, as production runs one.
+fn backfill_pipeline(
+    coord: &Arc<MemoryCoordinator>,
+    blob_store: &Arc<dyn BlobStore>,
+    namer: &Arc<CounterBlobNamer>,
+) -> Pipeline<MemoryCoordinator> {
+    let mut pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
     pipeline.register_primary_keys(ident(), vec![ColumnName("id".into())]);
     if SECOND_TABLE.get() > 0 {
         pipeline.register_primary_keys(other_ident(), vec![ColumnName("id".into())]);
@@ -843,6 +854,8 @@ struct DstHarness {
     storage: Storage,
     namer: Arc<CounterBlobNamer>,
     pipeline: Pipeline<MemoryCoordinator>,
+    /// The backfill's own pipeline, in `BACKFILL` mode.
+    backfill_pipeline: Option<Pipeline<MemoryCoordinator>>,
     materializer: Materializer<AuditedCatalog>,
     /// The materializer's catalog: checks invariant 10 after every commit.
     audited: Arc<AuditedCatalog>,
@@ -983,6 +996,7 @@ impl DstHarness {
             pending_external: None,
             external_compaction_seen: false,
             backfilling: false,
+            backfill_pipeline: None,
             other_live: BTreeSet::new(),
             slot_start,
             clock,
@@ -995,8 +1009,21 @@ impl DstHarness {
             // Rows written before the slot existed; the snapshot reads
             // them as of now while the workload keeps changing them.
             let mut h = Self::boot_with_seeds(&[(1, 10), (2, 20), (3, 30), (4, 40)]);
+            // The table's changes stream from when it joined the
+            // publication, a little before the backfill's snapshot.
+            let mut tx = h.db.begin_tx();
+            tx.update(&ident(), row(4, 41));
+            tx.commit(Timestamp(0)).unwrap();
             h.db.begin_snapshot();
             h.backfilling = true;
+            // As production adds a table mid-stream: its backfill runs on
+            // a pipeline of its own, and the table is gated — its changes
+            // stay unmaterialized — until the backfill completes.
+            h.backfill_pipeline = Some(backfill_pipeline(&h.coord, &h.blob_store, &h.namer));
+            block_on(h.materializer.register_table_pending(schema())).unwrap();
+            if let Some(b) = h.other.as_mut() {
+                block_on(b.register_table_pending(schema())).unwrap();
+            }
             // A half-loaded table matches no transaction boundary; that's
             // expected of a backfill, so audits wait until it's done.
             h.audited
@@ -1093,6 +1120,7 @@ impl DstHarness {
             pending_external: None,
             external_compaction_seen: false,
             backfilling: false,
+            backfill_pipeline: None,
             other_live: BTreeSet::new(),
             slot_start,
             clock,
@@ -1165,13 +1193,18 @@ impl DstHarness {
             return;
         }
         let s = Snapshotter::new(self.coord.clone() as Arc<dyn Coordinator>).with_chunk_size(1);
-        block_on(s.run_chunks(&self.db, &[schema()], &mut self.pipeline, Some(1))).unwrap();
+        let pipeline = self.backfill_pipeline.as_mut().expect("BACKFILL mode");
+        block_on(s.run_chunks(&self.db, &[schema()], pipeline, Some(1))).unwrap();
         let done = block_on(self.coord.table_state(&ident()))
             .unwrap()
             .is_some_and(|t| t.snapshot_complete);
         if done {
             self.db.end_snapshot();
             self.backfilling = false;
+            self.materializer.mark_snapshot_complete(&ident());
+            if let Some(b) = self.other.as_mut() {
+                b.mark_snapshot_complete(&ident());
+            }
             self.audited
                 .audit_paused
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1284,7 +1317,12 @@ impl DstHarness {
             "default",
             MAT_BATCH,
         );
-        block_on(materializer.register_table(discovered_schema(&self.db))).unwrap();
+        // As the lifecycle restarts: a table still backfilling is gated.
+        if self.backfilling {
+            block_on(materializer.register_table_pending(discovered_schema(&self.db))).unwrap();
+        } else {
+            block_on(materializer.register_table(discovered_schema(&self.db))).unwrap();
+        }
         register_other(&mut materializer);
         if DISTRIBUTED.get() {
             materializer.enable_distributed_mode(worker("a"), WORKER_TTL);
@@ -2787,6 +2825,63 @@ fn backfill_does_not_overwrite_newer_changes() {
     let mut h = DstHarness::boot();
     h.run_step(&Step::Update { id: 1, qty: 99 });
     h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
+/// A row deleted while the backfill runs stays deleted: its snapshot copy
+/// (from before the delete) mustn't bring it back.
+#[test]
+fn backfill_does_not_bring_back_rows_deleted_during_it() {
+    BACKFILL.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Delete { id: 2 });
+    h.run_step(&Step::DriveFlush);
+    check_invariants(&mut h).unwrap();
+}
+
+/// An update made while the backfill runs, leaving a TOASTed column
+/// unchanged, resolves that column from the row's snapshot copy — which
+/// has to be in Iceberg first.
+#[test]
+fn backfill_resolves_toast_updates_made_during_it() {
+    BACKFILL.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::ToastUpdate { id: 1, qty: 99 });
+    h.run_step(&Step::DriveFlush);
+    check_invariants(&mut h).unwrap();
+}
+
+/// A commit that fails while the backfill's rows are applied: the retry
+/// picks up from the snapshot cursor, and the changes still come after.
+#[test]
+fn a_failed_commit_while_applying_a_backfill_retries_cleanly() {
+    BACKFILL.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Update { id: 1, qty: 99 });
+    h.run_step(&Step::Delete { id: 2 });
+    h.run_step(&Step::DriveFlush);
+    while h.backfilling {
+        h.backfill_chunk();
+    }
+    h.audited
+        .fail_next_commit
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = block_on(h.materializer.cycle()).unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
+/// A backfill's rows are applied only once it has staged them all — even
+/// if the table is ungated early — or the rows staged after would be
+/// skipped as already applied.
+#[test]
+fn backfill_rows_wait_for_the_backfill_to_complete() {
+    BACKFILL.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::BackfillChunk);
+    h.materializer.mark_snapshot_complete(&ident());
     h.run_step(&Step::MaterializerCycle);
     check_invariants(&mut h).unwrap();
 }
