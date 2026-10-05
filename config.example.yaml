@@ -73,6 +73,9 @@ sink:
   #                      error at startup (see plan §Phase 7).
   credential_mode: static
   warehouse: s3://my-warehouse/staged
+  # Iceberg namespace for every table, in place of its PG schema. Tables
+  # with the same name in different PG schemas would collide, and are
+  # refused at startup. Empty: each table's PG schema is its namespace.
   namespace: default
   s3_endpoint: https://s3.us-east-1.amazonaws.com
   s3_access_key: REDACTED

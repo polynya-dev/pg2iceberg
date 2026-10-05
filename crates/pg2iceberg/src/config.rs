@@ -414,7 +414,33 @@ impl Config {
         let cfg: Config = serde_yaml::from_str(&raw)
             .with_context(|| format!("parse config at {}", path.display()))?;
         cfg.validate_mode()?;
+        cfg.validate_tables()?;
         Ok(cfg)
+    }
+
+    /// Every table needs an Iceberg table of its own. `sink.namespace`
+    /// replaces the PG schema, so `public.orders` and `sales.orders`
+    /// would both land in `<namespace>.orders`, their rows mixed.
+    fn validate_tables(&self) -> Result<()> {
+        let mut targets: BTreeMap<TableIdent, &str> = BTreeMap::new();
+        for t in &self.tables {
+            let ident = t.iceberg_ident(&self.sink.namespace)?;
+            match targets.insert(ident.clone(), &t.name) {
+                Some(other) if other == t.name => {
+                    anyhow::bail!("table {other} is listed twice in `tables`")
+                }
+                Some(other) => anyhow::bail!(
+                    "tables {other} and {} both map to Iceberg table {ident}: sink.namespace \
+                     {:?} replaces their PG schemas, so their rows would mix in one table. \
+                     Replicate only one of them, or leave sink.namespace unset so each PG \
+                     schema is its own Iceberg namespace",
+                    t.name,
+                    self.sink.namespace
+                ),
+                None => {}
+            }
+        }
+        Ok(())
     }
 
     /// Reject anything but logical replication up front, so every
@@ -532,6 +558,22 @@ impl TableConfig {
     /// `(schema, table)` parsed from the YAML `name`.
     pub fn qualified(&self) -> Result<(String, String)> {
         parse_qualified_name(&self.name)
+    }
+
+    /// The Iceberg table this table materializes to: in `sink_namespace`
+    /// when set, else in its PG schema. Tables with explicit `columns:`
+    /// keep their PG schema.
+    pub fn iceberg_ident(&self, sink_namespace: &str) -> Result<TableIdent> {
+        let (schema, name) = self.qualified()?;
+        let namespace = if sink_namespace.is_empty() || self.has_explicit_columns() {
+            schema
+        } else {
+            sink_namespace.to_string()
+        };
+        Ok(TableIdent {
+            namespace: Namespace(vec![namespace]),
+            name,
+        })
     }
 
     /// `True` when the operator has explicitly declared columns in
@@ -697,6 +739,63 @@ state:
             cfg.source.mode = mode.into();
             cfg.validate_mode().unwrap();
         }
+    }
+
+    /// A config replicating `tables` (discovered, no explicit columns)
+    /// under `sink.namespace`.
+    fn with_tables(tables: &[&str], sink_namespace: &str) -> Config {
+        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        cfg.tables = tables
+            .iter()
+            .map(|t| serde_yaml::from_str(&format!("name: {t}")).unwrap())
+            .collect();
+        cfg.sink.namespace = sink_namespace.into();
+        cfg
+    }
+
+    #[test]
+    fn same_named_tables_under_one_sink_namespace_are_refused() {
+        let err = with_tables(&["public.orders", "sales.orders"], "analytics")
+            .validate_tables()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("public.orders and sales.orders")
+                && err.contains("Iceberg table analytics.orders"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn same_named_tables_in_their_own_namespaces_are_accepted() {
+        with_tables(&["public.orders", "sales.orders"], "")
+            .validate_tables()
+            .unwrap();
+        with_tables(&["public.orders", "sales.customers"], "analytics")
+            .validate_tables()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_table_listed_twice_is_refused() {
+        let err = with_tables(&["public.orders", "public.orders"], "")
+            .validate_tables()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("listed twice"), "{err}");
+    }
+
+    #[test]
+    fn explicit_columns_keep_their_pg_schema() {
+        // SAMPLE's `public.orders` declares its columns.
+        let cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        assert_eq!(
+            cfg.tables[0].iceberg_ident("analytics").unwrap(),
+            TableIdent {
+                namespace: Namespace(vec!["public".into()]),
+                name: "orders".into(),
+            }
+        );
     }
 
     #[test]

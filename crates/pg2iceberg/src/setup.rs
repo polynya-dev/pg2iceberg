@@ -189,12 +189,10 @@ async fn discover_schemas(
             // The Iceberg namespace comes from `sink.namespace`. The
             // PG schema is preserved separately on `s.pg_schema`,
             // which `pg.discover_schema` populated above. When
-            // `sink.namespace` is empty, leave `ident.namespace` as
-            // the PG schema (legacy behaviour: PG schema doubles as
+            // `sink.namespace` is empty, `ident.namespace` stays the
+            // PG schema (legacy behaviour: PG schema doubles as
             // Iceberg namespace).
-            if !sink_namespace.is_empty() {
-                s.ident.namespace = pg2iceberg_core::Namespace(vec![sink_namespace.to_string()]);
-            }
+            s.ident = t.iceberg_ident(sink_namespace)?;
             // Operator-supplied PK overrides discovery.
             if !t.primary_key.is_empty() {
                 let pk_set: std::collections::BTreeSet<&str> =
