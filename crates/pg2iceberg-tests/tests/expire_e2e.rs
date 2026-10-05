@@ -129,11 +129,28 @@ fn expire_snapshots_drops_snapshots_older_than_retention() {
     // Snapshots with timestamp < 2500 are eligible: ids 1, 2.
     let n = block_on(h.cat.expire_snapshots(&ident(), 2500)).unwrap();
     assert_eq!(n, 2, "snapshots 1 and 2 should be expired");
+    // Already expired: a second pass has nothing left to do.
+    assert_eq!(block_on(h.cat.expire_snapshots(&ident(), 2500)).unwrap(), 0);
 
+    // Expiry drops snapshot metadata, not table state: the files 1 and 2
+    // added are still live, so `snapshots` still reports them (under
+    // their own sequence numbers) and every row stays visible.
     let snaps = block_on(h.cat.snapshots(&ident())).unwrap();
-    assert_eq!(snaps.len(), 3, "3 snapshots survive");
     let ids: Vec<i64> = snaps.iter().map(|s| s.id).collect();
-    assert_eq!(ids, vec![3, 4, 5]);
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    assert_eq!(visible_rows(&h, &s), 5);
+}
+
+fn visible_rows(h: &Harness, s: &TableSchema) -> usize {
+    block_on(pg2iceberg_iceberg::read_materialized_state(
+        &h.cat,
+        h.blob.as_ref(),
+        &ident(),
+        s,
+        &[ColumnName("id".into())],
+    ))
+    .unwrap()
+    .len()
 }
 
 #[test]
@@ -193,27 +210,8 @@ fn expire_then_more_inserts_keeps_state_consistent() {
 
     let snaps = block_on(h.cat.snapshots(&ident())).unwrap();
     let ids: Vec<i64> = snaps.iter().map(|s| s.id).collect();
-    assert_eq!(ids, vec![3, 4, 5, 6]);
+    assert_eq!(ids, vec![1, 2, 3, 4, 5, 6]);
 
-    // Note: in our sim model, `Snapshot.data_files` is "files added in
-    // this snapshot" rather than the full live set, so expiring a
-    // snapshot drops its added files from the verifier's view. Real
-    // iceberg's manifest lists carry forward live files into every
-    // snapshot, so post-expiry the current snapshot's manifest list
-    // still references everything that hasn't been compacted away. The
-    // prod-side `IcebergRustCatalog::expire_snapshots` uses
-    // `TableUpdate::RemoveSnapshots`, which preserves visibility
-    // correctly. We don't assert post-expiry row visibility against the
-    // sim because it would test the sim's representation, not the
-    // expiry-trait contract.
-    let visible = block_on(pg2iceberg_iceberg::read_materialized_state(
-        &h.cat,
-        h.blob.as_ref(),
-        &ident(),
-        &s,
-        &[ColumnName("id".into())],
-    ))
-    .unwrap();
-    // Only post-expire snapshots' added rows are visible (PKs 3, 4, 5, 6).
-    assert_eq!(visible.len(), 4);
+    // Every row stays visible: expiry dropped only snapshot metadata.
+    assert_eq!(visible_rows(&h, &s), 6);
 }

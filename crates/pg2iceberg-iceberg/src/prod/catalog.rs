@@ -357,6 +357,13 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         // parent_paths - current_paths gives the set of files dropped by
         // this Replace.
         let mut paths_per_snap: BTreeMap<i64, std::collections::BTreeSet<String>> = BTreeMap::new();
+        // Live files added by expired snapshots, by path. Expiry drops a
+        // snapshot from the metadata but not the files it added: they stay
+        // in the retained snapshots' manifests, as entries naming a
+        // snapshot that no longer exists.
+        let retained: std::collections::BTreeSet<i64> =
+            snaps.iter().map(|s| s.snapshot_id()).collect();
+        let mut expired_adds: BTreeMap<String, (i64, DataFile, DataContentType)> = BTreeMap::new();
         for snap in snaps {
             // Use the iceberg snapshot_id for manifest filtering (matches the
             // `added_snapshot_id` field stored in manifest entries), but report
@@ -389,6 +396,14 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     let df = me.data_file();
                     all_paths_this_snap.insert(df.file_path().to_string());
 
+                    let partition_values = iceberg_struct_to_partition_literals(df.partition());
+                    let our = DataFile {
+                        path: df.file_path().to_string(),
+                        record_count: df.record_count(),
+                        byte_size: df.file_size_in_bytes(),
+                        equality_field_ids: df.equality_ids().unwrap_or_default(),
+                        partition_values,
+                    };
                     // Match the sim's "files added in this commit"
                     // semantics: only surface entries first introduced
                     // by this snapshot. Judge by the entry's own snapshot
@@ -398,18 +413,25 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     // their original snapshot and sequence number.
                     // Surfacing them here would list them twice, the
                     // second time at the Replace's sequence number —
-                    // above deletes that still apply to them.
+                    // above deletes that still apply to them. An entry
+                    // naming an expired snapshot is collected for that
+                    // snapshot's stand-in instead.
                     if me.snapshot_id() != Some(snap_id) {
+                        let added_by_expired =
+                            me.snapshot_id().is_none_or(|id| !retained.contains(&id));
+                        // A `Deleted` entry names the snapshot that removed
+                        // the file. Our rewrite omits removed files instead,
+                        // but other engines maintaining the table write them.
+                        if added_by_expired && me.is_alive() {
+                            let seq = me.sequence_number().unwrap_or(seq_num);
+                            expired_adds.entry(our.path.clone()).or_insert((
+                                seq,
+                                our,
+                                df.content_type(),
+                            ));
+                        }
                         continue;
                     }
-                    let partition_values = iceberg_struct_to_partition_literals(df.partition());
-                    let our = DataFile {
-                        path: df.file_path().to_string(),
-                        record_count: df.record_count(),
-                        byte_size: df.file_size_in_bytes(),
-                        equality_field_ids: df.equality_ids().unwrap_or_default(),
-                        partition_values,
-                    };
                     match df.content_type() {
                         DataContentType::Data => data_files.push(our),
                         DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
@@ -452,6 +474,25 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 timestamp_ms: snap.timestamp_ms(),
             });
         }
+        // One stand-in snapshot per sequence number: MoR ordering only
+        // needs the files' sequence numbers, which the manifests keep.
+        let mut stand_ins: BTreeMap<i64, Snapshot> = BTreeMap::new();
+        for (seq, df, content) in expired_adds.into_values() {
+            let snap = stand_ins.entry(seq).or_insert_with(|| Snapshot {
+                id: seq,
+                data_files: Vec::new(),
+                delete_files: Vec::new(),
+                removed_paths: Vec::new(),
+                timestamp_ms: 0,
+            });
+            match content {
+                DataContentType::Data => snap.data_files.push(df),
+                DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
+                    snap.delete_files.push(df)
+                }
+            }
+        }
+        out.extend(stand_ins.into_values());
         out.sort_by_key(|s| s.id);
         Ok(out)
     }
@@ -1469,10 +1510,90 @@ mod tests {
         assert_eq!(n, 2, "two old snapshots should expire");
 
         let post = c.snapshots(&ident()).await.unwrap();
-        assert_eq!(post.len(), 1);
-        // The surviving snapshot is the current one (sequence number 3).
-        let surviving = post.first().unwrap();
-        assert_eq!(surviving.id, 3);
+        // The expired snapshots' metadata is gone, but the files they
+        // added are still the table: reported under stand-ins at their
+        // own sequence numbers, beside the current snapshot (3).
+        assert_eq!(live_files(&post), live_files(&pre));
+        assert_eq!(post.last().unwrap().id, 3);
+        assert!(post[..post.len() - 1].iter().all(|s| s.timestamp_ms == 0));
+    }
+
+    /// Every live data / delete file and the sequence number it applies
+    /// at, as a reader replaying `snapshots()` sees them.
+    fn live_files(snaps: &[Snapshot]) -> BTreeMap<String, i64> {
+        let removed: std::collections::BTreeSet<&str> = snaps
+            .iter()
+            .flat_map(|s| s.removed_paths.iter().map(String::as_str))
+            .collect();
+        snaps
+            .iter()
+            .flat_map(|s| {
+                s.data_files
+                    .iter()
+                    .chain(&s.delete_files)
+                    .map(move |f| (f.path.clone(), s.id))
+            })
+            .filter(|(p, _)| !removed.contains(p.as_str()))
+            .collect()
+    }
+
+    /// Expiry must not change what `snapshots()` replays to — not for
+    /// files the expired snapshots added, not for their deletes, and not
+    /// across a compaction — or the FileIndex rebuild, compaction and
+    /// orphan cleanup all work from a table that's missing files.
+    #[tokio::test]
+    async fn expiry_keeps_live_files_at_their_sequence_numbers() {
+        use crate::PreparedCompaction;
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let file = |name: &str, eq_ids: Vec<i32>| DataFile {
+            path: format!("memory:///warehouse/public/orders/{name}.parquet"),
+            record_count: 1,
+            byte_size: 100,
+            equality_field_ids: eq_ids,
+            partition_values: Vec::new(),
+        };
+        let tick = || tokio::time::sleep(std::time::Duration::from_millis(2));
+        let append = |data: Vec<DataFile>, deletes: Vec<DataFile>| {
+            c.commit_snapshot(PreparedCommit {
+                ident: ident(),
+                data_files: data,
+                equality_deletes: deletes,
+            })
+        };
+        append(vec![file("d0", vec![])], vec![]).await.unwrap();
+        tick().await;
+        append(vec![file("d1", vec![])], vec![file("e1", vec![1])])
+            .await
+            .unwrap();
+        tick().await;
+        append(vec![file("d2", vec![])], vec![]).await.unwrap();
+        tick().await;
+        c.commit_compaction(PreparedCompaction {
+            ident: ident(),
+            added_data_files: vec![file("c0", vec![])],
+            removed_paths: vec![file("d0", vec![]).path],
+        })
+        .await
+        .unwrap();
+        tick().await;
+        append(vec![file("d3", vec![])], vec![]).await.unwrap();
+
+        let pre = live_files(&c.snapshots(&ident()).await.unwrap());
+        let path = |n: &str| file(n, vec![]).path;
+        assert_eq!(
+            pre,
+            BTreeMap::from([
+                (path("d1"), 2),
+                (path("e1"), 2),
+                (path("d2"), 3),
+                (path("c0"), 4),
+                (path("d3"), 5),
+            ])
+        );
+        assert_eq!(c.expire_snapshots(&ident(), 1).await.unwrap(), 4);
+        assert_eq!(live_files(&c.snapshots(&ident()).await.unwrap()), pre);
     }
 
     /// Retention so high nothing expires.
