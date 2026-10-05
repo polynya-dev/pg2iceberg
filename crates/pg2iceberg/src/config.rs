@@ -252,13 +252,6 @@ pub struct SinkConfig {
     #[serde(default = "default_maintenance_grace")]
     pub maintenance_grace: String,
 
-    /// Blob-store prefix where the materializer writes data files.
-    /// Orphan cleanup operates only under this prefix. Should match
-    /// the path scheme `UuidMaterializerNamer` produces in
-    /// `run.rs`. Default `materialized/` mirrors what the binary uses.
-    #[serde(default = "default_materialized_prefix")]
-    pub materialized_prefix: String,
-
     /// Free-form REST-catalog props passthrough. Useful for
     /// vendor-specific settings (Polaris OAuth2
     /// server URI, etc.) without us having to enumerate every quirk.
@@ -307,7 +300,6 @@ impl Default for SinkConfig {
             target_file_size: default_target_file_size(),
             maintenance_retention: String::new(),
             maintenance_grace: default_maintenance_grace(),
-            materialized_prefix: default_materialized_prefix(),
             catalog_props: BTreeMap::new(),
             meta_namespace: String::new(),
         }
@@ -374,10 +366,6 @@ fn default_target_file_size() -> u64 {
 
 fn default_maintenance_grace() -> String {
     "30m".into()
-}
-
-fn default_materialized_prefix() -> String {
-    "materialized/".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]

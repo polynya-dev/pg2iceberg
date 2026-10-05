@@ -328,9 +328,10 @@ fn cleanup_orphans_cycle_records_maintenance_row() {
     h.drive_then_materialize();
 
     // Plant a real orphan: a parquet at a path that's NOT in any
-    // snapshot. Has to live under the prefix the cleanup scan uses.
+    // snapshot. Has to live in the table's directory, which the
+    // cleanup scan covers.
     block_on(h.blob.put(
-        "materialized/orders/orphan-001.parquet",
+        "s3://table/public.orders/data/orphan-001.parquet",
         Bytes::from_static(b"orphan-bytes"),
     ))
     .unwrap();
@@ -338,11 +339,7 @@ fn cleanup_orphans_cycle_records_maintenance_row() {
     // grace=0 means "treat everything as old enough to delete"; we
     // pass now_ms much larger than the orphan's mtime so it's
     // definitely past grace.
-    let _ = block_on(
-        h.materializer
-            .cleanup_orphans_cycle("materialized", i64::MAX / 2, 0),
-    )
-    .unwrap();
+    let _ = block_on(h.materializer.cleanup_orphans_cycle(i64::MAX / 2, 0)).unwrap();
 
     let maint = h.read_meta_table("maintenance");
     let clean_rows: Vec<&Row> = maint

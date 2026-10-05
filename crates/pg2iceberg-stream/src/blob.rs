@@ -23,13 +23,27 @@ pub struct BlobInfo {
     pub last_modified_ms: i64,
 }
 
+/// The object key a blob store addresses `path` by: `path` without its
+/// `scheme://bucket/` prefix, if it has one. A store is bound to one
+/// bucket, so `s3://warehouse/a/b.parquet` and `a/b.parquet` name the
+/// same object — compare paths by this key, never as written.
+pub fn object_key(path: &str) -> &str {
+    match path.split_once("://") {
+        Some((_scheme, rest)) => rest.split_once('/').map_or("", |(_bucket, key)| key),
+        None => path,
+    }
+}
+
 #[async_trait]
 pub trait BlobStore: Send + Sync {
+    /// `path` may be a full URI or an object key; see [`object_key`].
     async fn put(&self, path: &str, bytes: Bytes) -> Result<()>;
     async fn get(&self, path: &str) -> Result<Bytes>;
-    /// Enumerate every blob whose path starts with `prefix`. Returns
-    /// info for each (path, size, last-modified-ms). Used by the
-    /// orphan-file cleanup maintenance op.
+    /// Enumerate every blob whose object key starts with `prefix`'s.
+    /// Returns info for each (path, size, last-modified-ms), where
+    /// `path` is the object key — not the form it was written in, so
+    /// compare it with [`object_key`]. Used by the orphan-file cleanup
+    /// maintenance op.
     async fn list(&self, prefix: &str) -> Result<Vec<BlobInfo>>;
     /// Delete a single blob. Returns `Ok(())` even if the blob doesn't
     /// exist — orphan cleanup races with concurrent compaction commits

@@ -125,6 +125,12 @@ pub trait MaterializerNamer: Send + Sync {
     /// ClickHouse's `_path` virtual column) lean on it for partition
     /// pruning. Sticking to it keeps cross-engine debugging painless.
     async fn next_path(&self, table: &TableIdent, kind: &str, partition_segment: &str) -> String;
+
+    /// The directory every path [`Self::next_path`] hands out for
+    /// `table` lies under, and that holds nothing else — so orphan
+    /// cleanup can treat any file in it that `table` doesn't reference
+    /// as its own leftover.
+    fn table_dir(&self, table: &TableIdent) -> String;
 }
 
 /// Deterministic counter-based namer for the sim and tests. Never use it
@@ -160,6 +166,10 @@ impl MaterializerNamer for CounterMaterializerNamer {
             &format!("{n:010}"),
         )
     }
+
+    fn table_dir(&self, table: &TableIdent) -> String {
+        table_dir(&self.base, table)
+    }
 }
 
 /// Production namer: a random UUID per file, so paths never repeat —
@@ -189,9 +199,21 @@ impl MaterializerNamer for UuidMaterializerNamer {
             .collect();
         file_path(&self.base, table, kind, partition_segment, &id)
     }
+
+    fn table_dir(&self, table: &TableIdent) -> String {
+        table_dir(&self.base, table)
+    }
 }
 
-/// Layout: `<base>/<table>/data/[<col=val>/...]/<kind>-<id>.parquet`.
+/// `<base>/<namespace>.<table>`: one directory per table, namespace
+/// included, so same-named tables in different namespaces never share
+/// one. (Files written before the namespace was added sit in
+/// `<base>/<table>`; orphan cleanup leaves them alone.)
+fn table_dir(base: &str, table: &TableIdent) -> String {
+    format!("{}/{table}", base.trim_end_matches('/'))
+}
+
+/// Layout: `<table_dir>/data/[<col=val>/...]/<kind>-<id>.parquet`.
 /// Data and eq-delete files share the `data/` subdirectory (Iceberg
 /// writers always co-locate them); meta / compact / marker outputs go in
 /// their own per-kind subdir.
@@ -202,17 +224,15 @@ fn file_path(
     partition_segment: &str,
     id: &str,
 ) -> String {
+    let dir = table_dir(base, table);
     let kind_dir = match kind {
         "data" | "eq-delete" => "data",
         other => other,
     };
     if partition_segment.is_empty() {
-        format!("{base}/{}/{kind_dir}/{kind}-{id}.parquet", table.name)
+        format!("{dir}/{kind_dir}/{kind}-{id}.parquet")
     } else {
-        format!(
-            "{base}/{}/{kind_dir}/{partition_segment}/{kind}-{id}.parquet",
-            table.name
-        )
+        format!("{dir}/{kind_dir}/{partition_segment}/{kind}-{id}.parquet")
     }
 }
 
@@ -1208,11 +1228,11 @@ impl<C: Catalog> Materializer<C> {
     /// Returns `(ident, outcome)` for tables where at least one orphan
     /// was deleted or grace-protected.
     ///
-    /// `prefix` is the materializer's data-blob root (e.g. "materialized/").
-    /// Each table's blobs land under `{prefix}{table_name}/`; we list
-    /// per-table to avoid scanning the entire prefix on every cycle.
-    /// `now_ms` is the current wall-clock time (or test clock); orphans
-    /// younger than `now_ms - grace_period_ms` are protected.
+    /// Each table's scope is its own directory, as the materializer's
+    /// namer lays it out ([`MaterializerNamer::table_dir`]) — never a
+    /// directory another table writes to. `now_ms` is the current
+    /// wall-clock time (or test clock); orphans younger than
+    /// `now_ms - grace_period_ms` are protected.
     ///
     /// Per-table outcomes are also recorded into `<meta_ns>.maintenance`
     /// when meta recording is enabled, with `operation =
@@ -1220,20 +1240,14 @@ impl<C: Catalog> Materializer<C> {
     /// observability blips don't block cleanup retries.
     pub async fn cleanup_orphans_cycle(
         &mut self,
-        prefix: &str,
         now_ms: i64,
         grace_period_ms: i64,
     ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CleanupOutcome)>> {
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
         for ident in idents {
-            let table_prefix = format!(
-                "{}{}/",
-                prefix.trim_end_matches('/').to_string() + "/",
-                ident.name
-            );
-            // The leading `prefix.trim_end_matches('/').to_string() + "/"`
-            // normalizes any trailing slash so `format!` doesn't double-up.
+            // Trailing `/`: `ns.orders/` must not match `ns.orders2/`.
+            let table_prefix = format!("{}/", self.namer.table_dir(&ident));
             let started_micros = now_micros();
             let outcome = pg2iceberg_iceberg::cleanup_orphans(
                 self.catalog.as_ref(),

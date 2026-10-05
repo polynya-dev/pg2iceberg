@@ -27,13 +27,16 @@ use pg2iceberg_iceberg::{
 };
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
-use pg2iceberg_stream::BlobStore;
+use pg2iceberg_stream::{object_key, BlobStore};
 use pollster::block_on;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const PREFIX: &str = "data/orders/";
+/// The catalog references files by full URI, as production catalogs do;
+/// the blob store lists them by key (see `object_key`).
+const BUCKET: &str = "s3://warehouse/";
 
 fn ident() -> TableIdent {
     TableIdent {
@@ -105,7 +108,7 @@ impl Harness {
             .unwrap();
         let chunk = prepared.data.into_iter().next().unwrap();
         let n = self.counter.fetch_add(1, Ordering::SeqCst);
-        let path = format!("{PREFIX}data-{n}.parquet");
+        let path = format!("{BUCKET}{PREFIX}data-{n}.parquet");
         block_on(self.blob.put(&path, Bytes::clone(&chunk.chunk.bytes))).unwrap();
         block_on(self.cat.commit_snapshot(PreparedCommit {
             ident: schema.ident.clone(),
@@ -168,7 +171,7 @@ fn unreferenced_blobs_outside_grace_window_get_deleted() {
     let remaining: Vec<String> = h.blob.paths();
     assert_eq!(remaining.len(), 1);
     assert!(
-        remaining[0].starts_with(&format!("{PREFIX}data-")),
+        object_key(&remaining[0]).starts_with(&format!("{PREFIX}data-")),
         "the surviving blob should be the committed data file, got {:?}",
         remaining[0]
     );
@@ -266,7 +269,7 @@ fn compaction_replaced_files_become_orphans() {
     // Manually issue a compaction snapshot dropping the three originals
     // and adding one compacted file. (Real compaction would rewrite the
     // rows; here we just need the metadata to say "p1..p3 are gone".)
-    let compacted_path = format!("{PREFIX}data-compact.parquet");
+    let compacted_path = format!("{BUCKET}{PREFIX}data-compact.parquet");
     block_on(
         h.blob
             .put(&compacted_path, Bytes::from_static(b"compacted")),
@@ -322,4 +325,98 @@ fn cleanup_with_no_orphans_is_a_noop() {
     assert_eq!(outcome.deleted, 0);
     assert_eq!(outcome.bytes_freed, 0);
     assert_eq!(outcome.grace_protected, 0);
+}
+
+/// `public.orders`, `sales.orders` and `public.orders2` are different
+/// tables. Each one's cleanup may only consider its own files: the
+/// others' files are not in its snapshots, so a directory it shares
+/// with them — or one whose name is a prefix of theirs — would make
+/// them orphans.
+#[test]
+fn cleanup_keeps_other_tables_files() {
+    use pg2iceberg_coord::schema::CoordSchema;
+    use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
+    use pg2iceberg_logical::Materializer;
+    use pg2iceberg_sim::clock::TestClock;
+    use pg2iceberg_sim::coord::MemoryCoordinator;
+    use pg2iceberg_sim::id::SeqIdGen;
+
+    let coord = Arc::new(MemoryCoordinator::new(
+        CoordSchema::default_name(),
+        Arc::new(TestClock::at(0)),
+    ));
+    let blob = Arc::new(MemoryBlobStore::new());
+    let cat = Arc::new(MemoryCatalog::new());
+    let namer: Arc<dyn MaterializerNamer> = Arc::new(UuidMaterializerNamer::new(
+        Arc::new(SeqIdGen::new()),
+        "s3://warehouse/materialized",
+    ));
+    let mut m = Materializer::new(
+        coord,
+        blob.clone(),
+        cat.clone(),
+        namer.clone(),
+        "default",
+        1000,
+    );
+    let tables: Vec<TableSchema> = [
+        ("public", "orders"),
+        ("sales", "orders"),
+        ("public", "orders2"),
+    ]
+    .iter()
+    .map(|(ns, name)| {
+        let mut s = schema();
+        s.ident = TableIdent {
+            namespace: Namespace(vec![(*ns).into()]),
+            name: (*name).into(),
+        };
+        s
+    })
+    .collect();
+    for (i, s) in tables.iter().enumerate() {
+        block_on(m.register_table(s.clone())).unwrap();
+        // One committed data file per table, named the way the
+        // materializer names them.
+        let writer = TableWriter::new(s.clone());
+        let prepared = writer
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Insert,
+                    row: row(i as i32, 1),
+                    unchanged_cols: vec![],
+                }],
+                &FileIndex::new(),
+            )
+            .unwrap();
+        let chunk = prepared.data.into_iter().next().unwrap();
+        let path = block_on(namer.next_path(&s.ident, "data", ""));
+        block_on(blob.put(&path, Bytes::clone(&chunk.chunk.bytes))).unwrap();
+        block_on(cat.commit_snapshot(PreparedCommit {
+            ident: s.ident.clone(),
+            data_files: vec![DataFile {
+                path,
+                record_count: chunk.chunk.record_count,
+                byte_size: chunk.chunk.bytes.len() as u64,
+                equality_field_ids: vec![],
+                partition_values: chunk.partition_values,
+            }],
+            equality_deletes: vec![],
+        }))
+        .unwrap();
+    }
+
+    block_on(m.cleanup_orphans_cycle(i64::MAX / 2, 0)).unwrap();
+
+    for s in &tables {
+        let rows = block_on(pg2iceberg_iceberg::read_materialized_state(
+            cat.as_ref(),
+            blob.as_ref(),
+            &s.ident,
+            s,
+            &[ColumnName("id".into())],
+        ))
+        .unwrap_or_else(|e| panic!("{}: {e}", s.ident));
+        assert_eq!(rows.len(), 1, "{}", s.ident);
+    }
 }

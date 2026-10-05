@@ -84,8 +84,8 @@ sink:
   # `pg2iceberg maintain` (snapshot expiry + orphan cleanup)
   maintenance_retention: 168h    # 7 days. Snapshots older than this are dropped.
   maintenance_grace: 30m         # Orphan files younger than this are protected.
-  materialized_prefix: materialized/   # blob path prefix the materializer writes to;
-                                       # orphan-cleanup scans here
+                                 # Cleanup only scans each table's own directory,
+                                 # <warehouse>/materialized/<namespace>.<table>/.
 
   # Free-form REST catalog props passthrough. Layered on top of the
   # built-in props (uri, warehouse, auth, S3, access-delegation header).

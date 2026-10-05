@@ -464,9 +464,9 @@ pub async fn run_compact(cfg: Config) -> Result<()> {
 /// no-op for that step if blank.
 ///
 /// CLI `--retention` (e.g. `168h`) overrides
-/// `sink.maintenance_retention`. Cleanup grace and the materialized
-/// prefix come from `sink.maintenance_grace` /
-/// `sink.materialized_prefix`.
+/// `sink.maintenance_retention`. Cleanup grace comes from
+/// `sink.maintenance_grace`; each table's cleanup scope is the
+/// directory the materializer writes its files to.
 pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Result<()> {
     let retention_str = retention_override
         .clone()
@@ -510,13 +510,12 @@ pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Re
             .map(|d| d.as_millis().try_into().unwrap_or(i64::MAX))
             .unwrap_or(i64::MAX);
         let outcomes = materializer
-            .cleanup_orphans_cycle(&cfg.sink.materialized_prefix, now_ms, grace_ms)
+            .cleanup_orphans_cycle(now_ms, grace_ms)
             .await
             .context("cleanup_orphans_cycle")?;
         if outcomes.is_empty() {
             tracing::info!(
                 grace = %grace_str,
-                prefix = %cfg.sink.materialized_prefix,
                 "maintain: no orphan files found"
             );
         } else {

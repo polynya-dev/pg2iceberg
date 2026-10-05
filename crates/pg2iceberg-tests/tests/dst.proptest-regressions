@@ -8,3 +8,5 @@ cc 7a6d9f9068793aeb59e94e1d2dc689c3f2f96c92d1f913f1c538b690a10fb4c2 # shrinks to
 cc f4004e88b64de3768c2445a6cbe938954df146915f87ee4743a5ecabfc77fdec # shrinks to steps = [Insert { id: 1, qty: 0 }, DriveFlush, MaterializerCycle, RestartMaterializer, Insert { id: 2, qty: 0 }]
 cc 99fe1595dd1f5288f853c319e3e08cc43d2fe4ea6f13cdd25ef483e7ada1ebf9 # shrinks to steps = [BigTx { inserts: 4, qty: 0 }, DriveFlush, MaterializerCycle, Compact]
 cc 0e09a3050649b71730db017f27544887e48037a5d61c2cca3eeec0e2aad38f69 # shrinks to steps = [BigTx { inserts: 4, qty: 0 }, DriveFlush, MaterializerCycle, Expire]
+cc 6b572fac1704c6e51ff0567728dfee57a61889a8ff38070ba6083ca7cad37919 # shrinks to steps = [Insert { id: 1, qty: 0 }, CrashAndRestart, CleanupOrphans], smallint_pk = false
+cc 253e147de84091fc4db0c8cfb1d9e10d607d4a6f2eadb7e504fb50710ab6ef07 # shrinks to steps = [Insert { id: 1, qty: 0 }, CrashAndRestart, MaterializerCycle, CleanupOrphans], smallint_pk = false
