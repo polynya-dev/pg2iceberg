@@ -312,14 +312,42 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                             self.sink.record_change(del)?;
 
                             let mut upd = evt;
-                            // Strip `before` so the staging layer
-                            // doesn't carry duplicate data.
-                            upd.before = None;
+                            let old = upd.before.take().unwrap_or_default();
+                            // The new key has no committed row to
+                            // resolve unchanged TOAST columns from. Take
+                            // their values from the old tuple when it
+                            // has them (REPLICA IDENTITY FULL; a TOASTed
+                            // value is never NULL, so NULL is a key-only
+                            // tuple's filler). Otherwise stage the old
+                            // key as the update's `before`, for the
+                            // materializer to resolve them from.
+                            if let Some(after) = upd.after.as_mut() {
+                                upd.unchanged_cols.retain(|c| match old.get(c) {
+                                    Some(v) if *v != PgValue::Null => {
+                                        after.insert(c.clone(), v.clone());
+                                        false
+                                    }
+                                    _ => true,
+                                });
+                            }
+                            if !upd.unchanged_cols.is_empty() {
+                                upd.before = Some(
+                                    pks.iter()
+                                        .filter_map(|c| old.get(c).map(|v| (c.clone(), v.clone())))
+                                        .collect(),
+                                );
+                            }
                             self.sink.record_change(upd)?;
                             self.spill_if_full(xid).await?;
                             return Ok(());
                         }
                     }
+                }
+                // A staged UPDATE carries `before` only for a key change
+                // (above), where it is the old key.
+                let mut evt = evt;
+                if evt.op == Op::Update {
+                    evt.before = None;
                 }
                 self.sink.record_change(evt)?;
                 self.spill_if_full(xid).await?;

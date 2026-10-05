@@ -42,7 +42,9 @@ pub fn promote_re_inserts(
 /// Fill in `unchanged_cols` placeholders by reading the prior data file.
 ///
 /// For each row with non-empty `unchanged_cols`:
-/// - Look up the file path containing its PK via `FileIndex`.
+/// - Look up the file path containing its PK — or, for a row that moved
+///   from another key, that key ([`MaterializedRow::unchanged_from`]) —
+///   via `FileIndex`.
 /// - Find the corresponding row in `prior_rows_by_path` (caller pre-fetched
 ///   and decoded the file via `BlobStore` + [`crate::reader::read_data_file`]).
 /// - Copy each unchanged column's value into the row, then clear
@@ -64,7 +66,10 @@ pub fn resolve_unchanged_cols(
         if r.unchanged_cols.is_empty() {
             continue;
         }
-        let key = PkKey::from_row(&r.row, pk_cols);
+        let key = r
+            .unchanged_from
+            .clone()
+            .unwrap_or_else(|| PkKey::from_row(&r.row, pk_cols));
         let path = file_index.lookup(&key).ok_or_else(|| {
             WriterError::Encode(format!(
                 "TOAST resolution failed: PK {key} is not in any indexed data file"
@@ -120,6 +125,7 @@ mod tests {
             op,
             row: r,
             unchanged_cols: unchanged.into_iter().map(c).collect(),
+            unchanged_from: None,
         }
     }
 

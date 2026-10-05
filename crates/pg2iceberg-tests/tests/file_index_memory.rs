@@ -118,6 +118,7 @@ fn table_with_history(
                     op,
                     row: row(id(i), round as i32),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 })
                 .collect();
             let prepared = writer.prepare(&rows, &FileIndex::new()).unwrap();

@@ -111,6 +111,7 @@ fn insert(h: &Harness, s: &TableSchema, r: Row) {
             op: Op::Insert,
             row: r,
             unchanged_cols: vec![],
+            unchanged_from: None,
         }],
     );
 }

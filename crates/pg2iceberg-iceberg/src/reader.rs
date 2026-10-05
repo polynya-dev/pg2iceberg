@@ -280,11 +280,13 @@ mod tests {
                 op: Op::Insert,
                 row: row(1, 10),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             },
             MaterializedRow {
                 op: Op::Insert,
                 row: row(2, 20),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             },
         ];
         let prepared = w.prepare(&rows, &crate::FileIndex::new()).unwrap();
@@ -331,6 +333,7 @@ mod tests {
                     op: Op::Insert,
                     row: r,
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &crate::FileIndex::new(),
             )

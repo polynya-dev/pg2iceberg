@@ -972,6 +972,7 @@ mod tests {
                     op: Op::Insert,
                     row: row(1, 10),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1008,6 +1009,7 @@ mod tests {
                     op: Op::Delete,
                     row: pk_only(7),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1045,6 +1047,7 @@ mod tests {
                     op: Op::Update,
                     row: row(3, 99),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1086,16 +1089,19 @@ mod tests {
                         op: Op::Insert,
                         row: row(1, 10),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                     MaterializedRow {
                         op: Op::Update,
                         row: row(2, 20),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                     MaterializedRow {
                         op: Op::Delete,
                         row: pk_only(3),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                 ],
                 &FileIndex::new(),
@@ -1116,6 +1122,7 @@ mod tests {
                     op: Op::Insert,
                     row: row(1, 10),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1182,6 +1189,7 @@ mod tests {
                     op: Op::Insert,
                     row: r,
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1228,6 +1236,7 @@ mod tests {
                     op: Op::Insert,
                     row: r,
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1294,16 +1303,19 @@ mod tests {
                         op: Op::Insert,
                         row: row_with_region(1, "us"),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                     MaterializedRow {
                         op: Op::Insert,
                         row: row_with_region(2, "us"),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                     MaterializedRow {
                         op: Op::Insert,
                         row: row_with_region(3, "eu"),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                 ],
                 &FileIndex::new(),
@@ -1380,16 +1392,19 @@ mod tests {
                         op: Op::Insert,
                         row: row_with_ts(1, 19_723 * day_micros + 3_600_000_000),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                     MaterializedRow {
                         op: Op::Insert,
                         row: row_with_ts(2, 19_723 * day_micros + 7_200_000_000),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                     MaterializedRow {
                         op: Op::Insert,
                         row: row_with_ts(3, 19_724 * day_micros + 1),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                 ],
                 &FileIndex::new(),
@@ -1420,6 +1435,7 @@ mod tests {
                     op: Op::Delete,
                     row: row_with_ts(1, 19_723 * day_micros),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1453,6 +1469,7 @@ mod tests {
                     op: Op::Delete,
                     row: pk_only(1),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &fi,
             )
@@ -1477,6 +1494,7 @@ mod tests {
                     op: Op::Insert,
                     row: pk_only(1), // missing `region`
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1509,6 +1527,7 @@ mod tests {
                     op: Op::Delete,
                     row: pk_only(99), // PK absent from FileIndex
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(), // empty index
             )
@@ -1529,11 +1548,13 @@ mod tests {
                         op: Op::Insert,
                         row: row_with_region(1, "us"),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                     MaterializedRow {
                         op: Op::Insert,
                         row: row_with_region(2, "eu"),
                         unchanged_cols: vec![],
+                        unchanged_from: None,
                     },
                 ],
                 &FileIndex::new(),
@@ -1563,6 +1584,7 @@ mod tests {
                     op: Op::Update,
                     row: row_with_region(1, "us"),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -1611,6 +1633,7 @@ mod tests {
                     op: Op::Insert,
                     row: r,
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }
             })
             .collect();
@@ -1672,6 +1695,7 @@ mod tests {
                 op: Op::Insert,
                 row: r,
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }
         };
         let p = w
@@ -1737,6 +1761,7 @@ mod tests {
                     op: Op::Insert,
                     row: r,
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )

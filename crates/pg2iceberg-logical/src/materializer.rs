@@ -705,6 +705,7 @@ impl<C: Catalog> Materializer<C> {
             op: Op::Insert,
             row: stats.to_row(),
             unchanged_cols: Vec::new(),
+            unchanged_from: None,
         });
     }
 
@@ -721,6 +722,7 @@ impl<C: Catalog> Materializer<C> {
             op: Op::Insert,
             row: stats.to_row(),
             unchanged_cols: Vec::new(),
+            unchanged_from: None,
         });
     }
 
@@ -737,6 +739,7 @@ impl<C: Catalog> Materializer<C> {
             op: Op::Insert,
             row: stats.to_row(),
             unchanged_cols: Vec::new(),
+            unchanged_from: None,
         });
     }
 
@@ -753,6 +756,7 @@ impl<C: Catalog> Materializer<C> {
             op: Op::Insert,
             row: stats.to_row(),
             unchanged_cols: Vec::new(),
+            unchanged_from: None,
         });
     }
 
@@ -1782,6 +1786,7 @@ impl<C: Catalog> Materializer<C> {
                     op: Op::Insert,
                     row,
                     unchanged_cols: Vec::new(),
+                    unchanged_from: None,
                 }
             })
             .collect();
@@ -1896,6 +1901,7 @@ fn expand_truncates(
                 commit_ts: evt.commit_ts,
                 xid: evt.xid,
                 unchanged_cols: Vec::new(),
+                moved_from: None,
                 row,
             });
         }
@@ -1907,14 +1913,17 @@ fn expand_truncates(
 fn collect_toast_paths(
     rows: &[MaterializedRow],
     file_index: &FileIndex,
-    _pk_cols: &[ColumnName],
+    pk_cols: &[ColumnName],
 ) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for r in rows {
         if r.unchanged_cols.is_empty() {
             continue;
         }
-        let key = PkKey::from_row(&r.row, _pk_cols);
+        let key = r
+            .unchanged_from
+            .clone()
+            .unwrap_or_else(|| PkKey::from_row(&r.row, pk_cols));
         if let Some(p) = file_index.lookup(&key) {
             paths.insert(p.to_string());
         }
