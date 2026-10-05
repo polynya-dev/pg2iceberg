@@ -14,6 +14,7 @@
 
 pub mod materializer;
 pub mod pipeline;
+pub mod relation_event;
 pub mod runner;
 pub mod sink;
 

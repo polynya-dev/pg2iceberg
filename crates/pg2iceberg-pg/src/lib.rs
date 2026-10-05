@@ -125,12 +125,11 @@ pub enum DecodedMessage {
         commit_lsn: Lsn,
         xid: u32,
     },
-    /// Schema for a relation. Sent before any change events for that
-    /// relation, and re-sent after `ALTER TABLE` invalidates PG's
-    /// cache. The lifecycle compares incoming columns against the
-    /// materializer's registered schema; differences become
-    /// `SchemaChange::AddColumn` / `DropColumn` and trigger
-    /// `Catalog::evolve_schema`.
+    /// Schema for a relation. Sent before the first change to it in a
+    /// session or after its cache entry is invalidated (`ALTER TABLE`,
+    /// `TRUNCATE`, …). The pipeline stages a changed one in the log, in
+    /// order with the rows; the materializer applies it there
+    /// (`Catalog::evolve_schema`).
     Relation {
         ident: TableIdent,
         columns: Vec<RelationColumn>,

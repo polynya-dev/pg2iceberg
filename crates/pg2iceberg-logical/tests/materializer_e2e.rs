@@ -290,9 +290,10 @@ fn flushed_lsn_and_cursor_advance_independently_but_correctly() {
 
     run_materializer(&mut h);
 
-    // Cursor now points past the only log entry.
+    // Cursor now points past the only log entry: the table's columns
+    // and the row.
     let cur_after = block_on(h.coord.get_cursor("default", &ident())).unwrap();
-    assert_eq!(cur_after, Some(1));
+    assert_eq!(cur_after, Some(2));
 }
 
 #[test]

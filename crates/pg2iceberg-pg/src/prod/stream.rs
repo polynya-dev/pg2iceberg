@@ -286,7 +286,7 @@ impl ReaderState {
                     // pgoutput doesn't carry nullability; we stamp
                     // nullable=true on every non-PK column. PG only
                     // permits adding non-nullable columns with a
-                    // DEFAULT, and for that case `apply_relation`
+                    // DEFAULT, and for that case the materializer
                     // would still see a nullable add (which Iceberg
                     // tolerates).
                     let ty = pg2iceberg_core::map_pg_to_iceberg(pg_type)

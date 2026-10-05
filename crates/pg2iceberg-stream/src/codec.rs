@@ -84,9 +84,10 @@ fn op_to_str(op: Op) -> Option<&'static str> {
         // current FileIndex. Without staging, a TRUNCATE in PG would
         // silently leave Iceberg with the pre-truncate rows.
         Op::Truncate => Some("T"),
-        // Begin/Commit/Relation are control events consumed by the
-        // pipeline before reaching the writer.
-        Op::Relation => None,
+        // A source schema change, staged in order with the rows so the
+        // materializer applies it between the rows written before and
+        // after it. `_data` carries the table's columns.
+        Op::Relation => Some("R"),
     }
 }
 
@@ -96,18 +97,19 @@ fn op_from_str(s: &str) -> Option<Op> {
         "U" => Some(Op::Update),
         "D" => Some(Op::Delete),
         "T" => Some(Op::Truncate),
+        "R" => Some(Op::Relation),
         _ => None,
     }
 }
 
-/// Pick the row that gets staged for a given event: `after` for insert/update,
-/// `before` for delete. Returns `None` for non-DML ops, which the caller
-/// should filter before calling.
+/// Pick the row that gets staged for a given event: `after` for
+/// insert/update (and a relation's column list), `before` for delete.
+/// `None` for a truncate, which carries no row.
 fn staged_row(evt: &ChangeEvent) -> Option<&Row> {
     match evt.op {
-        Op::Insert | Op::Update => evt.after.as_ref(),
+        Op::Insert | Op::Update | Op::Relation => evt.after.as_ref(),
         Op::Delete => evt.before.as_ref(),
-        Op::Relation | Op::Truncate => None,
+        Op::Truncate => None,
     }
 }
 
@@ -206,7 +208,10 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedChunk {
     pub bytes: Bytes,
+    /// Records staged — every event, so log offsets count them all.
     pub record_count: u64,
+    /// Row changes among them (records less schema events).
+    pub row_count: u64,
     pub max_lsn: Lsn,
 }
 
@@ -219,6 +224,10 @@ pub fn encode_chunk(events: &[ChangeEvent]) -> Result<EncodedChunk> {
         .max()
         .unwrap_or(Lsn::ZERO);
     let record_count = batch.num_rows() as u64;
+    let row_count = events
+        .iter()
+        .filter(|e| op_to_str(e.op).is_some() && e.op != Op::Relation)
+        .count() as u64;
 
     let mut buf = Vec::<u8>::new();
     let props = WriterProperties::builder().build();
@@ -236,6 +245,7 @@ pub fn encode_chunk(events: &[ChangeEvent]) -> Result<EncodedChunk> {
     Ok(EncodedChunk {
         bytes: Bytes::from(buf),
         record_count,
+        row_count,
         max_lsn,
     })
 }
@@ -462,32 +472,29 @@ mod tests {
     }
 
     #[test]
-    fn non_dml_events_are_skipped() {
-        let evts = vec![
-            ChangeEvent {
-                table: ident(),
-                op: Op::Relation,
-                lsn: Lsn(1),
-                commit_ts: Timestamp(0),
-                xid: None,
-                before: None,
-                after: None,
-                unchanged_cols: vec![],
-            },
-            ChangeEvent {
-                table: ident(),
-                op: Op::Insert,
-                lsn: Lsn(2),
-                commit_ts: Timestamp(0),
-                xid: None,
-                before: None,
-                after: Some(row(&[("id", PgValue::Int4(1))])),
-                unchanged_cols: vec![],
-            },
-        ];
-        let chunk = encode_chunk(&evts).unwrap();
-        assert_eq!(chunk.record_count, 1);
-        assert_eq!(chunk.max_lsn, Lsn(2));
+    fn relation_events_round_trip_in_order_with_rows() {
+        let relation = ChangeEvent {
+            table: ident(),
+            op: Op::Relation,
+            lsn: Lsn(1),
+            commit_ts: Timestamp(0),
+            xid: Some(7),
+            before: None,
+            after: Some(row(&[("columns", PgValue::Json("[]".into()))])),
+            unchanged_cols: vec![],
+        };
+        let insert = ChangeEvent {
+            op: Op::Insert,
+            lsn: Lsn(2),
+            after: Some(row(&[("id", PgValue::Int4(1))])),
+            ..relation.clone()
+        };
+        let chunk = encode_chunk(&[relation.clone(), insert]).unwrap();
+        assert_eq!(chunk.record_count, 2);
+        let decoded = decode_chunk(&chunk.bytes).unwrap();
+        assert_eq!(decoded[0].op, Op::Relation);
+        assert_eq!(Some(&decoded[0].row), relation.after.as_ref());
+        assert_eq!(decoded[1].op, Op::Insert);
     }
 
     fn update(id: i32, before: Option<Row>) -> ChangeEvent {

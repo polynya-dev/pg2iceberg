@@ -141,12 +141,13 @@ fn flushed_lsn_covers_the_commit_after_single_tx() {
     assert_eq!(advanced, Some(wal_end));
     assert_eq!(h.pipeline.flushed_lsn(), wal_end);
 
-    // Coord state: one log_index row for "orders" at offset [0, 1).
+    // Coord state: one log_index row for "orders" at offset [0, 2): the
+    // table's columns (the session's first Relation message), then the row.
     let entries = block_on(h.coord.read_log(&ident("orders"), 0, 100)).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].start_offset, 0);
-    assert_eq!(entries[0].end_offset, 1);
-    assert_eq!(entries[0].record_count, 1);
+    assert_eq!(entries[0].end_offset, 2);
+    assert_eq!(entries[0].record_count, 2);
 
     // Blob store has the staged file; it round-trips via the codec.
     let paths = h.blob_store.paths();
@@ -154,9 +155,10 @@ fn flushed_lsn_covers_the_commit_after_single_tx() {
     assert_eq!(entries[0].s3_path, paths[0]);
     let bytes = block_on(h.blob_store.get(&paths[0])).unwrap();
     let mat = decode_chunk(&bytes).unwrap();
-    assert_eq!(mat.len(), 1);
-    assert_eq!(mat[0].op, Op::Insert);
-    assert_eq!(mat[0].lsn, change_lsn_before_commit(commit_lsn));
+    assert_eq!(mat.len(), 2);
+    assert_eq!(mat[0].op, Op::Relation);
+    assert_eq!(mat[1].op, Op::Insert);
+    assert_eq!(mat[1].lsn, change_lsn_before_commit(commit_lsn));
 }
 
 /// In a single-row tx the WAL is `Begin / Insert / Commit` with consecutive
@@ -187,10 +189,10 @@ fn flushed_lsn_advances_to_max_across_multiple_txns() {
     assert_eq!(advanced, Some(wal_end));
     assert_eq!(h.pipeline.flushed_lsn(), wal_end);
 
-    // One chunk covers all three rows: [0, 3).
+    // One chunk covers the table's columns and all three rows: [0, 4).
     let entries = block_on(h.coord.read_log(&ident("orders"), 0, 100)).unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!((entries[0].start_offset, entries[0].end_offset), (0, 3));
+    assert_eq!((entries[0].start_offset, entries[0].end_offset), (0, 4));
 }
 
 #[test]
@@ -263,9 +265,11 @@ fn second_flush_after_more_txns_appends_offsets_contiguously() {
     block_on(h.pipeline.flush()).unwrap();
 
     let entries = block_on(h.coord.read_log(&ident("orders"), 0, 100)).unwrap();
+    // The first holds the table's columns too; the second needs none
+    // (unchanged).
     assert_eq!(entries.len(), 2);
-    assert_eq!((entries[0].start_offset, entries[0].end_offset), (0, 1));
-    assert_eq!((entries[1].start_offset, entries[1].end_offset), (1, 3));
+    assert_eq!((entries[0].start_offset, entries[0].end_offset), (0, 2));
+    assert_eq!((entries[1].start_offset, entries[1].end_offset), (2, 4));
     assert!(h.pipeline.flushed_lsn() > last);
 }
 

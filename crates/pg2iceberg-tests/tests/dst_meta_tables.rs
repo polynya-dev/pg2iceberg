@@ -34,7 +34,6 @@ use pg2iceberg_iceberg::meta::{
 use pg2iceberg_iceberg::{read_data_file, Catalog};
 use pg2iceberg_logical::materializer::{CounterMaterializerNamer, Materializer};
 use pg2iceberg_logical::pipeline::{CounterBlobNamer, Pipeline};
-use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
@@ -143,9 +142,6 @@ impl Harness {
 
     fn drive_then_materialize(&mut self) {
         while let Some(msg) = self.stream.recv() {
-            if let DecodedMessage::Relation { ident, columns } = &msg {
-                block_on(self.materializer.apply_relation(ident, columns)).unwrap();
-            }
             block_on(self.pipeline.process(msg)).unwrap();
         }
         block_on(self.pipeline.flush()).unwrap();
