@@ -7,6 +7,7 @@
 
 use crate::file_index::FileIndex;
 use crate::fold::{pk_key, MaterializedRow};
+use crate::pk::PkKey;
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder,
     Float32Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
@@ -97,7 +98,7 @@ pub struct PreparedChunk {
     /// PKs of the rows in this chunk. The materializer feeds these into
     /// `FileIndex` (data chunks) or uses them as the "deleted PKs" set
     /// (equality-delete chunks).
-    pub pk_keys: Vec<String>,
+    pub pk_keys: Vec<PkKey>,
 }
 
 #[derive(Debug)]
@@ -235,7 +236,7 @@ impl TableWriter {
             let chunk = write_chunk(arrow_schema, cols, &row_refs)?;
             let pk_keys = rows
                 .iter()
-                .map(|r| pk_key(&r.row, &self.pk_col_names))
+                .map(|r| PkKey::from_row(&r.row, &self.pk_col_names))
                 .collect();
             return Ok(vec![PreparedChunk {
                 partition_values: Vec::new(),
@@ -266,7 +267,7 @@ impl TableWriter {
             let chunk = write_chunk(arrow_schema, cols, &row_refs)?;
             let pk_keys = group_rows
                 .iter()
-                .map(|r| pk_key(&r.row, &self.pk_col_names))
+                .map(|r| PkKey::from_row(&r.row, &self.pk_col_names))
                 .collect();
             out.push(PreparedChunk {
                 partition_values,
@@ -362,8 +363,8 @@ impl TableWriter {
 
         // Tier 2: FileIndex resolves Delete to its prior data file's
         // partition tuple.
-        let key_str = pk_key(&r.row, &self.pk_col_names);
-        if let Some(values) = file_index.partition_values_for_pk(&key_str) {
+        let key = PkKey::from_row(&r.row, &self.pk_col_names);
+        if let Some(values) = file_index.partition_values_for_pk(&key) {
             if values.len() == self.schema.partition_spec.len() {
                 return Ok(values.to_vec());
             }
@@ -374,7 +375,9 @@ impl TableWriter {
         // Tier 3: nowhere left to look. Error rather than silently drop —
         // a dropped delete is a correctness bug that's invisible in normal
         // operation (Go's behavior); we'd rather fail loudly.
-        Err(WriterError::DeletePartitionUnresolved { pk_key: key_str })
+        Err(WriterError::DeletePartitionUnresolved {
+            pk_key: pk_key(&r.row, &self.pk_col_names),
+        })
     }
 }
 
@@ -1437,7 +1440,7 @@ mod tests {
         let w = TableWriter::new(schema_partitioned_by_region());
         let mut fi = FileIndex::new();
         // Pretend a prior cycle wrote PK=1 into the "us" partition.
-        let pk = pk_key(&pk_only(1), &[col("id")]);
+        let pk = PkKey::from_row(&pk_only(1), &[col("id")]);
         fi.add_file(
             "data/region=us/abc.parquet".into(),
             vec![pk],
@@ -1536,7 +1539,7 @@ mod tests {
                 &FileIndex::new(),
             )
             .unwrap();
-        let mut by_region: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut by_region: BTreeMap<String, Vec<PkKey>> = BTreeMap::new();
         for chunk in &p.data {
             if let PartitionLiteral::String(r) = &chunk.partition_values[0] {
                 by_region.insert(r.clone(), chunk.pk_keys.clone());
@@ -1545,7 +1548,10 @@ mod tests {
         assert_eq!(by_region.get("us").unwrap().len(), 1);
         assert_eq!(by_region.get("eu").unwrap().len(), 1);
         // PK keys carry only the PK columns (id), not partition value.
-        assert!(by_region.get("us").unwrap()[0].contains("1"));
+        assert_eq!(
+            by_region.get("us").unwrap()[0],
+            PkKey::from_row(&pk_only(1), &[col("id")])
+        );
     }
 
     #[test]

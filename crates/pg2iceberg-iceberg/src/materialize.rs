@@ -7,7 +7,8 @@
 //! [`resolve_unchanged_cols`].
 
 use crate::file_index::FileIndex;
-use crate::fold::{pk_key, MaterializedRow};
+use crate::fold::MaterializedRow;
+use crate::pk::PkKey;
 use crate::writer::WriterError;
 use pg2iceberg_core::{ColumnName, Op, Row};
 use std::collections::BTreeMap;
@@ -30,7 +31,7 @@ pub fn promote_re_inserts(
 ) {
     for r in rows {
         if r.op == Op::Insert {
-            let key = pk_key(&r.row, pk_cols);
+            let key = PkKey::from_row(&r.row, pk_cols);
             if file_index.contains_pk(&key) {
                 r.op = Op::Update;
             }
@@ -63,7 +64,7 @@ pub fn resolve_unchanged_cols(
         if r.unchanged_cols.is_empty() {
             continue;
         }
-        let key = pk_key(&r.row, pk_cols);
+        let key = PkKey::from_row(&r.row, pk_cols);
         let path = file_index.lookup(&key).ok_or_else(|| {
             WriterError::Encode(format!(
                 "TOAST resolution failed: PK {key} is not in any indexed data file"
@@ -76,7 +77,7 @@ pub fn resolve_unchanged_cols(
         })?;
         let prior = priors
             .iter()
-            .find(|p| pk_key(p, pk_cols) == key)
+            .find(|p| PkKey::from_row(p, pk_cols) == key)
             .ok_or_else(|| {
                 WriterError::Encode(format!(
                     "TOAST resolution failed: PK {key} expected in file {path} but not found"
@@ -128,7 +129,7 @@ mod tests {
     fn insert_with_pk_in_index_becomes_update() {
         let mut fi = FileIndex::new();
         let pk_cols = vec![c("id")];
-        let key = pk_key(&row(1, 0), &pk_cols);
+        let key = PkKey::from_row(&row(1, 0), &pk_cols);
         fi.add_file("p0".into(), vec![key], Vec::new());
 
         let mut rows = vec![mat(Op::Insert, row(1, 99), vec![])];
@@ -149,7 +150,7 @@ mod tests {
     fn update_and_delete_are_left_alone() {
         let mut fi = FileIndex::new();
         let pk_cols = vec![c("id")];
-        let key = pk_key(&row(1, 0), &pk_cols);
+        let key = PkKey::from_row(&row(1, 0), &pk_cols);
         fi.add_file("p0".into(), vec![key], Vec::new());
 
         let mut rows = vec![
@@ -167,7 +168,7 @@ mod tests {
     fn unchanged_col_filled_from_prior_data_file() {
         let pk_cols = vec![c("id")];
         let mut fi = FileIndex::new();
-        let key = pk_key(&row(1, 0), &pk_cols);
+        let key = PkKey::from_row(&row(1, 0), &pk_cols);
         fi.add_file("p0".into(), vec![key], Vec::new());
 
         // Prior row had qty=42; the staged update marks `qty` as unchanged
@@ -209,7 +210,7 @@ mod tests {
     fn file_not_prefetched_errors() {
         let pk_cols = vec![c("id")];
         let mut fi = FileIndex::new();
-        let key = pk_key(&row(1, 0), &pk_cols);
+        let key = PkKey::from_row(&row(1, 0), &pk_cols);
         fi.add_file("p0".into(), vec![key], Vec::new());
         // prior_rows_by_path is empty — caller forgot to fetch p0.
         let prior = BTreeMap::new();

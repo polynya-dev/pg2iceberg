@@ -9,6 +9,7 @@ pub mod fold;
 pub mod materialize;
 pub mod meta;
 pub mod orphan;
+pub mod pk;
 #[cfg(feature = "prod")]
 pub mod prod;
 pub mod reader;
@@ -22,6 +23,7 @@ pub use file_index::{rebuild_from_catalog, FileIndex};
 pub use fold::{fold_events, pk_key, MaterializedRow};
 pub use materialize::{promote_re_inserts, resolve_unchanged_cols};
 pub use orphan::{cleanup_orphans, CleanupError, CleanupOutcome};
+pub use pk::PkKey;
 pub use reader::read_data_file;
 pub use verify::read_materialized_state;
 pub use writer::{DataChunk, PreparedChunk, PreparedFiles, TableWriter, WriterError};

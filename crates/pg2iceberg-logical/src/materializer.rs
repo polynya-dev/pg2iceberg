@@ -37,8 +37,8 @@ use pg2iceberg_iceberg::meta::{
 };
 use pg2iceberg_iceberg::{
     fold_events, promote_re_inserts, read_data_file, rebuild_from_catalog, resolve_unchanged_cols,
-    Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PreparedCommit, TableWriter,
-    WriterError,
+    Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PkKey, PreparedCommit,
+    TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -1359,23 +1359,22 @@ impl<C: Catalog> Materializer<C> {
         .await
         .map_err(|e| MaterializerError::Compact(e.to_string()))?;
 
-        // If we actually rewrote anything, rebuild FileIndex from the
-        // new catalog state. Stale entries pointing at compacted-away
-        // files would route deletes incorrectly.
         if let Some(o) = &outcome {
             // Remap what the pass rewrote rather than rebuilding FileIndex
             // from catalog history, which would re-read the whole table
             // (and briefly hold a second full index) on every pass.
+            // Outputs first: they take over every live PK of the inputs,
+            // so removing the inputs then has nothing left to scan for.
             let entry_mut = self.tables.get_mut(ident).expect("checked above");
-            for path in &o.rewritten_files {
-                entry_mut.file_index.remove_file(path);
-            }
             for f in &o.added_files {
                 entry_mut.file_index.add_file(
                     f.path.clone(),
                     f.pk_keys.clone(),
                     f.partition_values.clone(),
                 );
+            }
+            for path in &o.rewritten_files {
+                entry_mut.file_index.remove_file(path);
             }
 
             // Record + flush a meta `compactions` row. Best-effort:
@@ -1522,7 +1521,7 @@ impl<C: Catalog> Materializer<C> {
         // Iceberg we model that as one equality-delete per known PK so the
         // next snapshot's MoR reads return zero rows. Subsequent same-tx
         // INSERTs survive the fold's last-write-wins on the same PK.
-        let events = expand_truncates(events, &entry.file_index, &entry.pk_cols);
+        let events = expand_truncates(events, &entry.file_index, &entry.schema);
 
         // Fold + TOAST + re-insert. Pre-fetch any prior data files needed
         // for TOAST resolution; that's cheap when no UPDATE has unchanged_cols.
@@ -1552,9 +1551,9 @@ impl<C: Catalog> Materializer<C> {
         // Track per-data-file which PKs ended up where, so the FileIndex
         // update below points at the right partition file.
         let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared_files.data.len());
-        let mut data_pk_groups: Vec<(String, Vec<String>, Vec<pg2iceberg_core::PartitionLiteral>)> =
+        let mut data_pk_groups: Vec<(String, Vec<PkKey>, Vec<pg2iceberg_core::PartitionLiteral>)> =
             Vec::with_capacity(prepared_files.data.len());
-        let mut deleted_pks: Vec<String> = Vec::new();
+        let mut deleted_pks: Vec<PkKey> = Vec::new();
 
         for chunk in prepared_files.data {
             let segment =
@@ -1856,7 +1855,7 @@ fn now_micros() -> i64 {
 fn expand_truncates(
     events: Vec<MatEvent>,
     file_index: &FileIndex,
-    pk_cols: &[ColumnName],
+    schema: &TableSchema,
 ) -> Vec<MatEvent> {
     if !events.iter().any(|e| e.op == Op::Truncate) {
         return events;
@@ -1867,22 +1866,16 @@ fn expand_truncates(
             out.push(evt);
             continue;
         }
-        // Decode each PK key (a JSON array of PgValues) back into a
-        // PK-only Row keyed by the schema's PK columns. Bad keys
-        // (shouldn't happen — FileIndex stores what `pk_key` produces)
-        // are skipped rather than crashing the cycle.
-        for pk_key_str in file_index.all_pks() {
-            let values: Vec<pg2iceberg_core::PgValue> = match serde_json::from_str(pk_key_str) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if values.len() != pk_cols.len() {
+        // Decode each PK key back into a PK-only Row, over the PK
+        // columns in the order every key was built from (`pk_cols`).
+        // Keys that don't fit (shouldn't happen — FileIndex stores what
+        // `PkKey::from_row` produces) are skipped rather than crashing
+        // the cycle.
+        let pk_schema: Vec<ColumnSchema> = schema.primary_key_columns().cloned().collect();
+        for pk in file_index.all_pks() {
+            let Some(row) = pk.to_row(&pk_schema) else {
                 continue;
-            }
-            let mut row = Row::new();
-            for (col, val) in pk_cols.iter().zip(values) {
-                row.insert(col.clone(), val);
-            }
+            };
             out.push(MatEvent {
                 op: Op::Delete,
                 lsn: evt.lsn,
@@ -1907,7 +1900,7 @@ fn collect_toast_paths(
         if r.unchanged_cols.is_empty() {
             continue;
         }
-        let key = pg2iceberg_iceberg::pk_key(&r.row, _pk_cols);
+        let key = PkKey::from_row(&r.row, _pk_cols);
         if let Some(p) = file_index.lookup(&key) {
             paths.insert(p.to_string());
         }
