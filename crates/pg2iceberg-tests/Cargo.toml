@@ -31,6 +31,9 @@ testcontainers-modules = { version = "0.15", optional = true, features = ["postg
 testcontainers = { version = "0.27", optional = true }
 tokio-postgres = { version = "0.7", optional = true, default-features = false, features = ["runtime"] }
 object_store = { version = "0.11", optional = true, default-features = false, features = ["aws"] }
+# The DST's production backend reads a table's manifests directly, as
+# ground truth independent of pg2iceberg's own `snapshots()`.
+iceberg = { version = "0.9", optional = true }
 async-trait = { workspace = true, optional = true }
 anyhow = { version = "1", optional = true }
 uuid = { version = "1", optional = true, features = ["v4"] }
@@ -82,6 +85,7 @@ integration = [
     "dep:testcontainers",
     "dep:tokio-postgres",
     "dep:object_store",
+    "dep:iceberg",
     "dep:async-trait",
     "dep:anyhow",
     "dep:uuid",

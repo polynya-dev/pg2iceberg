@@ -19,7 +19,10 @@
 //! shows we need any of them, add behind a feature, not by rewriting the
 //! happy path.
 
+use crate::pgoutput::{self, OldTuple, RelationCol, ReplicaIdentity, TupleValue};
 use async_trait::async_trait;
+use bytes::Bytes;
+use pg2iceberg_core::typemap::PgType;
 use pg2iceberg_core::{
     ChangeEvent, ColumnName, ColumnSchema, Lsn, Op, PgValue, Row, TableIdent, TableSchema,
     Timestamp,
@@ -28,7 +31,7 @@ use pg2iceberg_pg::{
     DecodedMessage, PgClient, PgError, ReplicationStream, SlotMonitor, SnapshotId,
 };
 use pg2iceberg_snapshot::{SnapshotError, SnapshotSource};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -69,6 +72,44 @@ struct TableData {
     /// [`SimPostgres::table_oid`] so DST can model `DROP TABLE` +
     /// recreate (which yields a fresh oid).
     pg_oid: u32,
+    /// `REPLICA IDENTITY`: what an UPDATE's or DELETE's old row carries.
+    /// `Full` unless a test sets it, so a change always carries the
+    /// whole old row by default.
+    replica_identity: ReplicaIdentity,
+    /// Postgres types of columns that don't have the default type for
+    /// their Iceberg type ([`pgoutput::default_pg_type`]).
+    pg_types: BTreeMap<String, PgType>,
+}
+
+impl TableData {
+    /// `evt` as a walsender sends it given the table's replica identity:
+    /// under `Default`, a DELETE's old row and a key-changing UPDATE's
+    /// carry only the key (other columns `NULL`), and any other UPDATE
+    /// carries none.
+    fn shape_old_row(&self, mut evt: ChangeEvent) -> ChangeEvent {
+        if self.replica_identity == ReplicaIdentity::Full {
+            return evt;
+        }
+        let key_only = |row: &Row| -> Row {
+            row.iter()
+                .map(|(c, v)| {
+                    let key = self
+                        .schema
+                        .columns
+                        .iter()
+                        .any(|s| s.name == c.0 && s.is_primary_key);
+                    (c.clone(), if key { v.clone() } else { PgValue::Null })
+                })
+                .collect()
+        };
+        evt.before = match (evt.op, evt.before.as_ref(), evt.after.as_ref()) {
+            (Op::Delete, Some(b), _) => Some(key_only(b)),
+            (Op::Update, Some(b), Some(a)) if key_only(b) != key_only(a) => Some(key_only(b)),
+            (Op::Update, _, _) => None,
+            _ => evt.before,
+        };
+        evt
+    }
 }
 
 impl TableData {
@@ -224,6 +265,122 @@ pub struct SimPostgres {
     state: Arc<Mutex<DbState>>,
 }
 
+/// A table's relation as a walsender describes it at some WAL position.
+struct WireRelation {
+    rel_id: u32,
+    namespace: String,
+    name: String,
+    identity: ReplicaIdentity,
+    cols: Vec<RelationCol>,
+}
+
+impl WireRelation {
+    fn message(&self) -> Bytes {
+        pgoutput::relation(
+            self.rel_id,
+            &self.namespace,
+            &self.name,
+            self.identity,
+            &self.cols,
+        )
+    }
+
+    fn tuple(&self, row: &Row, unchanged: &[ColumnName]) -> Vec<TupleValue> {
+        self.cols
+            .iter()
+            .map(|c| {
+                let name = ColumnName(c.name.clone());
+                if unchanged.contains(&name) {
+                    return TupleValue::Unchanged;
+                }
+                match row.get(&name).and_then(pgoutput::pg_text) {
+                    Some(text) => TupleValue::Text(text),
+                    None => TupleValue::Null,
+                }
+            })
+            .collect()
+    }
+
+    /// `old`, as the old-tuple kind the table's replica identity sends.
+    fn old<'a>(&self, old: &'a [TupleValue]) -> OldTuple<'a> {
+        match self.identity {
+            ReplicaIdentity::Full => OldTuple::Full(old),
+            ReplicaIdentity::Default => OldTuple::Key(old),
+        }
+    }
+
+    /// `evt`, whose old row is already shaped by replica identity.
+    fn change(&self, evt: &ChangeEvent) -> Bytes {
+        let row = |r: &Option<Row>| r.clone().unwrap_or_default();
+        match evt.op {
+            Op::Insert => pgoutput::insert(self.rel_id, &self.tuple(&row(&evt.after), &[])),
+            Op::Update => {
+                let new = self.tuple(&row(&evt.after), &evt.unchanged_cols);
+                let old = evt.before.as_ref().map(|b| self.tuple(b, &[]));
+                pgoutput::update(self.rel_id, old.as_deref().map(|t| self.old(t)), &new)
+            }
+            Op::Delete => {
+                let old = self.tuple(&row(&evt.before), &[]);
+                pgoutput::delete(self.rel_id, self.old(&old))
+            }
+            Op::Truncate => pgoutput::truncate(&[self.rel_id]),
+            // Schema changes travel as WAL Relation records, not changes.
+            Op::Relation => self.message(),
+        }
+    }
+}
+
+impl DbState {
+    /// The commit LSN and timestamp of transaction `xid`, whose WAL
+    /// starts at or after `from`.
+    fn commit_of(&self, xid: u32, from: Lsn) -> (Lsn, Timestamp) {
+        let tx = self
+            .wal
+            .iter()
+            .filter(|e| e.lsn >= from && e.xid == Some(xid));
+        let ts = tx
+            .clone()
+            .find_map(|e| match &e.kind {
+                WalKind::Change(c) => Some(c.commit_ts),
+                _ => None,
+            })
+            .unwrap_or(Timestamp(0));
+        let commit = tx
+            .clone()
+            .find(|e| matches!(e.kind, WalKind::Commit))
+            .map_or(from, |e| e.lsn);
+        (commit, ts)
+    }
+
+    /// `ident`'s relation as of WAL position `at`: its columns from the
+    /// latest Relation record at or before `at`.
+    fn relation(&self, ident: &TableIdent, at: Lsn) -> Option<WireRelation> {
+        let t = self.tables.get(ident)?;
+        let columns = self.wal.iter().rev().find_map(|e| match &e.kind {
+            WalKind::Relation { ident: i, columns } if i == ident && e.lsn <= at => Some(columns),
+            _ => None,
+        })?;
+        Some(WireRelation {
+            rel_id: t.pg_oid,
+            namespace: ident.namespace.0.join("."),
+            name: ident.name.clone(),
+            identity: t.replica_identity,
+            cols: columns
+                .iter()
+                .map(|c| RelationCol {
+                    name: c.name.clone(),
+                    key: c.is_primary_key,
+                    pg_type: t
+                        .pg_types
+                        .get(&c.name)
+                        .copied()
+                        .unwrap_or_else(|| pgoutput::default_pg_type(c.ty)),
+                })
+                .collect(),
+        })
+    }
+}
+
 impl SimPostgres {
     pub fn new() -> Self {
         Self::default()
@@ -248,6 +405,8 @@ impl SimPostgres {
                 schema,
                 rows: BTreeMap::new(),
                 pg_oid,
+                replica_identity: ReplicaIdentity::Full,
+                pg_types: BTreeMap::new(),
             },
         );
         let lsn = s.alloc_lsn();
@@ -379,6 +538,8 @@ impl SimPostgres {
                 schema,
                 rows: BTreeMap::new(),
                 pg_oid,
+                replica_identity: ReplicaIdentity::Full,
+                pg_types: BTreeMap::new(),
             },
         );
         Ok(())
@@ -387,6 +548,21 @@ impl SimPostgres {
     /// Test hook: peek at a table's current oid. Real PG users get
     /// this from `pg_class.oid`; the sim mirrors it via
     /// [`SimPgClient::table_oid`].
+    /// `ALTER TABLE … REPLICA IDENTITY`.
+    pub fn set_replica_identity(&self, ident: &TableIdent, identity: ReplicaIdentity) {
+        if let Some(t) = self.state.lock().unwrap().tables.get_mut(ident) {
+            t.replica_identity = identity;
+        }
+    }
+
+    /// Declare `column`'s Postgres type, where it isn't the default for
+    /// its Iceberg type (e.g. `smallint` for an Iceberg `int`).
+    pub fn set_pg_type(&self, ident: &TableIdent, column: &str, ty: PgType) {
+        if let Some(t) = self.state.lock().unwrap().tables.get_mut(ident) {
+            t.pg_types.insert(column.to_string(), ty);
+        }
+    }
+
     pub fn table_oid(&self, ident: &TableIdent) -> Option<u32> {
         self.state
             .lock()
@@ -562,6 +738,25 @@ impl SimPostgres {
     /// Test-only: returns every committed change event for tables in the
     /// given publication, ordered by LSN. Used by DST invariant checks to
     /// compare the WAL "ground truth" against staged Parquet contents.
+    /// [`Self::dump_change_events`] as a walsender sends them: old rows
+    /// shaped by each table's replica identity.
+    pub fn dump_change_events_as_sent(&self, publication: &str) -> Result<Vec<ChangeEvent>> {
+        let events = self.dump_change_events(publication)?;
+        let s = self.state.lock().unwrap();
+        Ok(events
+            .into_iter()
+            .map(|e| match s.tables.get(&e.table) {
+                Some(t) => t.shape_old_row(e),
+                None => e,
+            })
+            .collect())
+    }
+
+    /// The LSN of transaction `xid`'s commit record.
+    pub fn commit_lsn(&self, xid: u32) -> Lsn {
+        self.state.lock().unwrap().commit_of(xid, Lsn::ZERO).0
+    }
+
     pub fn dump_change_events(&self, publication: &str) -> Result<Vec<ChangeEvent>> {
         let s = self.state.lock().unwrap();
         let pub_tables = &s
@@ -595,6 +790,8 @@ impl SimPostgres {
             publication: slot_state.publication,
             cursor_lsn: slot_state.restart_lsn,
             keepalive_sent: Lsn::ZERO,
+            wire_queue: VecDeque::new(),
+            relations_sent: BTreeSet::new(),
         })
     }
 }
@@ -640,6 +837,23 @@ enum TxOp {
     },
 }
 
+/// An UPDATE's `new_row` as the table stores it and as pgoutput sends
+/// it, given the TOASTed columns it leaves `unchanged`: the table keeps
+/// their `old` values; the WAL carries `NULL` in their place (the
+/// unchanged marker decodes to `NULL` plus an `unchanged_cols` entry).
+fn toast(new_row: Row, old: Option<&Row>, unchanged: &[ColumnName]) -> (Row, Row) {
+    let mut stored = new_row.clone();
+    let mut sent = new_row;
+    for col in unchanged {
+        match old.and_then(|o| o.get(col)) {
+            Some(v) => stored.insert(col.clone(), v.clone()),
+            None => stored.remove(col),
+        };
+        sent.insert(col.clone(), PgValue::Null);
+    }
+    (stored, sent)
+}
+
 impl TxHandle {
     pub fn xid(&self) -> u32 {
         self.xid
@@ -662,6 +876,10 @@ impl TxHandle {
         self
     }
 
+    /// `UPDATE` that leaves TOASTed columns `unchanged`, as pgoutput
+    /// reports it: the table keeps their old values (whatever `new_row`
+    /// holds for them is ignored), and the WAL row carries `NULL` plus an
+    /// `unchanged_cols` marker in their place.
     pub fn update_with_unchanged(
         &mut self,
         table: &TableIdent,
@@ -694,11 +912,24 @@ impl TxHandle {
         before_row: Row,
         new_row: Row,
     ) -> &mut Self {
+        self.update_with_pk_change_unchanged(table, before_row, new_row, Vec::new())
+    }
+
+    /// [`Self::update_with_pk_change`] that leaves TOASTed columns
+    /// `unchanged`: pgoutput still sends them as unchanged markers when
+    /// the key moves (see [`Self::update_with_unchanged`]).
+    pub fn update_with_pk_change_unchanged(
+        &mut self,
+        table: &TableIdent,
+        before_row: Row,
+        new_row: Row,
+        unchanged: Vec<ColumnName>,
+    ) -> &mut Self {
         self.ops.push(TxOp::UpdatePkChange {
             table: table.clone(),
             before_row,
             new_row,
-            unchanged_cols: Vec::new(),
+            unchanged_cols: unchanged,
         });
         self
     }
@@ -827,7 +1058,8 @@ impl TxHandle {
                     let t = s.tables.get_mut(&table).expect("validated above");
                     let key = t.pk_key(&new_row)?;
                     let before = t.rows.get(&key).cloned();
-                    t.rows.insert(key, new_row.clone());
+                    let (stored, sent) = toast(new_row, before.as_ref(), &unchanged_cols);
+                    t.rows.insert(key, stored);
                     s.wal.push(WalEntry {
                         lsn,
                         xid: Some(self.xid),
@@ -838,7 +1070,7 @@ impl TxHandle {
                             commit_ts,
                             xid: Some(self.xid),
                             before,
-                            after: Some(new_row),
+                            after: Some(sent),
                             unchanged_cols,
                         }),
                     });
@@ -873,8 +1105,9 @@ impl TxHandle {
                     let t = s.tables.get_mut(&table).expect("validated above");
                     let old_key = t.pk_key(&before_row)?;
                     let new_key = t.pk_key(&new_row)?;
-                    t.rows.remove(&old_key);
-                    t.rows.insert(new_key, new_row.clone());
+                    let old_row = t.rows.remove(&old_key);
+                    let (stored, sent) = toast(new_row, old_row.as_ref(), &unchanged_cols);
+                    t.rows.insert(new_key, stored);
                     s.wal.push(WalEntry {
                         lsn,
                         xid: Some(self.xid),
@@ -885,7 +1118,7 @@ impl TxHandle {
                             commit_ts,
                             xid: Some(self.xid),
                             before: Some(before_row),
-                            after: Some(new_row),
+                            after: Some(sent),
                             unchanged_cols,
                         }),
                     });
@@ -961,11 +1194,72 @@ pub struct SimReplicationStream {
     /// `wal_end` of the last keepalive sent, so a caught-up stream
     /// sends one per new position instead of on every `recv`.
     keepalive_sent: Lsn,
+    /// Encoded messages [`Self::recv_wire`] still has to hand out.
+    wire_queue: VecDeque<WireMessage>,
+    /// Tables this session has sent a Relation message for.
+    relations_sent: BTreeSet<TableIdent>,
+}
+
+/// What a walsender sends: a pgoutput message (an `XLogData` payload),
+/// or a keepalive.
+#[derive(Clone, Debug)]
+pub enum WireMessage {
+    Pgoutput(Bytes),
+    Keepalive { wal_end: Lsn, reply_requested: bool },
 }
 
 impl SimReplicationStream {
     pub fn slot_name(&self) -> &str {
         &self.slot
+    }
+
+    /// [`Self::recv`], encoded as a walsender sends it: pgoutput bytes,
+    /// with a Relation message before a table's first change in the
+    /// session, values in Postgres text format, unchanged TOAST columns
+    /// as markers, old rows shaped by replica identity, and `Begin`
+    /// carrying the commit record's LSN.
+    pub fn recv_wire(&mut self) -> Option<WireMessage> {
+        if let Some(m) = self.wire_queue.pop_front() {
+            return Some(m);
+        }
+        let msg = self.recv()?;
+        let s = self.db.state.lock().unwrap();
+        let mut out: Vec<WireMessage> = Vec::new();
+        match msg {
+            DecodedMessage::Begin { final_lsn, xid } => {
+                let (commit_lsn, ts) = s.commit_of(xid, final_lsn);
+                out.push(WireMessage::Pgoutput(pgoutput::begin(commit_lsn, ts, xid)));
+            }
+            DecodedMessage::Commit { commit_lsn, xid } => {
+                let (_, ts) = s.commit_of(xid, Lsn::ZERO);
+                out.push(WireMessage::Pgoutput(pgoutput::commit(
+                    commit_lsn, commit_lsn, ts,
+                )));
+            }
+            DecodedMessage::Relation { ident, .. } => {
+                if let Some(rel) = s.relation(&ident, self.cursor_lsn) {
+                    out.push(WireMessage::Pgoutput(rel.message()));
+                    self.relations_sent.insert(ident);
+                }
+            }
+            DecodedMessage::Change(evt) => {
+                let rel = s.relation(&evt.table, evt.lsn)?;
+                if self.relations_sent.insert(evt.table.clone()) {
+                    out.push(WireMessage::Pgoutput(rel.message()));
+                }
+                out.push(WireMessage::Pgoutput(rel.change(&evt)));
+            }
+            DecodedMessage::Keepalive {
+                wal_end,
+                reply_requested,
+            } => out.push(WireMessage::Keepalive {
+                wal_end,
+                reply_requested,
+            }),
+        }
+        drop(s);
+        self.wire_queue.extend(out);
+        self.wire_queue.pop_front()
     }
 
     /// Returns the next message at or after the cursor that's allowed by the
@@ -1030,7 +1324,11 @@ impl SimReplicationStream {
                         continue;
                     }
                     self.cursor_lsn = entry.lsn;
-                    return Some(DecodedMessage::Change(evt.clone()));
+                    let evt = match s.tables.get(&evt.table) {
+                        Some(t) => t.shape_old_row(evt.clone()),
+                        None => evt.clone(),
+                    };
+                    return Some(DecodedMessage::Change(evt));
                 }
             }
         }

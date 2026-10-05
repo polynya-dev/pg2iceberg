@@ -34,14 +34,22 @@
 //!
 //! `Expire` and `CleanupOrphans` are the two halves of `maintain`.
 //! Expiry drops snapshot metadata, never table state, so PG == Iceberg
-//! is checked against [`ReaderView`] — the table a query engine sees —
-//! and invariant 12 checks that `Catalog::snapshots`, which the FileIndex
+//! is checked against the table as a query engine reads it
+//! (`pg2iceberg_sim::oracle`: the table's real live files, columns by
+//! field id, deletes scoped by partition and sequence number), and
+//! invariant 12 checks that `Catalog::snapshots`, which the FileIndex
 //! rebuild, compaction, orphan cleanup and `verify` replay, still matches
 //! it.
+//!
+//! Each case runs on the sims or — under the `integration` feature — on
+//! production's catalog and blob store (`IcebergRustCatalog` over
+//! iceberg-rust's memory catalog, `ObjectStoreBlobStore` over
+//! object_store's `InMemory`), so their translation layers are exercised
+//! too.
 
 use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
-use pg2iceberg_core::typemap::IcebergType;
+use pg2iceberg_core::typemap::{IcebergType, PgType};
 use pg2iceberg_core::{
     ColumnName, ColumnSchema, Namespace, Op, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
@@ -52,15 +60,18 @@ use pg2iceberg_iceberg::{
 use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{Materializer, Pipeline};
+use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::blob::MemoryBlobStore;
-use pg2iceberg_sim::catalog::{MemoryCatalog, ReaderView};
+use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::id::SeqIdGen;
+use pg2iceberg_sim::oracle::{engine_read, live_files_from_history, LiveFile};
+use pg2iceberg_sim::pgoutput::ReplicaIdentity;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pg2iceberg_snapshot::Snapshotter;
 use pg2iceberg_stream::codec::decode_chunk;
-use pg2iceberg_stream::BlobStore;
+use pg2iceberg_stream::{object_key, BlobStore};
 use pollster::block_on;
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -105,8 +116,27 @@ fn schema() -> TableSchema {
                 nullable: false,
                 is_primary_key: false,
             },
+            // Stands in for a TOASTed column: `ToastUpdate` and `ChangePk`
+            // leave it unchanged, so pgoutput sends a marker, not a value.
+            ColumnSchema {
+                name: "note".into(),
+                field_id: 3,
+                ty: IcebergType::String,
+                nullable: true,
+                is_primary_key: false,
+            },
         ],
-        partition_spec: Vec::new(),
+        // Partitioned by a non-key column, so an UPDATE can move a row
+        // between partitions and a DELETE's key alone doesn't name one.
+        partition_spec: if PARTITIONED.get() {
+            vec![pg2iceberg_core::partition::PartitionField {
+                source_column: "qty".into(),
+                name: "qty_trunc".into(),
+                transform: pg2iceberg_core::partition::Transform::Truncate(50),
+            }]
+        } else {
+            Vec::new()
+        },
         pg_schema: None,
     }
 }
@@ -146,7 +176,12 @@ fn row(id: i32, qty: i32) -> Row {
     let mut r = BTreeMap::new();
     r.insert(ColumnName("id".into()), id_value(id));
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
+    r.insert(note(), PgValue::Text(format!("note-{id}-{qty}")));
     r
+}
+
+fn note() -> ColumnName {
+    ColumnName("note".into())
 }
 
 /// A table outside the publication. Its WAL never reaches the
@@ -181,10 +216,20 @@ enum Step {
     Insert { id: i32, qty: i32 },
     /// `BEGIN; UPDATE id SET qty=N; COMMIT` — skipped if `id` is missing.
     Update { id: i32, qty: i32 },
+    /// `UPDATE id SET qty=N` leaving the TOASTed `note` alone, so pgoutput
+    /// sends an unchanged marker for it — skipped if `id` is missing.
+    ToastUpdate { id: i32, qty: i32 },
+    /// `UPDATE SET id=to WHERE id=from`, optionally with `note` TOASTed
+    /// (unchanged marker) — skipped unless `from` exists and `to` doesn't.
+    ChangePk { from: i32, to: i32, toast: bool },
     /// `BEGIN; DELETE id; COMMIT` — skipped if `id` is missing.
     Delete { id: i32 },
     /// `BEGIN; INSERT id, qty; ROLLBACK`. Exercises the rollback path.
     RollbackInsert { id: i32, qty: i32 },
+    /// `BEGIN; TRUNCATE; [INSERT id, qty;] COMMIT` — with the insert, the
+    /// full-reload pattern. Rows written since the last materializer
+    /// cycle share a fold step with the TRUNCATE.
+    Truncate { reinsert: Option<(i32, i32)> },
     /// `BEGIN; INSERT INTO noise ...; COMMIT` — WAL for a table outside
     /// the publication. pgoutput skips the whole transaction, so only a
     /// keepalive tells the pipeline it can ack past it.
@@ -219,6 +264,16 @@ enum Step {
     /// single dirty file (or two clean ones) at a time, leaving older
     /// deletes and the rest of the table for later passes.
     Compact,
+    /// Another process (a `pg2iceberg compact` job) plans a compaction
+    /// pass and writes its output files, but doesn't commit yet.
+    ExternalCompactPlan,
+    /// That process commits the pass it planned — after whatever happened
+    /// to the table in between.
+    ExternalCompactCommit,
+    /// The next catalog commit applies, then reports failure (its
+    /// response is lost). The materializer must not lose or duplicate
+    /// anything when it retries.
+    LoseCommitResponse,
     /// `maintain`'s first half: expire every snapshot but the current
     /// one. Readers still see the whole table; the files those snapshots
     /// added stay live.
@@ -235,8 +290,13 @@ fn step_strategy() -> impl Strategy<Value = Step> {
     prop_oneof![
         5 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::Insert { id, qty }),
         3 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::Update { id, qty }),
+        2 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::ToastUpdate { id, qty }),
+        1 => (id.clone(), id.clone(), any::<bool>())
+            .prop_map(|(from, to, toast)| Step::ChangePk { from, to, toast }),
         2 => id.clone().prop_map(|id| Step::Delete { id }),
         1 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::RollbackInsert { id, qty }),
+        1 => prop::option::of((id.clone(), qty.clone()))
+            .prop_map(|reinsert| Step::Truncate { reinsert }),
         3 => qty.clone().prop_map(|qty| Step::UnpublishedWrite { qty }),
         2 => (1usize..=8, qty.clone()).prop_map(|(inserts, qty)| Step::BigTx { inserts, qty }),
         2 => (1usize..=6).prop_map(|n| Step::DrivePartial { n }),
@@ -248,8 +308,21 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => Just(Step::RestartMaterializer),
         2 => Just(Step::Compact),
         1 => Just(Step::Expire),
+        1 => Just(Step::LoseCommitResponse),
+        2 => Just(Step::ExternalCompactPlan),
+        2 => Just(Step::ExternalCompactCommit),
         1 => Just(Step::CleanupOrphans),
     ]
+}
+
+/// Half the cases under the `integration` feature — which builds
+/// production's catalog, blob store and pgoutput decoder — none without.
+fn integration_only() -> impl Strategy<Value = bool> {
+    if cfg!(feature = "integration") {
+        any::<bool>().boxed()
+    } else {
+        Just(false).boxed()
+    }
 }
 
 fn workload() -> impl Strategy<Value = Vec<Step>> {
@@ -270,17 +343,288 @@ fn mat_namer(id_gen: &Arc<SeqIdGen>) -> Arc<dyn MaterializerNamer> {
 const STAGE_PREFIX: &str = "s3://warehouse/staged";
 const MAT_PREFIX: &str = "s3://warehouse/materialized";
 
+thread_local! {
+    /// Whether this case runs on production's catalog and blob store.
+    static PROD_BACKEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this case's replication stream goes over the wire: the sim
+    /// encodes pgoutput and production's decoder decodes it.
+    static WIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this case's table is partitioned (by a non-key column).
+    static PARTITIONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this case's table has Postgres's default replica identity
+    /// (a DELETE sends only the key) rather than FULL.
+    static DEFAULT_IDENTITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A replication session on the wire: production's pgoutput decoding of
+/// what the sim's walsender encodes.
+#[cfg(feature = "integration")]
+struct Wire {
+    decoder: pg2iceberg_pg::prod::PgoutputDecoder,
+    decoded: std::collections::VecDeque<DecodedMessage>,
+}
+
+#[cfg(feature = "integration")]
+impl Wire {
+    /// A fresh session, or none unless this case runs on the wire.
+    fn for_case() -> Option<Self> {
+        WIRE.get().then(|| Self {
+            decoder: pg2iceberg_pg::prod::PgoutputDecoder::new(),
+            decoded: Default::default(),
+        })
+    }
+
+    fn next(&mut self, stream: &mut SimReplicationStream) -> Option<DecodedMessage> {
+        loop {
+            if let Some(m) = self.decoded.pop_front() {
+                return Some(m);
+            }
+            match stream.recv_wire()? {
+                pg2iceberg_sim::postgres::WireMessage::Pgoutput(bytes) => self.decoded.extend(
+                    self.decoder
+                        .decode(&bytes)
+                        .expect("production decodes the sim's pgoutput"),
+                ),
+                pg2iceberg_sim::postgres::WireMessage::Keepalive {
+                    wal_end,
+                    reply_requested,
+                } => {
+                    return Some(DecodedMessage::Keepalive {
+                        wal_end,
+                        reply_requested,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Where the materialized table lives, and the oracle that reads it as
+/// a query engine would.
+#[derive(Clone)]
+struct Storage {
+    catalog: Arc<dyn Catalog>,
+    blob: Arc<dyn BlobStore>,
+    backend: Backend,
+}
+
+#[derive(Clone)]
+enum Backend {
+    Sim {
+        catalog: Arc<MemoryCatalog>,
+        blob: Arc<MemoryBlobStore>,
+    },
+    #[cfg(feature = "integration")]
+    Prod {
+        iceberg: Arc<iceberg::memory::MemoryCatalog>,
+    },
+}
+
+impl Storage {
+    fn for_case() -> Self {
+        if PROD_BACKEND.get() {
+            #[cfg(feature = "integration")]
+            return prod_backend::storage();
+        }
+        Self::sim()
+    }
+
+    fn sim() -> Self {
+        let catalog = Arc::new(MemoryCatalog::new());
+        let blob = Arc::new(MemoryBlobStore::new());
+        Self {
+            catalog: catalog.clone(),
+            blob: blob.clone(),
+            backend: Backend::Sim { catalog, blob },
+        }
+    }
+
+    /// The table as a query engine reads it, sorted by PK: ground truth
+    /// for the invariants. See `pg2iceberg_sim::oracle`.
+    async fn engine_rows(&self, ident: &TableIdent) -> Result<Vec<Row>, String> {
+        let files = self.live_files(ident).await?;
+        let schema = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| format!("load_table: {e}"))?
+            .ok_or_else(|| format!("no table {ident}"))?
+            .schema;
+        let mut rows = engine_read(self.blob.as_ref(), &schema, &files).await?;
+        sort_by_pk(&mut rows);
+        Ok(rows)
+    }
+
+    /// The table's live files, from its real state rather than
+    /// `Catalog::snapshots`.
+    async fn live_files(&self, ident: &TableIdent) -> Result<Vec<LiveFile>, String> {
+        match &self.backend {
+            Backend::Sim { catalog, .. } => Ok(live_files_from_history(&catalog.history(ident))),
+            #[cfg(feature = "integration")]
+            Backend::Prod { iceberg } => prod_backend::live_files(iceberg, ident).await,
+        }
+    }
+
+    /// Object keys of every stored blob.
+    async fn blob_keys(&self) -> Result<BTreeSet<String>, String> {
+        Ok(self
+            .blob
+            .list("")
+            .await
+            .map_err(|e| format!("list blobs: {e}"))?
+            .into_iter()
+            .map(|b| object_key(&b.path).to_string())
+            .collect())
+    }
+
+    /// The sim blob store, for tests that count its reads.
+    fn sim_blob(&self) -> &MemoryBlobStore {
+        match &self.backend {
+            Backend::Sim { blob, .. } => blob,
+            #[cfg(feature = "integration")]
+            Backend::Prod { .. } => panic!("sim backend only"),
+        }
+    }
+}
+
+/// Production's catalog and blob store over in-memory backends.
+#[cfg(feature = "integration")]
+mod prod_backend {
+    use super::*;
+    use iceberg::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
+    use iceberg::spec::DataContentType;
+    use iceberg::{CatalogBuilder, NamespaceIdent};
+    use pg2iceberg_iceberg::prod::IcebergRustCatalog;
+    use pg2iceberg_stream::ObjectStoreBlobStore;
+    use std::collections::HashMap;
+
+    pub fn storage() -> Storage {
+        let iceberg = Arc::new(
+            block_on(MemoryCatalogBuilder::default().load(
+                "dst",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory:///warehouse".to_string(),
+                )]),
+            ))
+            .unwrap(),
+        );
+        let blob = Arc::new(WriteOnce(ObjectStoreBlobStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        ))));
+        Storage {
+            catalog: Arc::new(IcebergRustCatalog::new(iceberg.clone())),
+            blob,
+            backend: Backend::Prod { iceberg },
+        }
+    }
+
+    /// The live files of the table's current snapshot, straight from
+    /// its manifests.
+    pub async fn live_files(
+        iceberg: &iceberg::memory::MemoryCatalog,
+        ident: &TableIdent,
+    ) -> Result<Vec<LiveFile>, String> {
+        use iceberg::Catalog as _;
+        let err = |e: iceberg::Error| e.to_string();
+        let ns = NamespaceIdent::from_strs(&ident.namespace.0).map_err(err)?;
+        let table = iceberg
+            .load_table(&iceberg::TableIdent::new(ns, ident.name.clone()))
+            .await
+            .map_err(err)?;
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(Vec::new());
+        };
+        let list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .map_err(err)?;
+        let mut out = Vec::new();
+        for manifest_file in list.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(err)?;
+            for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
+                let df = entry.data_file();
+                let equality_ids = match df.content_type() {
+                    DataContentType::Data => None,
+                    DataContentType::EqualityDeletes => Some(df.equality_ids().unwrap_or_default()),
+                    DataContentType::PositionDeletes => {
+                        return Err(format!("unexpected position delete {}", df.file_path()))
+                    }
+                };
+                out.push(LiveFile {
+                    path: df.file_path().to_string(),
+                    seq: entry
+                        .sequence_number()
+                        .ok_or_else(|| format!("{}: no sequence number", df.file_path()))?,
+                    partition: format!("{:?}", df.partition()),
+                    equality_ids,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Refuses to overwrite an object, like the sim blob store: every path
+    /// pg2iceberg writes must be new.
+    struct WriteOnce(ObjectStoreBlobStore);
+
+    #[async_trait::async_trait]
+    impl BlobStore for WriteOnce {
+        async fn put(&self, path: &str, bytes: bytes::Bytes) -> pg2iceberg_stream::Result<()> {
+            if self.0.get(path).await.is_ok() {
+                return Err(pg2iceberg_stream::StreamError::Io(format!(
+                    "refusing to overwrite existing blob {path}"
+                )));
+            }
+            self.0.put(path, bytes).await
+        }
+        async fn get(&self, path: &str) -> pg2iceberg_stream::Result<bytes::Bytes> {
+            self.0.get(path).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> pg2iceberg_stream::Result<Vec<pg2iceberg_stream::BlobInfo>> {
+            self.0.list(prefix).await
+        }
+        async fn delete(&self, path: &str) -> pg2iceberg_stream::Result<()> {
+            self.0.delete(path).await
+        }
+    }
+}
+
+/// A pipeline set up the way production sets one up — including the
+/// table's primary key, without which it can't split a key-changing
+/// UPDATE into a Delete of the old key and an Update of the new one.
+fn new_pipeline(
+    coord: &Arc<MemoryCoordinator>,
+    blob_store: &Arc<dyn BlobStore>,
+    namer: &Arc<CounterBlobNamer>,
+) -> Pipeline<MemoryCoordinator> {
+    let mut pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
+    pipeline.register_primary_keys(ident(), vec![ColumnName("id".into())]);
+    pipeline
+}
+
 struct DstHarness {
     db: SimPostgres,
     coord: Arc<MemoryCoordinator>,
-    blob_store: Arc<MemoryBlobStore>,
-    catalog: Arc<MemoryCatalog>,
+    blob_store: Arc<dyn BlobStore>,
+    /// The backend behind `blob_store` and the catalog, and the oracle
+    /// that reads it as a query engine would.
+    storage: Storage,
     namer: Arc<CounterBlobNamer>,
     pipeline: Pipeline<MemoryCoordinator>,
     materializer: Materializer<AuditedCatalog>,
     /// The materializer's catalog: checks invariant 10 after every commit.
     audited: Arc<AuditedCatalog>,
     stream: SimReplicationStream,
+    /// The stream's wire session, when the case runs on the wire.
+    #[cfg(feature = "integration")]
+    wire: Option<Wire>,
     /// Mirror of which PK ids are currently live in the source DB. Used by
     /// the workload runner to pre-filter ops the proptest generator can't
     /// know about (state-dependent validity).
@@ -292,6 +636,12 @@ struct DstHarness {
     /// UUID source for materializer file names, shared by every
     /// materializer incarnation — like real UUIDs, never repeating.
     id_gen: Arc<SeqIdGen>,
+    /// A compaction pass another process (a `pg2iceberg compact` job)
+    /// has planned and written but not yet committed.
+    pending_external: Option<PreparedCompaction>,
+    /// Whether another process's compaction has committed: the running
+    /// materializer's FileIndex can't know which files it rewrote.
+    external_compaction_seen: bool,
 }
 
 impl DstHarness {
@@ -320,20 +670,22 @@ impl DstHarness {
             CoordSchema::default_name(),
             arc_clock,
         ));
-        let blob_store = Arc::new(MemoryBlobStore::new());
-        let catalog = Arc::new(MemoryCatalog::new());
+        let storage = Storage::for_case();
+        let blob_store = storage.blob.clone();
+        let catalog = storage.catalog.clone();
         let namer = Arc::new(CounterBlobNamer::new(STAGE_PREFIX));
-        let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
+        let pipeline = new_pipeline(&coord, &blob_store, &namer);
 
         let id_gen = Arc::new(SeqIdGen::new());
         let mat_namer = mat_namer(&id_gen);
         let audited = Arc::new(AuditedCatalog {
             inner: catalog.clone(),
-            blob: blob_store.clone(),
+            storage: storage.clone(),
             db: db.clone(),
             violations: Mutex::new(Vec::new()),
             fail_next_commit: Default::default(),
             audit_paused: Default::default(),
+            lose_next_response: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -345,22 +697,32 @@ impl DstHarness {
         );
         block_on(materializer.register_table(schema())).unwrap();
 
+        if SMALLINT_PK.get() {
+            db.set_pg_type(&ident(), "id", PgType::Int2);
+        }
+        if DEFAULT_IDENTITY.get() {
+            db.set_replica_identity(&ident(), ReplicaIdentity::Default);
+        }
         let stream = db.start_replication(SLOT).unwrap();
 
         Self {
             db,
             coord,
             blob_store,
-            catalog,
+            storage,
             namer,
             pipeline,
             materializer,
             audited,
             stream,
+            #[cfg(feature = "integration")]
+            wire: Wire::for_case(),
             live: seeds.iter().map(|(id, _)| *id).collect(),
             noise_next_id: 0,
             next_bulk_id: 1000,
             id_gen,
+            pending_external: None,
+            external_compaction_seen: false,
         }
     }
 
@@ -377,20 +739,22 @@ impl DstHarness {
             CoordSchema::default_name(),
             arc_clock,
         ));
-        let blob_store = Arc::new(MemoryBlobStore::new());
-        let catalog = Arc::new(MemoryCatalog::new());
+        let storage = Storage::for_case();
+        let blob_store = storage.blob.clone();
+        let catalog = storage.catalog.clone();
         let namer = Arc::new(CounterBlobNamer::new(STAGE_PREFIX));
-        let pipeline = Pipeline::new(coord.clone(), blob_store.clone(), namer.clone(), FLUSH_ROWS);
+        let pipeline = new_pipeline(&coord, &blob_store, &namer);
 
         let id_gen = Arc::new(SeqIdGen::new());
         let mat_namer = mat_namer(&id_gen);
         let audited = Arc::new(AuditedCatalog {
             inner: catalog.clone(),
-            blob: blob_store.clone(),
+            storage: storage.clone(),
             db: db.clone(),
             violations: Mutex::new(Vec::new()),
             fail_next_commit: Default::default(),
             audit_paused: Default::default(),
+            lose_next_response: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -402,39 +766,66 @@ impl DstHarness {
         );
         block_on(materializer.register_table(schema())).unwrap();
 
+        if SMALLINT_PK.get() {
+            db.set_pg_type(&ident(), "id", PgType::Int2);
+        }
+        if DEFAULT_IDENTITY.get() {
+            db.set_replica_identity(&ident(), ReplicaIdentity::Default);
+        }
         let stream = db.start_replication(SLOT).unwrap();
 
         Self {
             db,
             coord,
             blob_store,
-            catalog,
+            storage,
             namer,
             pipeline,
             materializer,
             audited,
             stream,
+            #[cfg(feature = "integration")]
+            wire: Wire::for_case(),
             live: BTreeSet::new(),
             noise_next_id: 0,
             next_bulk_id: 1000,
             id_gen,
+            pending_external: None,
+            external_compaction_seen: false,
         }
     }
 
     fn drive(&mut self) {
-        while let Some(msg) = self.stream.recv() {
-            block_on(self.pipeline.process(msg)).unwrap();
+        while let Some(msg) = self.next_message() {
+            self.process(msg);
         }
     }
 
     /// Process at most `n` messages — may stop mid-transaction.
     fn drive_partial(&mut self, n: usize) {
         for _ in 0..n {
-            match self.stream.recv() {
-                Some(msg) => block_on(self.pipeline.process(msg)).unwrap(),
+            match self.next_message() {
+                Some(msg) => self.process(msg),
                 None => break,
             }
         }
+    }
+
+    fn next_message(&mut self) -> Option<DecodedMessage> {
+        #[cfg(feature = "integration")]
+        if let Some(wire) = self.wire.as_mut() {
+            return wire.next(&mut self.stream);
+        }
+        self.stream.recv()
+    }
+
+    /// What the lifecycle does with a message: a schema change reaches
+    /// the materializer before the pipeline.
+    fn process(&mut self, msg: DecodedMessage) {
+        if let DecodedMessage::Relation { ident, columns } = &msg {
+            block_on(self.materializer.apply_relation(ident, columns)).unwrap();
+        }
+        block_on(self.pipeline.process(msg)).unwrap();
     }
 
     fn flush_and_ack(&mut self) {
@@ -442,8 +833,59 @@ impl DstHarness {
         self.stream.send_standby(self.pipeline.flushed_lsn());
     }
 
-    fn materialize(&mut self) -> usize {
-        block_on(self.materializer.cycle()).unwrap()
+    /// One materializer cycle; `None` if it failed because a commit's
+    /// response was lost — the lifecycle just runs the next cycle.
+    fn materialize(&mut self) -> Option<usize> {
+        match block_on(self.materializer.cycle()) {
+            Ok(n) => Some(n),
+            Err(e) if e.to_string().contains("response lost") => None,
+            Err(e) => panic!("materializer cycle: {e}"),
+        }
+    }
+
+    /// Plan and write a compaction pass as a separate `compact` process
+    /// would — its own FileIndex rebuilt from the catalog, its own file
+    /// namer — and hold the commit for `ExternalCompactCommit`.
+    fn external_compact_plan(&mut self) {
+        if self.pending_external.is_some() {
+            return;
+        }
+        let cfg = CompactionConfig {
+            data_file_threshold: 1,
+            delete_file_threshold: 1,
+            target_size_bytes: 1024,
+            max_input_bytes_per_pass: 1,
+        };
+        let pk_cols = [ColumnName("id".into())];
+        let index = block_on(pg2iceberg_iceberg::rebuild_from_catalog(
+            self.audited.as_ref(),
+            self.blob_store.as_ref(),
+            &ident(),
+            &schema(),
+            &pk_cols,
+        ))
+        .unwrap();
+        let held = HeldCompaction {
+            inner: self.audited.clone(),
+            held: Mutex::new(None),
+        };
+        let namer = mat_namer(&self.id_gen);
+        block_on(pg2iceberg_iceberg::compact_table(
+            &held,
+            self.blob_store.as_ref(),
+            |t, _| {
+                let namer = namer.clone();
+                let t = t.clone();
+                async move { namer.next_path(&t, "compact", "").await }
+            },
+            &ident(),
+            &schema(),
+            &pk_cols,
+            Some(&index),
+            &cfg,
+        ))
+        .unwrap();
+        self.pending_external = held.held.into_inner().unwrap();
     }
 
     /// A partial compaction pass must not change what readers see. The
@@ -460,34 +902,23 @@ impl DstHarness {
             max_input_bytes_per_pass: 1,
         };
         let state = |h: &Self| {
-            let mut rows = block_on(read_materialized_state(
-                &ReaderView(&h.catalog),
-                h.blob_store.as_ref(),
-                &ident(),
-                &schema(),
-                &[ColumnName("id".into())],
-            ))
-            .unwrap();
+            let mut rows = block_on(h.storage.engine_rows(&ident())).unwrap();
             sort_by_pk(&mut rows);
             rows
         };
         let before = state(self);
-        block_on(self.materializer.compact_table(&ident(), &cfg)).unwrap();
+        // Compaction errors are non-fatal in the lifecycle; a pass whose
+        // commit response was lost applied anyway.
+        match block_on(self.materializer.compact_table(&ident(), &cfg)) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("response lost") => {}
+            Err(e) => panic!("compaction: {e}"),
+        }
         // The materializer updates its FileIndex from what the pass
         // rewrote; it must match a rebuild from catalog history.
-        let rebuilt = block_on(pg2iceberg_iceberg::rebuild_from_catalog(
-            self.catalog.as_ref(),
-            self.blob_store.as_ref(),
-            &ident(),
-            &schema(),
-            &[ColumnName("id".into())],
-        ))
-        .unwrap();
-        assert_eq!(
-            self.materializer.file_index(&ident()),
-            Some(&rebuilt),
-            "FileIndex drifted from the catalog after compaction"
-        );
+        if let Err(e) = file_index_matches_catalog(self) {
+            panic!("after compaction: {e}");
+        }
         let after = state(self);
         if before != after {
             self.audited.violations.lock().unwrap().push(format!(
@@ -531,13 +962,12 @@ impl DstHarness {
 
     /// Drop the pipeline + stream as-is and rebuild from the slot.
     fn crash_mid_stream(&mut self) {
-        self.pipeline = Pipeline::new(
-            self.coord.clone(),
-            self.blob_store.clone(),
-            self.namer.clone(),
-            FLUSH_ROWS,
-        );
+        self.pipeline = new_pipeline(&self.coord, &self.blob_store, &self.namer);
         self.stream = self.db.start_replication(SLOT).unwrap();
+        #[cfg(feature = "integration")]
+        {
+            self.wire = Wire::for_case();
+        }
     }
 
     fn run_step(&mut self, step: &Step) {
@@ -549,6 +979,45 @@ impl DstHarness {
                     if tx.commit(Timestamp(0)).is_ok() {
                         self.live.insert(*id);
                     }
+                }
+            }
+            Step::ToastUpdate { id, qty } => {
+                if self.live.contains(id) {
+                    let mut tx = self.db.begin_tx();
+                    tx.update_with_unchanged(&ident(), row(*id, *qty), vec![note()]);
+                    let _ = tx.commit(Timestamp(0));
+                }
+            }
+            Step::ChangePk { from, to, toast } => {
+                if self.live.contains(from) && !self.live.contains(to) {
+                    let id = ColumnName("id".into());
+                    let before = self
+                        .db
+                        .read_table(&ident())
+                        .unwrap()
+                        .into_iter()
+                        .find(|r| stored(r.clone()).get(&id) == Some(&PgValue::Int4(*from)))
+                        .expect("live row");
+                    let mut after = before.clone();
+                    after.insert(id, id_value(*to));
+                    let unchanged = if *toast { vec![note()] } else { Vec::new() };
+                    let mut tx = self.db.begin_tx();
+                    tx.update_with_pk_change_unchanged(&ident(), before, after, unchanged);
+                    if tx.commit(Timestamp(0)).is_ok() {
+                        self.live.remove(from);
+                        self.live.insert(*to);
+                    }
+                }
+            }
+            Step::Truncate { reinsert } => {
+                let mut tx = self.db.begin_tx();
+                tx.truncate(&ident());
+                if let Some((id, qty)) = reinsert {
+                    tx.insert(&ident(), row(*id, *qty));
+                }
+                if tx.commit(Timestamp(0)).is_ok() {
+                    self.live.clear();
+                    self.live.extend(reinsert.map(|(id, _)| id));
                 }
             }
             Step::Update { id, qty } => {
@@ -612,6 +1081,21 @@ impl DstHarness {
             Step::CrashMidStream => self.crash_mid_stream(),
             Step::RestartMaterializer => self.restart_materializer(),
             Step::Compact => self.compact(),
+            Step::ExternalCompactPlan => self.external_compact_plan(),
+            Step::ExternalCompactCommit => {
+                if let Some(pass) = self.pending_external.take() {
+                    match block_on(self.audited.commit_compaction(pass)) {
+                        Ok(_) => {}
+                        Err(e) if e.to_string().contains("response lost") => {}
+                        Err(e) => panic!("external compaction commit: {e}"),
+                    }
+                    self.external_compaction_seen = true;
+                }
+            }
+            Step::LoseCommitResponse => self
+                .audited
+                .lose_next_response
+                .store(true, std::sync::atomic::Ordering::SeqCst),
             Step::Expire => {
                 block_on(self.materializer.expire_cycle(0)).unwrap();
             }
@@ -680,7 +1164,7 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
 
     // 10. Atomic visibility per table — now, and at every commit made
     //     since the last check (a cycle may commit several times).
-    block_on(atomic_visibility(&h.catalog, &h.blob_store, &h.db))?;
+    block_on(atomic_visibility(&h.storage, &h.db))?;
     if let Some(v) = h.audited.violations.lock().unwrap().first() {
         return Err(v.clone());
     }
@@ -704,9 +1188,9 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
             rows
         })
     };
-    let readers =
-        read(&ReaderView(&h.catalog)).map_err(|e| format!("invariant 12: readers' view: {e}"))?;
-    let history = read(h.catalog.as_ref()).map_err(|e| format!("invariant 12: history: {e}"))?;
+    let readers = block_on(h.storage.engine_rows(&ident()))
+        .map_err(|e| format!("invariant 12: readers' view: {e}"))?;
+    let history = read(h.audited.as_ref()).map_err(|e| format!("invariant 12: history: {e}"))?;
     if history != readers {
         return Err(format!(
             "invariant 12: Catalog::snapshots replays to {history:?}, readers see {readers:?}"
@@ -735,14 +1219,31 @@ fn file_index_matches_catalog(h: &DstHarness) -> Result<(), String> {
         ));
     }
     let rebuilt = block_on(pg2iceberg_iceberg::rebuild_from_catalog(
-        h.catalog.as_ref(),
+        h.audited.as_ref(),
         h.blob_store.as_ref(),
         &ident(),
         &schema(),
         &[ColumnName("id".into())],
     ))
     .map_err(|e| format!("rebuild_from_catalog: {e}"))?;
-    if *index != rebuilt {
+    // Another process's compaction moves rows to files this process's
+    // index can't know about; the keys and their partitions still match.
+    let drifted = if h.external_compaction_seen {
+        let keys = |fi: &pg2iceberg_iceberg::FileIndex| -> BTreeMap<String, String> {
+            fi.all_pks()
+                .map(|pk| {
+                    (
+                        pk.to_string(),
+                        format!("{:?}", fi.partition_values_for_pk(pk)),
+                    )
+                })
+                .collect()
+        };
+        keys(index) != keys(&rebuilt)
+    } else {
+        *index != rebuilt
+    };
+    if drifted {
         return Err(format!(
             "invariant 11: FileIndex drifted from the catalog:\n  materializer={index:?}\n  rebuilt={rebuilt:?}"
         ));
@@ -752,20 +1253,8 @@ fn file_index_matches_catalog(h: &DstHarness) -> Result<(), String> {
 
 /// Invariant 10: Iceberg matches PG as of some transaction boundary.
 /// Lagging behind is fine; a partly applied transaction is not.
-async fn atomic_visibility(
-    catalog: &MemoryCatalog,
-    blob: &MemoryBlobStore,
-    db: &SimPostgres,
-) -> Result<(), String> {
-    let mut iceberg = read_materialized_state(
-        &ReaderView(catalog),
-        blob,
-        &ident(),
-        &schema(),
-        &[ColumnName("id".into())],
-    )
-    .await
-    .map_err(|e| format!("read_materialized_state: {e}"))?;
+async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), String> {
+    let mut iceberg = storage.engine_rows(&ident()).await?;
     sort_by_pk(&mut iceberg);
     let events = db
         .dump_change_events(PUB)
@@ -783,7 +1272,19 @@ async fn atomic_visibility(
             let e = &events[i];
             match e.op {
                 Op::Insert | Op::Update => {
-                    let after = stored(e.after.clone().expect("insert/update carries after"));
+                    let mut after = stored(e.after.clone().expect("insert/update carries after"));
+                    // A key-changing UPDATE moves the row.
+                    let old_pk = e.before.as_ref().map(|b| pk(&stored(b.clone())));
+                    let prev = match old_pk {
+                        Some(k) if k != pk(&after) => state.remove(&k),
+                        _ => state.get(&pk(&after)).cloned(),
+                    };
+                    // Unchanged (TOASTed) columns keep their stored values.
+                    for col in &e.unchanged_cols {
+                        if let Some(v) = prev.as_ref().and_then(|p| p.get(col)) {
+                            after.insert(col.clone(), v.clone());
+                        }
+                    }
                     state.insert(pk(&after), after);
                 }
                 Op::Delete => {
@@ -804,13 +1305,63 @@ async fn atomic_visibility(
     Ok(())
 }
 
+/// A catalog that holds a compaction commit back instead of applying it,
+/// so another process's pass can commit after the table moved on.
+struct HeldCompaction {
+    inner: Arc<AuditedCatalog>,
+    held: Mutex<Option<PreparedCompaction>>,
+}
+
+#[async_trait::async_trait]
+impl Catalog for HeldCompaction {
+    async fn ensure_namespace(&self, ns: &Namespace) -> pg2iceberg_iceberg::Result<()> {
+        self.inner.ensure_namespace(ns).await
+    }
+    async fn load_table(
+        &self,
+        ident: &TableIdent,
+    ) -> pg2iceberg_iceberg::Result<Option<TableMetadata>> {
+        self.inner.load_table(ident).await
+    }
+    async fn create_table(
+        &self,
+        schema: &TableSchema,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.inner.create_table(schema).await
+    }
+    async fn commit_snapshot(
+        &self,
+        prepared: PreparedCommit,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.inner.commit_snapshot(prepared).await
+    }
+    async fn commit_compaction(
+        &self,
+        prepared: PreparedCompaction,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        let ident = prepared.ident.clone();
+        *self.held.lock().unwrap() = Some(prepared);
+        Ok(self.inner.load_table(&ident).await?.expect("table exists"))
+    }
+    async fn evolve_schema(
+        &self,
+        ident: &TableIdent,
+        changes: Vec<SchemaChange>,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.inner.evolve_schema(ident, changes).await
+    }
+    async fn snapshots(&self, ident: &TableIdent) -> pg2iceberg_iceberg::Result<Vec<Snapshot>> {
+        self.inner.snapshots(ident).await
+    }
+}
+
 /// The materializer's catalog in the DST: delegates to the in-memory
 /// catalog and checks invariant 10 after every commit — the moments a
 /// reader could observe the table — since one materializer cycle can
 /// commit several times between two DST steps.
 struct AuditedCatalog {
-    inner: Arc<MemoryCatalog>,
-    blob: Arc<MemoryBlobStore>,
+    inner: Arc<dyn Catalog>,
+    storage: Storage,
     db: SimPostgres,
     violations: Mutex<Vec<String>>,
     /// When set, the next multi-step commit fails without committing.
@@ -818,6 +1369,26 @@ struct AuditedCatalog {
     /// When set, commits aren't audited — for tests that count blob reads
     /// (an audit reads the whole table).
     audit_paused: std::sync::atomic::AtomicBool,
+    /// When set, the next commit — data or compaction — applies and then
+    /// reports failure, as a REST catalog does when the response is lost
+    /// (a timeout, a 502/504): "commit state unknown".
+    lose_next_response: std::sync::atomic::AtomicBool,
+}
+
+impl AuditedCatalog {
+    /// `result` of a commit that applied; turned into an error if this
+    /// commit's response is to be lost.
+    fn respond<T>(&self, result: T) -> pg2iceberg_iceberg::Result<T> {
+        if self
+            .lose_next_response
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(pg2iceberg_iceberg::IcebergError::Other(
+                "commit applied, response lost".into(),
+            ));
+        }
+        Ok(result)
+    }
 }
 
 impl AuditedCatalog {
@@ -825,7 +1396,7 @@ impl AuditedCatalog {
         if self.audit_paused.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        if let Err(e) = atomic_visibility(&self.inner, &self.blob, &self.db).await {
+        if let Err(e) = atomic_visibility(&self.storage, &self.db).await {
             self.violations
                 .lock()
                 .unwrap()
@@ -857,6 +1428,7 @@ impl Catalog for AuditedCatalog {
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
         let meta = self.inner.commit_snapshot(prepared).await?;
         self.audit().await;
+        let meta = self.respond(meta)?;
         Ok(meta)
     }
     async fn commit_snapshots(
@@ -873,6 +1445,7 @@ impl Catalog for AuditedCatalog {
         }
         let meta = self.inner.commit_snapshots(steps).await?;
         self.audit().await;
+        let meta = self.respond(meta)?;
         Ok(meta)
     }
     async fn commit_compaction(
@@ -881,6 +1454,7 @@ impl Catalog for AuditedCatalog {
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
         let meta = self.inner.commit_compaction(prepared).await?;
         self.audit().await;
+        let meta = self.respond(meta)?;
         Ok(meta)
     }
     async fn evolve_schema(
@@ -909,7 +1483,7 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     h.flush_and_ack();
     // Drain materializer; safety bound to catch infinite loops.
     for _ in 0..1000 {
-        if h.materialize() == 0 {
+        if h.materialize() == Some(0) {
             break;
         }
     }
@@ -932,9 +1506,9 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
         .map_err(|e| format!("read_log failed: {e}"))?;
 
     // 1. Every log_index s3_path resolves in blob_store.
-    let blob_paths: BTreeSet<String> = h.blob_store.paths().into_iter().collect();
+    let blob_keys = block_on(h.storage.blob_keys())?;
     for entry in &entries {
-        if !blob_paths.contains(&entry.s3_path) {
+        if !blob_keys.contains(object_key(&entry.s3_path)) {
             return Err(format!(
                 "invariant 1 (blob completeness) violated: log_index references {} but blob_store doesn't have it",
                 entry.s3_path
@@ -984,63 +1558,80 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
             decode_chunk(&bytes).map_err(|e| format!("decode_chunk({}): {e}", entry.s3_path))?;
         staged_events.append(&mut chunk);
     }
-    // A crash between a claim and the slot ack replays the transaction,
-    // so it's staged twice: staging is at-least-once and the fold absorbs
-    // the repeat (invariant 5). Compare distinct events; a repeat that
-    // differs from the original still shows up as a mismatch.
-    staged_events.sort_by_key(|m| m.lsn);
-    staged_events.dedup_by(|a, b| a.lsn == b.lsn && a.op == b.op && a.row == b.row);
-
-    let mut wal_events =
-        h.db.dump_change_events(PUB)
-            .map_err(|e| format!("dump_change_events: {e}"))?;
-    wal_events.sort_by_key(|c| c.lsn);
-
-    if staged_events.len() != wal_events.len() {
+    // Staging is at-least-once: a crash between a claim and the slot ack
+    // replays the transaction, staging it again, and the fold absorbs the
+    // repeat (invariant 5). So per transaction, staging holds its events,
+    // possibly repeated.
+    let mut staged: BTreeMap<u32, Vec<pg2iceberg_stream::MatEvent>> = BTreeMap::new();
+    for e in staged_events {
+        staged.entry(e.xid.unwrap_or(0)).or_default().push(e);
+    }
+    // What staging should hold for each WAL event: its row as sent, except
+    // that the pipeline splits a key-changing UPDATE into a Delete of the
+    // old key and an Update of the new one, and a TRUNCATE carries no row.
+    // On the wire every change carries its transaction's commit LSN.
+    let id = ColumnName("id".into());
+    let mut expected: BTreeMap<u32, Vec<(pg2iceberg_core::Lsn, Op, Row)>> = BTreeMap::new();
+    for c in
+        h.db.dump_change_events_as_sent(PUB)
+            .map_err(|e| format!("dump_change_events: {e}"))?
+    {
+        let xid = c.xid.unwrap_or(0);
+        let lsn = if WIRE.get() {
+            h.db.commit_lsn(xid)
+        } else {
+            c.lsn
+        };
+        let row = |r: &Option<Row>| {
+            r.clone().ok_or_else(|| {
+                format!("invariant 4: WAL event at lsn={} has no payload row", c.lsn)
+            })
+        };
+        let tx = expected.entry(xid).or_default();
+        match c.op {
+            Op::Update
+                if c.before.is_some()
+                    && c.before.as_ref().map(|b| b.get(&id))
+                        != c.after.as_ref().map(|a| a.get(&id)) =>
+            {
+                tx.push((lsn, Op::Delete, row(&c.before)?));
+                tx.push((lsn, Op::Update, row(&c.after)?));
+            }
+            Op::Insert | Op::Update => tx.push((lsn, c.op, row(&c.after)?)),
+            Op::Delete => tx.push((lsn, Op::Delete, row(&c.before)?)),
+            Op::Truncate => tx.push((lsn, Op::Truncate, Row::new())),
+            _ => return Err(format!("invariant 4: unexpected op in WAL: {:?}", c.op)),
+        }
+    }
+    if staged.keys().ne(expected.keys()) {
         return Err(format!(
-            "invariant 4 (WAL == staged) count: staged={}, wal={}",
-            staged_events.len(),
-            wal_events.len()
+            "invariant 4 (WAL == staged): staged transactions {:?}, WAL transactions {:?}",
+            staged.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
         ));
     }
-
-    for (m, c) in staged_events.iter().zip(wal_events.iter()) {
-        if m.lsn != c.lsn {
+    for (xid, want) in &expected {
+        let got = &staged[xid];
+        if got.len() % want.len() != 0 {
             return Err(format!(
-                "invariant 4: lsn mismatch staged={}, wal={}",
-                m.lsn, c.lsn
+                "invariant 4: xid {xid} staged {} events, not a multiple of its {}",
+                got.len(),
+                want.len()
             ));
         }
-        if m.op != c.op {
-            return Err(format!(
-                "invariant 4: op mismatch at lsn={}: staged={:?}, wal={:?}",
-                m.lsn, m.op, c.op
-            ));
-        }
-        let expected_row = match c.op {
-            Op::Insert | Op::Update => c.after.as_ref(),
-            Op::Delete => c.before.as_ref(),
-            _ => return Err(format!("invariant 4: non-DML op in WAL: {:?}", c.op)),
-        };
-        let expected = expected_row
-            .ok_or_else(|| format!("invariant 4: WAL event at lsn={} has no payload row", c.lsn))?;
-        if &m.row != expected {
-            return Err(format!(
-                "invariant 4: row mismatch at lsn={}: staged={:?}, wal={:?}",
-                m.lsn, m.row, expected
-            ));
+        for (m, (lsn, op, row)) in got.iter().zip(want.iter().cycle()) {
+            if m.lsn != *lsn || m.op != *op || m.row != *row {
+                return Err(format!(
+                    "invariant 4: xid {xid} staged ({}, {:?}, {:?}), WAL ({lsn}, {op:?}, {row:?})",
+                    m.lsn, m.op, m.row
+                ));
+            }
         }
     }
 
     // 5. Iceberg materialized state == PG ground truth.
-    let mut iceberg_rows = block_on(read_materialized_state(
-        &ReaderView(&h.catalog),
-        h.blob_store.as_ref(),
-        &ident(),
-        &schema(),
-        &[ColumnName("id".into())],
-    ))
-    .map_err(|e| format!("read_materialized_state: {e}"))?;
+    let mut iceberg_rows = block_on(h.storage.engine_rows(&ident()))
+        .map_err(|e| format!("read_materialized_state: {e}"))?;
     sort_by_pk(&mut iceberg_rows);
 
     let mut pg_rows =
@@ -1078,16 +1669,16 @@ fn check_invariants_with_snapshot(h: &mut DstHarness) -> Result<(), String> {
     h.drive();
     h.flush_and_ack();
     for _ in 0..16 {
-        if h.materialize() == 0 {
+        if h.materialize() == Some(0) {
             break;
         }
     }
 
     let entries = block_on(h.coord.read_log(&ident(), 0, 1_000_000))
         .map_err(|e| format!("read_log failed: {e}"))?;
-    let blob_paths: BTreeSet<String> = h.blob_store.paths().into_iter().collect();
+    let blob_keys = block_on(h.storage.blob_keys())?;
     for entry in &entries {
-        if !blob_paths.contains(&entry.s3_path) {
+        if !blob_keys.contains(object_key(&entry.s3_path)) {
             return Err(format!(
                 "invariant 1: log_index references {} but blob_store doesn't have it",
                 entry.s3_path
@@ -1118,14 +1709,8 @@ fn check_invariants_with_snapshot(h: &mut DstHarness) -> Result<(), String> {
     }
 
     // Invariant 5: PG == Iceberg at quiescence.
-    let mut iceberg_rows = block_on(read_materialized_state(
-        &ReaderView(&h.catalog),
-        h.blob_store.as_ref(),
-        &ident(),
-        &schema(),
-        &[ColumnName("id".into())],
-    ))
-    .map_err(|e| format!("read_materialized_state: {e}"))?;
+    let mut iceberg_rows = block_on(h.storage.engine_rows(&ident()))
+        .map_err(|e| format!("read_materialized_state: {e}"))?;
     sort_by_pk(&mut iceberg_rows);
     let mut pg_rows =
         h.db.read_table(&ident())
@@ -1152,8 +1737,16 @@ proptest! {
     fn pipeline_preserves_invariants_under_random_workload(
         steps in workload(),
         smallint_pk in any::<bool>(),
+        prod_backend in integration_only(),
+        wire in integration_only(),
+        partitioned in any::<bool>(),
+        default_identity in any::<bool>(),
     ) {
         SMALLINT_PK.set(smallint_pk);
+        PROD_BACKEND.set(prod_backend);
+        WIRE.set(wire);
+        PARTITIONED.set(partitioned);
+        DEFAULT_IDENTITY.set(default_identity);
         let mut h = DstHarness::boot();
         for (i, step) in steps.iter().enumerate() {
             h.run_step(step);
@@ -1270,6 +1863,160 @@ fn restart_after_expiry_keeps_reinserted_rows_unique() {
     check_invariants(&mut h).unwrap();
 }
 
+/// A TRUNCATE wipes every row the table holds — including rows written
+/// since the last materializer cycle, which share its fold step and
+/// aren't in the FileIndex yet.
+#[test]
+fn truncate_removes_rows_not_yet_materialized() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::Truncate { reinsert: None });
+    check_invariants(&mut h).unwrap();
+}
+
+/// A row updated twice in one batch with its TOASTed column unchanged
+/// both times keeps that column's value: the second update must not
+/// take the first one's unchanged placeholder for a value.
+#[test]
+fn repeated_toast_updates_keep_the_unchanged_value() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 4, qty: 0 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ToastUpdate { id: 4, qty: 7 });
+    h.run_step(&Step::ToastUpdate { id: 4, qty: 8 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// An UPDATE that moves a row to a new key with its TOASTed column
+/// unchanged: the column's value lives under the old key.
+#[test]
+fn key_change_with_toast_resolves_from_the_old_key() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 5, qty: 0 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ChangePk {
+        from: 5,
+        to: 1,
+        toast: true,
+    });
+    check_invariants(&mut h).unwrap();
+}
+
+/// A compaction pass can rewrite inputs whose rows were all deleted
+/// since, leaving no output file. Iceberg must still accept the commit
+/// that removes them — the sim catalog does; production's must too.
+#[cfg(feature = "integration")]
+#[test]
+fn compaction_with_no_surviving_rows_commits_on_iceberg() {
+    PROD_BACKEND.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::BigTx { inserts: 1, qty: 0 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Compact);
+    check_invariants(&mut h).unwrap();
+}
+
+/// An UPDATE that moves a row to another partition must delete it from
+/// the old one: Iceberg scopes an equality delete to its partition.
+#[test]
+fn update_moving_a_row_between_partitions_leaves_no_copy() {
+    PARTITIONED.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Update { id: 1, qty: 60 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// Under Postgres's default replica identity a DELETE carries only the
+/// key: a partitioned table's delete must still reach the row's
+/// partition.
+#[test]
+fn delete_under_default_replica_identity_reaches_the_rows_partition() {
+    PARTITIONED.set(true);
+    DEFAULT_IDENTITY.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Delete { id: 1 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// A commit can apply and still report failure (REST timeout, 502/504).
+/// The materializer then retries the same transaction, and must not
+/// apply it twice.
+#[test]
+fn retry_after_a_lost_commit_response_applies_once() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::BigTx { inserts: 3, qty: 0 });
+    h.run_step(&Step::LoseCommitResponse);
+    h.run_step(&Step::Insert { id: 1, qty: 0 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// A pipeline crash partway through staging a transaction, then a replay
+/// from the slot, must never make part of that transaction visible.
+#[test]
+fn pipeline_crash_mid_transaction_keeps_it_atomic() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 0 },
+        Step::BigTx { inserts: 1, qty: 0 },
+        Step::DrivePartial { n: 6 },
+        Step::DrivePartial { n: 3 },
+        Step::CrashMidStream,
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+}
+
+/// A compaction commit that applied but reported failure must not leave
+/// the materializer's FileIndex pointing at the files it rewrote.
+#[test]
+fn file_index_stays_true_after_a_lost_compaction_response() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::BigTx { inserts: 2, qty: 0 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::LoseCommitResponse);
+    h.run_step(&Step::Compact);
+    check_invariants(&mut h).unwrap();
+}
+
+/// A `compact` job plans a pass, the materializer then commits an update
+/// to a row in the pass's input, and only then does the job commit: the
+/// rewritten copy of the old row must not come back.
+#[test]
+fn external_compaction_racing_an_update_keeps_the_new_row() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::Insert { id: 2, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    // Row 2 moves on: the first file now holds a dead row, so it's worth
+    // rewriting.
+    h.run_step(&Step::Update { id: 2, qty: 11 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ExternalCompactPlan);
+    assert!(h.pending_external.is_some(), "the job planned a pass");
+    h.run_step(&Step::Update { id: 1, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ExternalCompactCommit);
+    check_invariants(&mut h).unwrap();
+}
+
 #[test]
 fn happy_path_one_insert_one_flush() {
     let mut h = DstHarness::boot();
@@ -1339,14 +2086,7 @@ fn truncate_inside_large_transaction_hides_its_earlier_inserts() {
         h.run_step(&Step::MaterializerCycle);
         check_step_invariants(&h).unwrap();
     }
-    let mut iceberg = block_on(read_materialized_state(
-        &ReaderView(&h.catalog),
-        h.blob_store.as_ref(),
-        &ident(),
-        &schema(),
-        &[ColumnName("id".into())],
-    ))
-    .unwrap();
+    let mut iceberg = block_on(h.storage.engine_rows(&ident())).unwrap();
     sort_by_pk(&mut iceberg);
     let mut pg = stored_rows(h.db.read_table(&ident()).unwrap());
     sort_by_pk(&mut pg);
@@ -1403,11 +2143,11 @@ fn compaction_does_not_replay_the_table() {
     h.audited
         .audit_paused
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let before = h.blob_store.gets();
+    let before = h.storage.sim_blob().gets();
     let out = block_on(h.materializer.compact_table(&ident(), &cfg))
         .unwrap()
         .expect("the dirty file is rewritten");
-    let reads = h.blob_store.gets() - before;
+    let reads = h.storage.sim_blob().gets() - before;
     h.audited
         .audit_paused
         .store(false, std::sync::atomic::Ordering::SeqCst);

@@ -3016,6 +3016,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "iceberg",
  "object_store",
  "peak_alloc",
  "pg2iceberg",
