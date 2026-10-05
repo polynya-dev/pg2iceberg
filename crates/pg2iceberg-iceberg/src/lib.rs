@@ -317,9 +317,17 @@ pub trait Catalog: Send + Sync {
             "expire_snapshots not implemented for this Catalog impl".into(),
         ))
     }
-    /// Append-only snapshot history for `ident`. Used by the verifier (MoR
-    /// reads) and by materializer restart code (FileIndex rebuild). Ordered
-    /// by snapshot id ascending.
+    /// Append-only snapshot history for `ident`, ordered by snapshot id
+    /// ascending. Replaying it — each snapshot's deletes and data files,
+    /// minus every `removed_paths` — yields the table's current state;
+    /// the verifier, FileIndex rebuild, compaction and orphan cleanup all
+    /// rely on that.
+    ///
+    /// That must hold after snapshot expiry too: expiring a snapshot drops
+    /// its metadata, not the files it added, which stay live until a later
+    /// snapshot removes them. Those files are reported under a stand-in
+    /// snapshot per sequence number (`id` = the files' sequence number,
+    /// `timestamp_ms` = 0 when unknown).
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>>;
 }
 

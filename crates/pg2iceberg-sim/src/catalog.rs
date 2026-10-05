@@ -4,6 +4,11 @@
 //! a monotonic snapshot id (= `prev_id + 1`); the verifier uses these ids to
 //! apply Iceberg MoR semantics (delete file at snap N applies only to data
 //! files at snap < N).
+//!
+//! Expiring a snapshot drops its metadata, as in Iceberg, but not the table
+//! state: files it added stay live until a later snapshot removes them.
+//! [`ReaderView`] is that state — what a query engine reading the current
+//! snapshot sees — independent of what [`Catalog::snapshots`] reports.
 
 use async_trait::async_trait;
 use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
@@ -22,7 +27,10 @@ struct State {
 
 struct MemTable {
     metadata: TableMetadata,
+    /// Every snapshot ever committed, expired or not.
     snapshots: Vec<Snapshot>,
+    /// Ids of expired snapshots.
+    expired: BTreeSet<i64>,
     next_snapshot_id: i64,
 }
 
@@ -101,6 +109,7 @@ impl Catalog for MemoryCatalog {
             MemTable {
                 metadata: metadata.clone(),
                 snapshots: Vec::new(),
+                expired: BTreeSet::new(),
                 next_snapshot_id: 1,
             },
         );
@@ -222,11 +231,15 @@ impl Catalog for MemoryCatalog {
         // Never drop the current snapshot (Iceberg invariant).
         let current_id = table.metadata.current_snapshot_id;
 
-        let before = table.snapshots.len();
-        table
+        let expire: Vec<i64> = table
             .snapshots
-            .retain(|snap| snap.timestamp_ms >= cutoff || Some(snap.id) == current_id);
-        Ok(before - table.snapshots.len())
+            .iter()
+            .filter(|snap| snap.timestamp_ms < cutoff && Some(snap.id) != current_id)
+            .map(|snap| snap.id)
+            .filter(|id| !table.expired.contains(id))
+            .collect();
+        table.expired.extend(&expire);
+        Ok(expire.len())
     }
 
     async fn evolve_schema(
@@ -250,8 +263,59 @@ impl Catalog for MemoryCatalog {
         Ok(table.metadata.clone())
     }
 
+    /// An expired snapshot is reported with only the files it added that
+    /// are still live, as the trait requires.
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>> {
         let s = self.state.lock().unwrap();
+        let Some(t) = s.tables.get(ident) else {
+            return Ok(Vec::new());
+        };
+        let removed: BTreeSet<&str> = t
+            .snapshots
+            .iter()
+            .flat_map(|snap| snap.removed_paths.iter().map(String::as_str))
+            .collect();
+        let live = |files: &[pg2iceberg_iceberg::DataFile]| {
+            files
+                .iter()
+                .filter(|f| !removed.contains(f.path.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        Ok(t.snapshots
+            .iter()
+            .filter_map(|snap| {
+                if !t.expired.contains(&snap.id) {
+                    return Some(snap.clone());
+                }
+                let stand_in = Snapshot {
+                    data_files: live(&snap.data_files),
+                    delete_files: live(&snap.delete_files),
+                    ..snap.clone()
+                };
+                let empty = stand_in.data_files.is_empty()
+                    && stand_in.delete_files.is_empty()
+                    && stand_in.removed_paths.is_empty();
+                (!empty).then_some(stand_in)
+            })
+            .collect())
+    }
+}
+
+/// The table as a query engine reading its current snapshot sees it:
+/// every committed snapshot's files, expired or not. A
+/// [`pg2iceberg_iceberg::verify::DynCatalog`] whose `snapshots` is the full
+/// history, so `read_materialized_state` over it is the ground truth that
+/// `Catalog::snapshots` must replay to.
+pub struct ReaderView<'a>(pub &'a MemoryCatalog);
+
+#[async_trait]
+impl pg2iceberg_iceberg::verify::DynCatalog for ReaderView<'_> {
+    async fn snapshots(
+        &self,
+        ident: &TableIdent,
+    ) -> pg2iceberg_iceberg::verify::Result<Vec<Snapshot>> {
+        let s = self.0.state.lock().unwrap();
         Ok(s.tables
             .get(ident)
             .map(|t| t.snapshots.clone())

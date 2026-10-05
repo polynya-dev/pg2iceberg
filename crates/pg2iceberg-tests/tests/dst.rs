@@ -31,6 +31,13 @@
 //! rebuilds its FileIndex from catalog history, and must never reuse a
 //! file path a committed snapshot references (the sim blob store refuses
 //! overwrites).
+//!
+//! `Expire` and `CleanupOrphans` are the two halves of `maintain`.
+//! Expiry drops snapshot metadata, never table state, so PG == Iceberg
+//! is checked against [`ReaderView`] — the table a query engine sees —
+//! and invariant 12 checks that `Catalog::snapshots`, which the FileIndex
+//! rebuild, compaction, orphan cleanup and `verify` replay, still matches
+//! it.
 
 use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::Coordinator;
@@ -46,7 +53,7 @@ use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer}
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{Materializer, Pipeline};
 use pg2iceberg_sim::blob::MemoryBlobStore;
-use pg2iceberg_sim::catalog::MemoryCatalog;
+use pg2iceberg_sim::catalog::{MemoryCatalog, ReaderView};
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::id::SeqIdGen;
@@ -212,6 +219,14 @@ enum Step {
     /// single dirty file (or two clean ones) at a time, leaving older
     /// deletes and the rest of the table for later passes.
     Compact,
+    /// `maintain`'s first half: expire every snapshot but the current
+    /// one. Readers still see the whole table; the files those snapshots
+    /// added stay live.
+    Expire,
+    /// `maintain`'s second half: delete every blob under the
+    /// materializer's prefix that the table doesn't reference, with no
+    /// grace period.
+    CleanupOrphans,
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
@@ -233,6 +248,8 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => Just(Step::CrashAndRestart),
         1 => Just(Step::RestartMaterializer),
         2 => Just(Step::Compact),
+        1 => Just(Step::Expire),
+        1 => Just(Step::CleanupOrphans),
     ]
 }
 
@@ -245,8 +262,12 @@ fn workload() -> impl Strategy<Value = Vec<Step>> {
 /// The production file namer: a fresh instance per materializer
 /// incarnation, drawing from the shared UUID sequence.
 fn mat_namer(id_gen: &Arc<SeqIdGen>) -> Arc<dyn MaterializerNamer> {
-    Arc::new(UuidMaterializerNamer::new(id_gen.clone(), "s3://table"))
+    Arc::new(UuidMaterializerNamer::new(id_gen.clone(), MAT_PREFIX))
 }
+
+/// Where the materializer writes data files (`<prefix>/<table>/...`), and
+/// so where orphan cleanup looks.
+const MAT_PREFIX: &str = "s3://table";
 
 struct DstHarness {
     db: SimPostgres,
@@ -439,7 +460,7 @@ impl DstHarness {
         };
         let state = |h: &Self| {
             let mut rows = block_on(read_materialized_state(
-                h.catalog.as_ref(),
+                &ReaderView(&h.catalog),
                 h.blob_store.as_ref(),
                 &ident(),
                 &schema(),
@@ -590,6 +611,16 @@ impl DstHarness {
             Step::CrashMidStream => self.crash_mid_stream(),
             Step::RestartMaterializer => self.restart_materializer(),
             Step::Compact => self.compact(),
+            Step::Expire => {
+                block_on(self.materializer.expire_cycle(0)).unwrap();
+            }
+            Step::CleanupOrphans => {
+                block_on(
+                    self.materializer
+                        .cleanup_orphans_cycle(MAT_PREFIX, i64::MAX, 0),
+                )
+                .unwrap();
+            }
         }
     }
 }
@@ -658,7 +689,33 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     }
 
     // 11. The materializer's FileIndex is what the catalog holds.
-    file_index_matches_catalog(h)
+    file_index_matches_catalog(h)?;
+
+    // 12. The catalog's history replays to the table readers see —
+    //     before and after snapshot expiry. The FileIndex rebuild,
+    //     compaction, orphan cleanup and `verify` all read it.
+    let read = |catalog: &dyn pg2iceberg_iceberg::verify::DynCatalog| {
+        block_on(read_materialized_state(
+            catalog,
+            h.blob_store.as_ref(),
+            &ident(),
+            &schema(),
+            &[ColumnName("id".into())],
+        ))
+        .map(|mut rows| {
+            sort_by_pk(&mut rows);
+            rows
+        })
+    };
+    let readers =
+        read(&ReaderView(&h.catalog)).map_err(|e| format!("invariant 12: readers' view: {e}"))?;
+    let history = read(h.catalog.as_ref()).map_err(|e| format!("invariant 12: history: {e}"))?;
+    if history != readers {
+        return Err(format!(
+            "invariant 12: Catalog::snapshots replays to {history:?}, readers see {readers:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Invariant 11: the materializer's FileIndex equals a rebuild from the
@@ -704,7 +761,7 @@ async fn atomic_visibility(
     db: &SimPostgres,
 ) -> Result<(), String> {
     let mut iceberg = read_materialized_state(
-        catalog,
+        &ReaderView(catalog),
         blob,
         &ident(),
         &schema(),
@@ -980,7 +1037,7 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
 
     // 5. Iceberg materialized state == PG ground truth.
     let mut iceberg_rows = block_on(read_materialized_state(
-        h.catalog.as_ref(),
+        &ReaderView(&h.catalog),
         h.blob_store.as_ref(),
         &ident(),
         &schema(),
@@ -1065,7 +1122,7 @@ fn check_invariants_with_snapshot(h: &mut DstHarness) -> Result<(), String> {
 
     // Invariant 5: PG == Iceberg at quiescence.
     let mut iceberg_rows = block_on(read_materialized_state(
-        h.catalog.as_ref(),
+        &ReaderView(&h.catalog),
         h.blob_store.as_ref(),
         &ident(),
         &schema(),
@@ -1167,6 +1224,43 @@ fn smallint_pk_file_index_survives_compaction() {
     check_invariants(&mut h).unwrap();
 }
 
+/// `maintain` = expire, then delete unreferenced files. Files added by
+/// expired snapshots are still part of the table; cleanup must keep them.
+#[test]
+fn orphan_cleanup_after_expiry_keeps_live_files() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Expire);
+    h.run_step(&Step::CleanupOrphans);
+    check_invariants(&mut h).unwrap();
+}
+
+/// A materializer restarted after expiry rebuilds its FileIndex; rows
+/// from expired snapshots must be in it, or a delete + re-insert of one
+/// folds into an `Insert` that leaves the old row live beside the new.
+#[test]
+fn restart_after_expiry_keeps_reinserted_rows_unique() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Expire);
+    h.run_step(&Step::RestartMaterializer);
+    h.run_step(&Step::Delete { id: 1 });
+    h.run_step(&Step::Insert { id: 1, qty: 30 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
 #[test]
 fn happy_path_one_insert_one_flush() {
     let mut h = DstHarness::boot();
@@ -1237,7 +1331,7 @@ fn truncate_inside_large_transaction_hides_its_earlier_inserts() {
         check_step_invariants(&h).unwrap();
     }
     let mut iceberg = block_on(read_materialized_state(
-        h.catalog.as_ref(),
+        &ReaderView(&h.catalog),
         h.blob_store.as_ref(),
         &ident(),
         &schema(),
