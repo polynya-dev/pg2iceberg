@@ -2520,6 +2520,31 @@ fn truncate_removes_rows_not_yet_materialized() {
     check_invariants(&mut h).unwrap();
 }
 
+/// A key change with a TOASTed column unchanged, replayed after a crash
+/// between its claim and the slot ack: the replayed copy's delete of the
+/// old key comes after the first copy's moved the row. A delete has no
+/// TOASTed value to resolve, so it must not look for one.
+#[test]
+fn replayed_key_change_with_toast_deletes_without_resolving() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 0 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ChangePk {
+        from: 1,
+        to: 5,
+        toast: true,
+    });
+    // Its Begin, change and Commit, claimed before any keepalive: the
+    // restart resends the transaction committing at the claimed LSN.
+    h.run_step(&Step::DrivePartial { n: 3 });
+    block_on(h.pipeline.flush()).unwrap();
+    h.run_step(&Step::CrashMidStream);
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
 /// A row updated twice in one batch with its TOASTed column unchanged
 /// both times keeps that column's value: the second update must not
 /// take the first one's unchanged placeholder for a value.

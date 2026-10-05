@@ -356,6 +356,8 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                             let mut del = evt.clone();
                             del.op = Op::Delete;
                             del.after = None;
+                            // A delete has no TOASTed values to resolve.
+                            del.unchanged_cols.clear();
                             self.sink.record_change(del)?;
 
                             let mut upd = evt;
