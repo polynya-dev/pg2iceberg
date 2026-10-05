@@ -83,11 +83,7 @@ pub trait SnapshotSource: Send + Sync {
     ) -> Result<Vec<Row>>;
 }
 
-/// Pseudo-xid base for synthetic snapshot transactions. Real PG xids are
-/// monotonic from 1; we reserve a high range so collisions are impossible.
-/// Each table gets `BASE + table_index`, so all events for a table land in
-/// the same buffer.
-pub const SNAPSHOT_XID_BASE: u32 = 0xFFFF_FF00;
+pub use pg2iceberg_core::SNAPSHOT_XID_BASE;
 
 /// `_pg2iceberg.markers` is the **blue-green replica alignment**
 /// table. It is *not* the snapshot↔CDC fence — that lives in

@@ -30,8 +30,8 @@ use pg2iceberg_coord::{Coordinator, LogEntry};
 use pg2iceberg_core::metrics::{names, Labels};
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
-    ColumnName, ColumnSchema, IdGen, Metrics, Namespace, NoopMetrics, Op, PgValue, Row, TableIdent,
-    TableSchema,
+    is_snapshot_xid, ColumnName, ColumnSchema, IdGen, Lsn, Metrics, Namespace, NoopMetrics, Op,
+    PgValue, Row, TableIdent, TableSchema,
 };
 use pg2iceberg_iceberg::meta::{
     self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
@@ -383,7 +383,35 @@ struct TableEntry {
     /// One that comes back was re-added, so it's a new column (see
     /// [`reconcile_columns`]).
     dropped: BTreeSet<String>,
+    /// A backfill staged alongside the table's changes.
+    backfill: Backfill,
 }
+
+/// A table backfilled mid-stream ([`Materializer::register_table_pending`])
+/// has its snapshot staged into its log alongside its changes, in no
+/// useful order: a change streamed before the backfill reached its row
+/// lands ahead of the row's older snapshot copy, and applied in log order
+/// the old copy would win (or bring back a deleted row, or leave an
+/// unchanged TOAST value nothing to resolve from). So its snapshot rows
+/// are applied first — tracked by a cursor of their own, under
+/// [`Materializer::snapshot_group`] — and then its changes, less those
+/// the snapshot already reflects.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Backfill {
+    /// Not looked up yet.
+    Unknown,
+    /// None to apply.
+    Absent,
+    /// Snapshot rows to apply, from this log offset on (-1: the start).
+    Applying(i64),
+    /// Snapshot rows applied. Changes that committed before `since` — the
+    /// first snapshot's LSN (a backfill resumed after a restart takes a
+    /// newer one), so every snapshot row reflects them — are skipped.
+    Applied { since: Option<Lsn> },
+}
+
+/// The snapshot cursor's value once a backfill's rows are all applied.
+const SNAPSHOT_APPLIED: i64 = i64::MAX;
 
 /// Log entries fetched per `read_log` call while a cycle drains a table.
 const LOG_PAGE_ENTRIES: usize = 64;
@@ -405,6 +433,9 @@ struct Unit {
     xids: BTreeSet<u32>,
     max_lsn: i64,
     max_source_ts_micros: i64,
+    /// Snapshot rows of a backfill: committing advances the snapshot
+    /// cursor (see [`Backfill`]).
+    snapshot: bool,
 }
 
 /// Whether a cut between `last` (end of what's buffered) and `next`
@@ -872,6 +903,7 @@ impl<C: Catalog> Materializer<C> {
                 writer,
                 gated_until_snapshot: false,
                 dropped: BTreeSet::new(),
+                backfill: Backfill::Unknown,
             },
         );
         Ok(())
@@ -893,6 +925,11 @@ impl<C: Catalog> Materializer<C> {
     /// materialization.
     pub async fn register_table_pending(&mut self, schema: TableSchema) -> Result<()> {
         self.register_table(schema.clone()).await?;
+        // Its snapshot rows are to be applied ahead of its changes; this
+        // cursor records that, durably, and tracks their progress.
+        self.coord
+            .ensure_cursor(&self.snapshot_group(), &schema.ident)
+            .await?;
         if let Some(entry) = self.tables.get_mut(&schema.ident) {
             entry.gated_until_snapshot = true;
         }
@@ -960,6 +997,96 @@ impl<C: Catalog> Materializer<C> {
         Ok(())
     }
 
+    /// The `mat_cursor` group of a backfill's snapshot rows (see
+    /// [`Backfill`]).
+    fn snapshot_group(&self) -> String {
+        format!("{}#snapshot", self.group)
+    }
+
+    /// The table's [`Backfill`], looked up once.
+    async fn backfill(&mut self, ident: &TableIdent) -> Result<Backfill> {
+        let known = self.tables.get(ident).map(|e| e.backfill);
+        if let Some(b) = known.filter(|b| *b != Backfill::Unknown) {
+            return Ok(b);
+        }
+        let backfill = match self.coord.get_cursor(&self.snapshot_group(), ident).await? {
+            None => Backfill::Absent,
+            Some(SNAPSHOT_APPLIED) => Backfill::Applied {
+                since: self.first_snapshot_lsn(ident).await?,
+            },
+            Some(at) => Backfill::Applying(at),
+        };
+        if let Some(entry) = self.tables.get_mut(ident) {
+            entry.backfill = backfill;
+        }
+        Ok(backfill)
+    }
+
+    /// The LSN of the table's first snapshot row: the earliest snapshot,
+    /// since backfill runs stage in order.
+    async fn first_snapshot_lsn(&self, ident: &TableIdent) -> Result<Option<Lsn>> {
+        let mut after = 0;
+        loop {
+            let entries = self.coord.read_log(ident, after, LOG_PAGE_ENTRIES).await?;
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            for e in entries {
+                let bytes = self.blob_store.get(&e.s3_path).await?;
+                let first = decode_chunk(&bytes)?
+                    .into_iter()
+                    .find(|evt| is_snapshot_xid(evt.xid));
+                if let Some(evt) = first {
+                    return Ok(Some(evt.lsn));
+                }
+                after = e.end_offset;
+            }
+        }
+    }
+
+    /// Apply a backfill's snapshot rows ahead of the table's changes: read
+    /// the log on from `from`, folding only snapshot rows, to its end —
+    /// the backfill is complete, so no more come. They're folded in
+    /// bounded steps, like a large transaction, and committed together:
+    /// the table goes from empty to its snapshot at once, never shown
+    /// half loaded. A crash before the commit re-applies them, which
+    /// changes nothing.
+    async fn apply_snapshot_rows(&mut self, ident: &TableIdent, from: i64) -> Result<usize> {
+        let mut after = from.max(0) as u64;
+        let mut unit = Unit {
+            snapshot: true,
+            ..Unit::default()
+        };
+        loop {
+            let entries = self.coord.read_log(ident, after, LOG_PAGE_ENTRIES).await?;
+            if entries.is_empty() {
+                break;
+            }
+            for e in entries {
+                let bytes = self.blob_store.get(&e.s3_path).await?;
+                let rows: Vec<MatEvent> = decode_chunk(&bytes)?
+                    .into_iter()
+                    .filter(|evt| is_snapshot_xid(evt.xid))
+                    .collect();
+                if !unit.buf.is_empty() && unit.buf.len() + rows.len() > self.batch_rows {
+                    self.prepare_step(ident, &mut unit).await?;
+                }
+                unit.buf.extend(rows);
+                unit.end_offset = Some(e.end_offset);
+                after = e.end_offset;
+            }
+        }
+        let folded = self.commit_unit(ident, &mut unit).await?;
+        self.coord
+            .set_cursor(&self.snapshot_group(), ident, SNAPSHOT_APPLIED)
+            .await?;
+        let since = self.first_snapshot_lsn(ident).await?;
+        if let Some(entry) = self.tables.get_mut(ident) {
+            entry.backfill = Backfill::Applied { since };
+        }
+        Ok(folded)
+    }
+
     /// Buffer a log entry's events into `unit`, applying its relation
     /// events in place: rows before one are staged under the old schema
     /// first.
@@ -969,7 +1096,17 @@ impl<C: Catalog> Materializer<C> {
         unit: &mut Unit,
         events: Vec<MatEvent>,
     ) -> Result<()> {
+        let backfill = self.tables.get(ident).map(|e| e.backfill);
         for evt in events {
+            if let Some(Backfill::Applied { since }) = backfill {
+                // Snapshot rows went first; and a change the snapshot
+                // already reflects would turn its row back.
+                let reflected =
+                    evt.op != Op::Relation && since.is_some_and(|since| evt.lsn < since);
+                if is_snapshot_xid(evt.xid) || reflected {
+                    continue;
+                }
+            }
             if evt.op != Op::Relation {
                 unit.buf.push(evt);
                 continue;
@@ -1373,6 +1510,19 @@ impl<C: Catalog> Materializer<C> {
         if !self.tables.contains_key(ident) {
             return Err(MaterializerError::UnknownTable(ident.clone()));
         }
+        if let Backfill::Applying(from) = self.backfill(ident).await? {
+            // Only once the backfill has staged every row — its rows are
+            // done at the log's end — whatever the gate says.
+            let complete = self
+                .coord
+                .table_state(ident)
+                .await?
+                .is_some_and(|t| t.snapshot_complete);
+            if !complete {
+                return Ok(0);
+            }
+            return self.apply_snapshot_rows(ident, from).await;
+        }
 
         let cursor = self
             .coord
@@ -1600,8 +1750,13 @@ impl<C: Catalog> Materializer<C> {
         let commit_duration_ms = (now_micros() - started_micros) / 1000;
 
         // Advance cursor only after commit success.
+        let group = if unit.snapshot {
+            self.snapshot_group()
+        } else {
+            self.group.clone()
+        };
         self.coord
-            .set_cursor(&self.group, ident, end_offset as i64)
+            .set_cursor(&group, ident, end_offset as i64)
             .await?;
 
         // Blue-green meta-marker emission. After cursor + FileIndex are
@@ -1611,7 +1766,8 @@ impl<C: Catalog> Materializer<C> {
         // audit trail for blue-green replica diffing. Pass the *new*
         // cursor so the coord's eligibility check considers everything we
         // just committed as processed.
-        if self.meta_marker.is_some() {
+        // (Snapshot rows carry no markers; their cursor isn't this one.)
+        if self.meta_marker.is_some() && !unit.snapshot {
             self.emit_pending_markers(ident, end_offset as i64).await?;
         }
 

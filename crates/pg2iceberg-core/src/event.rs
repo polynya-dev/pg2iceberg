@@ -23,6 +23,17 @@ pub enum Op {
 /// deterministic.
 pub type Row = BTreeMap<ColumnName, PgValue>;
 
+/// Pseudo-xid base for synthetic snapshot transactions. Real PG xids are
+/// monotonic from 1; we reserve a high range so collisions are impossible.
+/// Each table gets `BASE + table_index`, so all events for a table land in
+/// the same buffer.
+pub const SNAPSHOT_XID_BASE: u32 = 0xFFFF_FF00;
+
+/// Whether an event with this xid is a snapshot row, not a change.
+pub fn is_snapshot_xid(xid: Option<u32>) -> bool {
+    xid.is_some_and(|x| x >= SNAPSHOT_XID_BASE)
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ChangeEvent {
     pub table: TableIdent,
