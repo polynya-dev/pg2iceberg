@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use pg2iceberg_core::{Namespace, Op, TableIdent};
+use pg2iceberg_core::{ColumnName, Namespace, Op, PgValue, TableIdent};
 use pg2iceberg_pg::{
     prod::{PgClientImpl, TlsMode},
     DecodedMessage, PgClient,
@@ -461,6 +461,87 @@ async fn start_replication_streams_insert_events() {
         commits_seen >= 1,
         "expected ≥1 Commit event, got {commits_seen}"
     );
+}
+
+/// Columns of types the decoder has no mapping for — a domain, an enum,
+/// an array, an interval — replicate, typed as discovery types them: the
+/// domain as its base type, the rest as text.
+#[tokio::test]
+async fn start_replication_types_columns_as_discovery_does() {
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+    let u = uniq();
+    let table = format!("typed_{u}");
+    let pubname = format!("p_{u}");
+    let slot = format!("s_{u}");
+    regular
+        .batch_execute(&format!(
+            "CREATE DOMAIN posint_{u} AS int4 CHECK (VALUE > 0); \
+             CREATE TYPE color_{u} AS ENUM ('red', 'green'); \
+             CREATE TABLE {table} (id int4 PRIMARY KEY, d posint_{u}, e color_{u}, \
+                                   a int4[], i interval)"
+        ))
+        .await
+        .expect("create table");
+
+    let client = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("repl connect");
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: table.clone(),
+    };
+    let discovered = client
+        .discover_schema("public", &table)
+        .await
+        .expect("discover");
+    client
+        .create_publication(&pubname, std::slice::from_ref(&ident))
+        .await
+        .expect("publication");
+    let cp = client.create_slot(&slot).await.expect("slot");
+    regular
+        .batch_execute(&format!(
+            "INSERT INTO {table} VALUES (1, 5, 'red', '{{1,2}}', '1 day 2 hours')"
+        ))
+        .await
+        .expect("insert");
+
+    let mut stream = client
+        .start_replication(&slot, cp, &pubname)
+        .await
+        .expect("start_replication");
+    let mut relation = None;
+    let after = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(15), stream.recv())
+            .await
+            .expect("recv deadline")
+            .expect("stream error");
+        match msg {
+            DecodedMessage::Relation { ident: t, columns } if t.name == table => {
+                relation = Some(columns);
+            }
+            DecodedMessage::Change(ev) if ev.op == Op::Insert && ev.table.name == table => {
+                break ev.after.expect("Insert carries after-row");
+            }
+            _ => {}
+        }
+    };
+
+    let relation = relation.expect("Relation precedes the first change");
+    for c in &discovered.columns {
+        let decoded = relation.iter().find(|r| r.name == c.name).expect("column");
+        assert_eq!(
+            decoded.ty, c.ty,
+            "column {}: decoded vs discovered type",
+            c.name
+        );
+    }
+    let value = |c: &str| after[&ColumnName(c.into())].clone();
+    assert_eq!(value("d"), PgValue::Int4(5));
+    assert_eq!(value("e"), PgValue::Text("red".into()));
+    assert_eq!(value("a"), PgValue::Text("{1,2}".into()));
+    assert_eq!(value("i"), PgValue::Text("1 day 02:00:00".into()));
 }
 
 #[tokio::test]
