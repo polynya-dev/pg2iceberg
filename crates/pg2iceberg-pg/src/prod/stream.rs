@@ -41,7 +41,7 @@
 //!   pgoutput protocol metadata to consumers).
 //! - `PrimaryKeepAlive` → `DecodedMessage::Keepalive`.
 
-use crate::prod::typemap::pg_type_from_oid;
+use crate::prod::typemap::{column_type, Domain};
 use crate::prod::value_decode::decode_text;
 use crate::{ChangeEvent, DecodedMessage, PgError, RelationColumn, ReplicationStream, Result};
 use async_trait::async_trait;
@@ -95,7 +95,7 @@ struct RelationCache {
 #[derive(Debug, Clone)]
 struct ColumnInfo {
     name: String,
-    pg_type: Option<PgType>,
+    pg_type: PgType,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,10 +123,10 @@ pub struct ReplicationStreamImpl {
 }
 
 impl ReplicationStreamImpl {
-    pub(crate) fn wrap(stream: LogicalReplicationStream) -> Self {
+    pub(crate) fn wrap(stream: LogicalReplicationStream, domains: HashMap<u32, Domain>) -> Self {
         let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
-        let reader = tokio::spawn(reader_task(Box::pin(stream), events_tx, cmd_rx));
+        let reader = tokio::spawn(reader_task(Box::pin(stream), domains, events_tx, cmd_rx));
         Self {
             events_rx,
             cmd_tx,
@@ -183,6 +183,8 @@ struct ReaderState {
     /// Truncate carries N rel_ids; we emit one Change per rel_id.
     /// `VecDeque` so we drain in arrival order with `pop_front`.
     pending: VecDeque<DecodedMessage>,
+    /// The source's domains, to type a domain column as its base type.
+    domains: HashMap<u32, Domain>,
 }
 
 /// Production's pgoutput decoding without a connection: give it each
@@ -198,6 +200,17 @@ pub struct PgoutputDecoder {
 impl PgoutputDecoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A decoder for a source with these domains (see
+    /// [`super::PgClientImpl::domains`]).
+    pub fn with_domains(domains: HashMap<u32, Domain>) -> Self {
+        Self {
+            state: ReaderState {
+                domains,
+                ..Default::default()
+            },
+        }
     }
 
     /// Decode one pgoutput message. A TRUNCATE of several relations
@@ -262,7 +275,7 @@ impl ReaderState {
                     Vec::with_capacity(r.columns().len());
                 for c in r.columns() {
                     let name = c.name().map_err(io_to_pg)?.to_string();
-                    let pg_type = pg_type_from_oid(c.type_id() as u32, c.type_modifier());
+                    let pg_type = column_type(c.type_id() as u32, c.type_modifier(), &self.domains);
                     internal_columns.push(ColumnInfo {
                         name: name.clone(),
                         pg_type,
@@ -276,14 +289,7 @@ impl ReaderState {
                     // DEFAULT, and for that case `apply_relation`
                     // would still see a nullable add (which Iceberg
                     // tolerates).
-                    let pg_type_unwrapped = pg_type.ok_or_else(|| {
-                        PgError::Protocol(format!(
-                            "unsupported PG type for column {name} at oid {} (modifier {})",
-                            c.type_id(),
-                            c.type_modifier()
-                        ))
-                    })?;
-                    let ty = pg2iceberg_core::map_pg_to_iceberg(pg_type_unwrapped)
+                    let ty = pg2iceberg_core::map_pg_to_iceberg(pg_type)
                         .map_err(|e| PgError::Protocol(format!("type map for {name}: {e}")))?
                         .iceberg;
                     decoded_columns.push(RelationColumn {
@@ -612,10 +618,14 @@ fn forward_keepalive(
 /// stream errors, or `JoinHandle::abort` fires.
 async fn reader_task<W: ReplicationWire>(
     mut wire: W,
+    domains: HashMap<u32, Domain>,
     events_tx: mpsc::Sender<Result<DecodedMessage>>,
     mut cmd_rx: mpsc::Receiver<Cmd>,
 ) {
-    let mut state = ReaderState::default();
+    let mut state = ReaderState {
+        domains,
+        ..Default::default()
+    };
     // Last LSN we acked back to PG via `Cmd::Standby`. Reused for
     // `reply_requested=1` keepalive replies to confirm liveness without
     // advancing the slot beyond what the main loop has durably persisted.
@@ -770,7 +780,7 @@ mod reader_tests {
         let (events_tx, _events_rx) =
             mpsc::channel::<Result<DecodedMessage>>(EVENTS_CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
-        let reader = tokio::spawn(reader_task(wire, events_tx, cmd_rx));
+        let reader = tokio::spawn(reader_task(wire, HashMap::new(), events_tx, cmd_rx));
 
         // Issue a standby ack, exactly like the main loop's Standby tick.
         let (done_tx, done_rx) = oneshot::channel();
@@ -962,7 +972,7 @@ mod reader_tests {
         let (events_tx, mut events_rx) =
             mpsc::channel::<Result<DecodedMessage>>(EVENTS_CHANNEL_CAPACITY);
         let (_cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
-        let reader = tokio::spawn(reader_task(wire, events_tx, cmd_rx));
+        let reader = tokio::spawn(reader_task(wire, HashMap::new(), events_tx, cmd_rx));
 
         let mut forwarded = Vec::new();
         for _ in 0..2 {
@@ -1006,7 +1016,7 @@ mod reader_tests {
             .await
             .expect("prime the channel");
         let (_cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
-        let reader = tokio::spawn(reader_task(wire, events_tx, cmd_rx));
+        let reader = tokio::spawn(reader_task(wire, HashMap::new(), events_tx, cmd_rx));
 
         tokio::time::timeout(PATIENCE, async {
             while standbys.lock().unwrap().is_empty() {
@@ -1080,10 +1090,7 @@ fn decode_tuple(tuple: &Tuple, columns: &[ColumnInfo]) -> Result<(Row, Vec<Colum
                 unchanged.push(key);
             }
             TupleData::Text(bytes) => {
-                let pg_type = col.pg_type.ok_or_else(|| {
-                    PgError::Protocol(format!("unsupported column type for {}", col.name))
-                })?;
-                let val = decode_text(pg_type, bytes)
+                let val = decode_text(col.pg_type, bytes)
                     .map_err(|e| PgError::Protocol(format!("column {}: {e}", col.name)))?;
                 row.insert(key, val);
             }

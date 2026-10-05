@@ -1182,6 +1182,18 @@ fn probes() -> Vec<Probe> {
             ..probe("int_domain", "{ns}.posint", "5", PgValue::Int4(5))
         },
         Probe {
+            setup: "CREATE DOMAIN {ns}.price AS numeric(10,2)",
+            ..probe(
+                "numeric_domain",
+                "{ns}.price",
+                "'12.34'",
+                PgValue::Numeric(Decimal {
+                    unscaled_be_bytes: 1234i128.to_be_bytes().to_vec(),
+                    scale: 2,
+                }),
+            )
+        },
+        Probe {
             setup: "CREATE DOMAIN {ns}.email AS text",
             ..probe("text_domain", "{ns}.email", "'a@b.c'", text("a@b.c"))
         },
@@ -1325,17 +1337,18 @@ async fn run_probe(p: &Probe) -> (String, Result<PgValue, String>) {
         client.batch_execute(&sql).await.unwrap();
     }
 
-    let discovered = match PgClientImpl::connect(dsn().await).await {
-        Ok(c) => match c.discover_schema(&ns, "t").await {
-            Ok(schema) => schema
-                .columns
-                .iter()
-                .find(|c| c.name == "v")
-                .map_or("no column v".into(), |c| format!("{:?}", c.ty)),
-            Err(e) => format!("discovery fails: {e}"),
-        },
-        Err(e) => format!("connect: {e}"),
+    // Production's view of the source: the column's type from discovery,
+    // and the domains its decoder types columns with.
+    let source = PgClientImpl::connect(dsn().await).await.expect("connect");
+    let discovered = match source.discover_schema(&ns, "t").await {
+        Ok(schema) => schema
+            .columns
+            .iter()
+            .find(|c| c.name == "v")
+            .map_or("no column v".into(), |c| format!("{:?}", c.ty)),
+        Err(e) => format!("discovery fails: {e}"),
     };
+    let domains = source.domains().await.expect("domains");
 
     if !p.session.is_empty() {
         client.batch_execute(p.session).await.unwrap();
@@ -1354,7 +1367,7 @@ async fn run_probe(p: &Probe) -> (String, Result<PgValue, String>) {
         .batch_execute(&format!("SELECT pg_drop_replication_slot('{ns}_slot')"))
         .await
         .unwrap();
-    let mut decoder = PgoutputDecoder::new();
+    let mut decoder = PgoutputDecoder::with_domains(domains);
     for r in &rows {
         let msgs = match decoder.decode(&Bytes::from(r.get::<_, Vec<u8>>(0))) {
             Ok(m) => m,

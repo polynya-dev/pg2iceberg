@@ -19,12 +19,14 @@
 //! disconnects through a side channel today.
 
 use crate::prod::tls::{build_rustls_connector, TlsMode};
+use crate::prod::typemap::Domain;
 use crate::{
     DecodedMessage, PgClient, PgError, ReplicationStream, Result, SlotHealth, SnapshotId, WalStatus,
 };
 use async_trait::async_trait;
 use pg2iceberg_core::{Lsn, TableIdent};
 use postgres_replication::LogicalReplicationStream;
+use std::collections::HashMap;
 use tokio::task::AbortHandle;
 use tokio_postgres::{config::ReplicationMode, Client, NoTls, SimpleQueryMessage};
 
@@ -117,6 +119,40 @@ impl PgClientImpl {
         table: &str,
     ) -> Result<pg2iceberg_core::TableSchema> {
         super::discover::discover_schema(&self.client, schema, table).await
+    }
+
+    /// The source's domains, keyed by oid. pgoutput names a domain
+    /// column's type by the domain's oid; the decoder types it as the
+    /// domain's base type, as discovery does.
+    pub async fn domains(&self) -> Result<HashMap<u32, Domain>> {
+        let rows = self
+            .client
+            .simple_query("SELECT oid, typbasetype, typtypmod FROM pg_type WHERE typtype = 'd'")
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        let mut out = HashMap::new();
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let field = |i: usize| -> Result<&str> {
+                    row.try_get(i)
+                        .map_err(|e| PgError::Protocol(e.to_string()))?
+                        .ok_or_else(|| PgError::Protocol("pg_type returned NULL".into()))
+                };
+                let parse = |i: usize| -> Result<i64> {
+                    let v = field(i)?;
+                    v.parse()
+                        .map_err(|e| PgError::Protocol(format!("parse pg_type value {v:?}: {e}")))
+                };
+                out.insert(
+                    parse(0)? as u32,
+                    Domain {
+                        base_oid: parse(1)? as u32,
+                        typmod: parse(2)? as i32,
+                    },
+                );
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -501,6 +537,8 @@ impl PgClient for PgClientImpl {
             format_lsn(start),
             opts
         );
+        // Before streaming takes over the connection.
+        let domains = self.domains().await?;
         let copy_stream = self
             .client
             .copy_both_simple::<bytes::Bytes>(&q)
@@ -508,6 +546,7 @@ impl PgClient for PgClientImpl {
             .map_err(|e| PgError::Protocol(e.to_string()))?;
         Ok(Box::new(super::ReplicationStreamImpl::wrap(
             LogicalReplicationStream::new(copy_stream),
+            domains,
         )))
     }
 

@@ -1,13 +1,43 @@
 //! Postgres OID + type-modifier → [`pg2iceberg_core::PgType`].
 //!
 //! Mirrors `postgres/schema.go:38-88` (the `ParseType` table) and
-//! `postgres/schema.go:104-138` (numeric typmod handling). Unknown OIDs
-//! are reported as `None`; the caller decides whether to fail or fall
-//! back to `Text` (we choose the latter at the source-side, matching
-//! Go's behavior for forward-compat with new PG types).
+//! `postgres/schema.go:104-138` (numeric typmod handling).
+//! [`pg_type_from_oid`] reports unknown OIDs as `None`; [`column_type`]
+//! types a replicated column the way schema discovery does — domains as
+//! their base type, unknown types as `Text`.
 
 use pg2iceberg_core::typemap::PgType;
 use postgres_types::Type;
+use std::collections::HashMap;
+
+/// A domain's underlying type, from `pg_type` (`typbasetype`, `typtypmod`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Domain {
+    pub base_oid: u32,
+    pub typmod: i32,
+}
+
+/// The type of a column whose Relation message names type `oid`, as
+/// schema discovery types it from `information_schema.columns.udt_name`:
+/// a domain as its underlying type (`domains`, keyed by domain oid), and
+/// every type without a mapping (enum, array, interval, …) as text.
+/// Decoding a column as anything else would hand the materializer
+/// values that don't match the table's schema, or reject the table.
+pub fn column_type(oid: u32, type_modifier: i32, domains: &HashMap<u32, Domain>) -> PgType {
+    let (mut oid, mut type_modifier) = (oid, type_modifier);
+    // A domain can be over another domain. The bound only guards
+    // against a cycle, which `pg_type` can't hold.
+    for _ in 0..32 {
+        let Some(d) = domains.get(&oid) else {
+            break;
+        };
+        if type_modifier < 0 {
+            type_modifier = d.typmod;
+        }
+        oid = d.base_oid;
+    }
+    pg_type_from_oid(oid, type_modifier).unwrap_or(PgType::Text)
+}
 
 /// Decode the `(precision, scale)` pair carried by `pg_attribute.atttypmod`
 /// for `numeric` columns. The wire format is documented at
@@ -188,5 +218,65 @@ mod tests {
                 scale: Some(0),
             }
         );
+    }
+
+    #[test]
+    fn column_type_resolves_domains_and_falls_back_to_text() {
+        let numeric_10_2 = ((10 << 16) | 2) + 4;
+        let domains = HashMap::from([
+            // posint AS int4
+            (
+                90_001,
+                Domain {
+                    base_oid: Type::INT4.oid(),
+                    typmod: -1,
+                },
+            ),
+            // small_posint AS posint
+            (
+                90_002,
+                Domain {
+                    base_oid: 90_001,
+                    typmod: -1,
+                },
+            ),
+            // price AS numeric(10,2)
+            (
+                90_003,
+                Domain {
+                    base_oid: Type::NUMERIC.oid(),
+                    typmod: numeric_10_2,
+                },
+            ),
+            // colors AS an enum
+            (
+                90_004,
+                Domain {
+                    base_oid: 90_100,
+                    typmod: -1,
+                },
+            ),
+        ]);
+        assert_eq!(column_type(90_001, -1, &domains), PgType::Int4);
+        assert_eq!(column_type(90_002, -1, &domains), PgType::Int4);
+        assert_eq!(
+            column_type(90_003, -1, &domains),
+            PgType::Numeric {
+                precision: Some(10),
+                scale: Some(2),
+            }
+        );
+        assert_eq!(column_type(90_004, -1, &domains), PgType::Text);
+        // An enum, an array, interval: no mapping.
+        assert_eq!(column_type(90_100, -1, &domains), PgType::Text);
+        assert_eq!(
+            column_type(Type::INT4_ARRAY.oid(), -1, &domains),
+            PgType::Text
+        );
+        assert_eq!(
+            column_type(Type::INTERVAL.oid(), -1, &domains),
+            PgType::Text
+        );
+        assert_eq!(column_type(Type::INT8.oid(), -1, &domains), PgType::Int8);
     }
 }
