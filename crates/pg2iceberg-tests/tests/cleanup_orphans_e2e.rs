@@ -102,6 +102,7 @@ impl Harness {
                     op: Op::Insert,
                     row: r,
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )
@@ -385,6 +386,7 @@ fn cleanup_keeps_other_tables_files() {
                     op: Op::Insert,
                     row: row(i as i32, 1),
                     unchanged_cols: vec![],
+                    unchanged_from: None,
                 }],
                 &FileIndex::new(),
             )

@@ -2000,7 +2000,8 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     }
     // What staging should hold for each WAL event: its row as sent, except
     // that the pipeline splits a key-changing UPDATE into a Delete of the
-    // old key and an Update of the new one, and a TRUNCATE carries no row.
+    // old key and an Update of the new one (taking unchanged TOAST values
+    // from the old tuple when it has them), and a TRUNCATE carries no row.
     // On the wire every change carries its transaction's commit LSN.
     let id = ColumnName("id".into());
     let mut expected: BTreeMap<u32, Vec<(pg2iceberg_core::Lsn, Op, Row)>> = BTreeMap::new();
@@ -2032,8 +2033,18 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
                     && c.before.as_ref().map(|b| b.get(&id))
                         != c.after.as_ref().map(|a| a.get(&id)) =>
             {
-                tx.push((lsn, Op::Delete, row(&c.before)?));
-                tx.push((lsn, Op::Update, row(&c.after)?));
+                let before = row(&c.before)?;
+                let mut after = row(&c.after)?;
+                for col in &c.unchanged_cols {
+                    match before.get(col) {
+                        Some(v) if *v != PgValue::Null => {
+                            after.insert(col.clone(), v.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                tx.push((lsn, Op::Delete, before));
+                tx.push((lsn, Op::Update, after));
             }
             Op::Insert | Op::Update => tx.push((lsn, c.op, row(&c.after)?)),
             Op::Delete => tx.push((lsn, Op::Delete, row(&c.before)?)),
@@ -2391,6 +2402,27 @@ fn repeated_toast_updates_keep_the_unchanged_value() {
 /// unchanged: the column's value lives under the old key.
 #[test]
 fn key_change_with_toast_resolves_from_the_old_key() {
+    key_change_with_toast(false, false);
+}
+
+/// Under REPLICA IDENTITY DEFAULT the old tuple is key-only, so the value
+/// comes from the old key's committed row.
+#[test]
+fn key_change_with_toast_under_default_identity_resolves_from_the_old_key() {
+    key_change_with_toast(true, false);
+}
+
+/// The same through production's decoder, whose key-only old tuple has
+/// NULL in every other column.
+#[cfg(feature = "integration")]
+#[test]
+fn key_change_with_toast_under_default_identity_resolves_on_the_wire() {
+    key_change_with_toast(true, true);
+}
+
+fn key_change_with_toast(default_identity: bool, wire: bool) {
+    DEFAULT_IDENTITY.set(default_identity);
+    WIRE.set(wire);
     let mut h = DstHarness::boot();
     h.run_step(&Step::Insert { id: 5, qty: 0 });
     h.run_step(&Step::DriveFlush);
@@ -2401,6 +2433,28 @@ fn key_change_with_toast_resolves_from_the_old_key() {
         toast: true,
     });
     check_invariants(&mut h).unwrap();
+}
+
+/// A row moved twice and then updated in one batch, its TOASTed column
+/// unchanged throughout: the value is under the first key.
+#[test]
+fn moves_within_a_batch_resolve_toast_from_the_first_key() {
+    for default_identity in [false, true] {
+        DEFAULT_IDENTITY.set(default_identity);
+        let mut h = DstHarness::boot();
+        h.run_step(&Step::Insert { id: 5, qty: 0 });
+        h.run_step(&Step::DriveFlush);
+        h.run_step(&Step::MaterializerCycle);
+        for (from, to) in [(5, 1), (1, 2)] {
+            h.run_step(&Step::ChangePk {
+                from,
+                to,
+                toast: true,
+            });
+        }
+        h.run_step(&Step::ToastUpdate { id: 2, qty: 3 });
+        check_invariants(&mut h).unwrap();
+    }
 }
 
 /// A compaction pass can rewrite inputs whose rows were all deleted

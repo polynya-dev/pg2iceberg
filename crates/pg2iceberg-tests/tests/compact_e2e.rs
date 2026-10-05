@@ -219,6 +219,7 @@ fn insert(h: &Harness, s: &TableSchema, row: Row) {
             op: Op::Insert,
             row,
             unchanged_cols: vec![],
+            unchanged_from: None,
         }],
     );
 }
@@ -230,6 +231,7 @@ fn delete(h: &Harness, s: &TableSchema, row: Row) {
             op: Op::Delete,
             row,
             unchanged_cols: vec![],
+            unchanged_from: None,
         }],
     );
 }
@@ -505,6 +507,7 @@ fn compact_cycle_independently_handles_multiple_registered_tables() {
                 op: Op::Insert,
                 row: row_id_qty(i, i * 10),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
         );
     }
@@ -514,6 +517,7 @@ fn compact_cycle_independently_handles_multiple_registered_tables() {
             op: Op::Insert,
             row: row_id_qty(1, 1),
             unchanged_cols: vec![],
+            unchanged_from: None,
         }],
     );
 
@@ -783,6 +787,7 @@ fn op_row(op: Op, row: Row) -> MaterializedRow {
         op,
         row,
         unchanged_cols: vec![],
+        unchanged_from: None,
     }
 }
 

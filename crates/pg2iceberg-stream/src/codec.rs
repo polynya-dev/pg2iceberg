@@ -10,6 +10,12 @@
 //! | 4 | `_unchanged_cols` | string | nullable |
 //! | 5 | `_data` | string | not null |
 //! | 6 | `_xid` | int64 | nullable |
+//! | 7 | `_moved_from` | string | nullable |
+//!
+//! `_moved_from` is the old key of an `Update` that moved its row to a new
+//! key with TOAST columns unchanged (the event's `before`, which the
+//! pipeline keeps only then). Files written before it existed lack the
+//! column; they read as if it were null.
 //!
 //! Field IDs are persisted in Parquet column metadata under `PARQUET:field_id`
 //! so Iceberg readers resolve columns by ID, not name.
@@ -39,6 +45,7 @@ const COL_TS: &str = "_ts";
 const COL_UNCHANGED_COLS: &str = "_unchanged_cols";
 const COL_DATA: &str = "_data";
 const COL_XID: &str = "_xid";
+const COL_MOVED_FROM: &str = "_moved_from";
 
 /// Parquet schema for staged WAL files.
 ///
@@ -56,6 +63,7 @@ pub fn staged_schema() -> Arc<Schema> {
         field_with_id(COL_UNCHANGED_COLS, DataType::Utf8, true, 4),
         field_with_id(COL_DATA, DataType::Utf8, false, 5),
         field_with_id(COL_XID, DataType::Int64, true, 6),
+        field_with_id(COL_MOVED_FROM, DataType::Utf8, true, 7),
     ]))
 }
 
@@ -135,6 +143,7 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
     let mut unchanged_b = StringBuilder::with_capacity(cap, cap * 16);
     let mut data_b = StringBuilder::with_capacity(cap, cap * 64);
     let mut xid_b = Int64Builder::with_capacity(cap);
+    let mut moved_from_b = StringBuilder::new();
 
     for evt in events {
         let Some(op_str) = op_to_str(evt.op) else {
@@ -168,6 +177,13 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
             Some(xid) => xid_b.append_value(xid as i64),
             None => xid_b.append_null(),
         }
+        match (evt.op, &evt.before) {
+            (Op::Update, Some(before)) => moved_from_b.append_value(
+                serde_json::to_string(before)
+                    .map_err(|e| StreamError::Encode(format!("encode _moved_from: {e}")))?,
+            ),
+            _ => moved_from_b.append_null(),
+        }
     }
 
     let cols: Vec<Arc<dyn Array>> = vec![
@@ -177,6 +193,7 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
         Arc::new(unchanged_b.finish()),
         Arc::new(data_b.finish()),
         Arc::new(xid_b.finish()),
+        Arc::new(moved_from_b.finish()),
     ];
 
     RecordBatch::try_new(schema, cols)
@@ -270,6 +287,15 @@ fn decode_batch_into(batch: &RecordBatch, out: &mut Vec<MatEvent>) -> Result<()>
         .column_by_name(COL_XID)
         .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
         .ok_or_else(|| StreamError::Decode(format!("missing or wrong type: {COL_XID}")))?;
+    // Optional: absent from files written before it existed.
+    let moved_from_col = match batch.column_by_name(COL_MOVED_FROM) {
+        None => None,
+        Some(a) => Some(
+            a.as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| StreamError::Decode(format!("wrong type: {COL_MOVED_FROM}")))?,
+        ),
+    };
 
     for i in 0..n {
         let op_str = op_col.value(i);
@@ -290,6 +316,15 @@ fn decode_batch_into(batch: &RecordBatch, out: &mut Vec<MatEvent>) -> Result<()>
             Some(xid_col.value(i) as u32)
         };
 
+        let moved_from = match moved_from_col {
+            Some(c) if !c.is_null(i) => {
+                Some(serde_json::from_str(c.value(i)).map_err(|e| {
+                    StreamError::Decode(format!("decode _moved_from at row {i}: {e}"))
+                })?)
+            }
+            _ => None,
+        };
+
         out.push(MatEvent {
             op,
             lsn,
@@ -297,6 +332,7 @@ fn decode_batch_into(batch: &RecordBatch, out: &mut Vec<MatEvent>) -> Result<()>
             xid,
             unchanged_cols: unchanged,
             row,
+            moved_from,
         });
     }
 
@@ -325,12 +361,20 @@ mod tests {
     }
 
     #[test]
-    fn schema_has_six_fields_with_field_ids_1_to_6() {
+    fn schema_has_seven_fields_with_field_ids_1_to_7() {
         let s = staged_schema();
         let names: Vec<&str> = s.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
             names,
-            vec!["_op", "_lsn", "_ts", "_unchanged_cols", "_data", "_xid"]
+            vec![
+                "_op",
+                "_lsn",
+                "_ts",
+                "_unchanged_cols",
+                "_data",
+                "_xid",
+                "_moved_from"
+            ]
         );
         for (i, f) in s.fields().iter().enumerate() {
             let id = f
@@ -345,6 +389,7 @@ mod tests {
         assert!(s.field(3).is_nullable());
         assert!(!s.field(4).is_nullable());
         assert!(s.field(5).is_nullable());
+        assert!(s.field(6).is_nullable());
     }
 
     #[test]
@@ -443,6 +488,44 @@ mod tests {
         let chunk = encode_chunk(&evts).unwrap();
         assert_eq!(chunk.record_count, 1);
         assert_eq!(chunk.max_lsn, Lsn(2));
+    }
+
+    fn update(id: i32, before: Option<Row>) -> ChangeEvent {
+        ChangeEvent {
+            table: ident(),
+            op: Op::Update,
+            lsn: Lsn(7),
+            commit_ts: Timestamp(0),
+            xid: Some(3),
+            before,
+            after: Some(row(&[("id", PgValue::Int4(id)), ("note", PgValue::Null)])),
+            unchanged_cols: vec![ColumnName("note".into())],
+        }
+    }
+
+    #[test]
+    fn update_before_round_trips_as_moved_from() {
+        let old_key = row(&[("id", PgValue::Int4(1))]);
+        let chunk = encode_chunk(&[update(2, Some(old_key.clone())), update(3, None)]).unwrap();
+        let decoded = decode_chunk(&chunk.bytes).unwrap();
+        assert_eq!(decoded[0].moved_from, Some(old_key));
+        assert_eq!(decoded[1].moved_from, None);
+    }
+
+    #[test]
+    fn files_without_moved_from_still_decode() {
+        // A file staged before `_moved_from` existed: the first six columns.
+        let batch = encode_batch(&[update(2, Some(row(&[("id", PgValue::Int4(1))])))]).unwrap();
+        let old = batch.project(&[0, 1, 2, 3, 4, 5]).unwrap();
+        let mut buf = Vec::new();
+        let mut w = ArrowWriter::try_new(&mut buf, old.schema(), None).unwrap();
+        w.write(&old).unwrap();
+        w.close().unwrap();
+
+        let decoded = decode_chunk(&buf).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].moved_from, None);
+        assert_eq!(decoded[0].unchanged_cols, vec![ColumnName("note".into())]);
     }
 
     #[test]

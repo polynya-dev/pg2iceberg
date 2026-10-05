@@ -356,6 +356,7 @@ mod tests {
                 op: Op::Insert,
                 row: row(1, 10),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
             "snap1",
         );
@@ -386,6 +387,7 @@ mod tests {
                 op: Op::Insert,
                 row: row(1, 10),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
             "snap1",
         );
@@ -401,6 +403,7 @@ mod tests {
                 op: Op::Update,
                 row: row(1, 99),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
             "snap2",
         );
@@ -430,6 +433,7 @@ mod tests {
                 op: Op::Insert,
                 row: row(1, 10),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
             "snap1",
         );
@@ -442,6 +446,7 @@ mod tests {
                 op: Op::Delete,
                 row: pk_only(1),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
             "snap2",
         );
@@ -474,6 +479,7 @@ mod tests {
                 op: Op::Insert,
                 row: row(1, 10),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
             "snap1",
         );
@@ -486,6 +492,7 @@ mod tests {
                 op: Op::Delete,
                 row: pk_only(1),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
             "snap2",
         );
@@ -498,6 +505,7 @@ mod tests {
                 op: Op::Insert,
                 row: row(1, 200),
                 unchanged_cols: vec![],
+                unchanged_from: None,
             }],
             "snap3",
         );
