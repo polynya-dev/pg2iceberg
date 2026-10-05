@@ -39,11 +39,9 @@ pub fn decode_text(ty: PgType, bytes: &[u8]) -> Result<PgValue, DecodeError> {
             _ => return Err(bad()),
         },
         PgType::Int2 => PgValue::Int2(raw.parse().map_err(|_| bad())?),
-        PgType::Int4 | PgType::Oid => {
-            // PG `oid` is unsigned 32-bit; reading as i64 then casting
-            // accepts wraparound for `oid` values above 2^31.
-            PgValue::Int4(raw.parse::<i64>().map_err(|_| bad())? as i32)
-        }
+        PgType::Int4 => PgValue::Int4(raw.parse().map_err(|_| bad())?),
+        // Unsigned 32-bit, so `long`: values past 2^31 don't fit `int`.
+        PgType::Oid => PgValue::Int8(raw.parse::<u32>().map_err(|_| bad())?.into()),
         PgType::Int8 => PgValue::Int8(raw.parse().map_err(|_| bad())?),
         PgType::Float4 => PgValue::Float4(raw.parse().map_err(|_| bad())?),
         PgType::Float8 => PgValue::Float8(raw.parse().map_err(|_| bad())?),

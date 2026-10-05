@@ -2,8 +2,16 @@
 //!
 //! Inverse of [`crate::writer::TableWriter::prepare`]'s data-file output.
 //! Used by TOAST resolution (re-fetching prior column values for an
-//! `UPDATE ... SET col = unchanged_toast`) and by the `verify`
-//! subcommand.
+//! `UPDATE ... SET col = unchanged_toast`), compaction, FileIndex
+//! rebuilds and the `verify` subcommand.
+//!
+//! Like any Iceberg reader, it matches a schema column to the file's
+//! column with the same field id, not the same name: a column renamed
+//! since the file was written keeps its values, and a column re-added
+//! under an old name doesn't inherit them. A file written before a
+//! column was added reads it as NULL, and one written before a type
+//! promotion (`int` → `long`, `float` → `double`) reads as the promoted
+//! type.
 
 use crate::writer::WriterError;
 use arrow_array::RecordBatch;
@@ -35,8 +43,8 @@ pub fn read_data_file(bytes: &[u8], cols: &[ColumnSchema]) -> Result<Vec<Row>> {
 /// Decode a Parquet data file the way the Iceberg spec reads one:
 /// each of `cols` is matched to the file's column carrying the same
 /// `PARQUET:field_id`, not the same name, and a column the file doesn't
-/// have reads as `NULL`. A query engine reading the table resolves
-/// columns this way; [`read_data_file`] matches by name.
+/// have reads as `NULL`. Deliberately separate from [`RowBatches`] —
+/// tests use it as an independent oracle for that reader.
 pub fn read_data_file_by_field_id(bytes: Bytes, cols: &[ColumnSchema]) -> Result<Vec<Row>> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?
@@ -93,8 +101,14 @@ impl RowBatches {
             .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?;
         let parquet_schema = builder.parquet_schema();
         let wanted = (0..parquet_schema.num_columns()).filter(|&i| {
-            let name = parquet_schema.column(i).path().string();
-            cols.iter().any(|c| c.name == name)
+            let column = parquet_schema.column(i);
+            let info = column.self_type().get_basic_info();
+            if info.has_id() {
+                cols.iter().any(|c| c.field_id == info.id())
+            } else {
+                let name = column.path().string();
+                cols.iter().any(|c| c.name == name)
+            }
         });
         let projection = ProjectionMask::leaves(parquet_schema, wanted);
         let reader = builder
@@ -121,28 +135,57 @@ impl Iterator for RowBatches {
     }
 }
 
+/// The batch's column for each of `cols`: by field id (by name for a
+/// column the file wrote without one), `None` where the file has none.
+fn resolve_columns<'a>(
+    batch: &'a RecordBatch,
+    cols: &[ColumnSchema],
+) -> Vec<Option<&'a dyn Array>> {
+    let schema = batch.schema();
+    let mut by_id: BTreeMap<i32, usize> = BTreeMap::new();
+    let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, f) in schema.fields().iter().enumerate() {
+        match f
+            .metadata()
+            .get("PARQUET:field_id")
+            .and_then(|id| id.parse().ok())
+        {
+            Some(id) => {
+                by_id.insert(id, i);
+            }
+            None => {
+                by_name.insert(f.name().as_str(), i);
+            }
+        }
+    }
+    cols.iter()
+        .map(|c| {
+            by_id
+                .get(&c.field_id)
+                .or_else(|| by_name.get(c.name.as_str()))
+                .map(|&i| batch.column(i).as_ref())
+        })
+        .collect()
+}
+
 fn decode_batch(batch: &RecordBatch, cols: &[ColumnSchema]) -> Result<Vec<Row>> {
+    let arrays = resolve_columns(batch, cols);
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         let mut row: Row = BTreeMap::new();
-        for col in cols {
+        for (col, arr) in cols.iter().zip(&arrays) {
             let key = ColumnName(col.name.clone());
-            // Schema-evolution-tolerant read: if the parquet
-            // file pre-dates an `AddColumn`, the file simply
-            // doesn't carry the new column and Iceberg readers
-            // project NULL. Mirrors that behavior here so a
-            // mid-stream `ALTER TABLE ADD COLUMN` doesn't
-            // require backfilling old data files. Equality-delete
-            // reads (cols = PK-only) still hit every column
-            // they need, since PKs aren't dropped.
-            let Some(arr) = batch.column_by_name(&col.name) else {
+            // A file written before the column was added doesn't have
+            // it: Iceberg readers project NULL, so a mid-stream `ALTER
+            // TABLE ADD COLUMN` needs no backfill of old files.
+            let Some(arr) = *arr else {
                 row.insert(key, PgValue::Null);
                 continue;
             };
             if arr.is_null(i) {
                 row.insert(key, PgValue::Null);
             } else {
-                row.insert(key, decode_value(col.ty, arr.as_ref(), i)?);
+                row.insert(key, decode_value(col.ty, arr, i)?);
             }
         }
         out.push(row);
@@ -165,9 +208,17 @@ fn decode_value(ty: IcebergType, arr: &dyn Array, i: usize) -> Result<PgValue> {
     Ok(match ty {
         IcebergType::Boolean => PgValue::Bool(cast!(BooleanArray)?.value(i)),
         IcebergType::Int => PgValue::Int4(cast!(Int32Array)?.value(i)),
-        IcebergType::Long => PgValue::Int8(cast!(Int64Array)?.value(i)),
+        // A file written before an `int` → `long` promotion.
+        IcebergType::Long => match arr.as_any().downcast_ref::<Int32Array>() {
+            Some(old) => PgValue::Int8(old.value(i).into()),
+            None => PgValue::Int8(cast!(Int64Array)?.value(i)),
+        },
         IcebergType::Float => PgValue::Float4(cast!(Float32Array)?.value(i)),
-        IcebergType::Double => PgValue::Float8(cast!(Float64Array)?.value(i)),
+        // A file written before a `float` → `double` promotion.
+        IcebergType::Double => match arr.as_any().downcast_ref::<Float32Array>() {
+            Some(old) => PgValue::Float8(old.value(i).into()),
+            None => PgValue::Float8(cast!(Float64Array)?.value(i)),
+        },
         IcebergType::String => PgValue::Text(cast!(StringArray)?.value(i).to_string()),
         IcebergType::Date => PgValue::Date(DaysSinceEpoch(cast!(Date32Array)?.value(i))),
         IcebergType::Timestamp => {
@@ -295,6 +346,60 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0], row(1, 10));
         assert_eq!(decoded[1], row(2, 20));
+    }
+
+    /// A data file of `schema_id_qty()` holding `(1, 10)`.
+    fn id_qty_file() -> Bytes {
+        let rows = vec![MaterializedRow {
+            op: Op::Insert,
+            row: row(1, 10),
+            unchanged_cols: vec![],
+            unchanged_from: None,
+        }];
+        let prepared = TableWriter::new(schema_id_qty())
+            .prepare(&rows, &crate::FileIndex::new())
+            .unwrap();
+        prepared.data.into_iter().next().unwrap().chunk.bytes
+    }
+
+    fn read(bytes: Bytes, cols: Vec<ColumnSchema>) -> Row {
+        RowBatches::new(bytes, &cols, 16)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .remove(0)
+    }
+
+    #[test]
+    fn columns_resolve_by_field_id_not_name() {
+        let [id, qty] = schema_id_qty().columns.try_into().unwrap();
+        // qty (field 2) since renamed, and a new column under its old
+        // name (field 3): the values follow the field id.
+        let renamed = ColumnSchema {
+            name: "qty__dropped_2".into(),
+            nullable: true,
+            ..qty.clone()
+        };
+        let readded = ColumnSchema {
+            field_id: 3,
+            nullable: true,
+            ..qty
+        };
+        let got = read(id_qty_file(), vec![id, renamed, readded]);
+        assert_eq!(got[&col("qty__dropped_2")], PgValue::Int4(10));
+        assert_eq!(got[&col("qty")], PgValue::Null);
+    }
+
+    #[test]
+    fn promoted_columns_read_as_the_new_type() {
+        let [id, qty] = schema_id_qty().columns.try_into().unwrap();
+        let long = ColumnSchema {
+            ty: IcebergType::Long,
+            ..qty
+        };
+        let got = read(id_qty_file(), vec![id, long]);
+        assert_eq!(got[&col("qty")], PgValue::Int8(10));
     }
 
     #[test]

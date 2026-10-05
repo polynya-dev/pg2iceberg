@@ -36,9 +36,9 @@ use pg2iceberg_iceberg::meta::{
     self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
 };
 use pg2iceberg_iceberg::{
-    fold_events, promote_re_inserts, read_data_file, rebuild_from_catalog, resolve_unchanged_cols,
-    Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PkKey, PreparedCommit,
-    TableWriter, WriterError,
+    fold_events, promote_re_inserts, read_data_file, rebuild_from_catalog, reconcile_columns,
+    resolve_unchanged_cols, Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PkKey,
+    PreparedCommit, TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -378,6 +378,10 @@ struct TableEntry {
     /// [`Materializer::register_table`] entry, preserving existing
     /// behavior where the lifecycle gates the whole snapshot phase.
     gated_until_snapshot: bool,
+    /// Columns of `schema` the source was last seen without: soft-dropped.
+    /// One that comes back was re-added, so it's a new column (see
+    /// [`reconcile_columns`]).
+    dropped: BTreeSet<String>,
 }
 
 /// Log entries fetched per `read_log` call while a cycle drains a table.
@@ -832,9 +836,24 @@ impl<C: Catalog> Materializer<C> {
     pub async fn register_table(&mut self, schema: TableSchema) -> Result<()> {
         let ident = schema.ident.clone();
         self.catalog.ensure_namespace(&ident.namespace).await?;
-        if self.catalog.load_table(&ident).await?.is_none() {
-            self.catalog.create_table(&schema).await?;
-        }
+        // An existing table keeps its Iceberg schema — the columns and
+        // field ids the stream has evolved it to. `schema`'s columns come
+        // from discovery, which numbers them by position: after a column
+        // is dropped, the ones behind it would take others' field ids and
+        // land under the wrong Iceberg column. Nor does discovery's view
+        // of the source's *current* columns apply yet: the stream may
+        // still replay transactions from before a change. Its Relation
+        // messages evolve the schema in order ([`Self::apply_relation`]).
+        let schema = match self.catalog.load_table(&ident).await? {
+            None => {
+                self.catalog.create_table(&schema).await?;
+                schema
+            }
+            Some(meta) => TableSchema {
+                columns: meta.schema.columns,
+                ..schema
+            },
+        };
         // Notify the blob store that the table now exists in the
         // catalog. Static-creds backends ignore this; the
         // vended-credentials router uses it to load per-table STS
@@ -873,6 +892,7 @@ impl<C: Catalog> Materializer<C> {
                 file_index,
                 writer,
                 gated_until_snapshot: false,
+                dropped: BTreeSet::new(),
             },
         );
         Ok(())
@@ -911,28 +931,28 @@ impl<C: Catalog> Materializer<C> {
         }
     }
 
-    /// Apply a pgoutput Relation message: diff `incoming_columns`
-    /// against the registered schema for `ident`, build a
-    /// `Vec<SchemaChange>`, and call `Catalog::evolve_schema`. The
-    /// in-memory `TableEntry::schema` and `TableWriter` are
-    /// rebuilt from the post-evolution schema so subsequent
-    /// materialize cycles encode rows with the new shape.
+    /// Apply a pgoutput Relation message: bring the table's Iceberg
+    /// schema in line with `incoming_columns` ([`reconcile_columns`]),
+    /// call `Catalog::evolve_schema`, and rebuild the in-memory
+    /// `TableEntry::schema` and `TableWriter` from the result, so
+    /// subsequent materialize cycles encode rows with the new shape.
     ///
-    /// Detects three kinds of evolution:
+    /// - **AddColumn** for a new name, with a fresh field id.
+    /// - **DropColumn** (soft) for a non-PK column `incoming` lacks: it
+    ///   stays, nullable, so older data files keep resolving.
+    /// - **PromoteColumnType** for a legal Iceberg promotion (int→long,
+    ///   float→double, decimal precision increase). Illegal type
+    ///   changes (e.g. long→int, text→int) are rejected with
+    ///   `MaterializerError::Catalog` so the lifecycle fails loudly
+    ///   rather than silently truncate or coerce downstream readers.
+    /// - **RenameColumn + AddColumn** for a column the source dropped
+    ///   and re-added: Postgres gives it no values, so it's a new
+    ///   column, and the dropped one keeps its values under another
+    ///   name.
     ///
-    /// - **AddColumn**: a name in `incoming` that's not in our
-    ///   schema. Field id is allocated by `apply_schema_changes`
-    ///   from the schema's current high-water mark.
-    /// - **DropColumn**: a non-PK name in our schema that's not in
-    ///   `incoming`. Soft-drop — column stays as nullable so older
-    ///   data files keep resolving.
-    /// - **PromoteColumnType**: a name present in both, but
-    ///   `incoming.ty != current.ty` *and* the change is a legal
-    ///   Iceberg promotion (int→long, float→double, decimal
-    ///   precision increase). Illegal type changes (e.g. long→int,
-    ///   text→int) are rejected with `MaterializerError::Catalog`
-    ///   so the lifecycle fails loudly rather than silently
-    ///   truncate or coerce downstream readers.
+    /// The incoming `is_primary_key`/`nullable` are ignored:
+    /// pgoutput's key flag means "part of REPLICA IDENTITY" (every
+    /// column under `REPLICA IDENTITY FULL`), not "is primary key".
     ///
     /// **No-op when the table isn't registered** (the lifecycle
     /// only registers tables in YAML — incoming Relations for
@@ -956,115 +976,26 @@ impl<C: Catalog> Materializer<C> {
             Some(e) => e,
             None => return Ok(()),
         };
-
-        let mut current_names: std::collections::BTreeSet<String> = entry
-            .schema
-            .columns
+        let incoming: Vec<(String, pg2iceberg_core::IcebergType)> = incoming_columns
             .iter()
-            .map(|c| c.name.clone())
+            .map(|c| (c.name.clone(), c.ty))
             .collect();
-        let incoming_names: std::collections::BTreeSet<String> =
-            incoming_columns.iter().map(|c| c.name.clone()).collect();
-        let current_by_name: std::collections::BTreeMap<String, &ColumnSchema> = entry
-            .schema
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c))
-            .collect();
-
-        let mut changes: Vec<pg2iceberg_iceberg::SchemaChange> = Vec::new();
-        for c in incoming_columns {
-            match current_by_name.get(&c.name) {
-                None => {
-                    // Force `nullable: true` for evolution-time adds.
-                    // Two reasons:
-                    //   1. Iceberg requires new columns to be optional
-                    //      so prior data files (which don't carry the
-                    //      column) read back as NULL. Pushing through a
-                    //      non-nullable add would break readers.
-                    //   2. `c.nullable` is derived from pgoutput's
-                    //      Relation flag bit 0, which means "part of
-                    //      REPLICA IDENTITY" — *not* "is primary key".
-                    //      Under `REPLICA IDENTITY FULL` every column
-                    //      reports `is_replica_identity = 1`, so we'd
-                    //      incorrectly stamp every fresh column as
-                    //      non-nullable. The startup-time PK info from
-                    //      `discover_schemas` is the authoritative
-                    //      source; pgoutput's flag is wire-only signal.
-                    changes.push(pg2iceberg_iceberg::SchemaChange::AddColumn {
-                        name: c.name.clone(),
-                        ty: c.ty,
-                        nullable: true,
-                    });
-                }
-                Some(existing) => {
-                    if existing.ty != c.ty {
-                        // PK columns are part of the equality-delete
-                        // predicate; promoting a PK type would
-                        // invalidate every prior delete file's pk_key
-                        // hash. Refuse — operators must re-snapshot
-                        // for that case.
-                        if existing.is_primary_key {
-                            return Err(MaterializerError::Catalog(IcebergError::Other(format!(
-                                "cannot promote primary-key column {}: {:?} → {:?} \
-                                 (PK type is part of the equality-delete contract; \
-                                 changing it requires a full re-snapshot)",
-                                c.name, existing.ty, c.ty
-                            ))));
-                        }
-                        if !pg2iceberg_iceberg::is_legal_type_promotion(existing.ty, c.ty) {
-                            return Err(MaterializerError::Catalog(IcebergError::Other(format!(
-                                "column {} type change {:?} → {:?} is not a legal Iceberg \
-                                 promotion. Allowed: int→long, float→double, decimal \
-                                 precision increase. Other changes (narrowing, cross-family) \
-                                 require a full re-snapshot.",
-                                c.name, existing.ty, c.ty
-                            ))));
-                        }
-                        changes.push(pg2iceberg_iceberg::SchemaChange::PromoteColumnType {
-                            name: c.name.clone(),
-                            new_ty: c.ty,
-                        });
-                    }
-                }
-            }
-        }
-        for c in &entry.schema.columns {
-            // PK columns are immutable in our model — pgoutput won't
-            // drop them anyway. Skip to avoid soft-dropping a PK
-            // (which would set `nullable = true` on the PK column).
-            if c.is_primary_key {
-                continue;
-            }
-            if !incoming_names.contains(&c.name) {
-                changes.push(pg2iceberg_iceberg::SchemaChange::DropColumn {
-                    name: c.name.clone(),
-                });
-            }
-        }
-        if changes.is_empty() {
-            return Ok(());
-        }
-
-        // Catalog-side first so a failure leaves the materializer's
-        // in-memory state unchanged (next Relation will re-trigger
-        // the diff). After success, rebuild the TableWriter so it
-        // encodes with the new column set. Use the Iceberg-side
-        // ident (`lookup_ident`) — `ident` is the PG-side key from
-        // the pgoutput Relation message, which the catalog
-        // wouldn't recognise.
-        self.catalog
-            .evolve_schema(&lookup_ident, changes.clone())
-            .await?;
-        pg2iceberg_iceberg::apply_schema_changes(&mut entry.schema, &changes)
+        let changes = reconcile_columns(&entry.schema, &incoming, &entry.dropped)
             .map_err(MaterializerError::Catalog)?;
-        entry.writer = TableWriter::new(entry.schema.clone());
-        // current_names is rebuilt next call from the updated schema;
-        // explicit insertion keeps Clippy happy + makes the
-        // post-state self-consistent within this call.
-        for c in &entry.schema.columns {
-            current_names.insert(c.name.clone());
+        if !changes.is_empty() {
+            // Catalog-side first so a failure leaves the materializer's
+            // in-memory state unchanged (the next Relation re-triggers
+            // the diff). Use the Iceberg-side ident (`lookup_ident`) —
+            // `ident` is the PG-side key from the pgoutput Relation
+            // message, which the catalog wouldn't recognise.
+            self.catalog
+                .evolve_schema(&lookup_ident, changes.clone())
+                .await?;
+            pg2iceberg_iceberg::apply_schema_changes(&mut entry.schema, &changes)
+                .map_err(MaterializerError::Catalog)?;
+            entry.writer = TableWriter::new(entry.schema.clone());
         }
+        entry.dropped = absent_from(&entry.schema, &incoming);
         Ok(())
     }
 
@@ -1908,6 +1839,19 @@ fn expand_truncates(
         // Drop the Truncate sentinel itself — its expansion is in `out`.
     }
     out
+}
+
+/// The columns of `schema` that `source` doesn't have.
+fn absent_from(
+    schema: &TableSchema,
+    source: &[(String, pg2iceberg_core::IcebergType)],
+) -> BTreeSet<String> {
+    schema
+        .columns
+        .iter()
+        .filter(|c| !source.iter().any(|(name, _)| *name == c.name))
+        .map(|c| c.name.clone())
+        .collect()
 }
 
 fn collect_toast_paths(
