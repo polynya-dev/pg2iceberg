@@ -762,12 +762,29 @@ mod prod_backend {
                     seq: entry
                         .sequence_number()
                         .ok_or_else(|| format!("{}: no sequence number", df.file_path()))?,
-                    partition: format!("{:?}", df.partition()),
+                    partition: df
+                        .partition()
+                        .iter()
+                        .map(partition_literal)
+                        .collect::<Result<_, _>>()?,
                     equality_ids,
                 });
             }
         }
         Ok(out)
+    }
+
+    /// The harness partitions by `truncate(qty)`: an int, or null.
+    fn partition_literal(
+        value: Option<&iceberg::spec::Literal>,
+    ) -> Result<pg2iceberg_core::partition::PartitionLiteral, String> {
+        use iceberg::spec::{Literal, PrimitiveLiteral};
+        use pg2iceberg_core::partition::PartitionLiteral;
+        match value {
+            None => Ok(PartitionLiteral::Null),
+            Some(Literal::Primitive(PrimitiveLiteral::Int(n))) => Ok(PartitionLiteral::Int(*n)),
+            Some(other) => Err(format!("unexpected partition value {other:?}")),
+        }
     }
 
     /// Refuses to overwrite an object, like the sim blob store: every path

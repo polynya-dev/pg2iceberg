@@ -155,13 +155,13 @@ impl TableWriter {
     /// then group each bucket by partition tuple. Each group is serialized
     /// to one parquet chunk; the caller flushes per materializer cycle.
     ///
-    /// `file_index` is consulted only for partitioned tables to recover
-    /// partition values for `Delete` rows that don't carry the partition
-    /// source column on the row payload (replica identity DEFAULT case
-    /// when partition col isn't in the PK). The two-tier resolution
-    /// checks the row payload first, then falls back to the FileIndex.
-    /// A tier-3 miss surfaces as `WriterError::DeletePartitionUnresolved`
-    /// rather than a silent drop, so the operator gets a clear signal.
+    /// `file_index` places equality deletes on partitioned tables: a
+    /// delete goes to the partition its key is indexed in, where the row
+    /// lives. An unindexed key falls back to the row payload, then
+    /// errors: a key-only `Delete` (replica identity DEFAULT, partition
+    /// col outside the PK) with nowhere to look surfaces as
+    /// `WriterError::DeletePartitionUnresolved` rather than a silent
+    /// drop, so the operator gets a clear signal.
     /// Pass `&FileIndex::new()` for unpartitioned schemas or when the
     /// caller has no file index (e.g. test harnesses).
     pub fn prepare(
@@ -202,12 +202,14 @@ impl TableWriter {
             &self.full_arrow_schema,
             &self.schema.columns,
             file_index,
+            false,
         )?;
         let equality_deletes = self.group_and_encode(
             &delete_rows,
             &self.pk_arrow_schema,
             &self.pk_columns,
             file_index,
+            true,
         )?;
 
         Ok(PreparedFiles {
@@ -217,12 +219,15 @@ impl TableWriter {
         })
     }
 
+    /// `deletes`: `rows` are equality deletes (of a Delete, or of an
+    /// Update's previous version), partitioned where their rows live.
     fn group_and_encode(
         &self,
         rows: &[&MaterializedRow],
         arrow_schema: &Arc<Schema>,
         cols: &[ColumnSchema],
         file_index: &FileIndex,
+        deletes: bool,
     ) -> Result<Vec<PreparedChunk>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -253,7 +258,10 @@ impl TableWriter {
         type Group<'a> = (Vec<PartitionLiteral>, Vec<&'a MaterializedRow>);
         let mut groups: Vec<Group> = Vec::new();
         for r in rows {
-            let tuple = self.compute_partition_tuple(r, file_index)?;
+            let tuple = match self.indexed_partition(r, file_index) {
+                Some(tuple) if deletes => tuple,
+                _ => self.compute_partition_tuple(r, file_index)?,
+            };
             if let Some(slot) = groups.iter_mut().find(|(k, _)| k == &tuple) {
                 slot.1.push(r);
             } else {
@@ -317,9 +325,27 @@ impl TableWriter {
         })
     }
 
+    /// The partition the FileIndex has `r`'s key in: where its row lives
+    /// in Iceberg. An equality delete reaches only rows in its own
+    /// partition, and the row payload can't tell where that is — a
+    /// key-only delete (REPLICA IDENTITY DEFAULT) carries NULLs, and an
+    /// update's new values may name another partition than its old row's.
+    fn indexed_partition(
+        &self,
+        r: &MaterializedRow,
+        file_index: &FileIndex,
+    ) -> Option<Vec<PartitionLiteral>> {
+        let key = PkKey::from_row(&r.row, &self.pk_col_names);
+        file_index
+            .partition_values_for_pk(&key)
+            .filter(|values| values.len() == self.schema.partition_spec.len())
+            .map(<[PartitionLiteral]>::to_vec)
+    }
+
     /// Compute the partition tuple for one row. Tier-1: read partition
     /// source columns from the row. Tier-2 (Delete only): consult FileIndex.
-    /// Tier-3 (Delete only): error.
+    /// Tier-3 (Delete only): error. (An equality delete whose key is
+    /// indexed takes the indexed partition first — [`Self::indexed_partition`].)
     fn compute_partition_tuple(
         &self,
         r: &MaterializedRow,
@@ -1475,6 +1501,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(p.equality_deletes.len(), 1);
+        assert_eq!(
+            p.equality_deletes[0].partition_values,
+            vec![PartitionLiteral::String("us".into())]
+        );
+    }
+
+    #[test]
+    fn key_only_delete_goes_where_the_row_lives() {
+        // REPLICA IDENTITY DEFAULT: the delete carries NULL for `region`.
+        // A delete in the NULL partition would reach nothing.
+        let w = TableWriter::new(schema_partitioned_by_region());
+        let mut fi = FileIndex::new();
+        fi.add_file(
+            "data/region=us/abc.parquet".into(),
+            vec![PkKey::from_row(&pk_only(1), &[col("id")])],
+            vec![PartitionLiteral::String("us".into())],
+        );
+        let mut row = pk_only(1);
+        row.insert(col("region"), PgValue::Null);
+
+        let p = w
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Delete,
+                    row,
+                    unchanged_cols: vec![],
+                    unchanged_from: None,
+                }],
+                &fi,
+            )
+            .unwrap();
+        assert_eq!(
+            p.equality_deletes[0].partition_values,
+            vec![PartitionLiteral::String("us".into())]
+        );
+    }
+
+    #[test]
+    fn update_moving_partitions_deletes_in_the_old_one() {
+        let w = TableWriter::new(schema_partitioned_by_region());
+        let mut fi = FileIndex::new();
+        fi.add_file(
+            "data/region=us/abc.parquet".into(),
+            vec![PkKey::from_row(&pk_only(1), &[col("id")])],
+            vec![PartitionLiteral::String("us".into())],
+        );
+
+        let p = w
+            .prepare(
+                &[MaterializedRow {
+                    op: Op::Update,
+                    row: row_with_region(1, "eu"),
+                    unchanged_cols: vec![],
+                    unchanged_from: None,
+                }],
+                &fi,
+            )
+            .unwrap();
+        assert_eq!(
+            p.data[0].partition_values,
+            vec![PartitionLiteral::String("eu".into())]
+        );
         assert_eq!(
             p.equality_deletes[0].partition_values,
             vec![PartitionLiteral::String("us".into())]

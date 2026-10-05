@@ -9,10 +9,14 @@
 //!   ([`read_data_file_by_field_id`]).
 //! - An equality delete removes a row only if it is in the same partition
 //!   and has a higher sequence number.
+//! - A row lives in the partition its own values compute to. One stored
+//!   elsewhere is skipped by any query that prunes on its partition
+//!   column, so reading it is an error rather than a row.
 //! - The live file set comes from the table's actual state — the full
 //!   history ([`live_files_from_history`]) or the current snapshot's
 //!   manifests — never from `Catalog::snapshots`.
 
+use pg2iceberg_core::partition::{apply_transform, PartitionLiteral};
 use pg2iceberg_core::{ColumnName, ColumnSchema, Row, TableSchema};
 use pg2iceberg_iceberg::{read_data_file_by_field_id, PkKey, Snapshot};
 use pg2iceberg_stream::BlobStore;
@@ -24,9 +28,8 @@ pub struct LiveFile {
     pub path: String,
     /// The file's data sequence number.
     pub seq: i64,
-    /// The file's partition tuple, rendered so that equal tuples compare
-    /// equal. Empty for unpartitioned tables.
-    pub partition: String,
+    /// The file's partition tuple. Empty for unpartitioned tables.
+    pub partition: Vec<PartitionLiteral>,
     /// `Some(equality field ids)` for an equality-delete file.
     pub equality_ids: Option<Vec<i32>>,
 }
@@ -51,7 +54,7 @@ pub fn live_files_from_history(snapshots: &[Snapshot]) -> Vec<LiveFile> {
                 out.push(LiveFile {
                     path: f.path.clone(),
                     seq: snap.id,
-                    partition: format!("{:?}", f.partition_values),
+                    partition: f.partition_values.clone(),
                     equality_ids,
                 });
             }
@@ -73,7 +76,7 @@ pub async fn engine_read(
     struct Deletes {
         cols: Vec<ColumnName>,
         seq: i64,
-        partition: String,
+        partition: Vec<PartitionLiteral>,
         keys: BTreeSet<PkKey>,
     }
     let mut deletes = Vec::new();
@@ -112,12 +115,34 @@ pub async fn engine_read(
                     && d.partition == f.partition
                     && d.keys.contains(&PkKey::from_row(&row, &d.cols))
             });
-            if !deleted {
-                out.push(row);
+            if deleted {
+                continue;
             }
+            let home = partition_of(&row, schema).map_err(|e| format!("{}: {e}", f.path))?;
+            if home != f.partition {
+                return Err(format!(
+                    "{}: {row:?} is stored in partition {:?}, but its values put it in {home:?}",
+                    f.path, f.partition
+                ));
+            }
+            out.push(row);
         }
     }
     Ok(out)
+}
+
+/// The partition `row`'s values compute to under `schema`'s spec.
+fn partition_of(row: &Row, schema: &TableSchema) -> Result<Vec<PartitionLiteral>, String> {
+    schema
+        .partition_spec
+        .iter()
+        .map(|f| {
+            let value = row
+                .get(&ColumnName(f.source_column.clone()))
+                .ok_or_else(|| format!("{row:?} has no partition column {}", f.source_column))?;
+            apply_transform(value, f.transform).map_err(|e| e.to_string())
+        })
+        .collect()
 }
 
 async fn read(blob: &dyn BlobStore, path: &str, cols: &[ColumnSchema]) -> Result<Vec<Row>, String> {
