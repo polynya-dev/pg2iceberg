@@ -1916,10 +1916,27 @@ impl Catalog for AuditedCatalog {
     }
 }
 
+/// pgoutput tells pg2iceberg about a schema change only with the table's
+/// next change; until a write comes, Iceberg can't reflect it — a column
+/// dropped and re-added still shows its old values. That write comes
+/// eventually: make it now, writing a row back unchanged, so the end
+/// state compares what pg2iceberg can know.
+fn write_after_schema_change(h: &DstHarness) {
+    if !h.db.relation_changed_since_last_change(&ident()) {
+        return;
+    }
+    if let Some(row) = h.db.read_table(&ident()).unwrap().into_iter().next() {
+        let mut tx = h.db.begin_tx();
+        tx.update(&ident(), row);
+        tx.commit(Timestamp(0)).unwrap();
+    }
+}
+
 fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     while h.backfilling {
         h.backfill_chunk();
     }
+    write_after_schema_change(h);
     // Reach quiescence: drain WAL, flush, ack, then materialize until idle.
     // Loop because a flush may produce events the materializer hasn't seen.
     h.drive();
@@ -2209,6 +2226,7 @@ fn sort_by_pk(rows: &mut [Row]) {
 /// We keep invariants 1, 2, 3, and 5 — the headline correctness property
 /// (PG == Iceberg at quiescence) still holds, which is what matters.
 fn check_invariants_with_snapshot(h: &mut DstHarness) -> Result<(), String> {
+    write_after_schema_change(h);
     h.drive();
     h.flush_and_ack();
     for _ in 0..16 {
@@ -2623,6 +2641,42 @@ fn re_added_column_does_not_bring_back_dropped_values() {
     h.run_step(&Step::DropNote);
     h.run_step(&Step::AddNote);
     h.run_step(&Step::Insert { id: 2, qty: 20 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// Rows staged before a column is dropped and re-added, but materialized
+/// after: their values belong to the dropped column, not the new one.
+/// (Fails today: schema changes apply when the Relation message arrives,
+/// ahead of rows already staged, which are keyed by column name.)
+#[test]
+fn rows_staged_before_a_re_add_keep_their_values_out_of_the_new_column() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::DropNote);
+    h.run_step(&Step::AddNote);
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// Compaction and TOAST resolution read older data files, which hold the
+/// dropped column's values under the re-added column's name: they must
+/// read columns by field id, or those values come back.
+#[test]
+fn reading_old_files_after_a_re_add_keeps_the_new_column_empty() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::Insert { id: 2, qty: 20 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::DropNote);
+    h.run_step(&Step::AddNote);
+    h.run_step(&Step::Insert { id: 3, qty: 30 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ToastUpdate { id: 1, qty: 11 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Compact);
     check_invariants(&mut h).unwrap();
 }
 

@@ -87,8 +87,9 @@ pub const DEFAULT_NUMERIC_SCALE: u8 = 18;
 pub fn map_pg_to_iceberg(pg: PgType) -> Result<Mapped, MapError> {
     let iceberg = match pg {
         PgType::Bool => IcebergType::Boolean,
-        PgType::Int2 | PgType::Int4 | PgType::Oid => IcebergType::Int,
-        PgType::Int8 => IcebergType::Long,
+        PgType::Int2 | PgType::Int4 => IcebergType::Int,
+        // `oid` is unsigned 32-bit: values past 2^31 don't fit `int`.
+        PgType::Int8 | PgType::Oid => IcebergType::Long,
         PgType::Float4 => IcebergType::Float,
         PgType::Float8 => IcebergType::Double,
         PgType::Numeric { precision, scale } => return map_numeric(precision, scale),
@@ -194,18 +195,17 @@ mod tests {
     }
 
     #[test]
-    fn int2_int4_oid_all_map_to_int() {
-        for ty in [PgType::Int2, PgType::Int4, PgType::Oid] {
+    fn int2_int4_map_to_int() {
+        for ty in [PgType::Int2, PgType::Int4] {
             assert_eq!(map_pg_to_iceberg(ty).unwrap().iceberg, IcebergType::Int);
         }
     }
 
     #[test]
-    fn int8_maps_to_long() {
-        assert_eq!(
-            map_pg_to_iceberg(PgType::Int8).unwrap().iceberg,
-            IcebergType::Long
-        );
+    fn int8_and_oid_map_to_long() {
+        for ty in [PgType::Int8, PgType::Oid] {
+            assert_eq!(map_pg_to_iceberg(ty).unwrap().iceberg, IcebergType::Long);
+        }
     }
 
     #[test]

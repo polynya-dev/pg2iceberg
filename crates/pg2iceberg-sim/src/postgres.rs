@@ -878,6 +878,22 @@ impl SimPostgres {
     }
 
     /// Snapshot of a table's rows in PK order, for tests / verify.
+    /// Whether `ident`'s relation changed (DDL, or an invalidation) after
+    /// its last row change. pgoutput tells a consumer about a schema
+    /// change only with the table's next change, so it hasn't told one.
+    pub fn relation_changed_since_last_change(&self, ident: &TableIdent) -> bool {
+        let s = self.state.lock().unwrap();
+        let relation = s.wal.iter().rev().find_map(|e| match &e.kind {
+            WalKind::Relation { ident: i, .. } if i == ident => Some(e.lsn),
+            _ => None,
+        });
+        let change = s.wal.iter().rev().find_map(|e| match &e.kind {
+            WalKind::Change(c) if &c.table == ident => Some(e.lsn),
+            _ => None,
+        });
+        relation > change
+    }
+
     pub fn read_table(&self, ident: &TableIdent) -> Result<Vec<Row>> {
         let s = self.state.lock().unwrap();
         let t = s
