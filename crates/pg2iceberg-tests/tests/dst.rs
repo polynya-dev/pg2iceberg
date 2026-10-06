@@ -300,6 +300,9 @@ fn register_other(m: &mut Materializer<AuditedCatalog>) {
     }
 }
 
+/// `note`'s default, when `AddNoteWithDefault` adds it.
+const DEFAULT_NOTE: &str = "dflt";
+
 fn note() -> ColumnName {
     ColumnName("note".into())
 }
@@ -453,6 +456,10 @@ enum Step {
     /// `ALTER TABLE ADD COLUMN note text` — a new column that happens to
     /// reuse a dropped one's name; its old values must not come back.
     AddNote,
+    /// `ALTER TABLE ADD COLUMN note text DEFAULT 'dflt'`: rows already in
+    /// the table read `'dflt'` — Postgres stores the value once instead of
+    /// writing it into them, so the WAL carries nothing for them.
+    AddNoteWithDefault,
     /// Another process (a `pg2iceberg compact` job) plans a compaction
     /// pass and writes its output files, but doesn't commit yet.
     ExternalCompactPlan,
@@ -519,6 +526,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => Just(Step::ClockTick),
         1 => Just(Step::DropNote),
         1 => Just(Step::AddNote),
+        1 => Just(Step::AddNoteWithDefault),
         2 => Just(Step::ExternalCompactPlan),
         2 => Just(Step::ExternalCompactCommit),
         1 => Just(Step::ExternalCompactMidCommit),
@@ -563,6 +571,9 @@ thread_local! {
     /// Whether the source table has its `note` column right now (the
     /// workload can drop and re-add it).
     static NOTE_PRESENT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Whether `note` was added with a default since pg2iceberg last
+    /// staged the stream (see `Step::DropNote`).
+    static NOTE_DEFAULT_UNSTAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether this case starts with rows only an initial snapshot can
     /// deliver, backfilled chunk by chunk while changes stream in.
     static BACKFILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -580,6 +591,17 @@ thread_local! {
     /// Whether this case's table has Postgres's default replica identity
     /// (a DELETE sends only the key) rather than FULL.
     static DEFAULT_IDENTITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// What this thread's materializers record (see [`metrics`]).
+    static METRICS: Arc<pg2iceberg_core::InMemoryMetrics> =
+        Arc::new(pg2iceberg_core::InMemoryMetrics::new());
+}
+
+/// The metrics this thread's materializers record.
+fn metrics() -> Arc<pg2iceberg_core::InMemoryMetrics> {
+    METRICS.with(Arc::clone)
 }
 
 /// A replication session on the wire: production's pgoutput decoding of
@@ -929,14 +951,17 @@ fn cycle(m: &mut Materializer<AuditedCatalog>) -> Option<usize> {
 
 /// A pipeline set up the way production sets one up — including the
 /// table's primary key, without which it can't split a key-changing
-/// UPDATE into a Delete of the old key and an Update of the new one.
+/// UPDATE into a Delete of the old key and an Update of the new one, and
+/// `db`'s catalog for column defaults.
 fn new_pipeline(
     coord: &Arc<MemoryCoordinator>,
     blob_store: &Arc<dyn BlobStore>,
     namer: &Arc<CounterBlobNamer>,
+    db: &SimPostgres,
 ) -> Pipeline<MemoryCoordinator> {
     let mut pipeline = backfill_pipeline(coord, blob_store, namer);
     pipeline.track_replication();
+    pipeline.read_column_defaults(Arc::new(db.clone()));
     pipeline
 }
 
@@ -1028,6 +1053,7 @@ impl DstHarness {
     fn boot_with_seeds(seeds: &[(i32, i32)]) -> Self {
         // A fresh table has its `note` column (proptest reuses the thread).
         NOTE_PRESENT.set(true);
+        NOTE_DEFAULT_UNSTAGED.set(false);
         let db = SimPostgres::new();
         db.create_table(schema()).unwrap();
         db.create_table(noise_schema()).unwrap();
@@ -1059,7 +1085,7 @@ impl DstHarness {
         let blob_store = storage.blob.clone();
         let catalog = storage.catalog.clone();
         let namer = Arc::new(CounterBlobNamer::new(STAGE_PREFIX));
-        let pipeline = new_pipeline(&coord, &blob_store, &namer);
+        let pipeline = new_pipeline(&coord, &blob_store, &namer, &db);
 
         let id_gen = Arc::new(SeqIdGen::new());
         let mat_namer = mat_namer(&id_gen);
@@ -1075,25 +1101,27 @@ impl DstHarness {
             land_before_next_commit: Default::default(),
             applied: Default::default(),
         });
-        let mut materializer = Materializer::new(
+        let mut materializer = Materializer::with_metrics(
             coord.clone() as Arc<dyn Coordinator>,
             blob_store.clone(),
             audited.clone(),
             mat_namer,
             "default",
             MAT_BATCH,
+            metrics(),
         );
         block_on(materializer.register_table(schema())).unwrap();
         register_other(&mut materializer);
         let other = DISTRIBUTED.get().then(|| {
             materializer.enable_distributed_mode(worker("a"), WORKER_TTL);
-            let mut b = Materializer::new(
+            let mut b = Materializer::with_metrics(
                 coord.clone() as Arc<dyn Coordinator>,
                 blob_store.clone(),
                 audited.clone(),
                 self::mat_namer(&id_gen),
                 "default",
                 MAT_BATCH,
+                metrics(),
             );
             block_on(b.register_table(schema())).unwrap();
             register_other(&mut b);
@@ -1166,6 +1194,7 @@ impl DstHarness {
         }
         // A fresh table has its `note` column (proptest reuses the thread).
         NOTE_PRESENT.set(true);
+        NOTE_DEFAULT_UNSTAGED.set(false);
         let db = SimPostgres::new();
         db.create_table(schema()).unwrap();
         db.create_table(noise_schema()).unwrap();
@@ -1188,7 +1217,7 @@ impl DstHarness {
         let blob_store = storage.blob.clone();
         let catalog = storage.catalog.clone();
         let namer = Arc::new(CounterBlobNamer::new(STAGE_PREFIX));
-        let pipeline = new_pipeline(&coord, &blob_store, &namer);
+        let pipeline = new_pipeline(&coord, &blob_store, &namer, &db);
 
         let id_gen = Arc::new(SeqIdGen::new());
         let mat_namer = mat_namer(&id_gen);
@@ -1204,25 +1233,27 @@ impl DstHarness {
             land_before_next_commit: Default::default(),
             applied: Default::default(),
         });
-        let mut materializer = Materializer::new(
+        let mut materializer = Materializer::with_metrics(
             coord.clone() as Arc<dyn Coordinator>,
             blob_store.clone(),
             audited.clone(),
             mat_namer,
             "default",
             MAT_BATCH,
+            metrics(),
         );
         block_on(materializer.register_table(schema())).unwrap();
         register_other(&mut materializer);
         let other = DISTRIBUTED.get().then(|| {
             materializer.enable_distributed_mode(worker("a"), WORKER_TTL);
-            let mut b = Materializer::new(
+            let mut b = Materializer::with_metrics(
                 coord.clone() as Arc<dyn Coordinator>,
                 blob_store.clone(),
                 audited.clone(),
                 self::mat_namer(&id_gen),
                 "default",
                 MAT_BATCH,
+                metrics(),
             );
             block_on(b.register_table(schema())).unwrap();
             register_other(&mut b);
@@ -1473,13 +1504,14 @@ impl DstHarness {
     /// Pipeline-process crash. Slot, coord, and blob store survive (durable
     /// storage); pipeline state and replication-stream cursor are lost.
     fn restart_materializer(&mut self) {
-        let mut materializer = Materializer::new(
+        let mut materializer = Materializer::with_metrics(
             self.coord.clone() as Arc<dyn Coordinator>,
             self.blob_store.clone(),
             self.audited.clone(),
             mat_namer(&self.id_gen),
             "default",
             MAT_BATCH,
+            metrics(),
         );
         // As the lifecycle restarts: a table still backfilling is gated.
         if self.backfilling {
@@ -1520,6 +1552,32 @@ impl DstHarness {
         self.restart_materializer();
     }
 
+    /// Add `note` back — with `default`, if given — unless it's there.
+    fn add_note(&mut self, default: Option<PgValue>) {
+        if NOTE_PRESENT.get() {
+            return;
+        }
+        // A column re-added in last place can't be told from one never
+        // dropped unless pg2iceberg saw the drop, which pgoutput reports
+        // only with the table's next change: make it first. (Without it —
+        // no change between drop and re-add — the re-add is invisible.)
+        write_after_schema_change(self);
+        let col = schema()
+            .columns
+            .into_iter()
+            .find(|c| c.name == "note")
+            .unwrap();
+        NOTE_DEFAULT_UNSTAGED.set(default.is_some());
+        match default {
+            Some(value) => self
+                .db
+                .alter_add_column_with_default(&ident(), col, value)
+                .unwrap(),
+            None => self.db.alter_add_column(&ident(), col).unwrap(),
+        }
+        NOTE_PRESENT.set(true);
+    }
+
     fn crash_and_restart(&mut self) {
         // Drain + ack first so we model "graceful crash after a flush" — the
         // simpler case. Mid-flush crashes (orphan blobs from PUT-without-claim)
@@ -1532,7 +1590,7 @@ impl DstHarness {
     /// Drop the pipeline + stream as-is and restart replication where
     /// the lifecycle does.
     fn crash_mid_stream(&mut self) {
-        self.pipeline = new_pipeline(&self.coord, &self.blob_store, &self.namer);
+        self.pipeline = new_pipeline(&self.coord, &self.blob_store, &self.namer, &self.db);
         self.restart_stream();
     }
 
@@ -1723,23 +1781,20 @@ impl DstHarness {
                 .advance(WORKER_TTL + std::time::Duration::from_secs(1)),
             Step::DropNote => {
                 if NOTE_PRESENT.get() {
+                    // pg2iceberg reads a column's default when it stages the
+                    // column's add, and the drop clears it: dropped within
+                    // pg2iceberg's lag, the column leaves older rows without
+                    // it — a known gap. Model the drop coming later.
+                    if NOTE_DEFAULT_UNSTAGED.replace(false) {
+                        self.drive();
+                        self.flush_and_ack();
+                    }
                     self.db.alter_drop_column(&ident(), "note").unwrap();
                     NOTE_PRESENT.set(false);
                 }
             }
-            Step::AddNote => {
-                if !NOTE_PRESENT.get() {
-                    // A column re-added in last place can't be told from
-                    // one never dropped unless pg2iceberg saw the drop,
-                    // which pgoutput reports only with the table's next
-                    // change: make it first. (Without it — no change
-                    // between drop and re-add — the re-add is invisible.)
-                    write_after_schema_change(self);
-                    let col = schema().columns.into_iter().find(|c| c.name == "note");
-                    self.db.alter_add_column(&ident(), col.unwrap()).unwrap();
-                    NOTE_PRESENT.set(true);
-                }
-            }
+            Step::AddNote => self.add_note(None),
+            Step::AddNoteWithDefault => self.add_note(Some(PgValue::Text(DEFAULT_NOTE.into()))),
             Step::ExternalCompactPlan => self.external_compact_plan(),
             Step::ExternalCompactCommit => {
                 if let Some(pass) = self.pending_external.take() {
@@ -1992,6 +2047,31 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
             }
             boundaries.push((state.values().cloned().collect(), columns.clone()));
         }
+        // A column added since has, in the rows already there, the value
+        // Postgres gave them (its default), which no WAL carries.
+        let added: Vec<ColumnName> = columns
+            .iter()
+            .filter(|c| !kept.contains(c))
+            .map(|c| ColumnName(c.clone()))
+            .collect();
+        if !added.is_empty() && !state.is_empty() {
+            let before: BTreeMap<i32, Row> = db
+                .rows_at(&ident(), pg2iceberg_core::Lsn(events[i].lsn.0 - 1))
+                .into_iter()
+                .map(|r| {
+                    let r = stored(r);
+                    (pk(&r), r)
+                })
+                .collect();
+            for (k, row) in state.iter_mut() {
+                for c in &added {
+                    if let Some(v) = before.get(k).and_then(|r| r.get(c)) {
+                        row.insert(c.clone(), v.clone());
+                    }
+                }
+            }
+            boundaries.push((state.values().cloned().collect(), columns.clone()));
+        }
         while i < events.len() && events[i].xid == xid {
             let e = &events[i];
             match e.op {
@@ -2067,6 +2147,16 @@ impl Catalog for HeldCompaction {
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
         self.inner.commit_snapshot(prepared).await
     }
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<PreparedCommit>,
+        log_range: Option<LogRange>,
+        remove_properties: BTreeSet<String>,
+    ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.inner
+            .commit_snapshots(steps, log_range, remove_properties)
+            .await
+    }
     async fn commit_compaction(
         &self,
         prepared: PreparedCompaction,
@@ -2079,8 +2169,11 @@ impl Catalog for HeldCompaction {
         &self,
         ident: &TableIdent,
         changes: Vec<SchemaChange>,
+        set_properties: BTreeMap<String, String>,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
-        self.inner.evolve_schema(ident, changes).await
+        self.inner
+            .evolve_schema(ident, changes, set_properties)
+            .await
     }
     async fn snapshots(&self, ident: &TableIdent) -> pg2iceberg_iceberg::Result<Vec<Snapshot>> {
         self.inner.snapshots(ident).await
@@ -2190,6 +2283,7 @@ impl Catalog for AuditedCatalog {
         &self,
         steps: Vec<PreparedCommit>,
         log_range: Option<LogRange>,
+        remove_properties: BTreeSet<String>,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
         if self
             .fail_next_commit
@@ -2203,7 +2297,7 @@ impl Catalog for AuditedCatalog {
         let ident = steps.first().map(|s| s.ident.clone());
         let meta = self
             .inner
-            .commit_snapshots(steps, log_range.clone())
+            .commit_snapshots(steps, log_range.clone(), remove_properties)
             .await?;
         // 16. Each log entry is applied at most once: a commit's range
         //     starts where the last one that landed ended, or later.
@@ -2239,8 +2333,12 @@ impl Catalog for AuditedCatalog {
         &self,
         ident: &TableIdent,
         changes: Vec<SchemaChange>,
+        set_properties: BTreeMap<String, String>,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
-        let meta = self.inner.evolve_schema(ident, changes).await?;
+        let meta = self
+            .inner
+            .evolve_schema(ident, changes, set_properties)
+            .await?;
         if self
             .fail_commit_after_schema_change
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -3776,6 +3874,217 @@ fn verify_matches_rows_keyed_by_a_smallint() {
     let mut h = DstHarness::boot();
     h.run_step(&Step::Insert { id: 1, qty: 10 });
     check_invariants(&mut h).unwrap();
+}
+
+/// A column added with a default: rows already in the table read it —
+/// Postgres stores the value once instead of writing it into them, so the
+/// WAL carries nothing for rows 1 and 2 — and must read it in Iceberg too.
+/// Row 4, deleted, shares a data file with row 2, and stays deleted.
+#[test]
+fn a_default_reaches_rows_that_predate_its_column() {
+    default_reaches_older_rows(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_default_reaches_rows_that_predate_its_column_on_iceberg() {
+    default_reaches_older_rows(true);
+}
+
+fn default_reaches_older_rows(prod: bool) {
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Insert { id: 2, qty: 20 },
+        Step::Insert { id: 4, qty: 40 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Delete { id: 4 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::DropNote,
+        Step::AddNoteWithDefault,
+        Step::Insert { id: 3, qty: 30 },
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// The commit after the column's schema change fails: the schema change
+/// stays, the rows given the default don't. The retry must still give
+/// them the default.
+#[test]
+fn a_failed_commit_after_adding_a_default_still_fills_it_in() {
+    failed_commit_after_adding_a_default(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_failed_commit_after_adding_a_default_still_fills_it_in_on_iceberg() {
+    failed_commit_after_adding_a_default(true);
+}
+
+fn failed_commit_after_adding_a_default(prod: bool) {
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::DropNote,
+        Step::AddNoteWithDefault,
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+    ] {
+        h.run_step(&step);
+    }
+    h.audited
+        .fail_commit_after_schema_change
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = block_on(h.materializer.cycle()).unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+    check_invariants(&mut h).unwrap();
+}
+
+/// A restarted stream sends the column's Relation again — and Postgres
+/// still stores its default. Rows given a value of their own since must
+/// keep it: the default is filled in once.
+#[test]
+fn a_default_is_filled_in_once() {
+    default_filled_in_once(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_default_is_filled_in_once_on_iceberg() {
+    default_filled_in_once(true);
+}
+
+fn default_filled_in_once(prod: bool) {
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::DropNote,
+        Step::AddNoteWithDefault,
+        Step::Insert { id: 3, qty: 30 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Update { id: 1, qty: 11 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::CrashMidStream,
+        Step::Insert { id: 4, qty: 40 },
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// The column is dropped again before pg2iceberg reads its default:
+/// Postgres has cleared it, so the rows that predate the column keep NULL
+/// for it — a known gap, which pg2iceberg must report rather than pass
+/// over.
+#[test]
+fn a_default_dropped_before_it_was_read_is_reported() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::DropNote,
+        Step::AddNoteWithDefault,
+        Step::Insert { id: 3, qty: 30 },
+    ] {
+        h.run_step(&step);
+    }
+    // Not `Step::DropNote`, which lets pg2iceberg read the default first.
+    h.db.alter_drop_column(&ident(), "note").unwrap();
+    NOTE_PRESENT.set(false);
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    let mut labels = pg2iceberg_core::Labels::new();
+    labels.insert("table".into(), ident().name);
+    labels.insert("column".into(), "note".into());
+    labels.insert("reason".into(), "column_gone".into());
+    assert_eq!(
+        metrics().counter_value(
+            pg2iceberg_core::metrics::names::UNFILLED_COLUMN_DEFAULTS,
+            &labels
+        ),
+        1
+    );
+}
+
+/// A column added with a default and dropped again: rows that predate it
+/// read the default until the drop, and keep it under the dropped
+/// column's name. (Found by the random DST.)
+#[test]
+fn a_default_dropped_after_it_was_staged_stays_filled_in() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 0 },
+        Step::DropNote,
+        Step::AddNoteWithDefault,
+        Step::Insert { id: 2, qty: 0 },
+        Step::DropNote,
+        Step::DriveFlushWithoutAck,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// The table is rewritten (`VACUUM FULL`) before pg2iceberg reads the new
+/// column's default: Postgres no longer stores the value rows 1 and 2
+/// read, so there's nothing to fill them in with — a known gap, which
+/// pg2iceberg must report rather than pass over.
+#[test]
+fn a_default_postgres_no_longer_stores_is_reported() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::DropNote,
+        Step::AddNoteWithDefault,
+    ] {
+        h.run_step(&step);
+    }
+    h.db.rewrite_table(&ident()).unwrap();
+    h.run_step(&Step::Insert { id: 3, qty: 30 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    let mut labels = pg2iceberg_core::Labels::new();
+    labels.insert("table".into(), ident().name);
+    labels.insert("column".into(), "note".into());
+    labels.insert("reason".into(), "not_stored".into());
+    assert_eq!(
+        metrics().counter_value(
+            pg2iceberg_core::metrics::names::UNFILLED_COLUMN_DEFAULTS,
+            &labels
+        ),
+        1
+    );
 }
 
 /// When a table changes owner between distributed workers, the new owner

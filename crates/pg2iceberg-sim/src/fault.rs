@@ -442,13 +442,16 @@ impl Catalog for FaultyCatalog {
         &self,
         steps: Vec<PreparedCommit>,
         log_range: Option<pg2iceberg_iceberg::LogRange>,
+        remove_properties: std::collections::BTreeSet<String>,
     ) -> IcebergResult<TableMetadata> {
         if self.plan.tick(ops::CAT_COMMIT_SNAPSHOT) {
             return Err(IcebergError::Other(
                 "injected fault: commit_snapshots".into(),
             ));
         }
-        self.inner.commit_snapshots(steps, log_range).await
+        self.inner
+            .commit_snapshots(steps, log_range, remove_properties)
+            .await
     }
 
     async fn commit_compaction(
@@ -467,8 +470,11 @@ impl Catalog for FaultyCatalog {
         &self,
         ident: &TableIdent,
         changes: Vec<SchemaChange>,
+        set_properties: std::collections::BTreeMap<String, String>,
     ) -> IcebergResult<TableMetadata> {
-        self.inner.evolve_schema(ident, changes).await
+        self.inner
+            .evolve_schema(ident, changes, set_properties)
+            .await
     }
 
     async fn expire_snapshots(

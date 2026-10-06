@@ -570,6 +570,7 @@ mod tests {
             &self,
             _ident: &TableIdent,
             _changes: Vec<SchemaChange>,
+            _set_properties: BTreeMap<String, String>,
         ) -> crate::Result<TableMetadata> {
             Err(IcebergError::Other("stub: evolve_schema".into()))
         }
@@ -614,6 +615,7 @@ mod tests {
             config,
             location: location.into(),
             log_ends: BTreeMap::new(),
+            properties: BTreeMap::new(),
         }
     }
 

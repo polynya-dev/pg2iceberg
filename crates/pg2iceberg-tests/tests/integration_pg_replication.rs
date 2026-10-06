@@ -518,7 +518,9 @@ async fn start_replication_types_columns_as_discovery_does() {
             .expect("recv deadline")
             .expect("stream error");
         match msg {
-            DecodedMessage::Relation { ident: t, columns } if t.name == table => {
+            DecodedMessage::Relation {
+                ident: t, columns, ..
+            } if t.name == table => {
                 relation = Some(columns);
             }
             DecodedMessage::Change(ev) if ev.op == Op::Insert && ev.table.name == table => {

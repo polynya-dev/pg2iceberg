@@ -315,6 +315,7 @@ impl ReaderState {
                     },
                 );
                 Ok(Some(DecodedMessage::Relation {
+                    rel_id: r.rel_id(),
                     ident,
                     columns: decoded_columns,
                 }))

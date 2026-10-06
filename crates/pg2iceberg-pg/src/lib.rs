@@ -131,6 +131,9 @@ pub enum DecodedMessage {
     /// order with the rows; the materializer applies it there
     /// (`Catalog::evolve_schema`).
     Relation {
+        /// The table's `pg_class.oid`: which table this is even after a
+        /// rename, or a drop and another table taking its name.
+        rel_id: u32,
         ident: TableIdent,
         columns: Vec<RelationColumn>,
     },
@@ -183,6 +186,35 @@ impl<P: PgClient + ?Sized> SlotMonitor for P {
     }
     async fn slot_health_for_watcher(&self, slot: &str) -> Result<Option<SlotHealth>> {
         PgClient::slot_health(self, slot).await
+    }
+}
+
+/// What Postgres's catalog says of a column's default.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ColumnDefault {
+    pub name: String,
+    /// The value rows that predate the column read for it, when Postgres
+    /// stores one instead of writing it into them: a column added with a
+    /// constant default, its table not rewritten since
+    /// (`pg_attribute.attmissingval`). Those rows carry no WAL for it.
+    pub stored: Option<pg2iceberg_core::PgValue>,
+    /// Whether the column has a default at all (`atthasdef`).
+    pub has_default: bool,
+}
+
+/// Postgres's catalog, asked for columns' defaults (see [`ColumnDefault`]).
+#[async_trait]
+pub trait ColumnDefaultSource: Send + Sync {
+    /// Every column the table with `pg_class.oid` `rel_id` has now, in
+    /// order; none if it no longer exists.
+    async fn column_defaults(&self, rel_id: u32) -> Result<Vec<ColumnDefault>>;
+}
+
+/// A client's [`PgClient::column_defaults`], as a source of its own.
+#[async_trait]
+impl ColumnDefaultSource for std::sync::Arc<dyn PgClient> {
+    async fn column_defaults(&self, rel_id: u32) -> Result<Vec<ColumnDefault>> {
+        PgClient::column_defaults(self.as_ref(), rel_id).await
     }
 }
 
@@ -282,4 +314,7 @@ pub trait PgClient: Send + Sync {
     /// for the table. Pre-existing rows must be backfilled via
     /// snapshot; the lifecycle handles that gating.
     async fn alter_publication_add_table(&self, name: &str, ident: &TableIdent) -> Result<()>;
+
+    /// See [`ColumnDefaultSource::column_defaults`].
+    async fn column_defaults(&self, rel_id: u32) -> Result<Vec<ColumnDefault>>;
 }

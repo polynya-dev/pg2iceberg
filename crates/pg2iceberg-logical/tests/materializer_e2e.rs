@@ -444,3 +444,157 @@ fn compact_cycle_then_subsequent_materialize_cycle_handles_new_inserts() {
     // Iceberg should match PG: PK 1 → qty 999, others unchanged.
     assert_eq!(read_iceberg(&h), read_pg(&h));
 }
+
+/// What Postgres's catalog says of the table's columns: `note` was added
+/// with a constant default, stored for the rows that predate it.
+struct NoteDefault;
+
+#[async_trait::async_trait]
+impl pg2iceberg_pg::ColumnDefaultSource for NoteDefault {
+    async fn column_defaults(
+        &self,
+        _rel_id: u32,
+    ) -> pg2iceberg_pg::Result<Vec<pg2iceberg_pg::ColumnDefault>> {
+        let column = |name: &str, stored: Option<&str>| pg2iceberg_pg::ColumnDefault {
+            name: name.into(),
+            stored: stored.map(|v| PgValue::Text(v.into())),
+            has_default: stored.is_some(),
+        };
+        Ok(vec![
+            column("id", None),
+            column("qty", None),
+            column("note", Some("x")),
+            column("flag", None),
+        ])
+    }
+}
+
+/// `BEGIN; INSERT 4; ALTER TABLE ADD note DEFAULT 'x'; UPDATE 1 SET note
+/// = 'y'; ALTER TABLE ADD flag; INSERT 3; COMMIT`, as pgoutput sends it
+/// (the sim runs no DDL inside a transaction). Rows that predate `note`
+/// read the default — row 4 too, written before the ALTER — and row 1
+/// keeps the value it got after it: the second schema change in the same
+/// transaction doesn't fill `note` in again.
+#[test]
+fn a_default_added_mid_transaction_is_filled_once() {
+    use pg2iceberg_core::{ChangeEvent, Lsn, Op};
+    use pg2iceberg_pg::{DecodedMessage, RelationColumn};
+
+    let mut h = boot();
+    h.pipeline.read_column_defaults(Arc::new(NoteDefault));
+    let relation = |extra: &[&str]| DecodedMessage::Relation {
+        rel_id: 16384,
+        ident: ident(),
+        columns: [
+            ("id", IcebergType::Int, true),
+            ("qty", IcebergType::Int, false),
+        ]
+        .into_iter()
+        .chain(extra.iter().map(|c| (*c, IcebergType::String, false)))
+        .map(|(name, ty, key)| RelationColumn {
+            name: name.into(),
+            ty,
+            is_primary_key: key,
+            nullable: !key,
+        })
+        .collect(),
+    };
+    let change = |op: Op, xid: u32, lsn: u64, values: &[(&str, PgValue)]| {
+        DecodedMessage::Change(ChangeEvent {
+            table: ident(),
+            op,
+            lsn: Lsn(lsn),
+            commit_ts: Timestamp(0),
+            xid: Some(xid),
+            before: None,
+            after: Some(values.iter().map(|(c, v)| (col(c), v.clone())).collect()),
+            unchanged_cols: Vec::new(),
+        })
+    };
+    let (int, text) = (PgValue::Int4, |s: &str| PgValue::Text(s.into()));
+    let tx1 = vec![
+        DecodedMessage::Begin {
+            final_lsn: Lsn(13),
+            xid: 1,
+        },
+        relation(&[]),
+        change(Op::Insert, 1, 11, &[("id", int(1)), ("qty", int(10))]),
+        change(Op::Insert, 1, 12, &[("id", int(2)), ("qty", int(20))]),
+        DecodedMessage::Commit {
+            commit_lsn: Lsn(13),
+            xid: 1,
+        },
+    ];
+    let tx2 = vec![
+        DecodedMessage::Begin {
+            final_lsn: Lsn(25),
+            xid: 2,
+        },
+        change(Op::Insert, 2, 21, &[("id", int(4)), ("qty", int(40))]),
+        relation(&["note"]),
+        change(
+            Op::Update,
+            2,
+            22,
+            &[("id", int(1)), ("qty", int(11)), ("note", text("y"))],
+        ),
+        relation(&["note", "flag"]),
+        change(
+            Op::Insert,
+            2,
+            23,
+            &[
+                ("id", int(3)),
+                ("qty", int(30)),
+                ("note", text("x")),
+                ("flag", text("f")),
+            ],
+        ),
+        DecodedMessage::Commit {
+            commit_lsn: Lsn(25),
+            xid: 2,
+        },
+    ];
+    for tx in [tx1, tx2] {
+        for msg in tx {
+            block_on(h.pipeline.process(msg)).unwrap();
+        }
+        block_on(h.pipeline.flush()).unwrap();
+        run_materializer(&mut h);
+    }
+
+    let schema = block_on(h.catalog.load_table(&ident()))
+        .unwrap()
+        .unwrap()
+        .schema;
+    let rows = block_on(read_materialized_state(
+        h.catalog.as_ref(),
+        h.blob_store.as_ref(),
+        &ident(),
+        &schema,
+        &[col("id")],
+    ))
+    .unwrap();
+    let notes: BTreeMap<i32, (PgValue, PgValue)> = rows
+        .iter()
+        .map(|r| {
+            let id = match r[&col("id")] {
+                PgValue::Int4(n) => n,
+                ref v => panic!("id {v:?}"),
+            };
+            (id, (r[&col("note")].clone(), r[&col("flag")].clone()))
+        })
+        .collect();
+    assert_eq!(
+        notes,
+        BTreeMap::from([
+            (1, (text("y"), PgValue::Null)),
+            (2, (text("x"), PgValue::Null)),
+            (3, (text("x"), text("f"))),
+            (4, (text("x"), PgValue::Null)),
+        ])
+    );
+    // The fill's mark is gone with its commit.
+    let meta = block_on(h.catalog.load_table(&ident())).unwrap().unwrap();
+    assert!(meta.properties.is_empty(), "{:?}", meta.properties);
+}

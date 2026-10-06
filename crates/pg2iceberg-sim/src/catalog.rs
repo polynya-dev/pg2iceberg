@@ -142,6 +142,7 @@ impl Catalog for MemoryCatalog {
             config: BTreeMap::new(),
             location: String::new(),
             log_ends: BTreeMap::new(),
+            properties: BTreeMap::new(),
         };
         s.tables.insert(
             ident,
@@ -193,6 +194,7 @@ impl Catalog for MemoryCatalog {
         &self,
         steps: Vec<PreparedCommit>,
         log_range: Option<LogRange>,
+        remove_properties: BTreeSet<String>,
     ) -> Result<TableMetadata> {
         let ident = steps
             .first()
@@ -233,6 +235,9 @@ impl Catalog for MemoryCatalog {
             let snap = table.snapshots.last_mut().expect("just pushed");
             debug_assert_eq!(snap.id, id);
             snap.log_range = log_range;
+        }
+        for key in &remove_properties {
+            table.metadata.properties.remove(key);
         }
         Ok(table.metadata.clone())
     }
@@ -339,20 +344,22 @@ impl Catalog for MemoryCatalog {
         &self,
         ident: &TableIdent,
         changes: Vec<SchemaChange>,
+        set_properties: BTreeMap<String, String>,
     ) -> Result<TableMetadata> {
         let mut s = self.state.lock().unwrap();
         let table = s
             .tables
             .get_mut(ident)
             .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
-        if changes.is_empty() {
-            return Ok(table.metadata.clone());
-        }
         // Use the same helper the prod catalog uses, so both backends apply
         // identical field-id allocation and soft-drop semantics. The sim
         // does not produce snapshots for schema-only commits — it just
-        // updates the schema in metadata.
-        apply_schema_changes(&mut table.metadata.schema, &changes)?;
+        // updates the schema in metadata. Applied to a copy first, so a
+        // failed change leaves the table as it was.
+        let mut schema = table.metadata.schema.clone();
+        apply_schema_changes(&mut schema, &changes)?;
+        table.metadata.schema = schema;
+        table.metadata.properties.extend(set_properties);
         Ok(table.metadata.clone())
     }
 
@@ -520,6 +527,7 @@ mod tests {
                 ty: IcebergType::Long,
                 nullable: true,
             }],
+            BTreeMap::new(),
         ))
         .unwrap();
         assert_eq!(meta.schema.columns.len(), 2);
@@ -565,6 +573,7 @@ mod tests {
         let meta = block_on(c.evolve_schema(
             &ident(),
             vec![pg2iceberg_iceberg::SchemaChange::DropColumn { name: "qty".into() }],
+            BTreeMap::new(),
         ))
         .unwrap();
         assert_eq!(meta.schema.columns.len(), 2);
@@ -587,8 +596,50 @@ mod tests {
                 ty: IcebergType::Int,
                 nullable: true,
             }],
+            BTreeMap::new(),
         ))
         .unwrap_err();
         assert!(matches!(err, IcebergError::NotFound(_)));
+    }
+
+    #[test]
+    fn properties_set_with_a_schema_change_and_removed_with_a_commit() {
+        let c = MemoryCatalog::new();
+        block_on(c.ensure_namespace(&ident().namespace)).unwrap();
+        block_on(c.create_table(&schema())).unwrap();
+        let add = |name: &str| pg2iceberg_iceberg::SchemaChange::AddColumn {
+            name: name.into(),
+            ty: IcebergType::Int,
+            nullable: true,
+        };
+        let set = BTreeMap::from([("pg2iceberg.a".to_string(), "1".to_string())]);
+        let meta = block_on(c.evolve_schema(&ident(), vec![add("x")], set.clone())).unwrap();
+        assert_eq!(meta.properties, set);
+        // A change that fails sets none.
+        let other = BTreeMap::from([("pg2iceberg.b".to_string(), "2".to_string())]);
+        block_on(c.evolve_schema(&ident(), vec![add("y"), add("x")], other)).unwrap_err();
+        let meta = block_on(c.load_table(&ident())).unwrap().unwrap();
+        assert_eq!(meta.properties, set);
+        assert!(!meta.schema.columns.iter().any(|c| c.name == "y"));
+
+        let meta = block_on(c.commit_snapshots(
+            vec![PreparedCommit {
+                ident: ident(),
+                data_files: vec![DataFile {
+                    path: "s3://t/data-0.parquet".into(),
+                    record_count: 1,
+                    byte_size: 100,
+                    equality_field_ids: vec![],
+                    partition_values: Vec::new(),
+                    sequence_number: None,
+                }],
+                equality_deletes: vec![],
+            }],
+            None,
+            BTreeSet::from(["pg2iceberg.a".to_string()]),
+        ))
+        .unwrap();
+        assert!(meta.properties.is_empty());
+        assert_eq!(meta.current_snapshot_id, Some(1));
     }
 }

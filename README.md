@@ -198,6 +198,7 @@ Unconstrained `numeric` columns (no precision specified) default to `decimal(38,
 | Change | Iceberg behavior |
 |---|---|
 | `ADD COLUMN` (nullable) | Appends a column with the next field id |
+| `ADD COLUMN … DEFAULT` | As above, and the rows already in the table get the default, which PostgreSQL stores instead of writing it to the WAL. If PostgreSQL no longer has the value when pg2iceberg reads it (a volatile default, or a rewrite, drop or rename in between), they keep NULL, with a warning; see [schema evolution](docs/architecture/schema-evolution.md#columns-added-with-a-default) |
 | `DROP COLUMN` | Renamed to `<name>__dropped_<field id>` and made nullable: its values stay readable, and a column later added with its name is a new one |
 | `ALTER COLUMN TYPE` (legal promotion: `int → long`, `float → double`, decimal precision increase) | Type-promote in place, field id preserved |
 | `ALTER COLUMN TYPE` (illegal: narrowing, cross-family) | Refuses with an actionable error; operator must re-snapshot |

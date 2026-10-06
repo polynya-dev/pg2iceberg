@@ -3650,6 +3650,7 @@ dependencies = [
  "pg2iceberg-stream",
  "pg2iceberg-validate",
  "pollster",
+ "serde",
  "serde_json",
  "thiserror",
  "tracing",
