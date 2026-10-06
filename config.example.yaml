@@ -3,7 +3,14 @@
 # Fields that the Rust port doesn't yet consume (control-plane
 # metadata, materializer cycle knobs, etc.) are still parsed cleanly
 # and ignored.
+#
+# Every section is optional: environment variables (POSTGRES_URL,
+# ICEBERG_CATALOG_URL, ...) override this file, and `${VAR}` in a string
+# value reads one. `pg2iceberg init` writes a starting point for your
+# database. See docs/usage/configuration.md.
 
+# Leave `tables:` out to replicate every table with a primary key;
+# `- name: sales.*` takes every such table in a schema.
 tables:
   # Schema is discovered from `information_schema.columns` +
   # `pg_index` at startup — same path the Go reference uses. PK
@@ -36,6 +43,8 @@ tables:
 
 source:
   mode: logical                # the only mode (default); may be omitted
+  # postgres_url: postgres://pg2iceberg:${PGPASSWORD}@db.example.com:5432/src?sslmode=require
+  #                            # a connection string, in place of `postgres:`
   postgres:
     host: db.example.com
     port: 5432
@@ -54,32 +63,35 @@ source:
 sink:
   catalog_uri: https://catalog.example.com
 
-  # Catalog auth flavor: "" (none) | "sigv4" (AWS Glue) | "bearer" |
-  # "oauth2". Only "bearer" and "" are currently exercised against
+  # Catalog auth flavor: "none" | "sigv4" (AWS Glue, S3 Tables) |
+  # "bearer" | "oauth2". Left out, it's inferred: a token means bearer,
+  # client credentials oauth2, an *.amazonaws.com catalog sigv4. Only
+  # "bearer" and none are currently exercised against
   # Polaris/Tabular/Snowflake-managed-catalog and the Iceberg REST
   # reference; "sigv4" + "oauth2" plumb through but aren't yet
   # tested end-to-end.
   catalog_auth: bearer
-  catalog_token: REDACTED-bearer-token
+  catalog_token: ${CATALOG_TOKEN}
   # catalog_client_id: ...
   # catalog_client_secret: ...
 
-  # Credential mode for staging blobs:
-  # "static" (default) — explicit S3 keys below.
-  # "iam"             — instance profile / AWS SSO / env-var chain
-  #                      (object_store::aws::AmazonS3Builder::from_env).
-  # "vended"          — temporary creds from the catalog's LoadTable
-  #                      response. NOT YET WIRED in the Rust port; will
-  #                      error at startup (see plan §Phase 7).
+  # Credential mode for S3:
+  # "static" — explicit S3 keys below.
+  # "iam"    — the AWS default credential chain: AWS_* environment
+  #            variables, a profile, an instance or task role.
+  # "vended" — temporary credentials from the catalog's LoadTable
+  #            response.
+  # Left out, it's inferred: static with s3_access_key set, iam with an
+  # s3:// warehouse, vended otherwise.
   credential_mode: static
   warehouse: s3://my-warehouse/staged
   # Iceberg namespace for every table, in place of its PG schema. Tables
   # with the same name in different PG schemas would collide, and are
   # refused at startup. Empty: each table's PG schema is its namespace.
   namespace: default
-  s3_endpoint: https://s3.us-east-1.amazonaws.com
+  s3_endpoint: https://s3.us-east-1.amazonaws.com   # MinIO, R2, ...; leave out for AWS
   s3_access_key: REDACTED
-  s3_secret_key: REDACTED
+  s3_secret_key: ${S3_SECRET_KEY}
   s3_region: us-east-1
   flush_interval: 10s
   flush_rows: 10000

@@ -4,7 +4,78 @@ icon: lucide/settings
 
 # Configuration
 
-pg2iceberg is configured via a YAML file passed with `--config`. Environment variables override individual fields. Subcommands accept additional flags — see [`pg2iceberg --help`](reference.md) for the full surface.
+pg2iceberg takes its settings from environment variables and an optional YAML file. Two are required — the source database and the Iceberg catalog — and the rest have defaults or are inferred:
+
+```bash
+export POSTGRES_URL=postgres://user:password@db.example.com:5432/app
+export ICEBERG_CATALOG_URL=https://catalog.example.com
+export ICEBERG_WAREHOUSE=s3://my-bucket/warehouse/
+pg2iceberg run
+```
+
+`pg2iceberg init` inspects the database and writes a config file to start from — see [below](#generating-a-config).
+
+## Where settings come from
+
+```
+defaults < config file < environment variables < flags
+```
+
+The config file is `--config <path>`, else `PG2ICEBERG_CONFIG`, else `pg2iceberg.yaml` in the current directory if it exists. Every section of it is optional.
+
+In the file's string values, `${VAR}` is replaced by the environment variable `VAR` (an error if it isn't set), and `$${` is a literal `${`. Comments aren't read, so a commented-out line may name a variable that isn't set. This keeps secrets out of the file:
+
+```yaml
+sink:
+  catalog_uri: https://catalog.example.com
+  catalog_token: ${CATALOG_TOKEN}
+```
+
+### Environment variables
+
+| Variable | Config field |
+|---|---|
+| `POSTGRES_URL` | `source.postgres_url`: a URL (`postgres://user:password@host:5432/db?sslmode=require`) or libpq `key=value` pairs |
+| `PG2ICEBERG_TABLES` | `tables`: comma-separated `schema.table`, or `schema.*` for every table with a primary key in a schema |
+| `PG2ICEBERG_SLOT` | `source.logical.slot_name` |
+| `PG2ICEBERG_PUBLICATION` | `source.logical.publication_name` |
+| `PG2ICEBERG_STATE_URL` | `state.postgres_url` |
+| `PG2ICEBERG_CONFIG` | the config file |
+| `ICEBERG_CATALOG_URL` | `sink.catalog_uri` |
+| `ICEBERG_CATALOG_AUTH` | `sink.catalog_auth` |
+| `ICEBERG_CATALOG_TOKEN` | `sink.catalog_token` |
+| `ICEBERG_CATALOG_CLIENT_ID` / `ICEBERG_CATALOG_CLIENT_SECRET` | `sink.catalog_client_id` / `sink.catalog_client_secret` |
+| `ICEBERG_WAREHOUSE` | `sink.warehouse` |
+| `ICEBERG_NAMESPACE` | `sink.namespace` |
+| `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` |
+
+AWS's own variables are read as AWS tools read them, and give way to the config file: `AWS_REGION` / `AWS_DEFAULT_REGION` for `sink.s3_region`, `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` for `sink.s3_endpoint`. Credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are read by the AWS default credential chain, with `credential_mode: iam`.
+
+### Inferred settings
+
+| Setting | When not set |
+|---|---|
+| `tables` | Every table with a primary key, when pg2iceberg starts — including ones created since the last start. Partitioned tables count as one table (their partitions replicate as it); views, unlogged tables, extensions' tables and pg2iceberg's own schema don't count. Tables without a primary key, or that the role can't read, or with a column Iceberg can't hold, are skipped with a warning. In distributed mode each process discovers the tables when it starts: after the WAL writer (`stream-only`) picks up a new table, restart the `materializer-only` workers, or list the tables. |
+| `sink.catalog_auth` | `bearer` with a `catalog_token`; `oauth2` with a `catalog_client_id`; `sigv4` when the catalog is an AWS endpoint (`*.amazonaws.com`: S3 Tables, Glue), signed for its service and region; else none. |
+| `sink.credential_mode` | `static` when `s3_access_key` is set; `iam`, the AWS default credential chain, with an `s3://` warehouse; otherwise — no `warehouse`, or a catalog-side name for one, as Polaris, Lakekeeper and R2 take — `vended`: temporary credentials from the catalog. |
+| `sink.s3_region` | The AWS catalog endpoint's region, else `us-east-1`. |
+| `sink.namespace` | Each table's Postgres schema. |
+| `sink.s3_endpoint` | AWS S3 itself. Set it for MinIO, R2 and other S3-compatible storage; pg2iceberg then uses path-style requests. |
+
+## Generating a config
+
+```bash
+POSTGRES_URL=postgres://... pg2iceberg init
+```
+
+`init` reads the environment (not an existing config file), and writes `pg2iceberg.yaml` (`--output <path>`, or `--output -` to print; `--force` to overwrite):
+
+- every table it would replicate, with its estimated size; the tables it would skip are listed, commented out, with the reason;
+- the settings the environment gives; secrets (`POSTGRES_URL`, catalog tokens and client secrets) as `${VAR}` references, so they stay in the environment.
+
+It also checks what replication needs of the database, and says how to fix what's missing: `wal_level = logical`, the replication privilege, a free replication slot, a place for pg2iceberg's state schema, and ownership of the tables (creating the publication takes it).
+
+Listing the tables pins them: a table created later isn't replicated until it's added. Delete `tables:` to replicate every table with a primary key again.
 
 ## Full reference
 
@@ -12,11 +83,12 @@ pg2iceberg is configured via a YAML file passed with `--config`. Environment var
 # Replication source
 source:
   mode: logical                  # the only mode (default); may be omitted
+  postgres_url: ""               # or a connection string, in place of `postgres`
   postgres:
-    host: ""                     # required
+    host: ""                     # required without postgres_url
     port: 5432
-    database: ""                 # required
-    user: ""                     # required
+    database: ""                 # required without postgres_url
+    user: ""                     # required without postgres_url
     password: ""
     sslmode: disable             # "disable" | "require" | "verify-ca" | "verify-full"
                                  # — currently anything non-disable enables
@@ -29,9 +101,9 @@ source:
     slot_name: pg2iceberg_slot
     standby_interval: 10s        # how often the standby_status ack is sent
 
-# Tables to replicate
+# Tables to replicate. Leave out for every table with a primary key.
 tables:
-  - name: public.orders          # fully-qualified PostgreSQL table name (required)
+  - name: public.orders          # fully-qualified PostgreSQL table name, or schema.*
     iceberg:
       partition:                 # partition transforms — six are supported:
         - "day(created_at)"      #   year/month/day/hour
@@ -54,18 +126,18 @@ tables:
 # Iceberg sink
 sink:
   catalog_uri: ""                # Iceberg REST catalog URL (required)
-  catalog_auth: ""               # "" | "bearer" | "oauth2" | "sigv4"
-  catalog_token: ""              # required when catalog_auth = "bearer"
+  catalog_auth: ""               # "none" | "bearer" | "oauth2" | "sigv4"; default: inferred
+  catalog_token: ""              # bearer token
   catalog_client_id: ""          # OAuth2 client ID
   catalog_client_secret: ""      # OAuth2 client secret
 
-  credential_mode: static        # "static" (default) | "iam" | "vended"
+  credential_mode: ""            # "static" | "iam" | "vended"; default: inferred
   warehouse: ""                  # s3://bucket/prefix (required for static/iam)
-  namespace: ""                  # Iceberg namespace (required)
-  s3_endpoint: ""                # required for credential_mode=static
-  s3_access_key: ""              # required for credential_mode=static
-  s3_secret_key: ""              # required for credential_mode=static
-  s3_region: us-east-1
+  namespace: ""                  # one Iceberg namespace for every table; default: each table's PG schema
+  s3_endpoint: ""                # S3-compatible storage (MinIO, R2); default: AWS
+  s3_access_key: ""              # static credentials
+  s3_secret_key: ""
+  s3_region: ""                  # default: inferred
 
   # Flush thresholds — flush when any threshold is reached
   flush_rows: 10000              # also caps change events held in memory
@@ -121,27 +193,6 @@ snapshot_only: false             # legacy field; prefer the `snapshot` subcomman
 - **`metrics_addr`** — parsed but not yet wired (Prometheus endpoint TODO).
 - **`state.path`** — file-based checkpoint store. Not implemented; coord is always Postgres-backed.
 - **`snapshot_only`** — use the `pg2iceberg snapshot` subcommand instead. The field still parses for backward compat.
-
-## Override precedence
-
-```
-defaults < YAML < environment variables < CLI flags
-```
-
-Common environment variables (full list in [reference.md](reference.md)):
-
-| Env var | YAML field |
-|---|---|
-| `POSTGRES_URL` | `source.postgres.dsn` (parsed into host/port/database/user/password) |
-| `TABLES` | `tables` (comma-separated, qualified `schema.table`) |
-| `MODE` | `source.mode` |
-| `SLOT_NAME` | `source.logical.slot_name` |
-| `PUBLICATION_NAME` | `source.logical.publication_name` |
-| `ICEBERG_CATALOG_URL` | `sink.catalog_uri` |
-| `WAREHOUSE` | `sink.warehouse` |
-| `NAMESPACE` | `sink.namespace` |
-| `S3_ENDPOINT` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_REGION` | `sink.s3_*` |
-| `STATE_POSTGRES_URL` | `state.postgres_url` |
 
 !!! note "OAuth2 catalog auth"
     Setting `catalog_auth: oauth2` plus `catalog_client_id` / `catalog_client_secret` causes pg2iceberg to forward OAuth2 props to iceberg-rust's REST client (`oauth2-server-uri` derived from `catalog_uri`). Verified end-to-end against the Iceberg REST reference; production deployments against Snowflake / Tabular / Polaris should also work but haven't been integration-tested in CI.

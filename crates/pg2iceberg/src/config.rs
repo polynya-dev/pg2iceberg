@@ -4,6 +4,12 @@
 //! `sink` (catalog + storage + credential mode + flush knobs),
 //! `state` (coordinator location).
 //!
+//! Every section is optional: a YAML file (see [`Config::load`]) and
+//! environment variables (see [`Config::apply_env`]) each supply what
+//! they set, and what's left out is inferred where it can be — the
+//! tables (every one with a primary key), the catalog's auth, the
+//! storage credentials, the region.
+//!
 //! Some fields are accepted by the deserializer but not yet consumed
 //! at runtime (materializer cycle knobs,
 //! control-plane metadata, etc.). They're carried in the schema so
@@ -17,13 +23,30 @@ use anyhow::{Context, Result};
 use pg2iceberg_core::{ColumnSchema, IcebergType, Namespace, PgType, TableIdent, TableSchema};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The config file read when neither `--config` nor `PG2ICEBERG_CONFIG`
+/// names one, if it exists.
+pub const DEFAULT_CONFIG_PATH: &str = "pg2iceberg.yaml";
+
+/// Environment-variable lookup: the process environment in production,
+/// a map in tests. Unset and empty variables both read as `None`.
+pub type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The process environment, as an [`Env`].
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
+    /// Tables to replicate. Empty: every table with a primary key (see
+    /// [`TableConfig::is_pattern`] for `schema.*`).
     #[serde(default)]
     pub tables: Vec<TableConfig>,
+    #[serde(default)]
     pub source: SourceConfig,
+    #[serde(default)]
     pub sink: SinkConfig,
     #[serde(default)]
     pub state: StateConfig,
@@ -35,7 +58,8 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TableConfig {
-    /// Fully-qualified table name `"schema.name"`.
+    /// Fully-qualified table name `"schema.name"`, or `"schema.*"` for
+    /// every table with a primary key in the schema.
     pub name: String,
     #[serde(default)]
     pub skip_snapshot: bool,
@@ -79,6 +103,13 @@ pub struct SourceConfig {
     /// kept so existing configs that spell it out still parse.
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// The source database as one connection string — a URL
+    /// (`postgres://user:password@host:5432/db?sslmode=require`) or
+    /// libpq `key=value` pairs — in place of `postgres`'s fields.
+    /// Moved into [`PostgresConfig::url`] on load.
+    #[serde(default)]
+    pub postgres_url: String,
+    #[serde(default)]
     pub postgres: PostgresConfig,
     #[serde(default)]
     pub logical: LogicalConfig,
@@ -88,6 +119,7 @@ impl Default for SourceConfig {
     fn default() -> Self {
         Self {
             mode: default_mode(),
+            postgres_url: String::new(),
             postgres: PostgresConfig::default(),
             logical: LogicalConfig::default(),
         }
@@ -100,10 +132,17 @@ fn default_mode() -> String {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PostgresConfig {
+    /// A connection string (see [`SourceConfig::postgres_url`]). When
+    /// set, it's used as is, and the fields below are ignored.
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
     pub host: String,
     #[serde(default = "default_pg_port")]
     pub port: u16,
+    #[serde(default)]
     pub database: String,
+    #[serde(default)]
     pub user: String,
     #[serde(default)]
     pub password: String,
@@ -120,8 +159,12 @@ fn default_pg_port() -> u16 {
 }
 
 impl PostgresConfig {
-    /// Render as a libpq-style `key=value` connection string.
+    /// The connection string: [`Self::url`], or the fields as libpq-style
+    /// `key=value` pairs.
     pub fn dsn(&self) -> String {
+        if !self.url.is_empty() {
+            return self.url.clone();
+        }
         let sslmode = if self.sslmode.is_empty() {
             "disable"
         } else {
@@ -138,12 +181,39 @@ impl PostgresConfig {
     /// `tokio-postgres-rustls` always verifies server certs against
     /// the configured roots. Hostname-only / CA-only differentiation
     /// is a follow-on (see plan §"Remaining items for the binary").
+    ///
+    /// With a [`Self::url`], its own `sslmode` decides; left out, TLS is
+    /// off, as with the `sslmode` field.
     pub fn tls_label(&self) -> &str {
-        match self.sslmode.as_str() {
+        let sslmode = if self.url.is_empty() {
+            self.sslmode.as_str()
+        } else {
+            sslmode_in(&self.url).unwrap_or("")
+        };
+        match sslmode {
             "" | "disable" | "off" | "false" => "disable",
             _ => "webpki",
         }
     }
+
+    /// Whether a database to connect to is configured at all.
+    pub fn is_configured(&self) -> bool {
+        !self.url.is_empty() || !self.host.is_empty()
+    }
+}
+
+/// The `sslmode` a connection string sets: a URL's query parameter, or a
+/// `key=value` pair.
+fn sslmode_in(dsn: &str) -> Option<&str> {
+    let params: Vec<&str> = match dsn.split_once('?') {
+        Some((_, query)) if dsn.contains("://") => query.split('&').collect(),
+        _ => dsn.split_whitespace().collect(),
+    };
+    params
+        .into_iter()
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| *k == "sslmode")
+        .map(|(_, v)| v)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,8 +246,10 @@ fn default_slot() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SinkConfig {
+    #[serde(default)]
     pub catalog_uri: String,
-    /// `""` / `"none"` / `"sigv4"` / `"bearer"` / `"oauth2"`.
+    /// `"none"` / `"sigv4"` / `"bearer"` / `"oauth2"`. Empty: inferred
+    /// (see [`Self::resolved_catalog_auth`]).
     #[serde(default)]
     pub catalog_auth: String,
     #[serde(default)]
@@ -187,23 +259,30 @@ pub struct SinkConfig {
     #[serde(default)]
     pub catalog_client_secret: String,
 
-    /// `"static"` (default) — explicit S3 keys below.
+    /// `"static"` — explicit S3 keys below.
     /// `"vended"` — temporary credentials from the catalog's
-    /// `LoadTable` response. NOT YET WIRED; will error at startup.
-    /// `"iam"` — instance profile / AWS SSO / env-var chain.
-    #[serde(default = "default_credential_mode")]
+    /// `LoadTable` response.
+    /// `"iam"` — the AWS default credential chain: `AWS_*` environment
+    /// variables, a profile, an instance or task role.
+    /// Empty: inferred (see [`Self::resolved_credential_mode`]).
+    #[serde(default)]
     pub credential_mode: String,
 
     #[serde(default)]
     pub warehouse: String,
+    /// Iceberg namespace for every table. Empty: each table's PG schema.
+    #[serde(default)]
     pub namespace: String,
+    /// S3 endpoint for S3-compatible storage (MinIO, R2, ...). Empty:
+    /// AWS's own.
     #[serde(default)]
     pub s3_endpoint: String,
     #[serde(default)]
     pub s3_access_key: String,
     #[serde(default)]
     pub s3_secret_key: String,
-    #[serde(default = "default_region")]
+    /// Empty: inferred (see [`Self::resolved_region`]).
+    #[serde(default)]
     pub s3_region: String,
 
     #[serde(default)]
@@ -284,13 +363,13 @@ impl Default for SinkConfig {
             catalog_token: String::new(),
             catalog_client_id: String::new(),
             catalog_client_secret: String::new(),
-            credential_mode: default_credential_mode(),
+            credential_mode: String::new(),
             warehouse: String::new(),
             namespace: String::new(),
             s3_endpoint: String::new(),
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
-            s3_region: default_region(),
+            s3_region: String::new(),
             flush_interval: String::new(),
             flush_rows: default_flush_rows(),
             materializer_batch_rows: default_materializer_batch_rows(),
@@ -307,6 +386,49 @@ impl Default for SinkConfig {
 }
 
 impl SinkConfig {
+    /// `credential_mode`, or the one the rest implies: explicit S3 keys
+    /// mean `static`; an `s3://` warehouse, the AWS default credential
+    /// chain (`iam`); otherwise — no warehouse, or a catalog-side name
+    /// for one (Polaris, Lakekeeper, R2) — the catalog vends credentials.
+    pub fn resolved_credential_mode(&self) -> &str {
+        if !self.credential_mode.is_empty() {
+            &self.credential_mode
+        } else if !self.s3_access_key.is_empty() {
+            "static"
+        } else if self.warehouse.starts_with("s3://") || self.warehouse.starts_with("s3a://") {
+            "iam"
+        } else {
+            "vended"
+        }
+    }
+
+    /// `catalog_auth`, or the one the rest implies: a token means
+    /// `bearer`, client credentials `oauth2`, and an AWS endpoint (S3
+    /// Tables, Glue) `sigv4`.
+    pub fn resolved_catalog_auth(&self) -> &str {
+        if !self.catalog_auth.is_empty() {
+            &self.catalog_auth
+        } else if !self.catalog_token.is_empty() {
+            "bearer"
+        } else if !self.catalog_client_id.is_empty() {
+            "oauth2"
+        } else if aws_endpoint(&self.catalog_uri).is_some() {
+            "sigv4"
+        } else {
+            "none"
+        }
+    }
+
+    /// `s3_region`, else an AWS catalog endpoint's, else `us-east-1`.
+    pub fn resolved_region(&self) -> String {
+        if !self.s3_region.is_empty() {
+            return self.s3_region.clone();
+        }
+        aws_endpoint(&self.catalog_uri)
+            .map(|(_, region)| region)
+            .unwrap_or_else(|| "us-east-1".into())
+    }
+
     /// Translate the Go-shaped sink fields into the iceberg crate's
     /// `CompactionConfig` shape. Used on every materializer cycle.
     pub fn compaction_config(&self) -> pg2iceberg_iceberg::CompactionConfig {
@@ -336,12 +458,17 @@ impl SinkConfig {
     }
 }
 
-fn default_credential_mode() -> String {
-    "static".into()
-}
-
-fn default_region() -> String {
-    "us-east-1".into()
+/// `(service, region)` of an AWS endpoint URL, such as
+/// `https://s3tables.us-east-1.amazonaws.com/iceberg`: the SigV4 signing
+/// name and region.
+fn aws_endpoint(uri: &str) -> Option<(String, String)> {
+    let host = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+    let host = host.split(['/', ':']).next()?;
+    let labels: Vec<&str> = host.strip_suffix(".amazonaws.com")?.split('.').collect();
+    match labels.as_slice() {
+        [service, region] => Some((service.to_string(), region.to_string())),
+        _ => None,
+    }
 }
 
 fn default_flush_rows() -> usize {
@@ -406,24 +533,181 @@ fn default_group() -> String {
 }
 
 impl Config {
-    /// Read + parse a YAML file from disk.
-    pub fn load_from<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read config from {}", path.display()))?;
-        let cfg: Config = serde_yaml::from_str(&raw)
-            .with_context(|| format!("parse config at {}", path.display()))?;
-        cfg.validate_mode()?;
-        cfg.validate_tables()?;
-        Ok(cfg)
+    /// Load the config from the environment, and a YAML file if there is
+    /// one: `path`, else `PG2ICEBERG_CONFIG`, else `pg2iceberg.yaml` if it
+    /// exists. Environment variables override the file (see
+    /// [`Self::apply_env`]).
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        Self::load_with(path, &process_env)
+    }
+
+    /// [`Self::load`], with `env` for the environment.
+    pub fn load_with(path: Option<&Path>, env: Env) -> Result<Self> {
+        let path: Option<PathBuf> = match path {
+            Some(path) => Some(path.to_path_buf()),
+            None => env("PG2ICEBERG_CONFIG").map(PathBuf::from).or_else(|| {
+                let default = Path::new(DEFAULT_CONFIG_PATH);
+                default.exists().then(|| default.to_path_buf())
+            }),
+        };
+        let cfg = match &path {
+            Some(path) => {
+                tracing::info!(path = %path.display(), "reading config");
+                let raw = std::fs::read_to_string(path)
+                    .with_context(|| format!("read config from {}", path.display()))?;
+                Self::parse(&raw, env)
+                    .with_context(|| format!("parse config at {}", path.display()))?
+            }
+            None => Config::default(),
+        };
+        cfg.finish(env)
+    }
+
+    /// The config the environment alone gives, without reading any file.
+    pub fn from_env(env: Env) -> Result<Self> {
+        Config::default().finish(env)
+    }
+
+    fn finish(mut self, env: Env) -> Result<Self> {
+        self.apply_env(env)?;
+        if !self.source.postgres_url.is_empty() {
+            self.source.postgres.url = std::mem::take(&mut self.source.postgres_url);
+        }
+        self.validate_mode()?;
+        self.validate_tables()?;
+        Ok(self)
+    }
+
+    /// Parse YAML, with `${NAME}` in its string values replaced by the
+    /// environment variable `NAME`.
+    pub fn parse(yaml: &str, env: Env) -> Result<Self> {
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        if value.is_null() {
+            return Ok(Config::default());
+        }
+        interpolate(&mut value, env)?;
+        Ok(serde_yaml::from_value(value)?)
+    }
+
+    /// Environment variables, over whatever the file set:
+    ///
+    /// | Variable | Field |
+    /// |---|---|
+    /// | `POSTGRES_URL` | `source.postgres_url` |
+    /// | `PG2ICEBERG_TABLES` | `tables`: comma-separated `schema.table` or `schema.*` |
+    /// | `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.logical.slot_name` / `publication_name` |
+    /// | `PG2ICEBERG_STATE_URL` | `state.postgres_url` |
+    /// | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` |
+    /// | `ICEBERG_CATALOG_AUTH` | `sink.catalog_auth` |
+    /// | `ICEBERG_CATALOG_TOKEN` | `sink.catalog_token` |
+    /// | `ICEBERG_CATALOG_CLIENT_ID` / `_SECRET` | `sink.catalog_client_id` / `_secret` |
+    /// | `ICEBERG_WAREHOUSE` | `sink.warehouse` |
+    /// | `ICEBERG_NAMESPACE` | `sink.namespace` |
+    /// | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` |
+    ///
+    /// AWS's own variables fill in only what the file leaves out:
+    /// `AWS_REGION` / `AWS_DEFAULT_REGION` for `sink.s3_region`, and
+    /// `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` for `sink.s3_endpoint`.
+    /// Credentials (`AWS_ACCESS_KEY_ID`, ...) are read by the AWS
+    /// default credential chain itself (`credential_mode: iam`).
+    fn apply_env(&mut self, env: Env) -> Result<()> {
+        let set = |field: &mut String, name: &str| {
+            if let Some(value) = env(name) {
+                *field = value;
+            }
+        };
+        set(&mut self.source.postgres_url, "POSTGRES_URL");
+        set(&mut self.source.logical.slot_name, "PG2ICEBERG_SLOT");
+        set(
+            &mut self.source.logical.publication_name,
+            "PG2ICEBERG_PUBLICATION",
+        );
+        set(&mut self.state.postgres_url, "PG2ICEBERG_STATE_URL");
+        set(&mut self.sink.catalog_uri, "ICEBERG_CATALOG_URL");
+        set(&mut self.sink.catalog_auth, "ICEBERG_CATALOG_AUTH");
+        set(&mut self.sink.catalog_token, "ICEBERG_CATALOG_TOKEN");
+        set(
+            &mut self.sink.catalog_client_id,
+            "ICEBERG_CATALOG_CLIENT_ID",
+        );
+        set(
+            &mut self.sink.catalog_client_secret,
+            "ICEBERG_CATALOG_CLIENT_SECRET",
+        );
+        set(&mut self.sink.warehouse, "ICEBERG_WAREHOUSE");
+        set(&mut self.sink.namespace, "ICEBERG_NAMESPACE");
+        set(&mut self.sink.credential_mode, "ICEBERG_CREDENTIAL_MODE");
+        if let Some(tables) = env("PG2ICEBERG_TABLES") {
+            self.tables = tables
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|name| !name.is_empty())
+                .map(TableConfig::named)
+                .collect();
+        }
+        let fill = |field: &mut String, names: &[&str]| {
+            if field.is_empty() {
+                if let Some(value) = names.iter().find_map(|name| env(name)) {
+                    *field = value;
+                }
+            }
+        };
+        fill(
+            &mut self.sink.s3_region,
+            &["AWS_REGION", "AWS_DEFAULT_REGION"],
+        );
+        fill(
+            &mut self.sink.s3_endpoint,
+            &["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL"],
+        );
+        Ok(())
+    }
+
+    /// A source database is configured.
+    pub fn require_source(&self) -> Result<()> {
+        let pg = &self.source.postgres;
+        if !pg.url.is_empty()
+            || !(pg.host.is_empty() || pg.database.is_empty() || pg.user.is_empty())
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "no source database configured: set POSTGRES_URL \
+             (postgres://user:password@host:5432/database), or source.postgres_url in {DEFAULT_CONFIG_PATH}"
+        )
+    }
+
+    /// An Iceberg catalog is configured.
+    pub fn require_catalog(&self) -> Result<()> {
+        if !self.sink.catalog_uri.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "no Iceberg catalog configured: set ICEBERG_CATALOG_URL (a REST catalog, such as \
+             http://localhost:8181), or sink.catalog_uri in {DEFAULT_CONFIG_PATH}"
+        )
     }
 
     /// Every table needs an Iceberg table of its own. `sink.namespace`
     /// replaces the PG schema, so `public.orders` and `sales.orders`
     /// would both land in `<namespace>.orders`, their rows mixed.
-    fn validate_tables(&self) -> Result<()> {
+    /// `schema.*` stands for tables yet to be found, and can't carry
+    /// settings for a particular one.
+    pub fn validate_tables(&self) -> Result<()> {
         let mut targets: BTreeMap<TableIdent, &str> = BTreeMap::new();
         for t in &self.tables {
+            if t.is_pattern() {
+                if !t.columns.is_empty()
+                    || !t.primary_key.is_empty()
+                    || !t.iceberg.partition.is_empty()
+                {
+                    anyhow::bail!(
+                        "{} can't set columns, primary_key or iceberg.partition: list the \
+                         tables that need them by name",
+                        t.name
+                    );
+                }
+                continue;
+            }
             let ident = t.iceberg_ident(&self.sink.namespace)?;
             match targets.insert(ident.clone(), &t.name) {
                 Some(other) if other == t.name => {
@@ -481,7 +765,8 @@ impl Config {
         if !self.sink.warehouse.is_empty() {
             props.insert("warehouse".into(), self.sink.warehouse.clone());
         }
-        match self.sink.catalog_auth.as_str() {
+        let region = self.sink.resolved_region();
+        match self.sink.resolved_catalog_auth() {
             "bearer" if !self.sink.catalog_token.is_empty() => {
                 props.insert("token".into(), self.sink.catalog_token.clone());
             }
@@ -501,8 +786,19 @@ impl Config {
                     ),
                 );
             }
+            // Requests signed with the AWS default credential chain's
+            // credentials, for the service the endpoint names (S3
+            // Tables' `s3tables`, Glue's `glue`).
+            "sigv4" => {
+                props.insert("rest.sigv4-enabled".into(), "true".into());
+                props.insert("rest.signing-region".into(), region.clone());
+                if let Some((service, _)) = aws_endpoint(&self.sink.catalog_uri) {
+                    props.insert("rest.signing-name".into(), service);
+                }
+            }
             _ => {}
         }
+        let credential_mode = self.sink.resolved_credential_mode();
         // Vended-credentials mode requires the
         // `X-Iceberg-Access-Delegation: vended-credentials` header on
         // every catalog request. iceberg-rust's REST client already
@@ -510,7 +806,7 @@ impl Config {
         // requests, so we set it here when credential_mode=vended.
         // Operators can override via explicit `catalog_props` if they
         // need a different delegation type (e.g. `remote-signing`).
-        if self.sink.credential_mode == "vended" {
+        if credential_mode == "vended" {
             props.insert(
                 "header.x-iceberg-access-delegation".into(),
                 "vended-credentials".into(),
@@ -528,10 +824,8 @@ impl Config {
             // MinIO answers with a 404. Mirrors the blob store.
             props.insert("s3.path-style-access".into(), "true".into());
         }
-        if !self.sink.s3_region.is_empty() {
-            props.insert("s3.region".into(), self.sink.s3_region.clone());
-        }
-        if self.sink.credential_mode == "static" {
+        props.insert("s3.region".into(), region);
+        if credential_mode == "static" {
             if !self.sink.s3_access_key.is_empty() {
                 props.insert("s3.access-key-id".into(), self.sink.s3_access_key.clone());
             }
@@ -556,6 +850,23 @@ impl Config {
 }
 
 impl TableConfig {
+    /// A table by name alone, every other setting its default.
+    pub fn named(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            skip_snapshot: false,
+            primary_key: Vec::new(),
+            columns: Vec::new(),
+            iceberg: IcebergTableConfig::default(),
+        }
+    }
+
+    /// Whether this names every table in a schema (`schema.*`) rather
+    /// than one.
+    pub fn is_pattern(&self) -> bool {
+        self.name.ends_with(".*")
+    }
+
     /// `(schema, table)` parsed from the YAML `name`.
     pub fn qualified(&self) -> Result<(String, String)> {
         parse_qualified_name(&self.name)
@@ -626,6 +937,56 @@ impl TableConfig {
             pg_schema: None,
         })
     }
+}
+
+/// Replace `${NAME}` in every string in `value` with the environment
+/// variable `NAME`; `$${` is a literal `${`. Comments are left alone, so
+/// a commented-out line can name a variable that isn't set.
+fn interpolate(value: &mut serde_yaml::Value, env: Env) -> Result<()> {
+    use serde_yaml::Value;
+    match value {
+        Value::String(s) => *s = interpolate_str(s, env)?,
+        Value::Sequence(items) => {
+            for item in items {
+                interpolate(item, env)?;
+            }
+        }
+        Value::Mapping(map) => {
+            for (_, item) in map.iter_mut() {
+                interpolate(item, env)?;
+            }
+        }
+        Value::Tagged(tagged) => interpolate(&mut tagged.value, env)?,
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn interpolate_str(s: &str, env: Env) -> Result<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        if let Some(tail) = after.strip_prefix("${") {
+            out.push_str("${");
+            rest = tail;
+        } else if let Some(tail) = after.strip_prefix('{') {
+            let end = tail
+                .find('}')
+                .with_context(|| format!("unterminated `${{` in {s:?}"))?;
+            let name = &tail[..end];
+            let value = env(name)
+                .with_context(|| format!("the config uses ${{{name}}}, which isn't set"))?;
+            out.push_str(&value);
+            rest = &tail[end + 1..];
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Split `"schema.table"` → `("schema", "table")`. Errors on
@@ -976,11 +1337,252 @@ sink:
         assert_eq!(cfg.source.postgres.port, 5432);
         assert_eq!(cfg.source.logical.slot_name, "pg2iceberg_slot");
         assert_eq!(cfg.source.logical.publication_name, "pg2iceberg_pub");
-        assert_eq!(cfg.sink.credential_mode, "static");
-        assert_eq!(cfg.sink.s3_region, "us-east-1");
+        // No warehouse: the catalog vends credentials.
+        assert_eq!(cfg.sink.resolved_credential_mode(), "vended");
+        assert_eq!(cfg.sink.resolved_catalog_auth(), "none");
+        assert_eq!(cfg.sink.resolved_region(), "us-east-1");
         assert_eq!(cfg.sink.flush_rows, 10_000);
         assert_eq!(cfg.sink.materializer_batch_rows, 50_000);
         assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
         assert_eq!(cfg.state.group, "default");
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn the_environment_alone_is_a_config() {
+        let env = vars(&[
+            ("POSTGRES_URL", "postgres://u:p@db:5432/app?sslmode=require"),
+            ("PG2ICEBERG_TABLES", "public.orders, sales.*"),
+            ("PG2ICEBERG_SLOT", "my_slot"),
+            ("ICEBERG_CATALOG_URL", "https://catalog.example.com"),
+            ("ICEBERG_CATALOG_TOKEN", "t0ken"),
+            ("ICEBERG_WAREHOUSE", "s3://lake/"),
+            ("ICEBERG_NAMESPACE", "analytics"),
+            ("AWS_REGION", "eu-west-1"),
+        ]);
+        let cfg = Config::from_env(&env).unwrap();
+        cfg.require_source().unwrap();
+        cfg.require_catalog().unwrap();
+        assert_eq!(
+            cfg.source.postgres.dsn(),
+            "postgres://u:p@db:5432/app?sslmode=require"
+        );
+        assert_eq!(cfg.source.postgres.tls_label(), "webpki");
+        assert_eq!(
+            cfg.tables
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["public.orders", "sales.*"]
+        );
+        assert!(cfg.tables[1].is_pattern());
+        assert_eq!(cfg.source.logical.slot_name, "my_slot");
+        assert_eq!(cfg.source.logical.publication_name, "pg2iceberg_pub");
+        assert_eq!(cfg.sink.namespace, "analytics");
+        assert_eq!(cfg.sink.resolved_catalog_auth(), "bearer");
+        // No keys given: the AWS default credential chain.
+        assert_eq!(cfg.sink.resolved_credential_mode(), "iam");
+        assert_eq!(cfg.sink.resolved_region(), "eu-west-1");
+        let props = cfg.rest_catalog_props();
+        assert_eq!(props.get("token").map(String::as_str), Some("t0ken"));
+        assert_eq!(
+            props.get("s3.region").map(String::as_str),
+            Some("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn the_environment_overrides_the_file_but_aws_variables_only_fill_in() {
+        let yaml = SAMPLE.to_string();
+        let env = vars(&[
+            ("ICEBERG_CATALOG_URL", "http://other:8181"),
+            ("AWS_REGION", "eu-west-1"),
+            ("AWS_ENDPOINT_URL_S3", "http://elsewhere:9000"),
+        ]);
+        let mut cfg = Config::parse(&yaml, &env).unwrap();
+        cfg.apply_env(&env).unwrap();
+        assert_eq!(cfg.sink.catalog_uri, "http://other:8181");
+        assert_eq!(cfg.sink.s3_region, "us-east-1");
+        assert_eq!(cfg.sink.s3_endpoint, "http://localhost:9000");
+    }
+
+    #[test]
+    fn missing_settings_name_the_variables_to_set() {
+        let cfg = Config::from_env(&vars(&[])).unwrap();
+        let source = cfg.require_source().unwrap_err().to_string();
+        assert!(source.contains("POSTGRES_URL"), "{source}");
+        let catalog = cfg.require_catalog().unwrap_err().to_string();
+        assert!(catalog.contains("ICEBERG_CATALOG_URL"), "{catalog}");
+    }
+
+    #[test]
+    fn strings_in_the_file_read_variables() {
+        let env = vars(&[("TOKEN", "t0ken"), ("HOST", "db")]);
+        let yaml = r#"
+# A comment naming ${UNSET} is left alone.
+source:
+  postgres_url: postgres://u@${HOST}/app
+sink:
+  catalog_uri: http://catalog
+  catalog_token: ${TOKEN}
+  catalog_props:
+    "header.x-price": "$5 and $${literal}"
+"#;
+        let cfg = Config::parse(yaml, &env).unwrap();
+        assert_eq!(cfg.source.postgres_url, "postgres://u@db/app");
+        assert_eq!(cfg.sink.catalog_token, "t0ken");
+        assert_eq!(
+            cfg.sink
+                .catalog_props
+                .get("header.x-price")
+                .map(String::as_str),
+            Some("$5 and ${literal}")
+        );
+        let err = Config::parse("sink:\n  catalog_token: ${NOPE}\n", &env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("${NOPE}"), "{err}");
+        // An empty file is an empty config.
+        assert!(Config::parse("", &env).unwrap().tables.is_empty());
+    }
+
+    #[test]
+    fn a_connection_strings_sslmode_decides_tls() {
+        let pg = |url: &str| PostgresConfig {
+            url: url.into(),
+            ..PostgresConfig::default()
+        };
+        assert_eq!(pg("postgres://u@db/app").tls_label(), "disable");
+        assert_eq!(
+            pg("postgres://u@db/app?sslmode=disable").tls_label(),
+            "disable"
+        );
+        assert_eq!(
+            pg("postgres://u@db/app?application_name=x&sslmode=verify-full").tls_label(),
+            "webpki"
+        );
+        assert_eq!(
+            pg("host=db dbname=app sslmode=require").tls_label(),
+            "webpki"
+        );
+        assert_eq!(pg("host=db dbname=app").tls_label(), "disable");
+    }
+
+    #[test]
+    fn the_credential_mode_follows_from_what_is_given() {
+        let sink = |keys: bool, warehouse: &str, explicit: &str| SinkConfig {
+            s3_access_key: if keys { "k".into() } else { String::new() },
+            warehouse: warehouse.into(),
+            credential_mode: explicit.into(),
+            ..SinkConfig::default()
+        };
+        assert_eq!(
+            sink(true, "s3://w/", "").resolved_credential_mode(),
+            "static"
+        );
+        assert_eq!(sink(false, "s3://w/", "").resolved_credential_mode(), "iam");
+        assert_eq!(sink(false, "", "").resolved_credential_mode(), "vended");
+        assert_eq!(
+            sink(false, "my_catalog", "").resolved_credential_mode(),
+            "vended"
+        );
+        assert_eq!(sink(true, "", "iam").resolved_credential_mode(), "iam");
+    }
+
+    #[test]
+    fn an_aws_catalog_is_signed_for_its_service_and_region() {
+        let sink = SinkConfig {
+            catalog_uri: "https://s3tables.ap-southeast-1.amazonaws.com/iceberg".into(),
+            warehouse: "arn:aws:s3tables:ap-southeast-1:123456789012:bucket/b".into(),
+            ..SinkConfig::default()
+        };
+        assert_eq!(sink.resolved_catalog_auth(), "sigv4");
+        assert_eq!(sink.resolved_region(), "ap-southeast-1");
+        let cfg = Config {
+            sink,
+            ..Config::default()
+        };
+        let props = cfg.rest_catalog_props();
+        assert_eq!(
+            props.get("rest.sigv4-enabled").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            props.get("rest.signing-region").map(String::as_str),
+            Some("ap-southeast-1")
+        );
+        assert_eq!(
+            props.get("rest.signing-name").map(String::as_str),
+            Some("s3tables")
+        );
+        assert_eq!(
+            aws_endpoint("https://glue.us-west-2.amazonaws.com/iceberg"),
+            Some(("glue".to_string(), "us-west-2".to_string()))
+        );
+        assert_eq!(aws_endpoint("http://localhost:8181"), None);
+    }
+
+    #[test]
+    fn client_credentials_mean_oauth2() {
+        let sink = SinkConfig {
+            catalog_uri: "https://polaris".into(),
+            catalog_client_id: "id".into(),
+            catalog_client_secret: "secret".into(),
+            ..SinkConfig::default()
+        };
+        assert_eq!(sink.resolved_catalog_auth(), "oauth2");
+    }
+
+    #[test]
+    fn static_keys_on_aws_itself_use_virtual_hosted_requests() {
+        let cfg = Config {
+            sink: SinkConfig {
+                catalog_uri: "http://catalog".into(),
+                warehouse: "s3://w/".into(),
+                s3_access_key: "k".into(),
+                s3_secret_key: "s".into(),
+                ..SinkConfig::default()
+            },
+            ..Config::default()
+        };
+        let props = cfg.rest_catalog_props();
+        assert_eq!(props.get("s3.access-key-id").map(String::as_str), Some("k"));
+        assert!(!props.contains_key("s3.path-style-access"));
+        assert!(!props.contains_key("s3.endpoint"));
+    }
+
+    #[test]
+    fn the_example_configs_load() {
+        let env = vars(&[("CATALOG_TOKEN", "t"), ("S3_SECRET_KEY", "s")]);
+        let example = Config::parse(include_str!("../../../config.example.yaml"), &env).unwrap();
+        example.validate_tables().unwrap();
+        assert_eq!(example.sink.catalog_token, "t");
+        assert_eq!(example.sink.s3_secret_key, "s");
+        let single =
+            Config::parse(include_str!("../../../example/single/config.yaml"), &env).unwrap();
+        single.validate_tables().unwrap();
+        assert_eq!(single.tables.len(), 5);
+    }
+
+    #[test]
+    fn a_schema_pattern_cant_carry_one_tables_settings() {
+        let mut cfg = Config {
+            tables: vec![TableConfig {
+                primary_key: vec!["id".into()],
+                ..TableConfig::named("public.*")
+            }],
+            ..Config::default()
+        };
+        let err = cfg.validate_tables().unwrap_err().to_string();
+        assert!(err.contains("public.*"), "{err}");
+        cfg.tables = vec![TableConfig::named("public.*")];
+        cfg.validate_tables().unwrap();
     }
 }

@@ -18,11 +18,14 @@ Pre-built images are not yet published. Once a release pipeline is in place, the
 docker pull ghcr.io/polynya-dev/pg2iceberg:latest
 ```
 
-The image's entrypoint is the `pg2iceberg` binary; pass a subcommand:
+The image's entrypoint is the `pg2iceberg` binary; pass a subcommand, and the settings as environment variables (or mount a config file):
 
 ```bash
-docker run --rm -v $(pwd)/config.yaml:/etc/pg2iceberg/config.yaml \
-  pg2iceberg-rust:dev run --config /etc/pg2iceberg/config.yaml
+docker run --rm \
+  -e POSTGRES_URL=postgres://user:password@db:5432/app \
+  -e ICEBERG_CATALOG_URL=https://catalog.example.com \
+  -e ICEBERG_WAREHOUSE=s3://my-bucket/warehouse/ \
+  pg2iceberg-rust:dev run
 ```
 
 ## Build from source

@@ -208,7 +208,9 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
         }],
         source: SourceConfig {
             mode: "logical".into(),
+            postgres_url: String::new(),
             postgres: PostgresConfig {
+                url: String::new(),
                 host: pg_host,
                 port: pg_port,
                 database: "postgres".into(),

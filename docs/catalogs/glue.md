@@ -34,9 +34,7 @@ AWS Glue acts as an Iceberg REST catalog via its native Iceberg endpoint. Authen
 
 ```yaml
 source:
-  postgres_url: "postgres://user:pass@host:5432/db?sslmode=disable"
-  publication: pg2iceberg
-  slot: pg2iceberg
+  postgres_url: "postgres://user:pass@host:5432/db"
 
 sink:
   catalog_uri: "https://glue.us-east-1.amazonaws.com/iceberg"

@@ -159,6 +159,73 @@ impl PgClientImpl {
     pub async fn domains(&self) -> Result<HashMap<u32, Domain>> {
         domains_of(&*self.client().await?).await
     }
+
+    /// Every table a publication can hold — an ordinary or partitioned
+    /// table, not a partition (its parent replicates it), temporary,
+    /// unlogged, an extension's own, or in a system schema — by schema
+    /// and name.
+    pub async fn list_tables(&self) -> Result<Vec<SourceTable>> {
+        let rows = self
+            .client()
+            .await?
+            .simple_query(
+                "SELECT n.nspname, c.relname, \
+                        EXISTS (SELECT 1 FROM pg_index i \
+                                WHERE i.indrelid = c.oid AND i.indisprimary), \
+                        c.relkind = 'p', \
+                        has_table_privilege(c.oid, 'SELECT'), \
+                        (CASE WHEN c.relkind = 'p' THEN \
+                            (SELECT coalesce(sum(greatest(l.reltuples, 0)), 0) \
+                             FROM pg_partition_tree(c.oid) t JOIN pg_class l ON l.oid = t.relid \
+                             WHERE t.isleaf) \
+                         ELSE greatest(c.reltuples, 0) END)::int8 \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition \
+                   AND c.relpersistence = 'p' \
+                   AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
+                   AND NOT EXISTS (SELECT 1 FROM pg_depend d \
+                                   WHERE d.classid = 'pg_class'::regclass \
+                                     AND d.objid = c.oid AND d.deptype = 'e') \
+                 ORDER BY 1, 2",
+            )
+            .await
+            .map_err(|e| PgError::Protocol(format!("list tables: {e}")))?;
+        let mut out = Vec::new();
+        for msg in rows {
+            let SimpleQueryMessage::Row(row) = msg else {
+                continue;
+            };
+            let text = |i: usize| -> Result<&str> {
+                row.try_get(i)
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                    .ok_or_else(|| PgError::Protocol(format!("list tables: column {i} is NULL")))
+            };
+            out.push(SourceTable {
+                schema: text(0)?.to_string(),
+                name: text(1)?.to_string(),
+                has_primary_key: text(2)? == "t",
+                partitioned: text(3)? == "t",
+                readable: text(4)? == "t",
+                row_estimate: text(5)?.parse().unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// A table in the source database (see [`PgClientImpl::list_tables`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceTable {
+    pub schema: String,
+    pub name: String,
+    pub has_primary_key: bool,
+    /// Declaratively partitioned: its partitions replicate as it.
+    pub partitioned: bool,
+    /// Whether the connecting role can read it, as the initial snapshot
+    /// does.
+    pub readable: bool,
+    /// Rows, as the planner's statistics estimate them.
+    pub row_estimate: i64,
 }
 
 async fn domains_of(client: &Client) -> Result<HashMap<u32, Domain>> {

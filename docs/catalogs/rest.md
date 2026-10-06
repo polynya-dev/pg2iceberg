@@ -12,9 +12,7 @@ The quickstart docker-compose includes an Iceberg REST catalog backed by MinIO:
 
 ```yaml
 source:
-  postgres_url: "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
-  publication: pg2iceberg
-  slot: pg2iceberg
+  postgres_url: "postgres://postgres:postgres@localhost:5432/postgres"
 
 sink:
   catalog_uri: "http://localhost:8181"
@@ -31,7 +29,20 @@ tables:
   - name: public.orders
 ```
 
+Or with environment variables alone — every table with a primary key, the S3 keys read by the AWS default credential chain:
+
+```bash
+export POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres
+export ICEBERG_CATALOG_URL=http://localhost:8181
+export ICEBERG_WAREHOUSE=s3://warehouse/
+export AWS_ENDPOINT_URL_S3=http://localhost:9000
+export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin
+pg2iceberg run
+```
+
 ## Generic configuration reference
+
+Both settings are inferred when left out — see [Configuration](../usage/configuration.md#inferred-settings).
 
 | `catalog_auth` | Use when |
 |----------------|----------|

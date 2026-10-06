@@ -15,9 +15,7 @@ icon: simple/snowflake
 
 ```yaml
 source:
-  postgres_url: "postgres://user:pass@host:5432/db?sslmode=disable"
-  publication: pg2iceberg
-  slot: pg2iceberg
+  postgres_url: "postgres://user:pass@host:5432/db"
 
 sink:
   catalog_uri: "https://polaris.example.com"
@@ -30,6 +28,8 @@ sink:
 tables:
   - name: public.orders
 ```
+
+The same with environment variables: `ICEBERG_CATALOG_URL`, `ICEBERG_CATALOG_CLIENT_ID` and `ICEBERG_CATALOG_CLIENT_SECRET` (client credentials imply `oauth2`), and `ICEBERG_CREDENTIAL_MODE=vended`.
 
 | Field | Value |
 |-------|-------|

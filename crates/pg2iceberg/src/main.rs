@@ -11,56 +11,59 @@
 //!   migration. First step of any greenfield deployment.
 //! - `run` — assemble the full pipeline (PG client + coord + catalog +
 //!   blob store) and run it until SIGINT.
+//! - `init` — inspect the source database and write a config for it.
+//!
+//! Every subcommand reads its config from environment variables and an
+//! optional YAML file (see [`Config::load`]).
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use pg2iceberg::config::{self, Config};
-use pg2iceberg::run;
+use pg2iceberg::config::{self, Config, DEFAULT_CONFIG_PATH};
+use pg2iceberg::{init, run, tables};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Config file. Default: `PG2ICEBERG_CONFIG`, else `pg2iceberg.yaml` if
+    /// present, else environment variables alone.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Inspect the source database (`POSTGRES_URL`) and write a config for
+    /// it: every table pg2iceberg can replicate, the settings the
+    /// environment gives, secrets as `${VAR}` references. Checks what
+    /// replication needs of the database too.
+    Init {
+        /// Where to write it; `-` prints it.
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        output: String,
+        /// Overwrite an existing file.
+        #[arg(long)]
+        force: bool,
+    },
     /// Smoke-test the PG replication-mode connection.
-    ConnectPg {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    ConnectPg,
     /// Smoke-test the Iceberg catalog connection.
-    ConnectIceberg {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    ConnectIceberg,
     /// Run the coordinator's idempotent schema migration. Safe to run
     /// repeatedly — every statement is `CREATE … IF NOT EXISTS`.
-    MigrateCoord {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    MigrateCoord,
     /// Run the full pipeline.
-    Run {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    Run,
     /// One-shot: run a single compaction pass over every configured
     /// table and exit. Useful for cron / k8s CronJob deployments where
     /// compaction runs out-of-band from the replication loop.
-    Compact {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    Compact,
     /// One-shot: run snapshot expiry over every configured table and
     /// exit. Reads `sink.maintenance_retention` from YAML; CLI
     /// override takes precedence when supplied.
     Maintain {
-        #[arg(long)]
-        config: PathBuf,
         /// Override `sink.maintenance_retention` (e.g. `168h`, `30m`).
         /// Parsed by `humantime`.
         #[arg(long)]
@@ -72,8 +75,6 @@ enum Command {
     /// table reports a non-empty diff. Day-2 confidence check: "is
     /// my mirror correct?"
     Verify {
-        #[arg(long)]
-        config: PathBuf,
         /// Per-PG-read chunk cap. Tradeoff: larger chunks = fewer
         /// round-trips, larger peak memory. 1024 mirrors the snapshot
         /// phase default.
@@ -89,10 +90,7 @@ enum Command {
     /// exist yet — that pins the WAL from `consistent_point` onward so
     /// a later `run` doesn't lose any data committed between snapshot
     /// completion and CDC start.
-    Snapshot {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    Snapshot,
     /// One-shot: drop the replication slot, drop the publication, and
     /// drop the coordinator schema (CASCADE). Used to tear down all
     /// PG-side state created by a pg2iceberg pipeline ahead of a
@@ -103,10 +101,7 @@ enum Command {
     /// publication / schema are skipped silently), but does **not**
     /// delete the materialized Iceberg tables — that has to be done
     /// out-of-band against the catalog.
-    Cleanup {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    Cleanup,
     /// Distributed mode: WAL writer only. Captures pgoutput, stages
     /// parquet to S3, advances the slot. **Does not run the
     /// materializer cycle** — pair with one or more
@@ -114,10 +109,7 @@ enum Command {
     ///
     /// Only one stream-only process per slot (PG enforces single
     /// consumer); scale the materializer side instead.
-    StreamOnly {
-        #[arg(long)]
-        config: PathBuf,
-    },
+    StreamOnly,
     /// Distributed mode: materializer worker only. Reads staged
     /// parquet from coord + S3 and writes to Iceberg. **Does not
     /// open a replication slot**. Multiple workers register under
@@ -127,8 +119,6 @@ enum Command {
     /// The `--worker-id` must be process-unique (e.g. a k8s pod name)
     /// and stable across restarts of the same process.
     MaterializerOnly {
-        #[arg(long)]
-        config: PathBuf,
         /// Process-unique worker identity. Two workers claiming the
         /// same id will trample each other's heartbeat row in
         /// `_pg2iceberg.consumers` and produce undefined assignment.
@@ -147,25 +137,47 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let config = cli.config;
     match cli.command {
-        Command::ConnectPg { config } => connect_pg(&Config::load_from(config)?).await,
-        Command::ConnectIceberg { config } => connect_iceberg(&Config::load_from(config)?).await,
-        Command::MigrateCoord { config } => migrate_coord(&Config::load_from(config)?).await,
-        Command::Run { config } => run::run(Config::load_from(config)?).await,
-        Command::Compact { config } => run::run_compact(Config::load_from(config)?).await,
-        Command::Maintain { config, retention } => {
-            run::run_maintain(Config::load_from(config)?, retention).await
+        Command::Init { output, force } => {
+            if config.is_some() {
+                anyhow::bail!("init reads the environment, not a config file: drop --config");
+            }
+            init::run(&config::process_env, &output, force).await
         }
-        Command::Verify { config, chunk_size } => {
-            run::run_verify(Config::load_from(config)?, chunk_size).await
+        Command::ConnectPg => connect_pg(&source(config)?).await,
+        Command::ConnectIceberg => connect_iceberg(&Config::load(config.as_deref())?).await,
+        Command::MigrateCoord => migrate_coord(&source(config)?).await,
+        Command::Run => run::run(replicated(config).await?).await,
+        Command::Compact => run::run_compact(replicated(config).await?).await,
+        Command::Maintain { retention } => {
+            run::run_maintain(replicated(config).await?, retention).await
         }
-        Command::Snapshot { config } => run::run_snapshot_only(Config::load_from(config)?).await,
-        Command::Cleanup { config } => run::run_cleanup(Config::load_from(config)?).await,
-        Command::StreamOnly { config } => run::run_stream_only(Config::load_from(config)?).await,
-        Command::MaterializerOnly { config, worker_id } => {
-            run::run_materializer_only(Config::load_from(config)?, worker_id).await
+        Command::Verify { chunk_size } => {
+            run::run_verify(replicated(config).await?, chunk_size).await
+        }
+        Command::Snapshot => run::run_snapshot_only(replicated(config).await?).await,
+        Command::Cleanup => run::run_cleanup(source(config)?).await,
+        Command::StreamOnly => run::run_stream_only(replicated(config).await?).await,
+        Command::MaterializerOnly { worker_id } => {
+            run::run_materializer_only(replicated(config).await?, worker_id).await
         }
     }
+}
+
+/// The config, for a subcommand that needs the source database.
+fn source(config: Option<PathBuf>) -> Result<Config> {
+    let cfg = Config::load(config.as_deref())?;
+    cfg.require_source()?;
+    Ok(cfg)
+}
+
+/// The config, with the tables to replicate resolved (see
+/// [`tables::resolve`]).
+async fn replicated(config: Option<PathBuf>) -> Result<Config> {
+    let mut cfg = source(config)?;
+    tables::resolve(&mut cfg).await?;
+    Ok(cfg)
 }
 
 // ── connect-pg ──────────────────────────────────────────────────────────
@@ -206,34 +218,37 @@ async fn connect_pg(cfg: &Config) -> Result<()> {
 // ── connect-iceberg ────────────────────────────────────────────────────
 
 async fn connect_iceberg(cfg: &Config) -> Result<()> {
+    use iceberg::Catalog as _;
     use pg2iceberg_iceberg::prod::IcebergRustCatalog;
     use std::sync::Arc;
+    cfg.require_catalog()?;
     tracing::info!(uri = %cfg.sink.catalog_uri, warehouse = %cfg.sink.warehouse, "opening Iceberg REST catalog");
     let inner = run::build_rest_catalog(cfg).await?;
+    let namespaces = inner
+        .list_namespaces(None)
+        .await
+        .context("list the catalog's namespaces")?;
+    tracing::info!(count = namespaces.len(), "catalog namespaces listed");
     let catalog = IcebergRustCatalog::new(Arc::new(inner));
-    ensure_namespaces(&catalog, &cfg.tables).await?;
+    ensure_namespaces(&catalog, cfg).await?;
     println!("OK: Iceberg catalog connection established");
     Ok(())
 }
 
+/// Ensure the namespaces of the tables the config names.
 async fn ensure_namespaces<C: iceberg::Catalog + Send + Sync + 'static>(
     catalog: &pg2iceberg_iceberg::prod::IcebergRustCatalog<C>,
-    tables: &[config::TableConfig],
+    cfg: &Config,
 ) -> Result<()> {
-    use pg2iceberg_core::Namespace;
     use pg2iceberg_iceberg::Catalog as _;
-    // `connect-iceberg` is a connectivity smoke test — we don't
-    // need full column metadata here, just the parsed
-    // (schema, table) so we know which namespaces to ensure.
-    for t in tables {
-        let (ns, name) = t
-            .qualified()
+    for t in cfg.tables.iter().filter(|t| !t.is_pattern()) {
+        let ident = t
+            .iceberg_ident(&cfg.sink.namespace)
             .with_context(|| format!("parse table name {}", t.name))?;
-        let namespace = Namespace(vec![ns.clone()]);
         catalog
-            .ensure_namespace(&namespace)
+            .ensure_namespace(&ident.namespace)
             .await
-            .with_context(|| format!("ensure namespace for {ns}.{name}"))?;
+            .with_context(|| format!("ensure namespace for {ident}"))?;
         tracing::info!(table = %t.name, "namespace ready");
     }
     Ok(())
