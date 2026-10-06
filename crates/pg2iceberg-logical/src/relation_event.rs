@@ -9,6 +9,7 @@
 //! under another.
 
 use pg2iceberg_core::{ColumnName, IcebergType, PgValue, Row};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const COLUMNS: &str = "columns";
@@ -17,11 +18,25 @@ const DEFAULTS: &str = "defaults";
 /// A table's columns: name and type, in the source's order.
 pub type Columns = Vec<(String, IcebergType)>;
 
-/// The defaults of a table's columns that have one, by name, as Postgres's
-/// catalog had them when the event was staged: the value rows that
-/// predate the column read for it, or `None` for a default Postgres
-/// doesn't store for them (see [`pg2iceberg_pg::ColumnDefault`]).
-pub type Defaults = BTreeMap<String, Option<PgValue>>;
+/// What Postgres's catalog said, when the event was staged, of the value
+/// a column's rows that predate it read (see
+/// [`pg2iceberg_pg::ColumnDefault`]). The catalog has no history: a change
+/// since the column was added may have taken the value away.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum DefaultValue {
+    /// The value Postgres stores for them.
+    Stored(PgValue),
+    /// The column has a default Postgres doesn't store for them: a
+    /// volatile one, which gave each row its own, or the table was
+    /// rewritten since.
+    NotStored,
+    /// The catalog no longer has the column: dropped, or renamed, since.
+    ColumnGone,
+}
+
+/// The table's columns with a [`DefaultValue`], by name; a column without
+/// a default has none.
+pub type Defaults = BTreeMap<String, DefaultValue>;
 
 /// A relation event's contents.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -92,8 +107,9 @@ mod tests {
         let relation = Relation {
             columns: columns(),
             defaults: Defaults::from([
-                ("qty".into(), Some(PgValue::Int8(7))),
-                ("note".into(), None),
+                ("id".into(), DefaultValue::ColumnGone),
+                ("qty".into(), DefaultValue::Stored(PgValue::Int8(7))),
+                ("note".into(), DefaultValue::NotStored),
             ]),
         };
         assert_eq!(decode(&encode(&relation)), Some(relation));

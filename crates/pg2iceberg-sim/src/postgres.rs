@@ -603,17 +603,16 @@ impl SimPostgres {
         Ok(())
     }
 
-    /// What Postgres's catalog says of `ident`'s columns' defaults (see
-    /// [`pg2iceberg_pg::ColumnDefault`]).
-    pub fn column_defaults(&self, ident: &TableIdent) -> Vec<pg2iceberg_pg::ColumnDefault> {
+    /// What Postgres's catalog says of the columns' defaults of the table
+    /// with oid `rel_id` (see [`pg2iceberg_pg::ColumnDefaultSource`]).
+    pub fn column_defaults(&self, rel_id: u32) -> Vec<pg2iceberg_pg::ColumnDefault> {
         let s = self.state.lock().unwrap();
-        let Some(t) = s.tables.get(ident) else {
+        let Some(t) = s.tables.values().find(|t| t.pg_oid == rel_id) else {
             return Vec::new();
         };
         t.schema
             .columns
             .iter()
-            .filter(|c| t.defaults.contains_key(&c.name) || t.missing.contains_key(&c.name))
             .map(|c| pg2iceberg_pg::ColumnDefault {
                 name: c.name.clone(),
                 stored: t.missing.get(&c.name).cloned(),
@@ -782,6 +781,18 @@ impl SimPostgres {
                 missing: BTreeMap::new(),
             },
         );
+        Ok(())
+    }
+
+    /// Test hook: `DROP TABLE`.
+    pub fn drop_table(&self, ident: &TableIdent) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.tables
+            .remove(ident)
+            .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
+        for publication in s.publications.values_mut() {
+            publication.tables.remove(ident);
+        }
         Ok(())
     }
 
@@ -1769,6 +1780,7 @@ impl SimReplicationStream {
                         if let Some(columns) = s.relation_columns(&evt.table, entry.lsn) {
                             self.relations_sent.insert(evt.table.clone());
                             out.push(DecodedMessage::Relation {
+                                rel_id: s.tables[&evt.table].pg_oid,
                                 ident: evt.table.clone(),
                                 columns,
                             });
@@ -1947,9 +1959,9 @@ impl SnapshotSource for SimPostgres {
 impl pg2iceberg_pg::ColumnDefaultSource for SimPostgres {
     async fn column_defaults(
         &self,
-        table: &TableIdent,
+        rel_id: u32,
     ) -> std::result::Result<Vec<pg2iceberg_pg::ColumnDefault>, PgError> {
-        Ok(SimPostgres::column_defaults(self, table))
+        Ok(SimPostgres::column_defaults(self, rel_id))
     }
 }
 
@@ -2155,8 +2167,8 @@ impl PgClient for SimPgClient {
 
     async fn column_defaults(
         &self,
-        table: &TableIdent,
+        rel_id: u32,
     ) -> std::result::Result<Vec<pg2iceberg_pg::ColumnDefault>, PgError> {
-        Ok(self.db.column_defaults(table))
+        Ok(self.db.column_defaults(rel_id))
     }
 }

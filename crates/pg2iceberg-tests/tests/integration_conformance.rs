@@ -955,7 +955,7 @@ fn strip(msgs: Vec<DecodedMessage>) -> Vec<Decoded> {
             Some(match m {
                 DecodedMessage::Begin { .. } => Decoded::Begin,
                 DecodedMessage::Commit { .. } => Decoded::Commit,
-                DecodedMessage::Relation { ident, columns } => Decoded::Relation {
+                DecodedMessage::Relation { ident, columns, .. } => Decoded::Relation {
                     ident: ident.to_string(),
                     cols: columns
                         .into_iter()
@@ -1766,11 +1766,44 @@ async fn sim_reports_column_defaults_as_postgres_does() {
             format!("ALTER TABLE {ns}.t DROP COLUMN c"),
             Box::new(|db, t| db.alter_drop_column(t, "c").unwrap()),
         ),
+        // The table is gone; and the name, taken by another one, isn't it.
+        (
+            format!("DROP TABLE {ns}.t"),
+            Box::new(|db, t| db.drop_table(t).unwrap()),
+        ),
+        (
+            format!("CREATE TABLE {ns}.t (id int4 PRIMARY KEY, z text DEFAULT 'z')"),
+            Box::new(|db, t| {
+                db.create_table(TableSchema {
+                    ident: t.clone(),
+                    columns: vec![ColumnSchema {
+                        name: "id".into(),
+                        field_id: 1,
+                        ty: IcebergType::Int,
+                        nullable: false,
+                        is_primary_key: true,
+                    }],
+                    partition_spec: Vec::new(),
+                    pg_schema: None,
+                })
+                .unwrap()
+            }),
+        ),
     ];
+    // Asked by oid, as pgoutput names the table.
+    let real_oid: u32 = client
+        .query_one(&format!("SELECT '{ns}.t'::regclass::oid"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    let sim_oid = db.table_oid(&t).unwrap();
     for (sql, sim) in steps {
         client.batch_execute(&sql).await.unwrap();
         sim(&db, &t);
-        let real = prod.column_defaults(&t).await.expect("column_defaults");
-        assert_eq!(db.column_defaults(&t), real, "after {sql}");
+        let real = prod
+            .column_defaults(real_oid)
+            .await
+            .expect("column_defaults");
+        assert_eq!(db.column_defaults(sim_oid), real, "after {sql}");
     }
 }

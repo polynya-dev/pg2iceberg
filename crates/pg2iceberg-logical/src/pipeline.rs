@@ -415,8 +415,12 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                 self.sink.record_change(evt)?;
                 self.spill_if_full(xid).await?;
             }
-            DecodedMessage::Relation { ident, columns } => {
-                self.stage_relation(ident, &columns).await?;
+            DecodedMessage::Relation {
+                rel_id,
+                ident,
+                columns,
+            } => {
+                self.stage_relation(rel_id, ident, &columns).await?;
             }
             DecodedMessage::Keepalive { wal_end, .. } => {
                 // Only trustworthy between transactions: pgoutput sends a
@@ -443,14 +447,11 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     /// which may be past the change the message reports.
     async fn stage_relation(
         &mut self,
+        rel_id: u32,
         ident: TableIdent,
         columns: &[pg2iceberg_pg::RelationColumn],
     ) -> Result<()> {
-        let table = self
-            .table_translation
-            .get(&ident)
-            .cloned()
-            .unwrap_or_else(|| ident.clone());
+        let table = self.table_translation.get(&ident).cloned().unwrap_or(ident);
         if self.markers_table.as_ref() == Some(&table) {
             return Ok(());
         }
@@ -463,14 +464,27 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         }
         let mut defaults = relation_event::Defaults::new();
         if let Some(source) = &self.column_defaults {
-            for d in source.column_defaults(&ident).await? {
-                // A value the log can't hold is as good as not stored.
-                let stored = d
-                    .stored
-                    .filter(|v| relation_event::value_to_json(v).is_some());
-                if stored.is_some() || d.has_default {
-                    defaults.insert(d.name, stored);
-                }
+            let catalog: BTreeMap<String, pg2iceberg_pg::ColumnDefault> = source
+                .column_defaults(rel_id)
+                .await?
+                .into_iter()
+                .map(|d| (d.name.clone(), d))
+                .collect();
+            for (name, _) in &columns {
+                let value = match catalog.get(name) {
+                    None => relation_event::DefaultValue::ColumnGone,
+                    // A value the log can't hold is as good as not stored.
+                    Some(d) => match d
+                        .stored
+                        .clone()
+                        .filter(|v| relation_event::value_to_json(v).is_some())
+                    {
+                        Some(v) => relation_event::DefaultValue::Stored(v),
+                        None if d.has_default => relation_event::DefaultValue::NotStored,
+                        None => continue,
+                    },
+                };
+                defaults.insert(name.clone(), value);
             }
         }
         let (xid, lsn) = match self.open_tx {

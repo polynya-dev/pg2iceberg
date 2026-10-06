@@ -3994,6 +3994,42 @@ fn default_filled_in_once(prod: bool) {
     check_invariants(&mut h).unwrap();
 }
 
+/// The column is dropped again before pg2iceberg reads its default:
+/// Postgres has cleared it, so the rows that predate the column keep NULL
+/// for it — a known gap, which pg2iceberg must report rather than pass
+/// over.
+#[test]
+fn a_default_dropped_before_it_was_read_is_reported() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::DropNote,
+        Step::AddNoteWithDefault,
+        Step::Insert { id: 3, qty: 30 },
+    ] {
+        h.run_step(&step);
+    }
+    // Not `Step::DropNote`, which lets pg2iceberg read the default first.
+    h.db.alter_drop_column(&ident(), "note").unwrap();
+    NOTE_PRESENT.set(false);
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    let mut labels = pg2iceberg_core::Labels::new();
+    labels.insert("table".into(), ident().name);
+    labels.insert("column".into(), "note".into());
+    labels.insert("reason".into(), "column_gone".into());
+    assert_eq!(
+        metrics().counter_value(
+            pg2iceberg_core::metrics::names::UNFILLED_COLUMN_DEFAULTS,
+            &labels
+        ),
+        1
+    );
+}
+
 /// A column added with a default and dropped again: rows that predate it
 /// read the default until the drop, and keep it under the dropped
 /// column's name. (Found by the random DST.)
@@ -4041,6 +4077,7 @@ fn a_default_postgres_no_longer_stores_is_reported() {
     let mut labels = pg2iceberg_core::Labels::new();
     labels.insert("table".into(), ident().name);
     labels.insert("column".into(), "note".into());
+    labels.insert("reason".into(), "not_stored".into());
     assert_eq!(
         metrics().counter_value(
             pg2iceberg_core::metrics::names::UNFILLED_COLUMN_DEFAULTS,

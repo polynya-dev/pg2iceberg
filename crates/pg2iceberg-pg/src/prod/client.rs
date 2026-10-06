@@ -676,24 +676,19 @@ impl PgClient for PgClientImpl {
         }
     }
 
-    async fn column_defaults(&self, table: &TableIdent) -> Result<Vec<ColumnDefault>> {
-        let qualified = format!(
-            "{}.{}",
-            quote_ident(&table.namespace.0.join(".")),
-            quote_ident(&table.name)
-        );
-        // `attmissingval` is a one-element array of the column's type; its
-        // element's text form is what pgoutput sends for the value. (An
-        // array column's would be an array of arrays: left unread.)
+    async fn column_defaults(&self, rel_id: u32) -> Result<Vec<ColumnDefault>> {
+        // By oid, as pgoutput names the table: its name may be another
+        // table's by now. `attmissingval` is a one-element array of the
+        // column's type; its element's text form is what pgoutput sends
+        // for the value. (An array column's would be an array of arrays:
+        // left unread.)
         let q = format!(
             "SELECT a.attname, a.atttypid::int8, a.atttypmod, a.atthasdef, \
                     a.atthasmissing AND t.typcategory <> 'A', \
                     array_to_string(a.attmissingval, '') \
              FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
-             WHERE a.attrelid = {}::regclass AND a.attnum > 0 AND NOT a.attisdropped \
-               AND (a.atthasdef OR a.atthasmissing) \
-             ORDER BY a.attnum",
-            quote_lit(&qualified)
+             WHERE a.attrelid = {rel_id} AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum"
         );
         let client = self.client().await?;
         let rows = client

@@ -1028,10 +1028,10 @@ impl<C: Catalog> Materializer<C> {
 
     /// The [`FILL_PROPERTY`] marks for the columns `changes` add to
     /// `schema` with a default Postgres stores, if the table holds rows to
-    /// fill. A column added with a default it doesn't store — a volatile
-    /// one, which rewrote the table with a value per row, or one whose
-    /// table was rewritten since — is reported instead: those rows keep
-    /// NULL, as nothing has their values.
+    /// fill. An added column whose value Postgres no longer has is
+    /// reported instead — a volatile default (which gave each row its
+    /// own), or a table rewrite, drop or rename since the column was added
+    /// — as those rows keep NULL for it.
     fn fill_marks(
         &self,
         ident: &TableIdent,
@@ -1051,28 +1051,42 @@ impl<C: Catalog> Materializer<C> {
             .iter()
             .filter(|c| !schema.columns.iter().any(|old| old.field_id == c.field_id));
         for col in added {
-            let Some(default) = defaults.get(&col.name) else {
-                continue;
+            let reason = match defaults.get(&col.name) {
+                None => continue,
+                Some(relation_event::DefaultValue::Stored(value)) => {
+                    match relation_event::value_to_json(value) {
+                        Some(json) => {
+                            marks.insert(format!("{FILL_PROPERTY}{}", col.field_id), json);
+                            continue;
+                        }
+                        None => "not_stored",
+                    }
+                }
+                Some(relation_event::DefaultValue::NotStored) => "not_stored",
+                Some(relation_event::DefaultValue::ColumnGone) => "column_gone",
             };
-            match default.as_ref().and_then(relation_event::value_to_json) {
-                Some(json) => {
-                    marks.insert(format!("{FILL_PROPERTY}{}", col.field_id), json);
-                }
-                None => {
-                    tracing::warn!(
-                        table = %ident,
-                        column = %col.name,
-                        "column added with a default Postgres doesn't store for existing rows \
-                         (a volatile default, or the table was rewritten since): the rows \
-                         already in Iceberg keep NULL for it"
-                    );
-                    let mut labels = Labels::new();
-                    labels.insert("table".into(), ident.name.clone());
-                    labels.insert("column".into(), col.name.clone());
-                    self.metrics
-                        .counter(names::UNFILLED_COLUMN_DEFAULTS, &labels, 1);
-                }
+            if reason == "column_gone" {
+                tracing::warn!(
+                    table = %ident,
+                    column = %col.name,
+                    "column dropped or renamed in Postgres before pg2iceberg read its default: \
+                     if it had one, the rows already in Iceberg keep NULL for it"
+                );
+            } else {
+                tracing::warn!(
+                    table = %ident,
+                    column = %col.name,
+                    "column added with a default Postgres doesn't store for existing rows \
+                     (a volatile default, or the table was rewritten since): the rows \
+                     already in Iceberg keep NULL for it"
+                );
             }
+            let mut labels = Labels::new();
+            labels.insert("table".into(), ident.name.clone());
+            labels.insert("column".into(), col.name.clone());
+            labels.insert("reason".into(), reason.into());
+            self.metrics
+                .counter(names::UNFILLED_COLUMN_DEFAULTS, &labels, 1);
         }
         Ok(marks)
     }

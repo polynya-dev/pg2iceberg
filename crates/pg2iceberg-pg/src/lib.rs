@@ -131,6 +131,9 @@ pub enum DecodedMessage {
     /// order with the rows; the materializer applies it there
     /// (`Catalog::evolve_schema`).
     Relation {
+        /// The table's `pg_class.oid`: which table this is even after a
+        /// rename, or a drop and another table taking its name.
+        rel_id: u32,
         ident: TableIdent,
         columns: Vec<RelationColumn>,
     },
@@ -202,16 +205,16 @@ pub struct ColumnDefault {
 /// Postgres's catalog, asked for columns' defaults (see [`ColumnDefault`]).
 #[async_trait]
 pub trait ColumnDefaultSource: Send + Sync {
-    /// The columns of `table` (its source identity) that have a default
-    /// or a stored value.
-    async fn column_defaults(&self, table: &TableIdent) -> Result<Vec<ColumnDefault>>;
+    /// Every column the table with `pg_class.oid` `rel_id` has now, in
+    /// order; none if it no longer exists.
+    async fn column_defaults(&self, rel_id: u32) -> Result<Vec<ColumnDefault>>;
 }
 
 /// A client's [`PgClient::column_defaults`], as a source of its own.
 #[async_trait]
 impl ColumnDefaultSource for std::sync::Arc<dyn PgClient> {
-    async fn column_defaults(&self, table: &TableIdent) -> Result<Vec<ColumnDefault>> {
-        PgClient::column_defaults(self.as_ref(), table).await
+    async fn column_defaults(&self, rel_id: u32) -> Result<Vec<ColumnDefault>> {
+        PgClient::column_defaults(self.as_ref(), rel_id).await
     }
 }
 
@@ -313,5 +316,5 @@ pub trait PgClient: Send + Sync {
     async fn alter_publication_add_table(&self, name: &str, ident: &TableIdent) -> Result<()>;
 
     /// See [`ColumnDefaultSource::column_defaults`].
-    async fn column_defaults(&self, table: &TableIdent) -> Result<Vec<ColumnDefault>>;
+    async fn column_defaults(&self, rel_id: u32) -> Result<Vec<ColumnDefault>>;
 }

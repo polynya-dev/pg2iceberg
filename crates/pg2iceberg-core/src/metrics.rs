@@ -150,10 +150,12 @@ pub mod names {
     /// Counter: total rows materialized into Iceberg. Labels: `{table}`.
     pub const MATERIALIZER_ROWS_TOTAL: &str = "pg2iceberg_materializer_rows_total";
 
-    /// Counter: columns added with a default whose value the rows already
-    /// in the table read couldn't be filled in — Postgres no longer stores
-    /// it (a volatile default, or the table was rewritten since). Those
-    /// rows read NULL in Iceberg. Labels: `{table, column}`.
+    /// Counter: columns added whose value the rows already in the table
+    /// read couldn't be filled in, because Postgres no longer had it when
+    /// pg2iceberg read it. Those rows read NULL in Iceberg. Labels:
+    /// `{table, column, reason}`; `reason` is `not_stored` (a volatile
+    /// default, or the table was rewritten since) or `column_gone` (the
+    /// column was dropped or renamed since: it may have had none).
     pub const UNFILLED_COLUMN_DEFAULTS: &str = "pg2iceberg_unfilled_column_defaults_total";
 
     /// Counter: invariant-watcher violation count. Labels: `{invariant}`.

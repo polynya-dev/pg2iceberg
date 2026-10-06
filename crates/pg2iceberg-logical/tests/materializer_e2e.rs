@@ -445,21 +445,27 @@ fn compact_cycle_then_subsequent_materialize_cycle_handles_new_inserts() {
     assert_eq!(read_iceberg(&h), read_pg(&h));
 }
 
-/// What Postgres's catalog says of the table's defaults: `note` was added
-/// with a constant one, stored for the rows that predate it.
+/// What Postgres's catalog says of the table's columns: `note` was added
+/// with a constant default, stored for the rows that predate it.
 struct NoteDefault;
 
 #[async_trait::async_trait]
 impl pg2iceberg_pg::ColumnDefaultSource for NoteDefault {
     async fn column_defaults(
         &self,
-        _table: &TableIdent,
+        _rel_id: u32,
     ) -> pg2iceberg_pg::Result<Vec<pg2iceberg_pg::ColumnDefault>> {
-        Ok(vec![pg2iceberg_pg::ColumnDefault {
-            name: "note".into(),
-            stored: Some(PgValue::Text("x".into())),
-            has_default: true,
-        }])
+        let column = |name: &str, stored: Option<&str>| pg2iceberg_pg::ColumnDefault {
+            name: name.into(),
+            stored: stored.map(|v| PgValue::Text(v.into())),
+            has_default: stored.is_some(),
+        };
+        Ok(vec![
+            column("id", None),
+            column("qty", None),
+            column("note", Some("x")),
+            column("flag", None),
+        ])
     }
 }
 
@@ -477,6 +483,7 @@ fn a_default_added_mid_transaction_is_filled_once() {
     let mut h = boot();
     h.pipeline.read_column_defaults(Arc::new(NoteDefault));
     let relation = |extra: &[&str]| DecodedMessage::Relation {
+        rel_id: 16384,
         ident: ident(),
         columns: [
             ("id", IcebergType::Int, true),
