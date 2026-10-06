@@ -430,6 +430,29 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         expected.insert(1, 111);
         wait_for_iceberg(&assert_catalog, blob.as_ref(), &ident, &schema, &expected).await;
 
+        // `pg2iceberg verify`, as the binary runs it, after a column is
+        // added, filled and another dropped: Iceberg's field ids no
+        // longer follow the source's column positions.
+        src.batch_execute(&format!(
+            "ALTER TABLE {table} ADD COLUMN note text; \
+             UPDATE {table} SET note = 'n' || id; \
+             ALTER TABLE {table} DROP COLUMN balance; \
+             UPDATE {table} SET note = note || '!' WHERE id = 3"
+        ))
+        .await
+        .expect("add, fill, drop");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            // Fails until the materializer has applied the changes.
+            match pg2iceberg::run::run_verify(cfg.clone(), 100).await {
+                Ok(()) => break,
+                Err(e) if tokio::time::Instant::now() >= deadline => {
+                    panic!("verify still failing after the column drop: {e:#}")
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+
         let _ = shutdown_tx.send(());
     };
 

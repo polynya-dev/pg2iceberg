@@ -99,6 +99,8 @@ pg2iceberg maintain --config config.yaml --retention 168h   # CLI override
 
 Reads PG ground truth (REPEATABLE READ snapshot) and Iceberg materialized state for every configured table, compares row-by-row by primary key, prints per-table diff counts. Exits non-zero if any diff is non-empty.
 
+It compares the source table's current columns. Iceberg is read with its own schema, so columns the source dropped (kept in Iceberg, [renamed](../architecture/schema-evolution.md#dropped-columns)) are left out, and values are compared as Iceberg stores them (a `smallint` is an `int`).
+
 ```bash
 pg2iceberg verify --config config.yaml
 pg2iceberg verify --config config.yaml --chunk-size 4096
