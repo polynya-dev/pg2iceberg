@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
 use pg2iceberg_iceberg::PreparedCommit;
 use pg2iceberg_iceberg::{
-    apply_schema_changes, Catalog, DataFile, IcebergError, Result, SchemaChange, Snapshot,
-    TableMetadata,
+    apply_schema_changes, merge_log_ends, Catalog, DataFile, IcebergError, LogRange, Result,
+    SchemaChange, Snapshot, TableMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,33 @@ struct MemTable {
     /// Ids of expired snapshots.
     expired: BTreeSet<i64>,
     next_snapshot_id: i64,
+    /// Each snapshot's recorded log ends: those carried forward, and its
+    /// own commit's (see [`LogRange`]).
+    log_ends: BTreeMap<i64, BTreeMap<String, u64>>,
+}
+
+impl MemTable {
+    /// Record snapshot `id`, just committed: it carries the table's log
+    /// ends forward, with `range`'s.
+    fn record_log_ends(&mut self, id: i64, range: Option<&LogRange>) {
+        let mut ends = self.metadata.log_ends.clone();
+        if let Some(range) = range {
+            merge_log_ends(&mut ends, [(range.group.clone(), range.end)]);
+        }
+        self.log_ends.insert(id, ends);
+        self.refresh_log_ends();
+    }
+
+    /// Bring `metadata.log_ends` in line with the unexpired snapshots.
+    fn refresh_log_ends(&mut self) {
+        let mut ends = BTreeMap::new();
+        for (id, recorded) in &self.log_ends {
+            if !self.expired.contains(id) {
+                merge_log_ends(&mut ends, recorded.clone());
+            }
+        }
+        self.metadata.log_ends = ends;
+    }
 }
 
 #[derive(Default, Clone)]
@@ -114,6 +141,7 @@ impl Catalog for MemoryCatalog {
             current_snapshot_id: None,
             config: BTreeMap::new(),
             location: String::new(),
+            log_ends: BTreeMap::new(),
         };
         s.tables.insert(
             ident,
@@ -122,6 +150,7 @@ impl Catalog for MemoryCatalog {
                 snapshots: Vec::new(),
                 expired: BTreeSet::new(),
                 next_snapshot_id: 1,
+                log_ends: BTreeMap::new(),
             },
         );
         Ok(metadata)
@@ -153,12 +182,18 @@ impl Catalog for MemoryCatalog {
             removed_paths: Vec::new(),
             timestamp_ms: id * 1000,
             expired: false,
+            log_range: None,
         });
         table.metadata.current_snapshot_id = Some(id);
+        table.record_log_ends(id, None);
         Ok(table.metadata.clone())
     }
 
-    async fn commit_snapshots(&self, steps: Vec<PreparedCommit>) -> Result<TableMetadata> {
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<PreparedCommit>,
+        log_range: Option<LogRange>,
+    ) -> Result<TableMetadata> {
         let ident = steps
             .first()
             .map(|s| s.ident.clone())
@@ -174,6 +209,7 @@ impl Catalog for MemoryCatalog {
             .tables
             .get_mut(&ident)
             .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
+        let mut last = None;
         for step in steps {
             if step.data_files.is_empty() && step.equality_deletes.is_empty() {
                 continue;
@@ -187,8 +223,16 @@ impl Catalog for MemoryCatalog {
                 removed_paths: Vec::new(),
                 timestamp_ms: id * 1000,
                 expired: false,
+                log_range: None,
             });
             table.metadata.current_snapshot_id = Some(id);
+            last = Some(id);
+        }
+        if let Some(id) = last {
+            table.record_log_ends(id, log_range.as_ref());
+            let snap = table.snapshots.last_mut().expect("just pushed");
+            debug_assert_eq!(snap.id, id);
+            snap.log_range = log_range;
         }
         Ok(table.metadata.clone())
     }
@@ -249,8 +293,10 @@ impl Catalog for MemoryCatalog {
             removed_paths: prepared.removed_paths,
             timestamp_ms: id * 1000,
             expired: false,
+            log_range: None,
         });
         table.metadata.current_snapshot_id = Some(id);
+        table.record_log_ends(id, None);
         Ok(table.metadata.clone())
     }
 
@@ -285,6 +331,7 @@ impl Catalog for MemoryCatalog {
             .filter(|id| !table.expired.contains(id))
             .collect();
         table.expired.extend(&expire);
+        table.refresh_log_ends();
         Ok(expire.len())
     }
 
@@ -341,6 +388,7 @@ impl Catalog for MemoryCatalog {
                     delete_files: live(&snap.delete_files),
                     removed_paths: Vec::new(),
                     expired: true,
+                    log_range: None,
                     ..snap.clone()
                 };
                 let empty = stand_in.data_files.is_empty() && stand_in.delete_files.is_empty();

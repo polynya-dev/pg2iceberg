@@ -38,8 +38,8 @@ use pg2iceberg_iceberg::meta::{
 };
 use pg2iceberg_iceberg::{
     catch_up_from_catalog, fold_events, promote_re_inserts, read_data_file, reconcile_columns,
-    resolve_unchanged_cols, Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PkKey,
-    PreparedCommit, TableWriter, WriterError,
+    resolve_unchanged_cols, toast_source, Catalog, DataFile, FileIndex, IcebergError, LogRange,
+    MaterializedRow, PkKey, PreparedCommit, TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -106,6 +106,11 @@ pub enum MaterializerError {
     Compact(String),
     #[error("orphan cleanup: {0}")]
     Cleanup(String),
+    /// The unit being built starts in a log range the catalog says a
+    /// commit already applied, up to `end` (see [`LogRange`]): its cursor
+    /// update never happened. Handled within a cycle, never returned.
+    #[error("log already applied up to offset {end}")]
+    AlreadyApplied { end: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, MaterializerError>;
@@ -430,6 +435,8 @@ struct Unit {
     steps: Vec<PreparedCommit>,
     /// Decoded events of the step being built.
     buf: Vec<MatEvent>,
+    /// Log offset of the first entry consumed.
+    start_offset: Option<u64>,
     /// Log offset just past the last entry consumed.
     end_offset: Option<u64>,
     folded: usize,
@@ -1011,6 +1018,15 @@ impl<C: Catalog> Materializer<C> {
         format!("{}#snapshot", self.group)
     }
 
+    /// The `mat_cursor` group `unit` advances.
+    fn unit_group(&self, unit: &Unit) -> String {
+        if unit.snapshot {
+            self.snapshot_group()
+        } else {
+            self.group.clone()
+        }
+    }
+
     /// The table's [`Backfill`], looked up once.
     async fn backfill(&mut self, ident: &TableIdent) -> Result<Backfill> {
         let known = self.tables.get(ident).map(|e| e.backfill);
@@ -1060,6 +1076,22 @@ impl<C: Catalog> Materializer<C> {
     /// half loaded. A crash before the commit re-applies them, which
     /// changes nothing.
     async fn apply_snapshot_rows(&mut self, ident: &TableIdent, from: i64) -> Result<usize> {
+        let folded = match self.fold_snapshot_rows(ident, from).await {
+            // Their commit landed; marking them applied didn't happen.
+            Err(MaterializerError::AlreadyApplied { .. }) => 0,
+            result => result?,
+        };
+        self.coord
+            .set_cursor(&self.snapshot_group(), ident, SNAPSHOT_APPLIED)
+            .await?;
+        let since = self.first_snapshot_lsn(ident).await?;
+        if let Some(entry) = self.tables.get_mut(ident) {
+            entry.backfill = Backfill::Applied { since };
+        }
+        Ok(folded)
+    }
+
+    async fn fold_snapshot_rows(&mut self, ident: &TableIdent, from: i64) -> Result<usize> {
         let mut after = from.max(0) as u64;
         let mut unit = Unit {
             snapshot: true,
@@ -1076,6 +1108,9 @@ impl<C: Catalog> Materializer<C> {
                     .into_iter()
                     .filter(|evt| is_snapshot_xid(evt.xid))
                     .collect();
+                if unit.start_offset.is_none() {
+                    self.begin_unit(ident, &mut unit, e.start_offset).await?;
+                }
                 if !unit.buf.is_empty() && unit.buf.len() + rows.len() > self.batch_rows {
                     self.prepare_step(ident, &mut unit).await?;
                 }
@@ -1084,15 +1119,7 @@ impl<C: Catalog> Materializer<C> {
                 after = e.end_offset;
             }
         }
-        let folded = self.commit_unit(ident, &mut unit).await?;
-        self.coord
-            .set_cursor(&self.snapshot_group(), ident, SNAPSHOT_APPLIED)
-            .await?;
-        let since = self.first_snapshot_lsn(ident).await?;
-        if let Some(entry) = self.tables.get_mut(ident) {
-            entry.backfill = Backfill::Applied { since };
-        }
-        Ok(folded)
+        self.commit_unit(ident, &mut unit).await
     }
 
     /// Buffer a log entry's events into `unit`, applying its relation
@@ -1554,9 +1581,28 @@ impl<C: Catalog> Materializer<C> {
             if !complete {
                 return Ok(0);
             }
-            return self.apply_snapshot_rows(ident, from).await;
+            let folded = self.apply_snapshot_rows(ident, from).await?;
+            // None folded — already applied by a commit whose marking
+            // never happened, or none to apply: on to the changes.
+            if folded > 0 {
+                return Ok(folded);
+            }
         }
+        loop {
+            match self.apply_changes(ident).await {
+                // Skip what landed, and apply what's past it.
+                Err(MaterializerError::AlreadyApplied { end }) => {
+                    self.coord
+                        .set_cursor(&self.group, ident, end as i64)
+                        .await?;
+                }
+                result => return result,
+            }
+        }
+    }
 
+    /// Fold and commit the table's changes past its cursor, in units.
+    async fn apply_changes(&mut self, ident: &TableIdent) -> Result<usize> {
         let cursor = self
             .coord
             .get_cursor(&self.group, ident)
@@ -1603,6 +1649,9 @@ impl<C: Catalog> Materializer<C> {
                     }
                 }
                 events_read += events.len();
+                if unit.start_offset.is_none() {
+                    self.begin_unit(ident, &mut unit, e.start_offset).await?;
+                }
                 self.buffer_entry(ident, &mut unit, events).await?;
                 unit.end_offset = Some(e.end_offset);
                 after = e.end_offset;
@@ -1626,21 +1675,34 @@ impl<C: Catalog> Materializer<C> {
         Ok(folded)
     }
 
+    /// Start `unit` at the log entry at offset `start`, before applying
+    /// any of it — its schema changes apply as they're read: catch the
+    /// FileIndex up with other processes' commits, and check that no
+    /// commit already applied the log from here. One that did, whose
+    /// cursor update never happened, would be applied twice — against
+    /// the rows and schema it changed.
+    async fn begin_unit(&mut self, ident: &TableIdent, unit: &mut Unit, start: u64) -> Result<()> {
+        unit.start_offset = Some(start);
+        // The index is untouched since `index_at`.
+        let applied = self.sync_file_index(ident).await?;
+        if let Some(&end) = applied.get(&self.unit_group(unit)) {
+            if end > start {
+                return Err(MaterializerError::AlreadyApplied { end });
+            }
+        }
+        Ok(())
+    }
+
     /// Fold the buffered events into one snapshot step: upload its data
-    /// and equality-delete files and add the step to `unit`. FileIndex
-    /// first catches up with other processes' commits, then is updated
-    /// now, as if committed, so later steps of the same unit promote
-    /// re-inserts and resolve TOAST against these rows;
-    /// [`Self::commit_unit`] rebuilds it if the commit fails.
+    /// and equality-delete files and add the step to `unit`. FileIndex,
+    /// caught up with other processes' commits as the unit began
+    /// ([`Self::begin_unit`]), is updated now, as if committed, so later
+    /// steps of the same unit promote re-inserts and resolve TOAST against
+    /// these rows; [`Self::commit_unit`] rebuilds it if the commit fails.
     async fn prepare_step(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<()> {
         let events = std::mem::take(&mut unit.buf);
         if events.is_empty() {
             return Ok(());
-        }
-        if unit.steps.is_empty() {
-            // The unit's first step: the index is untouched since
-            // `index_at`.
-            self.sync_file_index(ident).await?;
         }
         // Observability stats come from the raw events, before the fold
         // collapses them to one row per PK.
@@ -1778,12 +1840,23 @@ impl<C: Catalog> Materializer<C> {
             .filter(|s| !s.data_files.is_empty() || !s.equality_deletes.is_empty())
             .count() as i64;
 
+        let group = self.unit_group(&unit);
+        let log_range = LogRange {
+            group: group.clone(),
+            start: unit.start_offset.unwrap_or(end_offset),
+            end: end_offset,
+        };
+
         // Commit catalog snapshots — durability gate.
         let started_micros = now_micros();
         let committed = if unit.steps.is_empty() {
             None
         } else {
-            match self.catalog.commit_snapshots(unit.steps).await {
+            match self
+                .catalog
+                .commit_snapshots(unit.steps, Some(log_range))
+                .await
+            {
                 Ok(meta) => {
                     // FileIndex holds the steps on top of `index_at`; their
                     // snapshots must follow it directly, or another process
@@ -1806,18 +1879,25 @@ impl<C: Catalog> Materializer<C> {
                     // the error, so a retry doesn't fold against rows that
                     // never landed.
                     self.rebuild_file_index(ident).await?;
-                    return Err(e.into());
+                    // Unless they did, the response lost: then carry on as
+                    // committed, rather than fail and have the next cycle
+                    // find out.
+                    let applied = self
+                        .catalog
+                        .load_table(ident)
+                        .await?
+                        .and_then(|meta| meta.log_ends.get(&group).copied());
+                    if !applied.is_some_and(|end| end >= end_offset) {
+                        return Err(e.into());
+                    }
+                    tracing::warn!(error = %e, table = %ident, "commit reported failure but landed");
+                    None
                 }
             }
         };
         let commit_duration_ms = (now_micros() - started_micros) / 1000;
 
         // Advance cursor only after commit success.
-        let group = if unit.snapshot {
-            self.snapshot_group()
-        } else {
-            self.group.clone()
-        };
         self.coord
             .set_cursor(&group, ident, end_offset as i64)
             .await?;
@@ -1883,18 +1963,17 @@ impl<C: Catalog> Materializer<C> {
     /// Catch the table's FileIndex up with commits this materializer
     /// didn't make, or didn't learn the outcome of: the worker that owned
     /// the table before it, a `compact` job, a commit whose response was
-    /// lost. The index must be untouched since `index_at`.
-    async fn sync_file_index(&mut self, ident: &TableIdent) -> Result<()> {
-        let current = self
-            .catalog
-            .load_table(ident)
-            .await?
-            .and_then(|m| m.current_snapshot_id);
+    /// lost. The index must be untouched since `index_at`. Returns the
+    /// table's [`TableMetadata::log_ends`](pg2iceberg_iceberg::TableMetadata::log_ends).
+    async fn sync_file_index(&mut self, ident: &TableIdent) -> Result<BTreeMap<String, u64>> {
+        let meta = self.catalog.load_table(ident).await?;
+        let current = meta.as_ref().and_then(|m| m.current_snapshot_id);
+        let log_ends = meta.map(|m| m.log_ends).unwrap_or_default();
         let entry = self.tables.get(ident).expect("checked by caller");
-        if current == entry.index_at {
-            return Ok(());
+        if current != entry.index_at {
+            self.catch_up_file_index(ident).await?;
         }
-        self.catch_up_file_index(ident).await
+        Ok(log_ends)
     }
 
     async fn catch_up_file_index(&mut self, ident: &TableIdent) -> Result<()> {
@@ -2115,11 +2194,7 @@ fn collect_toast_paths(
         if r.unchanged_cols.is_empty() || r.op == Op::Delete {
             continue;
         }
-        let key = r
-            .unchanged_from
-            .clone()
-            .unwrap_or_else(|| PkKey::from_row(&r.row, pk_cols));
-        if let Some(p) = file_index.lookup(&key) {
+        if let Some(p) = file_index.lookup(&toast_source(r, pk_cols, file_index)) {
             paths.insert(p.to_string());
         }
     }

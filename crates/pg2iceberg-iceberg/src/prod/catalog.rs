@@ -40,8 +40,8 @@ use pg2iceberg_core::{
 };
 
 use crate::{
-    apply_schema_changes, Catalog, DataFile, IcebergError, PreparedCommit, Result, SchemaChange,
-    Snapshot, TableMetadata,
+    apply_schema_changes, log_ends_property, merge_log_ends, recorded_log_ends, Catalog, DataFile,
+    IcebergError, LogRange, PreparedCommit, Result, SchemaChange, Snapshot, TableMetadata,
 };
 
 /// Wraps an `iceberg::Catalog` (e.g. `MemoryCatalog`, `RestCatalog`,
@@ -150,10 +150,14 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     }
 
     async fn commit_snapshot(&self, prepared: PreparedCommit) -> Result<TableMetadata> {
-        self.commit_snapshots(vec![prepared]).await
+        self.commit_snapshots(vec![prepared], None).await
     }
 
-    async fn commit_snapshots(&self, steps: Vec<PreparedCommit>) -> Result<TableMetadata> {
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<PreparedCommit>,
+        log_range: Option<LogRange>,
+    ) -> Result<TableMetadata> {
         let ident = steps
             .first()
             .map(|s| s.ident.clone())
@@ -172,6 +176,16 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             }
         }
 
+        // Recorded on the last snapshot, with every group's end so far.
+        let mut ends = table_log_ends(&table);
+        if let Some(range) = &log_range {
+            merge_log_ends(&mut ends, [(range.group.clone(), range.end)]);
+        }
+        let properties: HashMap<String, String> = log_range
+            .iter()
+            .flat_map(LogRange::to_properties)
+            .chain(log_ends_property(&ends))
+            .collect();
         let tx = Transaction::new(&table);
         let tx = match files.len() {
             // No work — match the sim-catalog noop semantics so the
@@ -187,8 +201,13 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 // FastAppendAction (forked) routes by `content_type()` into
                 // separate data and delete manifests at commit time.
                 .add_data_files(files.remove(0))
+                .set_snapshot_properties(properties)
                 .apply(tx),
-            _ => ChainedAppendAction { steps: files }.apply(tx),
+            _ => ChainedAppendAction {
+                steps: files,
+                properties,
+            }
+            .apply(tx),
         }
         .map_err(map_iceberg_err)?;
         let updated = tx
@@ -248,10 +267,14 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             // iceberg-rust refuses a snapshot that adds no files and sets
             // no summary property (apache/iceberg-rust#1548), and a pass
             // whose inputs' rows were all deleted adds none.
-            .set_snapshot_properties(HashMap::from([(
-                "pg2iceberg.operation".to_string(),
-                "compaction".to_string(),
-            )]));
+            .set_snapshot_properties(
+                [("pg2iceberg.operation".to_string(), "compaction".to_string())]
+                    .into_iter()
+                    // Carried forward: this snapshot may outlive those
+                    // that recorded them.
+                    .chain(log_ends_property(&table_log_ends(&table)))
+                    .collect(),
+            );
         let tx = action.apply(tx).map_err(map_iceberg_err)?;
         let updated = tx
             .commit(self.inner.as_ref())
@@ -489,6 +512,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 removed_paths,
                 timestamp_ms: snap.timestamp_ms(),
                 expired: false,
+                log_range: log_range_of(&snap),
             });
         }
         // One stand-in snapshot per sequence number: MoR ordering only
@@ -502,6 +526,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 removed_paths: Vec::new(),
                 timestamp_ms: 0,
                 expired: true,
+                log_range: None,
             });
             match content {
                 DataContentType::Data => snap.data_files.push(df),
@@ -581,6 +606,8 @@ fn to_iceberg_files(prepared: &PreparedCommit, table: &Table) -> Result<Vec<Iceb
 /// plumbing over public fork APIs, like [`ExpireSnapshotsAction`].
 struct ChainedAppendAction {
     steps: Vec<Vec<IcebergDataFile>>,
+    /// Summary properties of the last step's snapshot.
+    properties: HashMap<String, String>,
 }
 
 #[async_trait]
@@ -589,11 +616,14 @@ impl TransactionAction for ChainedAppendAction {
         let mut local = table.clone();
         let mut updates = Vec::new();
         let mut requirements = None;
-        for files in &self.steps {
-            let append = Transaction::new(&local)
+        for (i, files) in self.steps.iter().enumerate() {
+            let mut append = Transaction::new(&local)
                 .fast_append()
                 .with_check_duplicate(false)
                 .add_data_files(files.clone());
+            if i + 1 == self.steps.len() {
+                append = append.set_snapshot_properties(self.properties.clone());
+            }
             let mut step = Arc::new(append).commit(&local).await?;
             let step_updates = step.take_updates();
             requirements.get_or_insert(step.take_requirements());
@@ -989,7 +1019,27 @@ fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Res
             .map(|s| s.sequence_number()),
         config,
         location: table.metadata().location().to_string(),
+        log_ends: table_log_ends(table),
     })
+}
+
+/// [`TableMetadata::log_ends`]: what the table's snapshots record.
+fn table_log_ends(table: &iceberg::table::Table) -> BTreeMap<String, u64> {
+    let mut ends = BTreeMap::new();
+    for snap in table.metadata().snapshots() {
+        let properties = &snap.summary().additional_properties;
+        merge_log_ends(
+            &mut ends,
+            recorded_log_ends(|key| properties.get(key).map(String::as_str)),
+        );
+    }
+    ends
+}
+
+/// The log range a snapshot's summary records, if any.
+fn log_range_of(snap: &iceberg::spec::Snapshot) -> Option<LogRange> {
+    let properties = &snap.summary().additional_properties;
+    LogRange::from_properties(|key| properties.get(key).map(String::as_str))
 }
 
 fn map_iceberg_err(e: iceberg::Error) -> IcebergError {

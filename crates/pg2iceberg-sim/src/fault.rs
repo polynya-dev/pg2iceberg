@@ -432,13 +432,17 @@ impl Catalog for FaultyCatalog {
         self.inner.commit_snapshot(prepared).await
     }
 
-    async fn commit_snapshots(&self, steps: Vec<PreparedCommit>) -> IcebergResult<TableMetadata> {
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<PreparedCommit>,
+        log_range: Option<pg2iceberg_iceberg::LogRange>,
+    ) -> IcebergResult<TableMetadata> {
         if self.plan.tick(ops::CAT_COMMIT_SNAPSHOT) {
             return Err(IcebergError::Other(
                 "injected fault: commit_snapshots".into(),
             ));
         }
-        self.inner.commit_snapshots(steps).await
+        self.inner.commit_snapshots(steps, log_range).await
     }
 
     async fn commit_compaction(

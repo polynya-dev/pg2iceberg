@@ -913,6 +913,25 @@ impl SimPostgres {
             .unwrap_or_default()
     }
 
+    /// The columns `ident` had at `from` that it kept through `to`: a
+    /// column dropped in between isn't one, even if one with its name was
+    /// added since.
+    pub fn columns_kept(&self, ident: &TableIdent, from: Lsn, to: Lsn) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        let mut kept: Vec<String> = s
+            .columns_at(ident, from)
+            .map(|cols| cols.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        for e in s.wal.iter().filter(|e| e.lsn > from && e.lsn <= to) {
+            if let WalKind::Relation { ident: i, columns } = &e.kind {
+                if i == ident {
+                    kept.retain(|name| columns.iter().any(|c| &c.name == name));
+                }
+            }
+        }
+        kept
+    }
+
     /// Whether `ident`'s relation changed (DDL, or an invalidation) after
     /// its last row change. pgoutput tells a consumer about a schema
     /// change only with the table's next change, so it hasn't told one.

@@ -39,12 +39,24 @@ pub fn promote_re_inserts(
     }
 }
 
+/// The key whose committed row holds `r`'s unchanged values: the key it
+/// moved from ([`MaterializedRow::unchanged_from`]), else its own. A row
+/// that moved from a key the table no longer has is a replay — a
+/// key-changing transaction the pipeline staged again after a crash,
+/// directly after its first copy — which already moved the row: its own
+/// key has the values.
+pub fn toast_source(r: &MaterializedRow, pk_cols: &[ColumnName], file_index: &FileIndex) -> PkKey {
+    r.unchanged_from
+        .clone()
+        .filter(|from| file_index.contains_pk(from))
+        .unwrap_or_else(|| PkKey::from_row(&r.row, pk_cols))
+}
+
 /// Fill in `unchanged_cols` placeholders by reading the prior data file.
 ///
 /// For each row with non-empty `unchanged_cols`:
 /// - Look up the file path containing its PK — or, for a row that moved
-///   from another key, that key ([`MaterializedRow::unchanged_from`]) —
-///   via `FileIndex`.
+///   from another key, that key ([`toast_source`]) — via `FileIndex`.
 /// - Find the corresponding row in `prior_rows_by_path` (caller pre-fetched
 ///   and decoded the file via `BlobStore` + [`crate::reader::read_data_file`]).
 /// - Copy each unchanged column's value into the row, then clear
@@ -67,10 +79,7 @@ pub fn resolve_unchanged_cols(
         if r.unchanged_cols.is_empty() || r.op == Op::Delete {
             continue;
         }
-        let key = r
-            .unchanged_from
-            .clone()
-            .unwrap_or_else(|| PkKey::from_row(&r.row, pk_cols));
+        let key = toast_source(r, pk_cols, file_index);
         let path = file_index.lookup(&key).ok_or_else(|| {
             WriterError::Encode(format!(
                 "TOAST resolution failed: PK {key} is not in any indexed data file"
