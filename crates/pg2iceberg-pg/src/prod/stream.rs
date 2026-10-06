@@ -120,10 +120,17 @@ pub struct ReplicationStreamImpl {
     events_rx: mpsc::Receiver<Result<DecodedMessage>>,
     cmd_tx: mpsc::Sender<Cmd>,
     reader: JoinHandle<()>,
+    /// The connection `stream` runs on, closed with the stream — which
+    /// frees the slot for the next one.
+    _conn: super::client::Conn,
 }
 
 impl ReplicationStreamImpl {
-    pub(crate) fn wrap(stream: LogicalReplicationStream, domains: HashMap<u32, Domain>) -> Self {
+    pub(crate) fn wrap(
+        stream: LogicalReplicationStream,
+        domains: HashMap<u32, Domain>,
+        conn: super::client::Conn,
+    ) -> Self {
         let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
         let reader = tokio::spawn(reader_task(Box::pin(stream), domains, events_tx, cmd_rx));
@@ -131,6 +138,7 @@ impl ReplicationStreamImpl {
             events_rx,
             cmd_tx,
             reader,
+            _conn: conn,
         }
     }
 }

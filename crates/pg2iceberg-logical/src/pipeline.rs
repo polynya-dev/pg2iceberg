@@ -605,6 +605,48 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         self.shut_down
     }
 
+    /// Forget the replication session, for a new stream that starts at
+    /// [`replication_start_lsn`]: what arrived since the last flush, the
+    /// open transaction (its spilled chunks become orphans, as after a
+    /// crash), and the relations the old stream sent. The new stream
+    /// sends all of it again — keeping the relations would drop a schema
+    /// change that was buffered but not yet staged, as a duplicate.
+    /// Configuration and `flushed_lsn` stay: the slot was acked there,
+    /// and the new stream starts at or past it.
+    pub fn reset_session(&mut self) {
+        // Destructured so a new field can't be skipped: it is either
+        // reset here or listed as kept.
+        let Self {
+            sink,
+            flush_threshold,
+            spilled,
+            committed_spills,
+            keepalive_lsn,
+            pending_markers_by_xid,
+            ready_markers,
+            open_tx,
+            relations,
+            coord: _,
+            blob_store: _,
+            namer: _,
+            flushed_lsn: _,
+            metrics: _,
+            shut_down: _,
+            markers_table: _,
+            primary_keys: _,
+            table_translation: _,
+            replication: _,
+        } = self;
+        *sink = Sink::new(*flush_threshold);
+        spilled.clear();
+        committed_spills.clear();
+        *keepalive_lsn = Lsn::ZERO;
+        pending_markers_by_xid.clear();
+        ready_markers.clear();
+        *open_tx = None;
+        relations.clear();
+    }
+
     /// **Receipt-gated LSN advance.** Consumes a [`CoordCommitReceipt`] —
     /// since the receipt cannot be constructed outside `pg2iceberg-coord`'s
     /// internals, no caller can advance the slot LSN without the coord

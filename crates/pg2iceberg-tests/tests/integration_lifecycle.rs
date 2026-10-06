@@ -16,9 +16,10 @@
 //! This is a slow test (≈30–60s of container startup per test
 //! invocation). We keep it to one focused scenario — INSERT N rows in
 //! PG, drive the lifecycle, verify N rows land in Iceberg with
-//! correct contents — to keep CI cost reasonable. Negative scenarios
-//! (failure injection, partition transforms, schema evolution) are
-//! covered by sim DST already.
+//! correct contents, then drop every connection it has to Postgres and
+//! verify it carries on — to keep CI cost reasonable. Other negative
+//! scenarios (failure injection, partition transforms, schema
+//! evolution) are covered by sim DST already.
 
 #![cfg(feature = "integration")]
 
@@ -378,7 +379,6 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         partition_spec: vec![],
         pg_schema: None,
     };
-    let pk_cols = vec![ColumnName("id".into())];
 
     let test_work = async {
         // Brief delay so the lifecycle's snapshot phase has a chance
@@ -394,38 +394,41 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
             .expect("cdc insert");
         }
 
-        // Poll Iceberg until all 6 rows materialize, or time out.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-        let mut last_count = 0usize;
-        let visible = loop {
-            let attempt =
-                read_materialized_state(&assert_catalog, blob.as_ref(), &ident, &schema, &pk_cols)
-                    .await;
-            match attempt {
-                Ok(rows) if rows.len() >= 6 => break rows,
-                Ok(rows) => last_count = rows.len(),
-                Err(_) => {} // table may not exist yet
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("timed out waiting for Iceberg materialization; last_count={last_count}");
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        };
-
-        let mut by_id: BTreeMap<i32, i32> = BTreeMap::new();
-        for row in &visible {
-            let id = match row.get(&ColumnName("id".into())) {
-                Some(PgValue::Int4(v)) => *v,
-                other => panic!("unexpected id value: {other:?}"),
-            };
-            let balance = match row.get(&ColumnName("balance".into())) {
-                Some(PgValue::Int4(v)) => *v,
-                other => panic!("unexpected balance value: {other:?}"),
-            };
-            by_id.insert(id, balance);
-        }
         let expected: BTreeMap<i32, i32> = (1..=6).map(|i| (i, i * 100)).collect();
-        assert_eq!(by_id, expected, "PG state must equal Iceberg state");
+        wait_for_iceberg(&assert_catalog, blob.as_ref(), &ident, &schema, &expected).await;
+
+        // Then Postgres drops every connection pg2iceberg has to it — the
+        // stream's, the coordinator's, the slot monitor's — as a restart
+        // or failover would. It reconnects in-process: changes made after
+        // still arrive.
+        let terminated: i64 = src
+            .query_one(
+                "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, 10000)) \
+                 FROM pg_stat_activity \
+                 WHERE pid <> pg_backend_pid() AND datname = current_database() \
+                 AND backend_type IN ('client backend', 'walsender')",
+                &[],
+            )
+            .await
+            .expect("terminate pg2iceberg's connections")
+            .get(0);
+        assert!(terminated >= 3, "terminated {terminated} connections");
+        for i in 7..=9 {
+            src.execute(
+                &format!("INSERT INTO {table} (id, balance) VALUES ($1, $2)"),
+                &[&i, &(i * 100)],
+            )
+            .await
+            .expect("insert after the drop");
+        }
+        src.batch_execute(&format!(
+            "UPDATE {table} SET balance = 111 WHERE id = 1; DELETE FROM {table} WHERE id = 2"
+        ))
+        .await
+        .expect("update + delete after the drop");
+        let mut expected: BTreeMap<i32, i32> = (3..=9).map(|i| (i, i * 100)).collect();
+        expected.insert(1, 111);
+        wait_for_iceberg(&assert_catalog, blob.as_ref(), &ident, &schema, &expected).await;
 
         let _ = shutdown_tx.send(());
     };
@@ -454,6 +457,42 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
             .expect("lifecycle drained within 30s");
             result.expect("lifecycle ran to clean shutdown");
         }
+    }
+}
+
+/// Poll Iceberg until the table reads `expected` (id → balance), or
+/// time out.
+async fn wait_for_iceberg(
+    catalog: &IcebergRustCatalog<impl iceberg::Catalog + 'static>,
+    blob: &dyn pg2iceberg_stream::BlobStore,
+    ident: &TableIdent,
+    schema: &pg2iceberg_core::TableSchema,
+    expected: &BTreeMap<i32, i32>,
+) {
+    let pk_cols = [ColumnName("id".into())];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut last = BTreeMap::new();
+    loop {
+        // The table may not exist yet.
+        if let Ok(rows) = read_materialized_state(catalog, blob, ident, schema, &pk_cols).await {
+            last = rows
+                .iter()
+                .map(|row| {
+                    let int = |col: &str| match row.get(&ColumnName(col.into())) {
+                        Some(PgValue::Int4(v)) => *v,
+                        other => panic!("unexpected {col} value: {other:?}"),
+                    };
+                    (int("id"), int("balance"))
+                })
+                .collect();
+            if &last == expected {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for Iceberg to read {expected:?}; last read {last:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

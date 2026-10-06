@@ -81,6 +81,10 @@ services:
       context: ../..
       dockerfile: Dockerfile
     command: ["run", "--config", "/etc/pg2iceberg/config.yaml"]
+    # pg2iceberg rides out a dropped connection to Postgres, but exits on
+    # what it can't (a lasting outage, a coordinator write that failed);
+    # it resumes where it left off when restarted.
+    restart: unless-stopped
     environment:
       RUST_LOG: info
     volumes:

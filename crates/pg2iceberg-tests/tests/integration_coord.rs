@@ -105,6 +105,52 @@ fn claim(table: &TableIdent, count: u64, path: &str) -> OffsetClaim {
     }
 }
 
+/// Postgres dropping the coordinator's connection — restarting, failing
+/// over, or terminating it — costs at most the call in flight: the next
+/// one reconnects, to the same state.
+#[tokio::test]
+async fn coordinator_reconnects_after_its_connection_is_dropped() {
+    let pg = shared_pg().await;
+    let app = format!("coord_{}", uuid::Uuid::new_v4().simple());
+    let conn = connect_with(
+        &format!("{} application_name={app}", pg.dsn),
+        TlsMode::Disable,
+    )
+    .await
+    .expect("coord connect");
+    let schema = CoordSchema::sanitize(&format!(
+        "_pg2iceberg_test_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let coord = PostgresCoordinator::new(conn, schema);
+    coord.migrate().await.expect("migrate");
+    coord
+        .set_flushed_lsn(Lsn(42))
+        .await
+        .expect("set_flushed_lsn");
+
+    let admin = connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("admin connect");
+    let terminated: i64 = admin
+        .client
+        .query_one(
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, 10000)) \
+             FROM pg_stat_activity WHERE application_name = $1",
+            &[&app],
+        )
+        .await
+        .expect("terminate")
+        .get(0);
+    assert_eq!(terminated, 1);
+
+    let lsn = match coord.flushed_lsn().await {
+        Ok(lsn) => lsn,
+        Err(_) => coord.flushed_lsn().await.expect("reconnected"),
+    };
+    assert_eq!(lsn, Lsn(42));
+}
+
 #[tokio::test]
 async fn migrate_is_idempotent_against_real_pg() {
     let coord = fresh_coord().await;

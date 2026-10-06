@@ -1443,6 +1443,9 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
             ),
         ),
         stream: async_stream,
+        pg: Arc::new(pg2iceberg_sim::postgres::SimPgClient::new(h.db.clone())),
+        publication_name: PUB.into(),
+        snapshot_lsn: None,
         coord: h.coord.clone() as Arc<dyn Coordinator>,
         slot_monitor,
         watcher,
@@ -1475,6 +1478,238 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
         outcome.is_ok(),
         "main loop should exit cleanly: {outcome:?}"
     );
+}
+
+// ── Replication connection loss ───────────────────────────────────
+
+const LIFECYCLE_SLOT: &str = "lifecycle-slot";
+
+/// The full lifecycle over `db` — fresh slot, so the snapshot phase runs
+/// first — with the durable stores it writes to.
+#[allow(clippy::type_complexity)]
+fn sim_lifecycle(
+    db: &SimPostgres,
+) -> (
+    pg2iceberg_validate::LogicalLifecycle<MemoryCatalog>,
+    Arc<MemoryCoordinator>,
+    Arc<MemoryCatalog>,
+    Arc<MemoryBlobStore>,
+) {
+    use pg2iceberg_core::{IdGen, InMemoryMetrics, WorkerId};
+    use pg2iceberg_logical::Schedule;
+    use pg2iceberg_sim::postgres::SimPgClient;
+
+    struct ZeroIdGen;
+    impl IdGen for ZeroIdGen {
+        fn new_uuid(&self) -> [u8; 16] {
+            [0u8; 16]
+        }
+        fn worker_id(&self) -> WorkerId {
+            WorkerId("dst-reconnect".into())
+        }
+    }
+
+    let clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(TestClock::at(0));
+    let coord = Arc::new(MemoryCoordinator::new(
+        CoordSchema::default_name(),
+        clock.clone(),
+    ));
+    let blob = Arc::new(MemoryBlobStore::new());
+    let catalog = Arc::new(MemoryCatalog::new());
+    let pg_client = Arc::new(SimPgClient::new(db.clone()));
+    let snapshot_db = db.clone();
+    let lifecycle = pg2iceberg_validate::LogicalLifecycle {
+        pg: pg_client.clone(),
+        slot_monitor: pg_client,
+        coord: coord.clone() as Arc<dyn Coordinator>,
+        catalog: catalog.clone(),
+        blob: blob.clone() as Arc<dyn pg2iceberg_stream::BlobStore>,
+        clock,
+        id_gen: Arc::new(ZeroIdGen),
+        schemas: vec![schema()],
+        skip_snapshot_idents: BTreeSet::new(),
+        slot_name: LIFECYCLE_SLOT.into(),
+        publication_name: "lifecycle-pub".into(),
+        group: "default".into(),
+        schedule: Schedule::default(),
+        compaction: None,
+        flush_rows: 64,
+        mat_batch_rows: 128,
+        snapshot_source_factory: Box::new(move |_| {
+            Box::pin(async move {
+                Ok::<
+                    Box<dyn pg2iceberg_snapshot::SnapshotSource>,
+                    pg2iceberg_validate::LifecycleError,
+                >(Box::new(snapshot_db))
+            })
+        }),
+        materializer_namer: Arc::new(CounterMaterializerNamer::new("s3://table")),
+        blob_namer: Arc::new(CounterBlobNamer::new("s3://stage")),
+        metrics: Arc::new(InMemoryMetrics::new()),
+        meta_namespace: None,
+    };
+    (lifecycle, coord, catalog, blob)
+}
+
+fn note_column() -> ColumnSchema {
+    ColumnSchema {
+        name: "note".into(),
+        field_id: 0,
+        ty: IcebergType::String,
+        nullable: true,
+        is_primary_key: false,
+    }
+}
+
+fn noted_row(id: i32, qty: i32) -> Row {
+    let mut r = row(id, qty);
+    r.insert(
+        ColumnName("note".into()),
+        PgValue::Text(format!("note-{id}")),
+    );
+    r
+}
+
+/// Postgres drops the replication connection mid-run — after the stream
+/// delivered rows and a new column that are buffered, not yet staged —
+/// and the slot stays held for two more attempts, as by the dead
+/// connection's walsender. The lifecycle reopens the stream in-process,
+/// and Iceberg ends up matching Postgres: nothing buffered is lost, and
+/// the new column's Relation, sent again, is applied. Nor is anything
+/// staged twice: what was buffered goes, as the stream sends it again.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_reopens_a_dropped_replication_stream() {
+    use std::time::Duration;
+
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let mut tx = db.begin_tx();
+    for i in 1..=4 {
+        tx.insert(&ident(), row(i, i * 10));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    let (lifecycle, coord, catalog, blob) = sim_lifecycle(&db);
+
+    let script = db.clone();
+    // Polled by the main loop from its first iteration on.
+    let shutdown = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(5, 50));
+        tx.update(&ident(), row(1, 11));
+        tx.commit(Timestamp(0)).unwrap();
+        script.alter_add_column(&ident(), note_column()).unwrap();
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), noted_row(6, 60));
+        tx.commit(Timestamp(0)).unwrap();
+        // Past the loop's next tick, which reads them: buffered.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        script.terminate_walsenders();
+        script.hold_slot(LIFECYCLE_SLOT, 2);
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), noted_row(7, 70));
+        tx.delete(&ident(), row(2, 20));
+        tx.commit(Timestamp(0)).unwrap();
+        // Long enough for the reconnect's backoff, and to stream the rest.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .expect("the lifecycle survives the dropped connection");
+
+    let table = pg2iceberg_iceberg::Catalog::load_table(catalog.as_ref(), &ident())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut iceberg = read_materialized_state(
+        catalog.as_ref(),
+        blob.as_ref(),
+        &ident(),
+        &table.schema,
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    let mut pg = db.read_table(&ident()).unwrap();
+    sort_by_pk(&mut iceberg);
+    sort_by_pk(&mut pg);
+    let with_note = |rows: Vec<Row>| -> Vec<Row> {
+        rows.into_iter()
+            .map(|mut r| {
+                r.entry(ColumnName("note".into())).or_insert(PgValue::Null);
+                r
+            })
+            .collect()
+    };
+    assert_eq!(with_note(iceberg), with_note(pg));
+
+    let mut staged = 0;
+    for entry in coord.read_log(&ident(), 0, 1_000_000).await.unwrap() {
+        let bytes = pg2iceberg_stream::BlobStore::get(blob.as_ref(), &entry.s3_path)
+            .await
+            .unwrap();
+        let events = pg2iceberg_stream::codec::decode_chunk(&bytes).unwrap();
+        staged += events
+            .iter()
+            .filter(|e| e.op != pg2iceberg_core::Op::Relation)
+            .count();
+    }
+    assert_eq!(
+        staged, 9,
+        "rows staged: the 4 snapshotted, then the 5 changes after"
+    );
+}
+
+/// A replication stream that can't be reopened stops the process once
+/// the attempts run out, with the cause.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_gives_up_on_a_stream_it_cannot_reopen() {
+    use std::time::Duration;
+
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let (lifecycle, ..) = sim_lifecycle(&db);
+    let script = db.clone();
+    let shutdown = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        script.terminate_walsenders();
+        script.hold_slot(LIFECYCLE_SLOT, usize::MAX);
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    });
+    let err = pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .expect_err("the lifecycle stops");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("is active for another walsender")
+            && msg.contains(&format!(
+                "gave up after {} reconnect attempts",
+                pg2iceberg_validate::RECONNECT_ATTEMPTS
+            )),
+        "{msg}"
+    );
+}
+
+/// A shutdown while the stream is being reopened isn't held up by the
+/// backoff: the lifecycle drains and exits cleanly.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_shuts_down_while_reconnecting() {
+    use std::time::Duration;
+
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let (lifecycle, ..) = sim_lifecycle(&db);
+    let script = db.clone();
+    let shutdown = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        script.terminate_walsenders();
+        script.hold_slot(LIFECYCLE_SLOT, usize::MAX);
+        // Into the attempts, well short of giving up.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .expect("a clean shutdown");
 }
 
 // ── Smoke-style proptest ──────────────────────────────────────────

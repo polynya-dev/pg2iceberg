@@ -10,7 +10,9 @@
 //!
 //! `PostgresCoordinator` owns a `tokio_postgres::Client` plus the
 //! `AbortHandle` of its background connection task. Drop the
-//! coordinator to drop the connection.
+//! coordinator to drop the connection. Once the connection has closed
+//! (Postgres restarted, the network dropped it) the next call reopens
+//! it: the call in flight fails, but the process carries on.
 
 use crate::prod::connect::PgConn;
 use crate::schema::CoordSchema;
@@ -24,8 +26,7 @@ use async_trait::async_trait;
 use pg2iceberg_core::{Lsn, TableIdent, WorkerId};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::task::AbortHandle;
+use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 use tokio_postgres::Client;
 
 /// `claim_offsets` opens a transaction, which `tokio-postgres` only
@@ -34,9 +35,8 @@ use tokio_postgres::Client;
 /// they need. In our use case all coord ops are serialized through the
 /// materializer cycle anyway, so the mutex isn't a perf concern.
 pub struct PostgresCoordinator {
-    client: Mutex<Client>,
+    conn: Mutex<PgConn>,
     schema: CoordSchema,
-    _abort: AbortHandle,
 }
 
 impl PostgresCoordinator {
@@ -44,17 +44,29 @@ impl PostgresCoordinator {
     /// having opened the connection in regular (non-replication) mode.
     pub fn new(conn: PgConn, schema: CoordSchema) -> Self {
         Self {
-            client: Mutex::new(conn.client),
+            conn: Mutex::new(conn),
             schema,
-            _abort: conn.abort,
         }
+    }
+
+    /// The client, on a new connection if the last one closed. Every
+    /// method runs whole on one connection — a transaction included — and
+    /// leaves nothing on it, so a new one serves as well.
+    async fn client(&self) -> Result<MappedMutexGuard<'_, Client>> {
+        let mut conn = self.conn.lock().await;
+        if conn.client.is_closed() {
+            let fresh = conn.reopen().await?;
+            conn.abort.abort();
+            *conn = fresh;
+        }
+        Ok(MutexGuard::map(conn, |c| &mut c.client))
     }
 
     /// Run the schema migration. Idempotent — every statement uses
     /// `CREATE TABLE IF NOT EXISTS`. Caller is expected to invoke this
     /// once at startup before any other coord method.
     pub async fn migrate(&self) -> Result<()> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .batch_execute(&sql::create_schema(&self.schema))
             .await
@@ -75,7 +87,7 @@ impl PostgresCoordinator {
     /// intentionally don't close the connection so callers can chain
     /// teardown calls if needed.
     pub async fn teardown(&self) -> Result<()> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .batch_execute(&sql::drop_schema(&self.schema))
             .await
@@ -86,7 +98,7 @@ impl PostgresCoordinator {
 
 impl Drop for PostgresCoordinator {
     fn drop(&mut self) {
-        self._abort.abort();
+        self.conn.get_mut().abort.abort();
     }
 }
 
@@ -133,7 +145,7 @@ impl Coordinator for PostgresCoordinator {
         // Persists markers atomically inside its own short tx.
         if batch.claims.is_empty() {
             if !batch.markers.is_empty() || batch.replicated_lsn.is_some() {
-                let mut client = self.client.lock().await;
+                let mut client = self.client().await?;
                 let tx = client.transaction().await.map_err(pg)?;
                 let insert_marker = sql::insert_pending_marker(&self.schema);
                 for m in &batch.markers {
@@ -169,7 +181,7 @@ impl Coordinator for PostgresCoordinator {
         // COMMIT returns. The atomicity is what makes the durability
         // invariant work — pipeline either sees its log_index rows AND
         // its markers persisted together, or neither.
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(pg)?;
 
         let ensure_q = sql::ensure_log_seq_row(&self.schema);
@@ -274,7 +286,7 @@ impl Coordinator for PostgresCoordinator {
             .map_err(|_| CoordError::Other("after_offset > i64".into()))?;
         let limit_i64 =
             i64::try_from(limit).map_err(|_| CoordError::Other("limit > i64".into()))?;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(
                 &sql::read_log(&self.schema),
@@ -307,7 +319,7 @@ impl Coordinator for PostgresCoordinator {
         let key = table_key(table);
         let before_i64 = i64::try_from(before_offset)
             .map_err(|_| CoordError::Other("before_offset > i64".into()))?;
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(&sql::truncate_log(&self.schema), &[&key, &before_i64])
             .await
@@ -317,7 +329,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> Result<()> {
         let key = table_key(table);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(&sql::ensure_cursor(&self.schema), &[&group, &key])
             .await
@@ -327,7 +339,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn get_cursor(&self, group: &str, table: &TableIdent) -> Result<Option<i64>> {
         let key = table_key(table);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(&sql::get_cursor(&self.schema), &[&group, &key])
             .await
@@ -337,7 +349,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn set_cursor(&self, group: &str, table: &TableIdent, to_offset: i64) -> Result<()> {
         let key = table_key(table);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(&sql::set_cursor(&self.schema), &[&group, &key, &to_offset])
             .await
@@ -350,7 +362,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn register_consumer(&self, group: &str, worker: &WorkerId, ttl: Duration) -> Result<()> {
         let interval = duration_as_interval(ttl);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(
                 &sql::register_consumer(&self.schema),
@@ -362,7 +374,7 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn unregister_consumer(&self, group: &str, worker: &WorkerId) -> Result<()> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(
                 &sql::unregister_consumer(&self.schema),
@@ -376,7 +388,7 @@ impl Coordinator for PostgresCoordinator {
     async fn active_consumers(&self, group: &str) -> Result<Vec<WorkerId>> {
         // Sweep expired rows first so the returned list is "live as
         // of now" without bouncing through a separate cleanup pass.
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(&sql::expire_consumers(&self.schema), &[])
             .await
@@ -395,7 +407,7 @@ impl Coordinator for PostgresCoordinator {
         let key = table_key(table);
         // Sweep stale lock for this table first so a dead holder
         // doesn't block a live worker.
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(&sql::expire_locks(&self.schema), &[&key])
             .await
@@ -416,7 +428,7 @@ impl Coordinator for PostgresCoordinator {
     ) -> Result<bool> {
         let key = table_key(table);
         let interval = duration_as_interval(ttl);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let n = client
             .execute(
                 &sql::renew_lock(&self.schema),
@@ -429,7 +441,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn release_lock(&self, table: &TableIdent, worker: &WorkerId) -> Result<()> {
         let key = table_key(table);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(&sql::release_lock(&self.schema), &[&key, &worker.0])
             .await
@@ -438,7 +450,7 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn pipeline_system_identifier(&self) -> Result<u64> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(&sql::select_pipeline_meta(&self.schema), &[])
             .await
@@ -459,7 +471,7 @@ impl Coordinator for PostgresCoordinator {
         // means there's at most one writer that wins; everyone else
         // either matches the stored value (no-op) or returns
         // SystemIdMismatch.
-        let mut client = self.client.lock().await;
+        let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(pg)?;
         let stored: u64 = match tx
             .query(&sql::select_pipeline_meta(&self.schema), &[])
@@ -491,7 +503,7 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn flushed_lsn(&self) -> Result<Lsn> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(&sql::select_flushed_lsn(&self.schema), &[])
             .await
@@ -506,7 +518,7 @@ impl Coordinator for PostgresCoordinator {
     }
 
     async fn replicated_lsn(&self) -> Result<Lsn> {
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(&sql::select_replicated_lsn(&self.schema), &[])
             .await
@@ -518,7 +530,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn set_flushed_lsn(&self, lsn: Lsn) -> Result<()> {
         let v = lsn_to_i64(lsn);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(&sql::upsert_flushed_lsn(&self.schema), &[&v])
             .await
@@ -528,7 +540,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn table_state(&self, ident: &TableIdent) -> Result<Option<TableSnapshotState>> {
         let key = table_key(ident);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(&sql::select_table_state(&self.schema), &[&key])
             .await
@@ -559,7 +571,7 @@ impl Coordinator for PostgresCoordinator {
         let key = table_key(ident);
         let oid_i64: i64 = pg_oid as i64;
         let lsn_i64 = lsn_to_i64(snapshot_lsn);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(
                 &sql::mark_table_complete(&self.schema),
@@ -572,7 +584,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn snapshot_progress(&self, ident: &TableIdent) -> Result<Option<String>> {
         let key = table_key(ident);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(&sql::select_snapshot_progress(&self.schema), &[&key])
             .await
@@ -582,7 +594,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn set_snapshot_progress(&self, ident: &TableIdent, last_pk_key: &str) -> Result<()> {
         let key = table_key(ident);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(
                 &sql::upsert_snapshot_progress(&self.schema),
@@ -595,7 +607,7 @@ impl Coordinator for PostgresCoordinator {
 
     async fn clear_snapshot_progress(&self, ident: &TableIdent) -> Result<()> {
         let key = table_key(ident);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(&sql::delete_snapshot_progress(&self.schema), &[&key])
             .await
@@ -622,7 +634,7 @@ impl Coordinator for PostgresCoordinator {
         // `$1 || '.' || $2`.
         let namespace = table.namespace.0.join(".");
         let q = sql::pending_markers_eligible(&self.schema);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         let rows = client
             .query(&q, &[&namespace, &table.name, &cursor])
             .await
@@ -642,7 +654,7 @@ impl Coordinator for PostgresCoordinator {
     async fn record_marker_emitted(&self, uuid: &str, table: &TableIdent) -> Result<()> {
         let namespace = table.namespace.0.join(".");
         let q = sql::insert_marker_emission(&self.schema);
-        let client = self.client.lock().await;
+        let client = self.client().await?;
         client
             .execute(&q, &[&uuid, &namespace, &table.name])
             .await
