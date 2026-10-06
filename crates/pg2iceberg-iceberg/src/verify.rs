@@ -77,23 +77,20 @@ pub async fn read_materialized_state(
         .flat_map(|s| s.removed_paths.iter().cloned())
         .collect();
 
-    // Per-snapshot deleted-pk sets, in snapshot order. Skip delete files
-    // that have been compacted away — their PKs are already filtered out
-    // of the surviving data files.
-    let mut deletes_per_snap: Vec<(i64, BTreeSet<String>)> = Vec::with_capacity(snapshots.len());
+    // Each live delete file's deleted-pk set, with its sequence number.
+    // Skip delete files that have been compacted away — their PKs are
+    // already filtered out of the surviving data files.
+    let mut deletes: Vec<(i64, BTreeSet<String>)> = Vec::new();
     for snap in &snapshots {
-        let mut snap_deleted = BTreeSet::new();
         for df in &snap.delete_files {
             if removed_paths.contains(&df.path) {
                 continue;
             }
             let bytes = blob_store.get(&df.path).await?;
             let rows = read_data_file(&bytes, &pk_schema)?;
-            for row in rows {
-                snap_deleted.insert(pk_key(&row, pk_cols));
-            }
+            let keys = rows.iter().map(|row| pk_key(row, pk_cols)).collect();
+            deletes.push((df.sequence_number_in(snap), keys));
         }
-        deletes_per_snap.push((snap.id, snap_deleted));
     }
 
     let mut visible: Vec<Row> = Vec::new();
@@ -106,11 +103,12 @@ pub async fn read_materialized_state(
             }
             let bytes = blob_store.get(&df.path).await?;
             let rows = read_data_file(&bytes, &schema.columns)?;
+            let seq = df.sequence_number_in(snap);
             for row in rows {
                 let key = pk_key(&row, pk_cols);
-                let deleted_later = deletes_per_snap
+                let deleted_later = deletes
                     .iter()
-                    .any(|(sid, set)| *sid > snap.id && set.contains(&key));
+                    .any(|(sid, set)| *sid > seq && set.contains(&key));
                 if !deleted_later {
                     visible.push(row);
                 }
@@ -294,6 +292,7 @@ mod tests {
                 byte_size: 0,
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values,
+                sequence_number: None,
             });
         }
         for (i, chunk) in prepared.equality_deletes.into_iter().enumerate() {
@@ -309,6 +308,7 @@ mod tests {
                 byte_size: 0,
                 equality_field_ids: prepared.pk_field_ids.clone(),
                 partition_values: chunk.partition_values,
+                sequence_number: None,
             });
         }
         cat.snaps

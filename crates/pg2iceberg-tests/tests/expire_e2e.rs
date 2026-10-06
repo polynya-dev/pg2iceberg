@@ -97,6 +97,18 @@ impl Harness {
 
     /// Commit a compaction pass rewriting `removed` as one file of `rows`.
     fn compact(&self, schema: &TableSchema, removed: Vec<String>, rows: Vec<Row>) -> Vec<String> {
+        self.compact_planned_at(schema, removed, rows, None)
+    }
+
+    /// As [`Self::compact`], for a pass that read the table at snapshot
+    /// `planned_at`.
+    fn compact_planned_at(
+        &self,
+        schema: &TableSchema,
+        removed: Vec<String>,
+        rows: Vec<Row>,
+        planned_at: Option<i64>,
+    ) -> Vec<String> {
         let writer = TableWriter::new(schema.clone());
         let rows: Vec<MaterializedRow> = rows.into_iter().map(inserted).collect();
         let prepared = writer.prepare(&rows, &FileIndex::new()).unwrap();
@@ -106,6 +118,7 @@ impl Harness {
             ident: schema.ident.clone(),
             added_data_files,
             removed_paths: removed,
+            data_sequence_number: planned_at,
         }))
         .unwrap();
         paths
@@ -128,6 +141,7 @@ impl Harness {
                     byte_size: chunk.chunk.bytes.len() as u64,
                     equality_field_ids: equality_field_ids.clone(),
                     partition_values: chunk.partition_values,
+                    sequence_number: None,
                 }
             })
             .collect()
@@ -356,4 +370,27 @@ fn file_index_catching_up_across_missing_snapshots_rebuilds() {
 
     assert_eq!(catch_up(&h, &s, &mut fi, at), Some(5));
     assert_eq!(fi, rebuilt(&h, &s));
+}
+
+/// A compaction planned before a row's update commits after it: its copy
+/// of the old row stays deleted, so the key belongs to the update's file —
+/// whether the index catches up or rebuilds.
+#[test]
+fn file_index_catches_up_across_a_compaction_planned_before_an_update() {
+    let h = Harness::new();
+    let s = schema();
+    ensure(&h, &s);
+    let first = h.commit(&s, vec![inserted(row(1, 1)), inserted(row(2, 2))]);
+    let mut fi = FileIndex::new();
+    let at = catch_up(&h, &s, &mut fi, None);
+    // A pass plans at snapshot 1; row 1 is updated (snapshot 2) before it
+    // commits (snapshot 3).
+    let update = h.commit(&s, vec![deleted(1), inserted(row(1, 10))]);
+    h.compact_planned_at(&s, first, vec![row(1, 1), row(2, 2)], Some(1));
+
+    assert_eq!(catch_up(&h, &s, &mut fi, at), Some(3));
+    let rebuilt = rebuilt(&h, &s);
+    assert_eq!(fi, rebuilt);
+    let key = pg2iceberg_iceberg::PkKey::from_row(&row(1, 10), &[ColumnName("id".into())]);
+    assert_eq!(rebuilt.lookup(&key), Some(update[0].as_str()));
 }

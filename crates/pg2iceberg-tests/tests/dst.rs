@@ -1589,6 +1589,9 @@ impl DstHarness {
                     match block_on(self.audited.commit_compaction(pass)) {
                         Ok(_) => {}
                         Err(e) if e.to_string().contains("response lost") => {}
+                        // Another pass rewrote its files first; the job
+                        // plans again on its next run.
+                        Err(pg2iceberg_iceberg::IcebergError::Conflict(_)) => {}
                         Err(e) => panic!("external compaction commit: {e}"),
                     }
                 }
@@ -1967,7 +1970,12 @@ impl AuditedCatalog {
     async fn land_other_pass(&self) -> pg2iceberg_iceberg::Result<()> {
         let pass = self.land_before_next_commit.lock().unwrap().take();
         if let Some(pass) = pass {
-            self.inner.commit_compaction(pass).await?;
+            match self.inner.commit_compaction(pass).await {
+                // The job's pass lost to a newer rewrite of its files: the
+                // job fails, not this commit.
+                Ok(_) | Err(pg2iceberg_iceberg::IcebergError::Conflict(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -2810,6 +2818,9 @@ fn external_compaction_racing_an_update_keeps_the_new_row() {
     h.run_step(&Step::MaterializerCycle);
     h.run_step(&Step::ExternalCompactCommit);
     check_invariants(&mut h).unwrap();
+    // The rewritten copy is dead: the next pass must drop it, not keep it.
+    h.run_step(&Step::Compact);
+    check_invariants(&mut h).unwrap();
 }
 
 /// A `compact` job's commit lands while the materializer's is in flight,
@@ -2866,6 +2877,47 @@ fn a_compaction_landing_on_another_keeps_the_index_true() {
         "the job's pass landed"
     );
     check_invariants(&mut h).unwrap();
+}
+
+/// `external_compaction_racing_an_update_keeps_the_new_row` on
+/// iceberg-rust: the rewritten copy keeps the sequence number its pass
+/// read the table at.
+#[cfg(feature = "integration")]
+#[test]
+fn external_compaction_racing_an_update_keeps_the_new_row_on_iceberg() {
+    PROD_BACKEND.set(true);
+    external_compaction_racing_an_update_keeps_the_new_row();
+}
+
+/// A `compact` job and the materializer rewrite the same file; the job
+/// commits second. Its commit must fail rather than add a second copy of
+/// the file's rows.
+fn two_compactions_of_one_file(prod: bool) {
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::Insert { id: 2, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Update { id: 2, qty: 11 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ExternalCompactPlan);
+    assert!(h.pending_external.is_some(), "the job planned a pass");
+    h.run_step(&Step::Compact);
+    h.run_step(&Step::ExternalCompactCommit);
+    check_invariants(&mut h).unwrap();
+}
+
+#[test]
+fn two_compactions_of_one_file_keep_one_copy() {
+    two_compactions_of_one_file(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn two_compactions_of_one_file_keep_one_copy_on_iceberg() {
+    two_compactions_of_one_file(true);
 }
 
 /// Dropping a column and adding one with the same name gives a new,

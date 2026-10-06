@@ -35,8 +35,9 @@ pub struct LiveFile {
 }
 
 /// The live files of a table whose full commit history is `snapshots`:
-/// every file a snapshot added that no snapshot removed, at the sequence
-/// number of the snapshot that added it.
+/// every file a snapshot added that no snapshot removed, at its data
+/// sequence number — the snapshot's, unless the file keeps an older one
+/// (a compaction's output).
 pub fn live_files_from_history(snapshots: &[Snapshot]) -> Vec<LiveFile> {
     let removed: BTreeSet<&str> = snapshots
         .iter()
@@ -53,7 +54,7 @@ pub fn live_files_from_history(snapshots: &[Snapshot]) -> Vec<LiveFile> {
             if !removed.contains(f.path.as_str()) {
                 out.push(LiveFile {
                     path: f.path.clone(),
-                    seq: snap.id,
+                    seq: f.sequence_number_in(snap),
                     partition: f.partition_values.clone(),
                     equality_ids,
                 });
