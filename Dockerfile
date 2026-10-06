@@ -24,6 +24,12 @@
 #
 # Build:
 #   docker build -t pg2iceberg-rust:dev .
+#   docker build --platform linux/amd64 -t pg2iceberg-rust:dev .
+#
+# The build stage runs on the build host's architecture and
+# cross-compiles to the target's (linux/amd64 or linux/arm64), so an
+# amd64 image builds natively fast on an arm64 host (Apple Silicon)
+# and vice versa.
 #
 # Run:
 #   docker run --rm -v $(pwd)/config.yaml:/etc/pg2iceberg/config.yaml \
@@ -32,6 +38,8 @@
 ARG RUST_VERSION=1.85
 
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS build
+ARG BUILDARCH
+ARG TARGETARCH
 WORKDIR /src
 
 # System deps the build needs:
@@ -41,8 +49,18 @@ WORKDIR /src
 #   would silently switch object_store to native-tls if a feature flip
 #   ever changes default-features.
 # - `protobuf-compiler` not needed (no .proto in the build).
+# - a cross C toolchain when the target architecture isn't the build
+#   host's: `ring` and the compression crates build C code, and the
+#   final link needs the target's libc.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
+ && if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+      case "$TARGETARCH" in \
+        amd64) apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross ;; \
+        arm64) apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross ;; \
+        *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+      esac; \
+    fi \
  && rm -rf /var/lib/apt/lists/*
 
 # Pre-fetch deps. Copying just the manifests + workspace structure
@@ -51,6 +69,16 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 RUN cargo fetch --locked
+
+# The target's Rust triple and, cross-compiling, its C compiler and
+# linker. After the toolchain file, so the target is added to the
+# toolchain it selects.
+RUN case "$TARGETARCH" in \
+      amd64) echo x86_64-unknown-linux-gnu > /target ;; \
+      arm64) echo aarch64-unknown-linux-gnu > /target ;; \
+      *) echo "unsupported target architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+ && rustup target add "$(cat /target)"
 
 ARG FEATURES="prod"
 ARG COMMIT_SHA=""
@@ -62,9 +90,16 @@ ENV PG2ICEBERG_COMMIT_SHA=${COMMIT_SHA}
 # offline cache, so it'd technically work; we keep `--locked` only
 # to allow lockfile re-resolution if a transitive crate yanks
 # (rare, but cleaner failure mode).
-RUN cargo build --release --locked --bin pg2iceberg \
+RUN TARGET="$(cat /target)" \
+ && if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+      GCC="${TARGET%%-unknown-*}-linux-gnu-gcc"; \
+      export "CC_$(echo "$TARGET" | tr - _)=$GCC"; \
+      export "CARGO_TARGET_$(echo "$TARGET" | tr a-z- A-Z_)_LINKER=$GCC"; \
+    fi \
+ && CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --locked \
+    --target "$TARGET" --bin pg2iceberg \
     $(if [ -n "$FEATURES" ]; then echo "--features $FEATURES"; fi) \
- && strip target/release/pg2iceberg
+ && cp "target/$TARGET/release/pg2iceberg" /pg2iceberg
 
 # ── runtime ──────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -77,7 +112,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 65532 --no-create-home --shell /usr/sbin/nologin pg2iceberg
 
-COPY --from=build /src/target/release/pg2iceberg /usr/local/bin/pg2iceberg
+COPY --from=build /pg2iceberg /usr/local/bin/pg2iceberg
 
 USER pg2iceberg
 
