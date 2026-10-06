@@ -522,6 +522,11 @@ impl Config {
         // + region + path-style are always set when configured.
         if !self.sink.s3_endpoint.is_empty() {
             props.insert("s3.endpoint".into(), self.sink.s3_endpoint.clone());
+            // S3-compatible storage (MinIO, LocalStack) takes path-style
+            // requests, whatever the credentials. The file IO's default is
+            // virtual-hosted, addressing `<bucket>.<endpoint host>`, which
+            // MinIO answers with a 404. Mirrors the blob store.
+            props.insert("s3.path-style-access".into(), "true".into());
         }
         if !self.sink.s3_region.is_empty() {
             props.insert("s3.region".into(), self.sink.s3_region.clone());
@@ -536,10 +541,6 @@ impl Config {
                     self.sink.s3_secret_key.clone(),
                 );
             }
-            // Path-style access is the safe default for non-AWS S3
-            // (MinIO, LocalStack). Mirrors what `build_s3_static`
-            // does for the client-side blob store.
-            props.insert("s3.path-style-access".into(), "true".into());
             // Skip EC2 IMDS so unrelated AWS credential lookups don't
             // surface as cryptic "169.254.169.254 unreachable" errors
             // in non-AWS environments. Surfaced by the testcontainers
@@ -925,6 +926,23 @@ sink:
             Some("vended-credentials"),
             "vended mode must set the access-delegation header"
         );
+    }
+
+    /// S3-compatible storage takes path-style requests, whatever the
+    /// credentials: addressed virtual-hosted, as `<bucket>.<host>`, MinIO
+    /// answers 404.
+    #[test]
+    fn rest_catalog_props_use_path_style_with_a_custom_endpoint_in_every_mode() {
+        for mode in ["static", "iam", "vended"] {
+            let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+            cfg.sink.credential_mode = mode.into();
+            let props = cfg.rest_catalog_props();
+            assert_eq!(
+                props.get("s3.path-style-access").map(String::as_str),
+                Some("true"),
+                "{mode}"
+            );
+        }
     }
 
     #[test]

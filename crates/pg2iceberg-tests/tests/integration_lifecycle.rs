@@ -264,6 +264,69 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
     }
 }
 
+/// S3-compatible storage with the AWS default credential chain
+/// (`credential_mode: iam`), as for MinIO with `AWS_*` variables: the
+/// catalog's file IO, which writes each commit's manifests, must address
+/// it path-style, as it does with static keys. Addressed virtual-hosted,
+/// as `<bucket>.<host>`, MinIO answers 404 and the commit fails.
+#[tokio::test]
+async fn iam_credentials_with_a_custom_endpoint_commit_snapshots() {
+    use pg2iceberg_core::{ColumnSchema, IcebergType, TableSchema};
+    use pg2iceberg_iceberg::{Catalog as _, DataFile, PreparedCommit};
+
+    let stack = bring_up_stack().await;
+    let mut cfg = config_for_stack(&stack, "unused", "unused", "unused");
+    cfg.sink.credential_mode = "iam".into();
+    // The credential chain would read the keys from the environment,
+    // which a test can't set safely: hand them to the file IO directly.
+    cfg.sink
+        .catalog_props
+        .insert("s3.access-key-id".into(), "minioadmin".into());
+    cfg.sink
+        .catalog_props
+        .insert("s3.secret-access-key".into(), "minioadmin".into());
+    let catalog = IcebergRustCatalog::new(Arc::new(
+        build_rest_catalog(&cfg).await.expect("rest catalog"),
+    ));
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: format!("iam_{}", uniq()),
+    };
+    catalog
+        .ensure_namespace(&ident.namespace)
+        .await
+        .expect("namespace");
+    catalog
+        .create_table(&TableSchema {
+            ident: ident.clone(),
+            columns: vec![ColumnSchema {
+                name: "id".into(),
+                field_id: 1,
+                ty: IcebergType::Int,
+                nullable: false,
+                is_primary_key: true,
+            }],
+            partition_spec: Vec::new(),
+            pg_schema: None,
+        })
+        .await
+        .expect("create table");
+    catalog
+        .commit_snapshot(PreparedCommit {
+            ident,
+            data_files: vec![DataFile {
+                path: format!("s3://{}/iam/data.parquet", stack.bucket),
+                record_count: 1,
+                byte_size: 1,
+                equality_field_ids: vec![],
+                partition_values: Vec::new(),
+                sequence_number: None,
+            }],
+            equality_deletes: vec![],
+        })
+        .await
+        .expect("commit, writing manifests to MinIO");
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_inserts_propagate_pg_to_iceberg() {
     // Surface lifecycle / pipeline / catalog tracing into test output
