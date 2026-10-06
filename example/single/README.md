@@ -1,17 +1,27 @@
-# Smoke test
+# Single-node example and smoke test
 
-Real Postgres → pg2iceberg → Iceberg REST catalog + MinIO, under a mixed
-workload, then a row-by-row comparison of Postgres with ClickHouse reading
-the Iceberg tables. Uses [`example/single`](../single)'s rideshare schema,
-seed and service configs.
+A rideshare app's Postgres → pg2iceberg → Iceberg REST catalog + MinIO, with
+ClickHouse to query the Iceberg tables and a mixed workload to drive
+Postgres.
+
+Bring it up and watch rows arrive:
 
 ```sh
-cd example/smoke
-./run.sh                 # DURATION=300 by default (seconds of workload)
-docker compose --profile workload down -v
+cd example/single
+docker compose up -d --wait
+docker compose --profile workload up -d workload   # DURATION=300 seconds of writes
 ```
 
-It exits non-zero if Postgres and Iceberg differ. Logs land in `out/`.
+Then query `http://localhost:8123/play`, e.g.
+``SELECT * FROM rideshare.`rideshare.rides` ``.
+
+Or run it as a smoke test, which ends with a row-by-row comparison of
+Postgres and ClickHouse and exits non-zero if they differ (logs in `out/`):
+
+```sh
+./run.sh                 # DURATION=300 by default
+docker compose --profile workload down -v
+```
 
 ## What runs
 
