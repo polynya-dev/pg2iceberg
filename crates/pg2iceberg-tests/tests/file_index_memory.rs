@@ -140,6 +140,7 @@ fn table_with_history(
                     byte_size: c.chunk.bytes.len() as u64,
                     equality_field_ids: vec![],
                     partition_values: c.partition_values.clone(),
+                    sequence_number: None,
                 })
                 .collect();
             let equality_deletes = prepared
@@ -151,6 +152,7 @@ fn table_with_history(
                     byte_size: c.chunk.bytes.len() as u64,
                     equality_field_ids: prepared.pk_field_ids.clone(),
                     partition_values: c.partition_values.clone(),
+                    sequence_number: None,
                 })
                 .collect();
             block_on(cat.commit_snapshot(PreparedCommit {

@@ -90,8 +90,14 @@ pub struct PreparedCompaction {
     pub added_data_files: Vec<DataFile>,
     /// File paths that this compaction supersedes. Iceberg will drop them
     /// from the new snapshot's manifest list; readers see the compacted
-    /// output instead.
+    /// output instead. The commit fails if one is already gone — another
+    /// pass rewrote it, and this one's output would duplicate its rows.
     pub removed_paths: Vec<String>,
+    /// The snapshot the pass read its inputs at. Its outputs keep that data
+    /// sequence number rather than taking the new snapshot's: deletes
+    /// committed while the pass ran still apply to them. (With the new
+    /// snapshot's, a row deleted meanwhile would come back.)
+    pub data_sequence_number: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,12 +112,26 @@ pub struct DataFile {
     /// order. Empty for unpartitioned tables. The catalog translates this to
     /// an `iceberg::spec::Struct` at commit time.
     pub partition_values: Vec<PartitionLiteral>,
+    /// The file's data sequence number when it isn't its snapshot's: a
+    /// compaction's output keeps the one its pass was planned at, so
+    /// deletes committed while the pass ran still apply to it. `None`: the
+    /// snapshot's (see [`Self::sequence_number_in`]).
+    pub sequence_number: Option<i64>,
+}
+
+impl DataFile {
+    /// The file's data sequence number, as listed in `snapshot`. An
+    /// equality delete applies to data files with a lower one.
+    pub fn sequence_number_in(&self, snapshot: &Snapshot) -> i64 {
+        self.sequence_number.unwrap_or(snapshot.id)
+    }
 }
 
 /// One Iceberg snapshot. Snapshots are append-only and ordered by `id`.
 /// Iceberg MoR semantics: a delete file at snapshot `N` applies only to data
-/// files at snapshots `< N` (data and deletes from the same snapshot are
-/// kept consistent by the materializer).
+/// files with a data sequence number `< N` — their snapshot's, unless they
+/// carry their own ([`DataFile::sequence_number`]). Data and deletes from
+/// the same snapshot are kept consistent by the materializer.
 ///
 /// Compaction snapshots populate `removed_paths` with the paths of data /
 /// delete files that were live in prior snapshots but are no longer

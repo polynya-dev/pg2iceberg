@@ -237,10 +237,14 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         }
 
         let tx = Transaction::new(&table);
-        let action = tx
+        let mut action = tx
             .rewrite_files()
             .add_data_files(iceberg_added)
-            .remove_paths(prepared.removed_paths.iter().cloned())
+            .remove_paths(prepared.removed_paths.iter().cloned());
+        if let Some(seq) = prepared.data_sequence_number {
+            action = action.set_data_sequence_number(seq);
+        }
+        let action = action
             // iceberg-rust refuses a snapshot that adds no files and sets
             // no summary property (apache/iceberg-rust#1548), and a pass
             // whose inputs' rows were all deleted adds none.
@@ -404,12 +408,13 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     all_paths_this_snap.insert(df.file_path().to_string());
 
                     let partition_values = iceberg_struct_to_partition_literals(df.partition());
-                    let our = DataFile {
+                    let mut our = DataFile {
                         path: df.file_path().to_string(),
                         record_count: df.record_count(),
                         byte_size: df.file_size_in_bytes(),
                         equality_field_ids: df.equality_ids().unwrap_or_default(),
                         partition_values,
+                        sequence_number: None,
                     };
                     // Match the sim's "files added in this commit"
                     // semantics: only surface entries first introduced
@@ -439,6 +444,9 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                         }
                         continue;
                     }
+                    // A compaction's output keeps the sequence number its
+                    // pass read the table at.
+                    our.sequence_number = me.sequence_number().filter(|&seq| seq != seq_num);
                     match df.content_type() {
                         DataContentType::Data => data_files.push(our),
                         DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
@@ -1141,6 +1149,7 @@ mod tests {
                         byte_size: 256,
                         equality_field_ids: vec![],
                         partition_values: vec![PartitionLiteral::Long(1)],
+                        sequence_number: None,
                     },
                     DataFile {
                         path: "memory:///warehouse/public/orders/data-qty-2.parquet".into(),
@@ -1148,6 +1157,7 @@ mod tests {
                         byte_size: 384,
                         equality_field_ids: vec![],
                         partition_values: vec![PartitionLiteral::Long(2)],
+                        sequence_number: None,
                     },
                 ],
                 equality_deletes: vec![],
@@ -1247,6 +1257,7 @@ mod tests {
                 byte_size: chunk.chunk.bytes.len() as u64,
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values,
+                sequence_number: None,
             });
         }
         c.commit_snapshot(PreparedCommit {
@@ -1301,6 +1312,7 @@ mod tests {
                     byte_size: 64,
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
+                    sequence_number: None,
                 }],
                 equality_deletes: vec![],
             })
@@ -1366,6 +1378,7 @@ mod tests {
                         byte_size: 1024 + i * 100,
                         equality_field_ids: vec![],
                         partition_values: Vec::new(),
+                        sequence_number: None,
                     }],
                     equality_deletes: vec![],
                 })
@@ -1414,6 +1427,7 @@ mod tests {
                     byte_size: 100,
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
+                    sequence_number: None,
                 }],
                 equality_deletes: vec![],
             })
@@ -1431,8 +1445,10 @@ mod tests {
                 byte_size: 256,
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
+                sequence_number: None,
             }],
             removed_paths: original_paths.clone(),
+            data_sequence_number: None,
         })
         .await
         .unwrap();
@@ -1474,6 +1490,7 @@ mod tests {
                 ident: ident(),
                 added_data_files: vec![],
                 removed_paths: vec![],
+                data_sequence_number: None,
             })
             .await
             .unwrap();
@@ -1497,6 +1514,7 @@ mod tests {
                 byte_size: 100,
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
+                sequence_number: None,
             }],
             equality_deletes: vec![],
         })
@@ -1507,6 +1525,7 @@ mod tests {
             ident: ident(),
             added_data_files: vec![],
             removed_paths: vec![path.into()],
+            data_sequence_number: None,
         })
         .await
         .unwrap();
@@ -1542,6 +1561,7 @@ mod tests {
                     byte_size: 100,
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
+                    sequence_number: None,
                 }],
                 equality_deletes: vec![],
             })
@@ -1602,6 +1622,7 @@ mod tests {
             byte_size: 100,
             equality_field_ids: eq_ids,
             partition_values: Vec::new(),
+            sequence_number: None,
         };
         let tick = || tokio::time::sleep(std::time::Duration::from_millis(2));
         let append = |data: Vec<DataFile>, deletes: Vec<DataFile>| {
@@ -1623,6 +1644,7 @@ mod tests {
             ident: ident(),
             added_data_files: vec![file("c0", vec![])],
             removed_paths: vec![file("d0", vec![]).path],
+            data_sequence_number: None,
         })
         .await
         .unwrap();
@@ -1659,6 +1681,7 @@ mod tests {
                 byte_size: 100,
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
+                sequence_number: None,
             }],
             equality_deletes: vec![],
         })
@@ -1704,6 +1727,7 @@ mod tests {
                     byte_size: 64,
                     equality_field_ids: vec![1],
                     partition_values: Vec::new(),
+                    sequence_number: None,
                 }],
             })
             .await
@@ -1731,6 +1755,7 @@ mod tests {
                     byte_size: 1024,
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
+                    sequence_number: None,
                 }],
                 equality_deletes: vec![DataFile {
                     path: "memory:///warehouse/public/orders/eq-deletes-0.parquet".into(),
@@ -1738,6 +1763,7 @@ mod tests {
                     byte_size: 128,
                     equality_field_ids: vec![1],
                     partition_values: Vec::new(),
+                    sequence_number: None,
                 }],
             })
             .await
@@ -1771,6 +1797,7 @@ mod tests {
                     byte_size: 64,
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
+                    sequence_number: None,
                 }],
             })
             .await
@@ -1922,6 +1949,7 @@ mod tests {
                 byte_size: 256,
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
+                sequence_number: None,
             }],
             equality_deletes: vec![],
         })

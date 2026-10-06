@@ -261,12 +261,13 @@ impl fmt::Debug for FileIndex {
 /// delete that's needed to void the prior data file row, producing
 /// duplicate rows in MoR readers.
 ///
-/// MoR semantics: an equality-delete file at snapshot `N` voids data file
-/// rows whose PK matches at snapshots `< N`. Replaying the snapshots in
-/// order — each one's deletes, then its data files — therefore leaves
-/// exactly the live PKs, as the materializer's own updates do. Files
-/// are streamed a batch at a time and only their PK columns decoded, so
-/// the rebuild holds little beyond the index itself.
+/// MoR semantics: an equality-delete file with sequence number `N` voids
+/// data file rows whose PK matches at sequence numbers `< N`. Replaying
+/// the live files in sequence-number order — at each, its deletes, then
+/// its data files — therefore leaves exactly the live PKs, as the
+/// materializer's own updates do. Files are streamed a batch at a time and
+/// only their PK columns decoded, so the rebuild holds little beyond the
+/// index itself.
 pub async fn rebuild_from_catalog(
     catalog: &dyn pg2iceberg_iceberg_dyn::DynCatalog,
     blob_store: &dyn pg2iceberg_stream::BlobStore,
@@ -314,12 +315,6 @@ pub async fn catch_up_from_catalog(
         .iter()
         .zip(at.unwrap_or(0) + 1..)
         .all(|(s, seq)| s.id == seq && !s.expired);
-    let replay = if at.is_some() && whole && current >= at {
-        &snapshots[newer..]
-    } else {
-        *fi = FileIndex::new();
-        &snapshots[..]
-    };
 
     let pk_schema: Vec<pg2iceberg_core::ColumnSchema> = schema
         .columns
@@ -328,35 +323,68 @@ pub async fn catch_up_from_catalog(
         .cloned()
         .collect();
 
-    // Same compaction-aware skipping as the verifier — files superseded
-    // by a Replace snapshot don't contribute to the FileIndex.
-    let removed_paths: BTreeSet<&str> = replay
-        .iter()
-        .flat_map(|s| s.removed_paths.iter().map(String::as_str))
-        .collect();
-
-    for snap in replay {
-        for df in &snap.delete_files {
-            if !removed_paths.contains(df.path.as_str()) {
-                for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
-                    fi.remove_pks(&pks)
-                })
-                .await?;
+    if !(at.is_some() && whole && current >= at) {
+        // Rebuild from the live files. Files superseded by a Replace
+        // snapshot don't contribute — as for the verifier.
+        *fi = FileIndex::new();
+        let removed_paths: BTreeSet<&str> = snapshots
+            .iter()
+            .flat_map(|s| s.removed_paths.iter().map(String::as_str))
+            .collect();
+        let mut live: Vec<(i64, bool, &crate::DataFile)> = Vec::new();
+        for snap in &snapshots {
+            let files = (snap.delete_files.iter().map(|f| (false, f)))
+                .chain(snap.data_files.iter().map(|f| (true, f)));
+            for (data, f) in files {
+                if !removed_paths.contains(f.path.as_str()) {
+                    live.push((f.sequence_number_in(snap), data, f));
+                }
             }
         }
-        for df in &snap.data_files {
-            if !removed_paths.contains(df.path.as_str()) {
-                for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
+        // A compaction's output keeps an older sequence number than the
+        // snapshot that added it: deletes since apply to it.
+        live.sort_by_key(|(seq, data, _)| (*seq, *data));
+        for (_, data, df) in live {
+            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
+                if data {
                     fi.add_file(df.path.clone(), pks, df.partition_values.clone())
-                })
-                .await?;
-            }
+                } else {
+                    fi.remove_pks(&pks)
+                }
+            })
+            .await?;
         }
+        return Ok(current);
     }
-    // Files indexed before `at` that a later snapshot removed. Their rows
-    // that live on moved to the files replacing them, above.
-    for path in removed_paths {
-        fi.remove_file(path);
+
+    // Replay what happened since `at`, in order.
+    for snap in &snapshots[newer..] {
+        for df in &snap.delete_files {
+            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
+                fi.remove_pks(&pks)
+            })
+            .await?;
+        }
+        // A Replace's outputs hold its inputs' rows as of the snapshot its
+        // pass read: they take over the keys still in those inputs. A key
+        // deleted or rewritten since is elsewhere, or nowhere.
+        let inputs: BTreeSet<&str> = snap.removed_paths.iter().map(String::as_str).collect();
+        for df in &snap.data_files {
+            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
+                let pks: Vec<PkKey> = if inputs.is_empty() {
+                    pks
+                } else {
+                    pks.into_iter()
+                        .filter(|pk| fi.lookup(pk).is_some_and(|p| inputs.contains(p)))
+                        .collect()
+                };
+                fi.add_file(df.path.clone(), pks, df.partition_values.clone())
+            })
+            .await?;
+        }
+        for path in inputs {
+            fi.remove_file(path);
+        }
     }
     Ok(current)
 }

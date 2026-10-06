@@ -151,6 +151,7 @@ mod tests {
             byte_size: 1,
             equality_field_ids: vec![],
             partition_values: vec![],
+            sequence_number: None,
         };
         Snapshot {
             id,

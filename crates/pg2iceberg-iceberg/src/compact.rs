@@ -43,11 +43,14 @@
 //!   open file first.
 //! - **Seq-aware deletes.** A delete with seq 5 cannot retroactively delete
 //!   a row from snap 7: a row is dropped only if `delete_seq > row_seq`.
-//! - **Rewritten rows keep their verdict.** Outputs land at the Replace
-//!   snapshot's new sequence number, above every live delete. So no delete
-//!   newly applies to a rewritten row, and none could still drop one —
-//!   which is why every delete that applies to an input row is applied
-//!   here, before the row moves.
+//! - **Rewritten rows keep their verdict.** Outputs keep the data sequence
+//!   number of the snapshot the pass read
+//!   ([`PreparedCompaction::data_sequence_number`]), at or above every
+//!   delete it saw. So none of those applies to a rewritten row — which is
+//!   why each one that applies to an input row is applied here, before the
+//!   row moves. A delete committed while the pass ran is above it and
+//!   still applies, as it would have to the input; at the Replace
+//!   snapshot's own number, the deleted row would come back.
 //! - **A delete outlives every row it may apply to.** A delete with seq
 //!   `t` is retired only when no dirty data file with seq `< t` remains
 //!   after this pass. Clean files don't hold it back: by definition no
@@ -160,13 +163,9 @@ struct LiveFile {
     byte_size: u64,
     record_count: u64,
     partition_values: Vec<PartitionLiteral>,
-    /// Snapshot seq the file was added in. Iceberg attaches sequence
-    /// numbers to manifest entries; for files added via `FastAppend`
-    /// the entry's seq matches the snapshot's seq, which we surface as
-    /// `Snapshot.id`. For files inherited through carry-forward this
-    /// remains the *original* add seq — but our `snapshots()` impl
-    /// only surfaces files under their first-added snapshot, so the
-    /// snapshot we found a path in IS the snapshot it was added in.
+    /// The file's data sequence number ([`DataFile::sequence_number_in`]):
+    /// its snapshot's — `snapshots()` lists a file under the snapshot that
+    /// added it — or, for a compaction's output, the one its pass read.
     seq: i64,
 }
 
@@ -348,6 +347,8 @@ where
             ident: ident.clone(),
             added_data_files: out.added,
             removed_paths,
+            // The table as the pass read it: the last snapshot.
+            data_sequence_number: snapshots.last().map(|s| s.id),
         })
         .await?;
 
@@ -434,6 +435,7 @@ impl OutputFiles {
             byte_size,
             equality_field_ids: vec![],
             partition_values,
+            sequence_number: None,
         });
         self.added_pks.push(pks);
         Ok(())
@@ -549,13 +551,19 @@ fn compute_live_files(
             if removed.contains(df.path.as_str()) {
                 continue;
             }
-            data.insert(df.path.clone(), LiveFile::new(df, snap.id));
+            data.insert(
+                df.path.clone(),
+                LiveFile::new(df, df.sequence_number_in(snap)),
+            );
         }
         for df in &snap.delete_files {
             if removed.contains(df.path.as_str()) {
                 continue;
             }
-            deletes.insert(df.path.clone(), LiveFile::new(df, snap.id));
+            deletes.insert(
+                df.path.clone(),
+                LiveFile::new(df, df.sequence_number_in(snap)),
+            );
         }
     }
     (data, deletes)
@@ -576,6 +584,7 @@ mod tests {
             byte_size,
             equality_field_ids: vec![],
             partition_values: vec![],
+            sequence_number: None,
         }
     }
 

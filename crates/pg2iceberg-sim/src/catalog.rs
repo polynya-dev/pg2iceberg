@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
 use pg2iceberg_iceberg::PreparedCommit;
 use pg2iceberg_iceberg::{
-    apply_schema_changes, Catalog, IcebergError, Result, SchemaChange, Snapshot, TableMetadata,
+    apply_schema_changes, Catalog, DataFile, IcebergError, Result, SchemaChange, Snapshot,
+    TableMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -206,12 +207,44 @@ impl Catalog for MemoryCatalog {
         if prepared.added_data_files.is_empty() && prepared.removed_paths.is_empty() {
             return Ok(table.metadata.clone());
         }
+        // Like iceberg-rust's rewrite: a file another pass already removed
+        // fails the commit, or both passes' outputs would hold its rows.
+        let removed: BTreeSet<&str> = table
+            .snapshots
+            .iter()
+            .flat_map(|snap| snap.removed_paths.iter().map(String::as_str))
+            .collect();
+        let live: BTreeSet<&str> = table
+            .snapshots
+            .iter()
+            .flat_map(|snap| snap.data_files.iter().chain(&snap.delete_files))
+            .map(|f| f.path.as_str())
+            .filter(|path| !removed.contains(path))
+            .collect();
+        let missing: Vec<&String> = prepared
+            .removed_paths
+            .iter()
+            .filter(|path| !live.contains(path.as_str()))
+            .collect();
+        if !missing.is_empty() {
+            return Err(IcebergError::Conflict(format!(
+                "rewrite removes files no longer in the table: {missing:?}"
+            )));
+        }
 
         let id = table.next_snapshot_id;
         table.next_snapshot_id += 1;
+        let added = prepared
+            .added_data_files
+            .into_iter()
+            .map(|f| DataFile {
+                sequence_number: prepared.data_sequence_number,
+                ..f
+            })
+            .collect();
         table.snapshots.push(Snapshot {
             id,
-            data_files: prepared.added_data_files,
+            data_files: added,
             delete_files: Vec::new(),
             removed_paths: prepared.removed_paths,
             timestamp_ms: id * 1000,
@@ -400,6 +433,7 @@ mod tests {
                     byte_size: 100,
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
+                    sequence_number: None,
                 }],
                 equality_deletes: vec![],
             }))

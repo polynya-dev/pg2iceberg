@@ -828,6 +828,7 @@ impl<C: Catalog> Materializer<C> {
                     byte_size,
                     equality_field_ids: vec![],
                     partition_values: chunk.partition_values,
+                    sequence_number: None,
                 });
             }
             self.catalog
@@ -1708,6 +1709,7 @@ impl<C: Catalog> Materializer<C> {
                 byte_size,
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values.clone(),
+                sequence_number: None,
             });
             data_pk_groups.push((path, chunk.pk_keys, chunk.partition_values));
         }
@@ -1728,6 +1730,7 @@ impl<C: Catalog> Materializer<C> {
                 byte_size,
                 equality_field_ids: pk_field_ids.clone(),
                 partition_values: chunk.partition_values,
+                sequence_number: None,
             });
             deleted_pks.extend(chunk.pk_keys);
         }
@@ -1986,6 +1989,7 @@ impl<C: Catalog> Materializer<C> {
                 byte_size,
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values,
+                sequence_number: None,
             });
         }
         // Re-emission of an already-emitted marker would conflict on
