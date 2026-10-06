@@ -807,13 +807,11 @@ fn binary_materialize_tick_with_compaction_under_blob_put_fault_keeps_replicatio
     }
 }
 
+/// Between a flush and the next standby ack the slot lags what the
+/// pipeline has staged — by design: the slot only ever acknowledges what's
+/// staged. That's lag, not a violation.
 #[test]
-fn binary_watcher_tick_returns_violation_when_pipeline_ahead_of_slot() {
-    // The watcher helper is called every Watcher tick. Verifies it
-    // surfaces invariant 1 (`pipeline.flushed_lsn ≤
-    // slot.confirmed_flush_lsn`) when pipeline gets ahead — which
-    // would be a real bug in prod. Uses InMemoryMetrics so the
-    // counter increment is observable.
+fn watcher_lets_the_slot_lag_what_is_staged() {
     use pg2iceberg_core::{InMemoryMetrics, Metrics};
     let metrics: Arc<dyn Metrics> = Arc::new(InMemoryMetrics::new());
     let h = FaultHarness::boot();
@@ -823,6 +821,7 @@ fn binary_watcher_tick_returns_violation_when_pipeline_ahead_of_slot() {
         &watcher,
         /* pipeline_flushed_lsn */ pg2iceberg_core::Lsn(200),
         /* slot_confirmed_flush_lsn */ pg2iceberg_core::Lsn(100),
+        /* coord_flushed_lsn */ pg2iceberg_core::Lsn(200),
         /* slot_wal_status */ None,
         /* slot_safe_wal_size */ None,
         /* slot_restart_lsn */ pg2iceberg_core::Lsn::ZERO,
@@ -831,11 +830,39 @@ fn binary_watcher_tick_returns_violation_when_pipeline_ahead_of_slot() {
         "default",
         &[ident()],
     ));
-    assert_eq!(violations.len(), 1);
-    assert!(matches!(
-        violations[0],
-        pg2iceberg_validate::InvariantViolation::PipelineAheadOfSlot { .. }
+    assert_eq!(violations, []);
+}
+
+/// The slot past the LSN pg2iceberg recorded acking: every ack is
+/// recorded first, so something else advanced it — and the WAL in between
+/// was never staged.
+#[test]
+fn watcher_stops_on_a_slot_ahead_of_its_record() {
+    use pg2iceberg_core::{InMemoryMetrics, Metrics};
+    let metrics: Arc<dyn Metrics> = Arc::new(InMemoryMetrics::new());
+    let h = FaultHarness::boot();
+    let watcher = InvariantWatcher::new(h.coord.clone() as Arc<dyn Coordinator>, metrics);
+
+    let violations = block_on(run_watcher_tick(
+        &watcher,
+        /* pipeline_flushed_lsn */ pg2iceberg_core::Lsn(200),
+        /* slot_confirmed_flush_lsn */ pg2iceberg_core::Lsn(300),
+        /* coord_flushed_lsn */ pg2iceberg_core::Lsn(200),
+        /* slot_wal_status */ None,
+        /* slot_safe_wal_size */ None,
+        /* slot_restart_lsn */ pg2iceberg_core::Lsn::ZERO,
+        /* slot_conflicting */ false,
+        /* slot_name */ "test-slot",
+        "default",
+        &[ident()],
     ));
+    assert!(
+        matches!(
+            violations.as_slice(),
+            [v @ pg2iceberg_validate::InvariantViolation::SlotAheadOfRecord { .. }] if v.is_fatal()
+        ),
+        "{violations:?}"
+    );
 }
 
 #[test]
@@ -1446,6 +1473,7 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
         pg: Arc::new(pg2iceberg_sim::postgres::SimPgClient::new(h.db.clone())),
         publication_name: PUB.into(),
         snapshot_lsn: None,
+        recorded_lsn: pg2iceberg_core::Lsn::ZERO,
         coord: h.coord.clone() as Arc<dyn Coordinator>,
         slot_monitor,
         watcher,
@@ -1495,8 +1523,80 @@ fn sim_lifecycle(
     Arc<MemoryCatalog>,
     Arc<MemoryBlobStore>,
 ) {
+    let stores = SimStores::new();
+    let lifecycle = sim_lifecycle_on(db, &stores, pg2iceberg_logical::Schedule::default());
+    (lifecycle, stores.coord, stores.catalog, stores.blob)
+}
+
+/// A sim deployment's durable side, kept across its lifecycle runs. Its
+/// coordinator fails as `plan` says.
+struct SimStores {
+    clock: Arc<dyn pg2iceberg_core::Clock>,
+    coord: Arc<MemoryCoordinator>,
+    catalog: Arc<MemoryCatalog>,
+    blob: Arc<MemoryBlobStore>,
+    plan: FaultPlan,
+}
+
+impl SimStores {
+    fn new() -> Self {
+        let clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(TokioClock::new());
+        Self {
+            coord: Arc::new(MemoryCoordinator::new(
+                CoordSchema::default_name(),
+                clock.clone(),
+            )),
+            clock,
+            catalog: Arc::new(MemoryCatalog::new()),
+            blob: Arc::new(MemoryBlobStore::new()),
+            plan: FaultPlan::new(),
+        }
+    }
+}
+
+/// Time as tokio's clock tells it, so a paused-time test's main loop
+/// fires its handlers as virtual time passes.
+struct TokioClock {
+    start: tokio::time::Instant,
+}
+
+impl TokioClock {
+    fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl pg2iceberg_core::Clock for TokioClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(self.start.elapsed().as_micros() as i64)
+    }
+
+    async fn sleep(&self, d: std::time::Duration) {
+        tokio::time::sleep(d).await
+    }
+}
+
+/// Every handler due each second.
+fn every_second() -> pg2iceberg_logical::Schedule {
+    let second = std::time::Duration::from_secs(1);
+    pg2iceberg_logical::Schedule {
+        flush: second,
+        materialize: second,
+        standby: second,
+        watcher: second,
+    }
+}
+
+/// A lifecycle run over `db` and `stores`.
+fn sim_lifecycle_on(
+    db: &SimPostgres,
+    stores: &SimStores,
+    schedule: pg2iceberg_logical::Schedule,
+) -> pg2iceberg_validate::LogicalLifecycle<MemoryCatalog> {
     use pg2iceberg_core::{IdGen, InMemoryMetrics, WorkerId};
-    use pg2iceberg_logical::Schedule;
     use pg2iceberg_sim::postgres::SimPgClient;
 
     struct ZeroIdGen;
@@ -1509,29 +1609,25 @@ fn sim_lifecycle(
         }
     }
 
-    let clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(TestClock::at(0));
-    let coord = Arc::new(MemoryCoordinator::new(
-        CoordSchema::default_name(),
-        clock.clone(),
-    ));
-    let blob = Arc::new(MemoryBlobStore::new());
-    let catalog = Arc::new(MemoryCatalog::new());
     let pg_client = Arc::new(SimPgClient::new(db.clone()));
     let snapshot_db = db.clone();
-    let lifecycle = pg2iceberg_validate::LogicalLifecycle {
+    pg2iceberg_validate::LogicalLifecycle {
         pg: pg_client.clone(),
         slot_monitor: pg_client,
-        coord: coord.clone() as Arc<dyn Coordinator>,
-        catalog: catalog.clone(),
-        blob: blob.clone() as Arc<dyn pg2iceberg_stream::BlobStore>,
-        clock,
+        coord: Arc::new(FaultyCoordinator::new(
+            stores.coord.clone(),
+            stores.plan.clone(),
+        )),
+        catalog: stores.catalog.clone(),
+        blob: stores.blob.clone() as Arc<dyn pg2iceberg_stream::BlobStore>,
+        clock: stores.clock.clone(),
         id_gen: Arc::new(ZeroIdGen),
         schemas: vec![schema()],
         skip_snapshot_idents: BTreeSet::new(),
         slot_name: LIFECYCLE_SLOT.into(),
         publication_name: "lifecycle-pub".into(),
         group: "default".into(),
-        schedule: Schedule::default(),
+        schedule,
         compaction: None,
         flush_rows: 64,
         mat_batch_rows: 128,
@@ -1547,8 +1643,129 @@ fn sim_lifecycle(
         blob_namer: Arc::new(CounterBlobNamer::new("s3://stage")),
         metrics: Arc::new(InMemoryMetrics::new()),
         meta_namespace: None,
-    };
-    (lifecycle, coord, catalog, blob)
+    }
+}
+
+// ── The slot ack and its record ──────────────────────────────────
+
+/// Four rows, committed before the slot exists: the snapshot's.
+fn seeded_db() -> SimPostgres {
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let mut tx = db.begin_tx();
+    for i in 1..=4 {
+        tx.insert(&ident(), row(i, i * 10));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    db
+}
+
+/// The coordinator can't take the LSN the standby tick would ack. The
+/// slot must not be acked past what's recorded: the next start would find
+/// it ahead, and refuse to start as if it had been tampered with.
+#[tokio::test(start_paused = true)]
+async fn the_slot_is_never_acked_past_its_record() {
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    // The start's stamps (slot creation, snapshot) land; none after.
+    stores.plan.fail(ops::COORD_SET_FLUSHED_LSN, 2..1_000);
+    let lifecycle = sim_lifecycle_on(&db, &stores, every_second());
+    let script = db.clone();
+    let shutdown = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(5, 50));
+        tx.commit(Timestamp(0)).unwrap();
+        // Flush and standby ticks, their stamps failing.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .expect("a failed stamp isn't fatal");
+
+    let slot = db.slot_state(LIFECYCLE_SLOT).unwrap().confirmed_flush_lsn;
+    let record = stores.coord.flushed_lsn().await.unwrap();
+    assert!(
+        slot <= record,
+        "slot acked to {slot:?}, recorded {record:?}"
+    );
+    pg2iceberg_validate::run_logical_lifecycle(
+        sim_lifecycle_on(&db, &stores, every_second()),
+        Box::pin(std::future::ready(())),
+    )
+    .await
+    .expect("the next start");
+}
+
+/// Something else advances the slot mid-run — `pg_replication_slot_advance`,
+/// another consumer — past what pg2iceberg recorded acking: the WAL in
+/// between will never be staged. The watcher stops the lifecycle, as the
+/// next start would refuse.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_stops_on_a_slot_advanced_by_something_else() {
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let script = db.clone();
+    let shutdown = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(5, 50));
+        tx.commit(Timestamp(0)).unwrap();
+        // Another session acks the slot to the end of WAL.
+        let mut other = script.start_replication(LIFECYCLE_SLOT).unwrap();
+        other.send_standby(script.current_lsn());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let err = pg2iceberg_validate::run_logical_lifecycle(
+        sim_lifecycle_on(&db, &stores, every_second()),
+        shutdown,
+    )
+    .await
+    .expect_err("the lifecycle stops");
+    assert!(
+        matches!(&err, pg2iceberg_validate::LifecycleError::SlotHealth(msg) if msg.contains("invariant 1")),
+        "{err}"
+    );
+}
+
+/// A restart with nothing new to flush: the pipeline's flushed LSN starts
+/// at zero, and stamping it — at the drain, here — would erase the record
+/// of the highest LSN ever acked, which the next start checks the slot
+/// against.
+#[tokio::test(start_paused = true)]
+async fn a_restart_keeps_the_acked_lsn_on_record() {
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let script = db.clone();
+    let shutdown = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(5, 50));
+        tx.commit(Timestamp(0)).unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    pg2iceberg_validate::run_logical_lifecycle(
+        sim_lifecycle_on(&db, &stores, every_second()),
+        shutdown,
+    )
+    .await
+    .unwrap();
+    let recorded = stores.coord.flushed_lsn().await.unwrap();
+    assert!(recorded > pg2iceberg_core::Lsn::ZERO);
+
+    pg2iceberg_validate::run_logical_lifecycle(
+        sim_lifecycle_on(&db, &stores, every_second()),
+        Box::pin(std::future::ready(())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stores.coord.flushed_lsn().await.unwrap(), recorded);
 }
 
 fn note_column() -> ColumnSchema {

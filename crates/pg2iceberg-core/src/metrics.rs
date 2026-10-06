@@ -141,6 +141,9 @@ pub mod names {
     pub const PIPELINE_ROWS_STAGED_TOTAL: &str = "pg2iceberg_pipeline_rows_staged_total";
     /// Gauge: pipeline.flushed_lsn. Labels: `{}`.
     pub const PIPELINE_FLUSHED_LSN: &str = "pg2iceberg_pipeline_flushed_lsn";
+    /// Gauge: bytes of WAL staged but not yet acked to the slot — the
+    /// next standby tick's to ack. Labels: `{}`.
+    pub const SLOT_ACK_LAG: &str = "pg2iceberg_slot_ack_lag_bytes";
 
     /// Counter: total materializer cycle invocations. Labels: `{table}`.
     pub const MATERIALIZER_CYCLE_TOTAL: &str = "pg2iceberg_materializer_cycle_total";
