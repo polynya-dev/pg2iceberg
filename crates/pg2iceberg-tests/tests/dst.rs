@@ -53,7 +53,7 @@ use pg2iceberg_core::typemap::{IcebergType, PgType};
 use pg2iceberg_core::{
     ColumnName, ColumnSchema, Namespace, Op, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
-use pg2iceberg_iceberg::{read_materialized_state, CompactionConfig};
+use pg2iceberg_iceberg::CompactionConfig;
 use pg2iceberg_iceberg::{
     Catalog, LogRange, PreparedCommit, PreparedCompaction, SchemaChange, Snapshot, TableMetadata,
 };
@@ -2538,24 +2538,20 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
         }
     }
 
-    // 13. `pg2iceberg verify` reads what a query engine reads — or it
-    //     reports false mismatches, and misses real ones.
-    let mut verify_rows = block_on(read_materialized_state(
+    // 13. `pg2iceberg verify`, run as the binary runs it — with the schema
+    //     discovered from the source — finds the tables equal: they are
+    //     (5). A difference it reports is a false alarm.
+    let diff = block_on(pg2iceberg_validate::verify::verify_table(
+        &h.db,
         h.audited.as_ref(),
         h.blob_store.as_ref(),
-        &ident(),
-        &block_on(h.audited.load_table(&ident()))
-            .map_err(|e| e.to_string())?
-            .expect("table exists")
-            .schema,
-        &[ColumnName("id".into())],
+        &discovered_schema(&h.db),
+        3,
     ))
-    .map_err(|e| format!("invariant 13: verify's read: {e}"))?;
-    sort_by_pk(&mut verify_rows);
-    let verify_rows = on_source_columns(&h.db, verify_rows);
-    if verify_rows != iceberg_rows {
+    .map_err(|e| format!("invariant 13: verify: {e}"))?;
+    if !diff.is_empty() {
         return Err(format!(
-            "invariant 13 (verify == engine): verify reads {verify_rows:?}\n  engines read {iceberg_rows:?}"
+            "invariant 13 (verify finds PG == Iceberg): it reports {diff:?}"
         ));
     }
 
@@ -3749,6 +3745,36 @@ fn worker_writing_after_anothers_schema_change_keeps_old_rows_apart() {
             panic!("after {step:?}: {e}");
         }
     }
+    check_invariants(&mut h).unwrap();
+}
+
+/// `pg2iceberg verify` after a column is dropped: data files hold values
+/// by field id, and the source's schema numbers columns by position — so
+/// read by the source's, `qty` would read the dropped `note`'s values (and
+/// fail to decode them).
+#[test]
+fn verify_after_a_column_drop_reads_the_right_columns() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::DropNote,
+        Step::Update { id: 1, qty: 20 },
+    ] {
+        h.run_step(&step);
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// `pg2iceberg verify` on a table keyed by a `smallint`: Postgres reads
+/// the key as one, Iceberg stores it as an `int` — the same key, or every
+/// row is reported missing on both sides.
+#[test]
+fn verify_matches_rows_keyed_by_a_smallint() {
+    SMALLINT_PK.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
     check_invariants(&mut h).unwrap();
 }
 

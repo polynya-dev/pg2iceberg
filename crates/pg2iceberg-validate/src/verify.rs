@@ -10,8 +10,13 @@
 //! 2. Read every row from the table at that LSN (chunked, just like the
 //!    snapshot phase — uses `SnapshotSource::read_chunk`).
 //! 3. Read the materialized Iceberg state via [`read_materialized_state`],
-//!    which applies merge-on-read semantics.
-//! 4. Build PK-keyed maps, compare. Emit per-PK diffs:
+//!    which applies merge-on-read semantics — with the table's schema as
+//!    the catalog has it: data files hold values by field id, and the
+//!    source's schema numbers columns by position, which a dropped column
+//!    throws off.
+//! 4. Compare on the source's columns, with values as Iceberg stores them
+//!    (a `smallint` is an `int`). Build PK-keyed maps, compare. Emit
+//!    per-PK diffs:
 //!    - **pg_only** — PK in PG, not in Iceberg.
 //!    - **iceberg_only** — PK in Iceberg, not in PG.
 //!    - **mismatched** — same PK, differing non-PK column values.
@@ -21,8 +26,8 @@
 //! flag value drift — the user decides whether each is real corruption or
 //! known type-mapping behavior.
 
-use pg2iceberg_core::{ColumnName, Row, TableSchema};
-use pg2iceberg_iceberg::{pk_key, read_materialized_state, verify::DynCatalog};
+use pg2iceberg_core::{ColumnName, PgValue, Row, TableSchema};
+use pg2iceberg_iceberg::{pk_key, read_materialized_state, Catalog};
 use pg2iceberg_snapshot::SnapshotSource;
 use pg2iceberg_stream::BlobStore;
 use std::collections::BTreeMap;
@@ -34,6 +39,10 @@ pub enum VerifyError {
     Source(#[from] pg2iceberg_snapshot::SnapshotError),
     #[error("iceberg verify: {0}")]
     Iceberg(#[from] pg2iceberg_iceberg::verify::VerifyError),
+    #[error("catalog: {0}")]
+    Catalog(#[from] pg2iceberg_iceberg::IcebergError),
+    #[error("table {0} not found in the catalog")]
+    NoTable(pg2iceberg_core::TableIdent),
 }
 
 pub type Result<T> = std::result::Result<T, VerifyError>;
@@ -60,7 +69,8 @@ impl VerifyDiff {
 }
 
 /// Read PG ground truth (chunked) at the snapshot LSN, read Iceberg
-/// materialized state, return per-PK diff.
+/// materialized state, return per-PK diff. `schema` is the source table's
+/// (as discovered, or configured): its columns are the ones compared.
 ///
 /// `chunk_size` caps memory for the PG read pass.
 pub async fn verify_table<S, C>(
@@ -72,7 +82,7 @@ pub async fn verify_table<S, C>(
 ) -> Result<VerifyDiff>
 where
     S: SnapshotSource + ?Sized,
-    C: DynCatalog,
+    C: Catalog,
 {
     assert!(chunk_size > 0);
     let pk_cols: Vec<ColumnName> = schema
@@ -100,16 +110,23 @@ where
         let last = chunk.last().unwrap();
         last_pk = Some(pk_key(last, &pk_cols));
         for row in chunk {
+            let row = as_stored(schema, row);
             let key = pk_key(&row, &pk_cols);
             pg_by_pk.insert(key, row);
         }
     }
 
-    // 2. Read Iceberg materialized state.
+    // 2. Read Iceberg materialized state, by the catalog's field ids.
+    let table = catalog
+        .load_table(&schema.ident)
+        .await?
+        .ok_or_else(|| VerifyError::NoTable(schema.ident.clone()))?;
     let iceberg_rows =
-        read_materialized_state(catalog, blob_store, &schema.ident, schema, &pk_cols).await?;
+        read_materialized_state(catalog, blob_store, &schema.ident, &table.schema, &pk_cols)
+            .await?;
     let mut iceberg_by_pk: BTreeMap<String, Row> = BTreeMap::new();
     for row in iceberg_rows {
+        let row = as_stored(schema, row);
         let key = pk_key(&row, &pk_cols);
         iceberg_by_pk.insert(key, row);
     }
@@ -135,6 +152,25 @@ where
     }
 
     Ok(diff)
+}
+
+/// `row` on `schema`'s columns — NULL where it lacks one — with values as
+/// Iceberg stores them. Iceberg keeps columns the source dropped, and has
+/// no `smallint`.
+fn as_stored(schema: &TableSchema, row: Row) -> Row {
+    schema
+        .columns
+        .iter()
+        .map(|c| {
+            let name = ColumnName(c.name.clone());
+            let value = match row.get(&name) {
+                Some(PgValue::Int2(n)) => PgValue::Int4((*n).into()),
+                Some(v) => v.clone(),
+                None => PgValue::Null,
+            };
+            (name, value)
+        })
+        .collect()
 }
 
 /// Row comparison that handles a few PG-specific quirks. Currently:
