@@ -11,6 +11,4 @@ INSERT INTO e2e_delete (id, name) VALUES
     (3, 'charlie'),
     (4, 'diana');
 
--- NOTE: ClickHouse 26.2 does not apply Iceberg equality deletes yet,
--- so the reference output still includes the deleted rows.
 DELETE FROM e2e_delete WHERE id IN (2, 4);

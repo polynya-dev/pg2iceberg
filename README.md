@@ -230,6 +230,8 @@ SELECT * FROM rideshare.`rideshare.rides`
 
 You should see new rows appearing as the simulator drives PG.
 
+To check correctness end to end, [`example/smoke`](example/smoke) runs a mixed workload — deletes, large and rolled-back transactions, key changes, TOAST, schema changes, a crash — against the same stack, then compares Postgres with ClickHouse row by row.
+
 ## Configuration
 
 Configuration is YAML-first; see [`config.example.yaml`](config.example.yaml) for the full surface. CLI flags and env vars override individual fields.
