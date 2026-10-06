@@ -240,7 +240,14 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let action = tx
             .rewrite_files()
             .add_data_files(iceberg_added)
-            .remove_paths(prepared.removed_paths.iter().cloned());
+            .remove_paths(prepared.removed_paths.iter().cloned())
+            // iceberg-rust refuses a snapshot that adds no files and sets
+            // no summary property (apache/iceberg-rust#1548), and a pass
+            // whose inputs' rows were all deleted adds none.
+            .set_snapshot_properties(HashMap::from([(
+                "pg2iceberg.operation".to_string(),
+                "compaction".to_string(),
+            )]));
         let tx = action.apply(tx).map_err(map_iceberg_err)?;
         let updated = tx
             .commit(self.inner.as_ref())
@@ -1469,6 +1476,43 @@ mod tests {
             .await
             .unwrap();
         assert!(meta.current_snapshot_id.is_none());
+    }
+
+    /// A pass whose inputs' rows were all deleted removes them and adds
+    /// nothing.
+    #[tokio::test]
+    async fn commit_compaction_with_no_outputs_removes_its_inputs() {
+        use crate::PreparedCompaction;
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let path = "memory:///warehouse/public/orders/data-0.parquet";
+        c.commit_snapshot(PreparedCommit {
+            ident: ident(),
+            data_files: vec![DataFile {
+                path: path.into(),
+                record_count: 1,
+                byte_size: 100,
+                equality_field_ids: vec![],
+                partition_values: Vec::new(),
+            }],
+            equality_deletes: vec![],
+        })
+        .await
+        .unwrap();
+
+        c.commit_compaction(PreparedCompaction {
+            ident: ident(),
+            added_data_files: vec![],
+            removed_paths: vec![path.into()],
+        })
+        .await
+        .unwrap();
+
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps[1].data_files.is_empty());
+        assert_eq!(snaps[1].removed_paths, vec![path.to_string()]);
     }
 
     /// Snapshot expiry round-trip via real iceberg-rust: append several
