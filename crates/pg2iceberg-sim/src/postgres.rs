@@ -49,6 +49,8 @@ pub enum SimError {
     UnknownSlot(String),
     #[error("slot {0} already exists")]
     DuplicateSlot(String),
+    #[error("replication slot \"{0}\" is active for another walsender")]
+    SlotActive(String),
     #[error("primary key column {col} missing on insert into {table}")]
     MissingPkColumn { table: TableIdent, col: String },
     #[error("primary-key conflict on {table}: {detail}")]
@@ -213,6 +215,12 @@ struct DbState {
     versions: BTreeMap<TableIdent, Vec<(Lsn, Rows)>>,
     /// The LSN an open snapshot reads at (see [`SimPostgres::begin_snapshot`]).
     snapshot_at: Option<Lsn>,
+    /// Bumped by [`SimPostgres::terminate_walsenders`]: a stream started
+    /// under an earlier value has lost its connection.
+    walsender_generation: u64,
+    /// `START_REPLICATION`s still to refuse per slot, held by a dead
+    /// connection's walsender (see [`SimPostgres::hold_slot`]).
+    slot_holds: BTreeMap<String, usize>,
 }
 
 /// A table's rows, keyed by canonical PK.
@@ -252,6 +260,8 @@ impl Default for DbState {
             wal: Vec::new(),
             versions: BTreeMap::new(),
             snapshot_at: None,
+            walsender_generation: 0,
+            slot_holds: BTreeMap::new(),
         }
     }
 }
@@ -779,6 +789,23 @@ impl SimPostgres {
         Ok(())
     }
 
+    /// `pg_terminate_backend` on every walsender — or anything else that
+    /// cuts their connections (a restart, a failover, a network drop).
+    /// Each stream started so far fails its client's next read or write
+    /// (see [`AsyncSimStream`]); the slots keep their positions.
+    pub fn terminate_walsenders(&self) {
+        self.state.lock().unwrap().walsender_generation += 1;
+    }
+
+    /// The next `attempts` `START_REPLICATION`s on `slot` fail, as they
+    /// do while a dead connection's walsender still holds the slot —
+    /// until `wal_sender_timeout` or TCP keepalives notice it's gone:
+    /// `replication slot "…" is active for PID …`.
+    pub fn hold_slot(&self, slot: &str, attempts: usize) {
+        let mut s = self.state.lock().unwrap();
+        s.slot_holds.insert(slot.to_string(), attempts);
+    }
+
     /// Test hook: drop a publication. Idempotent — `IF EXISTS`
     /// semantics, mirrors the prod [`PgClient::drop_publication`].
     pub fn drop_publication(&self, name: &str) -> Result<()> {
@@ -961,12 +988,16 @@ impl SimPostgres {
     /// the later of `start` and the slot's `confirmed_flush_lsn` (see
     /// [`DbState::decoding_cursor`] for which transactions that sends).
     pub fn start_replication_at(&self, slot: &str, start: Lsn) -> Result<SimReplicationStream> {
-        let s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap();
         let slot_state = s
             .slots
             .get(slot)
             .cloned()
             .ok_or_else(|| SimError::UnknownSlot(slot.to_string()))?;
+        if let Some(holds) = s.slot_holds.get_mut(slot).filter(|n| **n > 0) {
+            *holds -= 1;
+            return Err(SimError::SlotActive(slot.to_string()));
+        }
         let cursor_lsn = s.decoding_cursor(slot_state.confirmed_flush_lsn.max(start));
         Ok(SimReplicationStream {
             db: self.clone(),
@@ -977,6 +1008,7 @@ impl SimPostgres {
             pending: VecDeque::new(),
             wire_queue: VecDeque::new(),
             relations_sent: BTreeSet::new(),
+            generation: s.walsender_generation,
         })
     }
 }
@@ -1417,6 +1449,8 @@ pub struct SimReplicationStream {
     /// Tables whose Relation message this session has sent since their
     /// relation cache entry was last invalidated.
     relations_sent: BTreeSet<TableIdent>,
+    /// [`DbState::walsender_generation`] when this stream started.
+    generation: u64,
 }
 
 /// What a walsender sends: a pgoutput message (an `XLogData` payload),
@@ -1654,6 +1688,12 @@ impl SimReplicationStream {
     pub fn cursor_lsn(&self) -> Lsn {
         self.cursor_lsn
     }
+
+    /// Whether this stream's walsender was terminated since it started
+    /// (see [`SimPostgres::terminate_walsenders`]).
+    pub fn is_terminated(&self) -> bool {
+        self.db.state.lock().unwrap().walsender_generation != self.generation
+    }
 }
 
 /// Wraps a `SimReplicationStream` so it satisfies the
@@ -1684,6 +1724,9 @@ impl pg2iceberg_pg::ReplicationStream for AsyncSimStream {
     async fn recv(
         &mut self,
     ) -> std::result::Result<pg2iceberg_pg::DecodedMessage, pg2iceberg_pg::PgError> {
+        if self.inner.is_terminated() {
+            return Err(terminated());
+        }
         match self.inner.recv() {
             Some(msg) => Ok(msg),
             None => {
@@ -1702,9 +1745,20 @@ impl pg2iceberg_pg::ReplicationStream for AsyncSimStream {
         flushed: Lsn,
         _applied: Lsn,
     ) -> std::result::Result<(), pg2iceberg_pg::PgError> {
+        if self.inner.is_terminated() {
+            return Err(terminated());
+        }
         self.inner.send_standby(flushed);
         Ok(())
     }
+}
+
+/// What the client of a terminated walsender reads: the server's FATAL,
+/// then a closed connection.
+fn terminated() -> pg2iceberg_pg::PgError {
+    pg2iceberg_pg::PgError::Connection(
+        "FATAL: terminating connection due to administrator command".into(),
+    )
 }
 
 #[async_trait]

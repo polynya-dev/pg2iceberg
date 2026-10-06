@@ -782,14 +782,11 @@ async fn drop_slot_rejects_active_slot() {
 }
 
 #[tokio::test]
-async fn slot_health_hangs_on_streaming_connection_needs_dedicated() {
-    // Regression for the watcher-hang bug: the lifecycle's slot-health
-    // watcher must run on a connection SEPARATE from the one
-    // `start_replication` puts into COPY-BOTH streaming mode. On the
-    // streaming connection, a normal `slot_health` query queues behind
-    // the never-ending copy stream and hangs forever — which froze the
-    // whole main loop one tick after snapshot (see
-    // `pg2iceberg::setup`'s dedicated `slot_monitor` connection).
+async fn client_stays_usable_while_it_streams() {
+    // `start_replication` streams on a connection of its own, so the
+    // client's own stays free for queries — the lifecycle's slot-health
+    // watcher runs on it. On one connection a query would queue behind
+    // the endless COPY BOTH and hang, stalling the main loop and CDC.
     let pg = shared_pg().await;
     let regular = regular_client(&pg.dsn).await;
 
@@ -807,42 +804,140 @@ async fn slot_health_hangs_on_streaming_connection_needs_dedicated() {
         name: table.clone(),
     };
 
-    // The streaming client: publication + slot + START_REPLICATION.
-    let streamer = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+    let client = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
         .await
-        .expect("streamer connect");
-    streamer
+        .expect("connect");
+    client
         .create_publication(&pubname, std::slice::from_ref(&ident))
         .await
         .expect("publication");
-    let cp = streamer.create_slot(&slot).await.expect("slot");
-    let _stream = streamer
+    let cp = client.create_slot(&slot).await.expect("slot");
+    let _stream = client
         .start_replication(&slot, cp, &pubname)
         .await
         .expect("start_replication");
 
-    // slot_health on the SAME (now COPY-BOTH) connection must hang: the
-    // query can't make progress behind the active copy stream. This is
-    // the exact failure that stalled the watcher (and thus CDC).
-    let on_streaming =
-        tokio::time::timeout(Duration::from_secs(3), streamer.slot_health(&slot)).await;
-    assert!(
-        on_streaming.is_err(),
-        "slot_health on the streaming (COPY-BOTH) connection must hang — \
-         that's why the watcher needs a dedicated connection"
-    );
+    let health = tokio::time::timeout(Duration::from_secs(10), client.slot_health(&slot))
+        .await
+        .expect("slot_health on the streaming client must not hang")
+        .expect("slot_health query ok")
+        .expect("the slot exists");
+    assert!(health.exists);
+}
 
-    // slot_health on a DEDICATED connection completes promptly — this is
-    // what the fix wires up for the watcher.
-    let monitor = PgClientImpl::connect_with(&pg.dsn, TlsMode::Disable)
+/// Terminate every backend connected with `application_name = app`,
+/// waiting for each to exit, as a Postgres restart or failover would
+/// (or an operator's `pg_terminate_backend`). Returns how many.
+async fn terminate_backends(regular: &tokio_postgres::Client, app: &str) -> i64 {
+    let row = regular
+        .query_one(
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, 10000)) \
+             FROM pg_stat_activity WHERE application_name = $1",
+            &[&app],
+        )
         .await
-        .expect("monitor connect");
-    let health = tokio::time::timeout(Duration::from_secs(10), monitor.slot_health(&slot))
+        .expect("terminate backends");
+    row.get(0)
+}
+
+/// Postgres dropping the connections — the stream's and the client's
+/// own — ends the stream with an error. `start_replication` on the same
+/// client then streams again, from where the slot was acked, and the
+/// client's queries reconnect too.
+#[tokio::test]
+async fn start_replication_resumes_after_the_connections_are_dropped() {
+    let pg = shared_pg().await;
+    let regular = regular_client(&pg.dsn).await;
+
+    let table = format!("rc_{}", uniq());
+    let pubname = format!("rcp_{}", uniq());
+    let slot = format!("rcs_{}", uniq());
+    let app = format!("rca_{}", uniq());
+    regular
+        .batch_execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY)"))
         .await
-        .expect("dedicated-connection slot_health must not hang")
-        .expect("slot_health query ok");
-    assert!(
-        health.is_some(),
-        "the slot exists, so a dedicated-connection probe returns its health"
+        .expect("create table");
+    let ident = TableIdent {
+        namespace: Namespace(vec!["public".into()]),
+        name: table.clone(),
+    };
+
+    let client = PgClientImpl::connect_with(
+        &format!("{} application_name={app}", pg.dsn),
+        TlsMode::Disable,
+    )
+    .await
+    .expect("connect");
+    client
+        .create_publication(&pubname, std::slice::from_ref(&ident))
+        .await
+        .expect("publication");
+    let cp = client.create_slot(&slot).await.expect("slot");
+    let mut stream = client
+        .start_replication(&slot, cp, &pubname)
+        .await
+        .expect("start_replication");
+
+    let insert = |id: i32| format!("INSERT INTO {table} (id) VALUES ({id})");
+    /// The ids inserted up to and including row `last`'s, and the LSN of
+    /// its transaction's commit.
+    async fn inserts_until(
+        stream: &mut Box<dyn pg2iceberg_pg::ReplicationStream>,
+        table: &str,
+        last: i32,
+    ) -> (Vec<i32>, pg2iceberg_core::Lsn) {
+        let mut ids = Vec::new();
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(15), stream.recv())
+                .await
+                .expect("recv deadline")
+                .expect("stream error");
+            match msg {
+                DecodedMessage::Change(ev) if ev.op == Op::Insert && ev.table.name == table => {
+                    match ev.after.unwrap().get(&ColumnName("id".into())) {
+                        Some(PgValue::Int4(id)) => ids.push(*id),
+                        other => panic!("unexpected id {other:?}"),
+                    }
+                }
+                DecodedMessage::Commit { commit_lsn, .. } if ids.last() == Some(&last) => {
+                    return (ids, commit_lsn)
+                }
+                _ => {}
+            }
+        }
+    }
+    regular.batch_execute(&insert(1)).await.expect("insert 1");
+    let (ids, acked) = inserts_until(&mut stream, &table, 1).await;
+    assert_eq!(ids, [1]);
+    stream.send_standby(acked, acked).await.expect("ack");
+
+    assert_eq!(
+        terminate_backends(&regular, &app).await,
+        2,
+        "the stream's and the client's"
     );
+    loop {
+        match tokio::time::timeout(Duration::from_secs(15), stream.recv()).await {
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => break,
+            Err(_) => panic!("the stream outlived its connection"),
+        }
+    }
+    drop(stream);
+
+    regular.batch_execute(&insert(2)).await.expect("insert 2");
+    let mut stream = client
+        .start_replication(&slot, acked, &pubname)
+        .await
+        .expect("start_replication again");
+    // Postgres sends the transaction committed at the start position
+    // again (see `replication_start_lsn`), then what followed.
+    let (ids, _) = inserts_until(&mut stream, &table, 2).await;
+    assert!(ids == [2] || ids == [1, 2], "{ids:?}");
+
+    // The client's own connection went too: the first query may fail
+    // with it, the next runs on a new one.
+    if client.slot_exists(&slot).await.is_err() {
+        assert!(client.slot_exists(&slot).await.expect("reconnected"));
+    }
 }

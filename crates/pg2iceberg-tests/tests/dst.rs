@@ -404,6 +404,11 @@ enum Step {
     /// staged-but-unclaimed objects are lost; the slot replays from
     /// `restart_lsn`.
     CrashMidStream,
+    /// The replication connection drops (Postgres restarts, the network
+    /// cuts it, the walsender is terminated) and the lifecycle reopens
+    /// the stream in-process: the pipeline's session is reset, the rest
+    /// of it — and everything else — carries on.
+    Reconnect,
     /// Drive replication + flush + ack: a complete pipeline cycle.
     DriveFlush,
     /// Run one materializer cycle for every registered table.
@@ -492,6 +497,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => Just(Step::FlushTick),
         1 => Just(Step::DriveFlushWithoutAck),
         1 => Just(Step::CrashMidStream),
+        1 => Just(Step::Reconnect),
         3 => Just(Step::DriveFlush),
         2 => Just(Step::MaterializerCycle),
         1 => Just(Step::CrashAndRestart),
@@ -1489,6 +1495,16 @@ impl DstHarness {
     /// the lifecycle does.
     fn crash_mid_stream(&mut self) {
         self.pipeline = new_pipeline(&self.coord, &self.blob_store, &self.namer);
+        self.restart_stream();
+    }
+
+    /// What the lifecycle does when the stream fails (`reopen_stream`).
+    fn reconnect(&mut self) {
+        self.pipeline.reset_session();
+        self.restart_stream();
+    }
+
+    fn restart_stream(&mut self) {
         let start = block_on(replication_start_lsn(&*self.coord, None)).unwrap();
         self.stream = self.db.start_replication_at(SLOT, start).unwrap();
         #[cfg(feature = "integration")]
@@ -1615,6 +1631,7 @@ impl DstHarness {
                 self.crash_mid_stream();
             }
             Step::CrashMidStream => self.crash_mid_stream(),
+            Step::Reconnect => self.reconnect(),
             Step::RestartMaterializer => self.restart_materializer(),
             Step::Compact => self.compact(),
             Step::BackfillChunk => self.backfill_chunk(),
@@ -2903,6 +2920,92 @@ fn pipeline_crash_mid_transaction_keeps_it_atomic() {
             panic!("after {step:?}: {e}");
         }
     }
+}
+
+/// The replication connection dropping partway through a large
+/// transaction: the reopened stream sends it again from its Begin, and
+/// none of the first copy — chunks already staged included — may be
+/// claimed with it.
+#[test]
+fn reconnect_mid_transaction_keeps_it_atomic() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 0 },
+        Step::BigTx { inserts: 6, qty: 0 },
+        // Begin, Relation, Insert, Commit, then far enough into the big
+        // transaction that a chunk of it is staged.
+        Step::DrivePartial { n: 10 },
+        Step::Reconnect,
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// The connection drops after a re-added column's Relation arrived but
+/// before it was staged. The reopened stream sends the Relation again;
+/// were it taken for the one already seen, pg2iceberg would never learn
+/// of the re-add, and row 3 would get back its dropped value.
+#[test]
+fn reconnect_keeps_a_relation_not_yet_staged() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 3, qty: 30 },
+        Step::DropNote,
+        Step::Update { id: 1, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::AddNote,
+        Step::Insert { id: 2, qty: 40 },
+        // Begin, Relation, Insert, Commit: buffered, not yet staged.
+        Step::DrivePartial { n: 4 },
+        Step::Reconnect,
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A keepalive received before the connection dropped vouches for the
+/// transactions buffered before it — which the reset discards. Kept, it
+/// would let the first flush after the reconnect, of only part of their
+/// replay, claim and ack past the rest: lost to the next crash.
+#[test]
+fn reconnect_forgets_keepalives_from_the_old_stream() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::DriveFlush,
+        Step::Insert { id: 2, qty: 20 },
+        Step::Insert { id: 3, qty: 30 },
+        Step::UnpublishedWrite { qty: 0 },
+        // Both transactions, then the keepalive past them.
+        Step::DrivePartial { n: 7 },
+        Step::Reconnect,
+        // Row 2's transaction again, with the Relation a new stream sends.
+        Step::DrivePartial { n: 4 },
+        Step::FlushTick,
+        Step::CrashMidStream,
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
 }
 
 /// A compaction commit that applied but reported failure must not leave

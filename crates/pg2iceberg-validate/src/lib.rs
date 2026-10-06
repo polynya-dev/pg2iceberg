@@ -17,7 +17,7 @@ pub mod watcher;
 pub use runtime::{
     drain_and_shutdown, run_logical_lifecycle, run_logical_main_loop, run_materialize_tick,
     run_watcher_tick, LifecycleError, LogicalLifecycle, LogicalLoop, MainLoopError,
-    MaterializeTickOutcome, SnapshotSourceFactory, SnapshotSourceFactoryFut,
+    MaterializeTickOutcome, SnapshotSourceFactory, SnapshotSourceFactoryFut, RECONNECT_ATTEMPTS,
 };
 pub use watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
 

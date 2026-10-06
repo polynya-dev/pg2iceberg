@@ -5,18 +5,18 @@
 //! protocol — enough for the catalog-style queries we need
 //! (`CREATE PUBLICATION`, slot CRUD, `pg_export_snapshot`) plus the
 //! `START_REPLICATION` / `CREATE_REPLICATION_SLOT` replication commands
-//! that aren't available in regular mode. Following Supabase etl's
-//! design, we keep a single replication-mode connection per pipeline
-//! rather than juggling two clients.
+//! that aren't available in regular mode.
 //!
 //! # Connection lifetime
 //!
 //! `tokio-postgres` returns the `Connection` future separately from the
-//! `Client`. We spawn the connection on a tokio task and store its
-//! `AbortHandle` so dropping the [`PgClientImpl`] also tears down the
-//! background task. If the connection errors, the next operation on
-//! the client surfaces that error — we don't try to surface mid-call
-//! disconnects through a side channel today.
+//! `Client`. We spawn the connection on a tokio task and abort it when
+//! the connection is dropped. A [`PgClientImpl`] keeps one connection
+//! for its queries, reopened on next use once it has closed (Postgres
+//! restarted, the network dropped it): the operation in flight fails,
+//! the next one runs on a new connection. Each `start_replication`
+//! opens a connection of its own, which the stream owns — `COPY BOTH`
+//! takes a connection over for good.
 
 use crate::prod::tls::{build_rustls_connector, TlsMode};
 use crate::prod::typemap::Domain;
@@ -27,46 +27,37 @@ use async_trait::async_trait;
 use pg2iceberg_core::{Lsn, TableIdent};
 use postgres_replication::LogicalReplicationStream;
 use std::collections::HashMap;
+use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 use tokio::task::AbortHandle;
 use tokio_postgres::{config::ReplicationMode, Client, NoTls, SimpleQueryMessage};
 
-/// Owns a `tokio_postgres::Client` configured for logical replication
-/// plus the abort handle of the background connection task.
+/// A `tokio_postgres` client in logical replication mode, on a
+/// connection reopened when it closes (see the module docs).
 pub struct PgClientImpl {
-    client: Client,
-    _conn_abort: AbortHandle,
+    conn: Mutex<Conn>,
+    config: tokio_postgres::Config,
+    tls: TlsMode,
 }
 
-impl PgClientImpl {
-    /// Connect to Postgres in **logical replication mode** with TLS
-    /// disabled. Convenience wrapper for tests / sample configs that
-    /// point at a local Postgres that doesn't require encryption.
-    /// Production-managed Postgres almost always wants `connect_with`
-    /// + `TlsMode::Webpki`.
-    pub async fn connect(conn_str: &str) -> Result<Self> {
-        Self::connect_with(conn_str, TlsMode::Disable).await
-    }
+/// A connection: its client, and the background task driving it,
+/// aborted when this is dropped.
+pub(crate) struct Conn {
+    client: Client,
+    task: AbortHandle,
+}
 
-    /// Connect with the configured [`TlsMode`]. The conn string follows
-    /// libpq URI/keyword format; the caller is responsible for setting
-    /// `dbname` (required by `START_REPLICATION`). Logical-replication
-    /// mode is added implicitly.
-    pub async fn connect_with(conn_str: &str, tls: TlsMode) -> Result<Self> {
-        let mut config: tokio_postgres::Config = conn_str
-            .parse()
-            .map_err(|e: tokio_postgres::Error| PgError::Connection(e.to_string()))?;
-        config.replication_mode(ReplicationMode::Logical);
-
+impl Conn {
+    async fn open(config: &tokio_postgres::Config, tls: TlsMode) -> Result<Self> {
         match tls {
-            TlsMode::Disable => Self::finish_connect(&config, NoTls).await,
+            TlsMode::Disable => Self::finish_open(config, NoTls).await,
             TlsMode::Webpki => {
                 let connector = build_rustls_connector()?;
-                Self::finish_connect(&config, connector).await
+                Self::finish_open(config, connector).await
             }
         }
     }
 
-    async fn finish_connect<T>(config: &tokio_postgres::Config, tls: T) -> Result<Self>
+    async fn finish_open<T>(config: &tokio_postgres::Config, tls: T) -> Result<Self>
     where
         T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket>
             + Clone
@@ -91,14 +82,53 @@ impl PgClientImpl {
 
         Ok(Self {
             client,
-            _conn_abort: handle.abort_handle(),
+            task: handle.abort_handle(),
         })
     }
 }
 
-impl Drop for PgClientImpl {
+impl Drop for Conn {
     fn drop(&mut self) {
-        self._conn_abort.abort();
+        self.task.abort();
+    }
+}
+
+impl PgClientImpl {
+    /// Connect to Postgres in **logical replication mode** with TLS
+    /// disabled. Convenience wrapper for tests / sample configs that
+    /// point at a local Postgres that doesn't require encryption.
+    /// Production-managed Postgres almost always wants `connect_with`
+    /// + `TlsMode::Webpki`.
+    pub async fn connect(conn_str: &str) -> Result<Self> {
+        Self::connect_with(conn_str, TlsMode::Disable).await
+    }
+
+    /// Connect with the configured [`TlsMode`]. The conn string follows
+    /// libpq URI/keyword format; the caller is responsible for setting
+    /// `dbname` (required by `START_REPLICATION`). Logical-replication
+    /// mode is added implicitly.
+    pub async fn connect_with(conn_str: &str, tls: TlsMode) -> Result<Self> {
+        let mut config: tokio_postgres::Config = conn_str
+            .parse()
+            .map_err(|e: tokio_postgres::Error| PgError::Connection(e.to_string()))?;
+        config.replication_mode(ReplicationMode::Logical);
+        let conn = Conn::open(&config, tls).await?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            config,
+            tls,
+        })
+    }
+
+    /// The client, on a new connection if the last one closed. A new
+    /// connection serves as well: the only state left on one is
+    /// `export_snapshot`'s transaction, which a closed one has lost.
+    async fn client(&self) -> Result<MappedMutexGuard<'_, Client>> {
+        let mut conn = self.conn.lock().await;
+        if conn.client.is_closed() {
+            *conn = Conn::open(&self.config, self.tls).await?;
+        }
+        Ok(MutexGuard::map(conn, |c| &mut c.client))
     }
 }
 
@@ -118,42 +148,45 @@ impl PgClientImpl {
         schema: &str,
         table: &str,
     ) -> Result<pg2iceberg_core::TableSchema> {
-        super::discover::discover_schema(&self.client, schema, table).await
+        super::discover::discover_schema(&*self.client().await?, schema, table).await
     }
 
     /// The source's domains, keyed by oid. pgoutput names a domain
     /// column's type by the domain's oid; the decoder types it as the
     /// domain's base type, as discovery does.
     pub async fn domains(&self) -> Result<HashMap<u32, Domain>> {
-        let rows = self
-            .client
-            .simple_query("SELECT oid, typbasetype, typtypmod FROM pg_type WHERE typtype = 'd'")
-            .await
-            .map_err(|e| PgError::Protocol(e.to_string()))?;
-        let mut out = HashMap::new();
-        for msg in rows {
-            if let SimpleQueryMessage::Row(row) = msg {
-                let field = |i: usize| -> Result<&str> {
-                    row.try_get(i)
-                        .map_err(|e| PgError::Protocol(e.to_string()))?
-                        .ok_or_else(|| PgError::Protocol("pg_type returned NULL".into()))
-                };
-                let parse = |i: usize| -> Result<i64> {
-                    let v = field(i)?;
-                    v.parse()
-                        .map_err(|e| PgError::Protocol(format!("parse pg_type value {v:?}: {e}")))
-                };
-                out.insert(
-                    parse(0)? as u32,
-                    Domain {
-                        base_oid: parse(1)? as u32,
-                        typmod: parse(2)? as i32,
-                    },
-                );
-            }
-        }
-        Ok(out)
+        domains(&*self.client().await?).await
     }
+}
+
+async fn domains(client: &Client) -> Result<HashMap<u32, Domain>> {
+    let rows = client
+        .simple_query("SELECT oid, typbasetype, typtypmod FROM pg_type WHERE typtype = 'd'")
+        .await
+        .map_err(|e| PgError::Protocol(e.to_string()))?;
+    let mut out = HashMap::new();
+    for msg in rows {
+        if let SimpleQueryMessage::Row(row) = msg {
+            let field = |i: usize| -> Result<&str> {
+                row.try_get(i)
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                    .ok_or_else(|| PgError::Protocol("pg_type returned NULL".into()))
+            };
+            let parse = |i: usize| -> Result<i64> {
+                let v = field(i)?;
+                v.parse()
+                    .map_err(|e| PgError::Protocol(format!("parse pg_type value {v:?}: {e}")))
+            };
+            out.insert(
+                parse(0)? as u32,
+                Domain {
+                    base_oid: parse(1)? as u32,
+                    typmod: parse(2)? as i32,
+                },
+            );
+        }
+    }
+    Ok(out)
 }
 
 #[async_trait]
@@ -197,7 +230,7 @@ impl PgClient for PgClientImpl {
             quote_ident(name),
             table_list
         );
-        simple_exec(&self.client, &q).await
+        simple_exec(&*self.client().await?, &q).await
     }
 
     async fn create_slot(&self, slot: &str) -> Result<Lsn> {
@@ -210,7 +243,8 @@ impl PgClient for PgClientImpl {
             quote_ident(slot)
         );
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query(&q)
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -238,7 +272,8 @@ impl PgClient for PgClientImpl {
             quote_lit(slot)
         );
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query(&q)
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -251,7 +286,8 @@ impl PgClient for PgClientImpl {
             quote_lit(slot)
         );
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query(&q)
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -275,7 +311,8 @@ impl PgClient for PgClientImpl {
             quote_lit(slot)
         );
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query(&q)
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -314,7 +351,8 @@ impl PgClient for PgClientImpl {
             quote_lit(slot)
         );
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query(&q)
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -371,7 +409,8 @@ impl PgClient for PgClientImpl {
             quote_lit(name),
         );
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query(&q)
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -401,7 +440,8 @@ impl PgClient for PgClientImpl {
             quote_lit(publication_name)
         );
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query(&q)
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -431,12 +471,12 @@ impl PgClient for PgClientImpl {
         // out the transaction when they no longer need the snapshot.
         // Today we leave it open implicitly — the snapshot stays valid
         // as long as this connection lives.
-        self.client
+        let client = self.client().await?;
+        client
             .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
-        let rows = self
-            .client
+        let rows = client
             .simple_query("SELECT pg_export_snapshot()")
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -462,7 +502,8 @@ impl PgClient for PgClientImpl {
         // xlogpos (text), dbname (text or NULL). systemid is the
         // 19-digit cluster fingerprint we want.
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query("IDENTIFY_SYSTEM")
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -486,7 +527,8 @@ impl PgClient for PgClientImpl {
         // `SHOW server_version_num` returns the encoded version string
         // (e.g. "160004" for PG 16.4). Available on every supported PG.
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query("SHOW server_version_num")
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -537,9 +579,12 @@ impl PgClient for PgClientImpl {
             format_lsn(start),
             opts
         );
-        // Before streaming takes over the connection.
-        let domains = self.domains().await?;
-        let copy_stream = self
+        // On a connection of its own, which the stream owns: streaming
+        // takes it over for good. When it ends — Postgres restarting,
+        // the network dropping it — calling this again reconnects.
+        let conn = Conn::open(&self.config, self.tls).await?;
+        let domains = domains(&conn.client).await?;
+        let copy_stream = conn
             .client
             .copy_both_simple::<bytes::Bytes>(&q)
             .await
@@ -547,6 +592,7 @@ impl PgClient for PgClientImpl {
         Ok(Box::new(super::ReplicationStreamImpl::wrap(
             LogicalReplicationStream::new(copy_stream),
             domains,
+            conn,
         )))
     }
 
@@ -561,7 +607,8 @@ impl PgClient for PgClientImpl {
             quote_lit(slot)
         );
         let rows = self
-            .client
+            .client()
+            .await?
             .simple_query(&probe)
             .await
             .map_err(|e| PgError::Protocol(e.to_string()))?;
@@ -590,12 +637,12 @@ impl PgClient for PgClientImpl {
             )));
         }
         let q = format!("SELECT pg_drop_replication_slot({})", quote_lit(slot));
-        simple_exec(&self.client, &q).await
+        simple_exec(&*self.client().await?, &q).await
     }
 
     async fn drop_publication(&self, name: &str) -> Result<()> {
         let q = format!("DROP PUBLICATION IF EXISTS {}", quote_ident(name));
-        simple_exec(&self.client, &q).await
+        simple_exec(&*self.client().await?, &q).await
     }
 
     async fn alter_publication_add_table(&self, name: &str, ident: &TableIdent) -> Result<()> {
@@ -613,7 +660,7 @@ impl PgClient for PgClientImpl {
             quote_ident(name),
             qualified
         );
-        match simple_exec(&self.client, &q).await {
+        match simple_exec(&*self.client().await?, &q).await {
             Ok(()) => Ok(()),
             // Idempotency: PG raises SQLSTATE 42710 ("relation … is
             // already member of publication") when the table is

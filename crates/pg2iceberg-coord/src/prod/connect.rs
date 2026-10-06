@@ -39,6 +39,16 @@ impl TlsMode {
 pub struct PgConn {
     pub client: Client,
     pub abort: AbortHandle,
+    /// What it connected with, to [`Self::reopen`] it.
+    conn_str: String,
+    tls: TlsMode,
+}
+
+impl PgConn {
+    /// A new connection to the same server.
+    pub async fn reopen(&self) -> Result<PgConn, CoordError> {
+        connect_with(&self.conn_str, self.tls).await
+    }
 }
 
 /// Backwards-compatible NoTls connect, kept for callers that don't
@@ -51,15 +61,15 @@ pub async fn connect(conn_str: &str) -> Result<PgConn, CoordError> {
 /// the configured [`TlsMode`].
 pub async fn connect_with(conn_str: &str, tls: TlsMode) -> Result<PgConn, CoordError> {
     match tls {
-        TlsMode::Disable => finish(conn_str, NoTls).await,
+        TlsMode::Disable => finish(conn_str, tls, NoTls).await,
         TlsMode::Webpki => {
             let connector = build_rustls_connector()?;
-            finish(conn_str, connector).await
+            finish(conn_str, tls, connector).await
         }
     }
 }
 
-async fn finish<T>(conn_str: &str, tls: T) -> Result<PgConn, CoordError>
+async fn finish<T>(conn_str: &str, mode: TlsMode, tls: T) -> Result<PgConn, CoordError>
 where
     T: tokio_postgres::tls::MakeTlsConnect<tokio_postgres::Socket> + Send + 'static,
     T::Stream: Send,
@@ -75,6 +85,8 @@ where
     Ok(PgConn {
         client,
         abort: handle.abort_handle(),
+        conn_str: conn_str.to_string(),
+        tls: mode,
     })
 }
 

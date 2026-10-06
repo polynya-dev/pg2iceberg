@@ -32,11 +32,12 @@ use pg2iceberg_logical::{
     runner::{Handler, Schedule, Ticker},
     Materializer, MaterializerError, Pipeline, PipelineError,
 };
-use pg2iceberg_pg::{PgClient, ReplicationStream, SlotMonitor};
+use pg2iceberg_pg::{DecodedMessage, PgClient, PgError, ReplicationStream, SlotMonitor};
 use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome, SnapshotSource};
 use pg2iceberg_stream::BlobStore;
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -697,6 +698,9 @@ where
         pipeline,
         materializer,
         stream,
+        pg: Arc::clone(&lc.pg),
+        publication_name: lc.publication_name,
+        snapshot_lsn: snap_lsn,
         coord: Arc::clone(&lc.coord),
         slot_monitor,
         watcher,
@@ -808,6 +812,13 @@ pub struct LogicalLoop<C: Coordinator + ?Sized + 'static, Cat: Catalog + 'static
     pub pipeline: Pipeline<C>,
     pub materializer: Materializer<Cat>,
     pub stream: Box<dyn ReplicationStream>,
+    /// Source PG, to reopen `stream` when it drops (see
+    /// [`run_logical_main_loop`]).
+    pub pg: Arc<dyn PgClient>,
+    pub publication_name: String,
+    /// The snapshot LSN `stream` started at, if the snapshot phase just
+    /// ran: a reopened stream starts past it too.
+    pub snapshot_lsn: Option<Lsn>,
     pub coord: Arc<dyn Coordinator>,
     pub slot_monitor: Arc<dyn SlotMonitor>,
     pub watcher: InvariantWatcher,
@@ -847,9 +858,12 @@ pub struct PendingSnapshotMsg {
 ///
 /// 1. `select!` on shutdown / replication recv / next-tick sleep.
 /// 2. On replication event → [`Pipeline::process`].
-/// 3. On tick → fire due handlers via [`run_materialize_tick`] /
+/// 3. On a replication error — Postgres restarted, the network dropped
+///    the connection, the walsender was terminated — reopen the stream
+///    (see [`reopen_stream`]).
+/// 4. On tick → fire due handlers via [`run_materialize_tick`] /
 ///    [`run_watcher_tick`] (the helpers the binary used to inline).
-/// 4. On shutdown → final flush + send_standby.
+/// 5. On shutdown → final flush + send_standby.
 ///
 /// **Why this is a library function:** the production binary's
 /// `run_inner` used to inline this whole loop (~80 lines), which
@@ -866,6 +880,7 @@ where
     F: Future<Output = ()> + Unpin + Send,
 {
     let mut ticker = Ticker::new(loop_state.clock.now(), loop_state.schedule.clone());
+    let mut outage = Outage::default();
     tokio::pin!(shutdown);
 
     loop {
@@ -903,19 +918,17 @@ where
                     }
                 }
             }
-            res = loop_state.stream.recv() => {
-                let msg = res.map_err(|e| MainLoopError::Recv(e.to_string()))?;
-                // Relation messages too: the pipeline stages schema
-                // changes in order with the rows, and the materializer
-                // applies them there.
-                loop_state
-                    .pipeline
-                    .process(msg)
-                    .await
-                    .map_err(|e| MainLoopError::Process(e.to_string()))?;
-            }
+            res = loop_state.stream.recv() => match res {
+                Ok(msg) => process_message(&mut loop_state.pipeline, msg).await?,
+                Err(e) => {
+                    if !reopen_stream(&mut loop_state, &mut outage, e, shutdown.as_mut()).await? {
+                        break;
+                    }
+                }
+            },
             _ = tokio::time::sleep(tick_sleep) => {}
         }
+        outage.end_if_stable(loop_state.clock.now());
 
         // Blue-green marker fast-path. When the pipeline observes a
         // marker INSERT in a committed tx, drive flush + materialize
@@ -938,6 +951,145 @@ where
     }
 
     drain_and_shutdown(loop_state).await
+}
+
+async fn process_message<C: Coordinator + ?Sized>(
+    pipeline: &mut Pipeline<C>,
+    msg: DecodedMessage,
+) -> Result<(), MainLoopError> {
+    // Relation messages too: the pipeline stages schema changes in order
+    // with the rows, and the materializer applies them there.
+    pipeline
+        .process(msg)
+        .await
+        .map_err(|e| MainLoopError::Process(e.to_string()))
+}
+
+/// Attempts to reopen a dropped replication stream before giving up.
+/// With [`reconnect_delay`]'s backoff they span about two and a half
+/// minutes: past `wal_sender_timeout`'s default of 60s, about how long a
+/// dead connection's walsender can hold the slot against the new one.
+pub const RECONNECT_ATTEMPTS: u32 = 10;
+
+/// A reopened stream that stays up this long ends the outage: the next
+/// drop starts a fresh budget of [`RECONNECT_ATTEMPTS`]. One that fails
+/// sooner — on a message that can't be decoded, say — keeps counting,
+/// so a persistent error still stops the process.
+const RECONNECT_STABLE: Duration = Duration::from_secs(60);
+
+/// Wait before reconnect attempt `attempt` (from 1): 0.5s, doubling, at
+/// most 30s.
+fn reconnect_delay(attempt: u32) -> Duration {
+    let backoff = Duration::from_millis(500) * 2u32.pow(attempt.saturating_sub(1).min(6));
+    backoff.min(Duration::from_secs(30))
+}
+
+/// The main loop's record of a replication outage.
+#[derive(Default)]
+struct Outage {
+    /// Reconnect attempts since the stream last stayed up for
+    /// [`RECONNECT_STABLE`].
+    attempts: u32,
+    /// When the stream was last reopened, until it has stayed up.
+    reopened_at: Option<Timestamp>,
+}
+
+impl Outage {
+    fn end_if_stable(&mut self, now: Timestamp) {
+        if let Some(at) = self.reopened_at {
+            if now.0.saturating_sub(at.0) >= RECONNECT_STABLE.as_micros() as i64 {
+                *self = Self::default();
+            }
+        }
+    }
+}
+
+/// Reopen a replication stream that failed with `cause`, as a restart
+/// would — the pipeline's session reset, the stream started at
+/// [`replication_start_lsn`] — but keeping everything else: the
+/// materializer and its FileIndex, the watcher, a background snapshot.
+/// Backs off between attempts and gives up after [`RECONNECT_ATTEMPTS`]
+/// in one outage. Returns `false` if `shutdown` resolved first.
+async fn reopen_stream<C, Cat, F>(
+    loop_state: &mut LogicalLoop<C, Cat>,
+    outage: &mut Outage,
+    cause: PgError,
+    mut shutdown: Pin<&mut F>,
+) -> Result<bool, MainLoopError>
+where
+    C: Coordinator + ?Sized + 'static,
+    Cat: Catalog + 'static,
+    F: Future<Output = ()>,
+{
+    tracing::warn!(error = %cause, "replication stream lost; reconnecting");
+    let mut cause = cause.to_string();
+    // Drop the old stream, and with it its connection, first: if that is
+    // still up (the stream failed on a message, not the connection), its
+    // walsender holds the slot against the new one.
+    loop_state.stream = Box::new(Disconnected);
+    loop_state.pipeline.reset_session();
+    loop {
+        if outage.attempts == RECONNECT_ATTEMPTS {
+            return Err(MainLoopError::Recv(format!(
+                "{cause} (gave up after {RECONNECT_ATTEMPTS} reconnect attempts)"
+            )));
+        }
+        outage.attempts += 1;
+        tokio::select! {
+            biased;
+            _ = shutdown.as_mut() => return Ok(false),
+            _ = tokio::time::sleep(reconnect_delay(outage.attempts)) => {}
+        }
+        match open_stream(loop_state).await {
+            Ok(stream) => {
+                loop_state.stream = stream;
+                outage.reopened_at = Some(loop_state.clock.now());
+                tracing::info!(attempt = outage.attempts, "replication stream reopened");
+                return Ok(true);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempt = outage.attempts, "replication reconnect failed");
+                cause = e;
+            }
+        }
+    }
+}
+
+async fn open_stream<C, Cat>(
+    loop_state: &LogicalLoop<C, Cat>,
+) -> Result<Box<dyn ReplicationStream>, String>
+where
+    C: Coordinator + ?Sized + 'static,
+    Cat: Catalog + 'static,
+{
+    let start = replication_start_lsn(&*loop_state.coord, loop_state.snapshot_lsn)
+        .await
+        .map_err(|e| e.to_string())?;
+    loop_state
+        .pg
+        .start_replication(&loop_state.slot_name, start, &loop_state.publication_name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The stream while it's being reopened. Only a shutdown during the
+/// reconnect sees it: the drain's final ack fails, as on the dead
+/// stream.
+struct Disconnected;
+
+#[async_trait::async_trait]
+impl ReplicationStream for Disconnected {
+    async fn recv(&mut self) -> pg2iceberg_pg::Result<DecodedMessage> {
+        Err(PgError::Connection(
+            "replication stream not connected".into(),
+        ))
+    }
+
+    async fn send_standby(&mut self, _flushed: Lsn, _applied: Lsn) -> pg2iceberg_pg::Result<()> {
+        Err(PgError::Connection(
+            "replication stream not connected".into(),
+        ))
+    }
 }
 
 /// Dispatch one Handler arm. Pure function — no select loop, no
