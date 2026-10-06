@@ -24,7 +24,7 @@ thiserror.workspace = true
 
 # iceberg-rust prod-impl wrap. Heavy transitive deps (reqwest, opendal,
 # arrow) but most of those are already in our graph from parquet.
-iceberg = { version = "0.9", optional = true }
+iceberg = { version = "0.10", optional = true }
 # Used by the vended-credentials S3 router (`prod::vended`) to construct
 # per-table object stores from catalog-vended creds.
 object_store = { version = "0.11", optional = true, default-features = false, features = ["aws"] }

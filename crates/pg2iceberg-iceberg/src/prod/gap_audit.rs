@@ -9,7 +9,8 @@
 //! create_table              → iceberg::Catalog::create_table                   ✅ wired
 //! commit_snapshot (append)  → iceberg::transaction::Transaction::fast_append   ✅ wired
 //! commit_snapshot (deletes) → fork-patched FastAppendAction routes by type     ✅ wired (via fork)
-//! evolve_schema             → iceberg::transaction::Transaction::update_schema ✅ wired (via fork)
+//! evolve_schema             → iceberg::transaction::Transaction::replace_schema ✅ wired (via fork)
+//! commit_compaction         → fork's Transaction::rewrite_files                ✅ wired (via fork)
 //! snapshots                 → table.metadata().snapshots() + manifest walk     ✅ wired
 //! ```
 //!
@@ -19,26 +20,32 @@
 //! ## We're on a patched fork of iceberg-rust
 //!
 //! The workspace `Cargo.toml` pins `iceberg` to
-//! `polynya-dev/iceberg-rust` (branch `polynya-patches`), based on
-//! upstream `v0.9.0`. The fork carries three non-invasive patches:
+//! `polynya-dev/iceberg-rust` (branch `polynya-patches-v0.10.1`), based on
+//! upstream `v0.10.1`. The fork's patches:
 //!
 //! 1. **`TransactionAction` visibility.** The trait (and
 //!    `BoxedTransactionAction`) flipped from `pub(crate)` to `pub`. Lets
 //!    downstream crates author custom transaction actions.
-//! 2. **`UpdateSchemaAction`.** Takes a target `Schema`, emits
+//! 2. **`ReplaceSchemaAction`.** Takes a target `Schema`, emits
 //!    `TableUpdate::AddSchema` + `TableUpdate::SetCurrentSchema(-1)` plus
 //!    `UuidMatch` / `CurrentSchemaIdMatch` / `LastAssignedFieldIdMatch`
-//!    requirements. Wrapped by a `Transaction::update_schema()`
-//!    convenience method matching upstream conventions.
+//!    requirements, via `Transaction::replace_schema()`. (Upstream's
+//!    `UpdateSchemaAction` evolves a schema column by column and can't
+//!    rename, promote or make a column optional.)
 //! 3. **`FastAppendAction` accepts mixed content types.** Files passed to
 //!    `add_data_files` are routed by `content_type()` into
 //!    `added_data_files` (Data) or `added_delete_files`
 //!    (EqualityDeletes / PositionDeletes). `SnapshotProducer` writes them
-//!    to separate manifests (`build_v{2,3}_data` vs
-//!    `build_v{2,3}_deletes`) per Iceberg-spec rules. The old
-//!    "Only data content type is allowed for fast append" check is gone.
+//!    to separate manifests per Iceberg-spec rules.
+//! 4. **`RewriteFilesAction`** for compaction: one `Replace` snapshot that
+//!    removes files by path and adds outputs at an explicit data sequence
+//!    number, fails if a removed file is already gone, and keeps the
+//!    summary's running totals.
+//! 5. **`Table::properties()`**: the REST `loadTable` response's `config`
+//!    (vended credentials).
+//! 6. **SigV4 request signing** for the REST catalog.
 //!
-//! All three are intended to be upstreamed as separate PRs; once they
+//! All are intended to be upstreamed as separate PRs; once they
 //! land we drop the fork and pin to a fresh crates.io release.
 //!
 //! ## Schema evolution wiring
@@ -52,7 +59,7 @@
 //!    catalog) — `AddColumn` appends with `field_id = max + 1`,
 //!    `DropColumn` is a soft drop that flips `nullable = true`.
 //! 3. Translating the evolved `TableSchema` back to an iceberg `Schema`
-//!    and submitting it via `Transaction::update_schema()` from the fork.
+//!    and submitting it via `Transaction::replace_schema()` from the fork.
 //!
 //! Both catalogs share `apply_schema_changes`, so the two backends never
 //! drift on field-id allocation or soft-drop semantics. The
