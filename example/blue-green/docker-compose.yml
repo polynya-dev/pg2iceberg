@@ -119,7 +119,7 @@ services:
 
   iceberg-rest:
     # Reuse the same REST catalog image as the single example.
-    build: ../../../single/iceberg-rest
+    build: ../single/iceberg-rest
     environment:
       AWS_ACCESS_KEY_ID: admin
       AWS_SECRET_ACCESS_KEY: password

@@ -220,6 +220,7 @@ Any catalog implementing the [Iceberg REST Catalog spec](https://iceberg.apache.
 ```sh
 cd example/single
 docker compose up -d --wait
+docker compose --profile workload up -d workload
 ```
 
 Open `http://localhost:8123/play` and run:
@@ -228,7 +229,9 @@ Open `http://localhost:8123/play` and run:
 SELECT * FROM rideshare.`rideshare.rides`
 ```
 
-You should see new rows appearing as the simulator drives PG.
+You should see new rows appearing as the workload drives PG.
+
+`./run.sh` in the same directory runs it as a smoke test: the mixed workload — deletes, large and rolled-back transactions, key changes, TOAST, schema changes — with a crash, external compactions and snapshot expiry alongside, then a row-by-row comparison of Postgres with ClickHouse. See [`example/single`](example/single).
 
 ## Configuration
 

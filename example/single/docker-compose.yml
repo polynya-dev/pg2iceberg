@@ -1,3 +1,6 @@
+# Postgres -> pg2iceberg -> Iceberg REST catalog + MinIO, with ClickHouse to
+# query the tables and a mixed workload to drive Postgres. See README.md.
+name: pg2iceberg-single
 services:
   postgres:
     image: postgres:16-alpine
@@ -5,47 +8,37 @@ services:
       POSTGRES_DB: rideshare
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    ports:
-      - "5502:5432"
+    ports: ["5502:5432"]
     volumes:
       - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
-      - pgdata:/var/lib/postgresql/data
+      - ./setup.sql:/docker-entrypoint-initdb.d/03-setup.sql
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rideshare"]
       interval: 2s
       timeout: 5s
-      retries: 10
+      retries: 30
 
   minio:
-    # minio/minio + minio/mc are no longer on Docker Hub; pgsty/* is a
-    # community-maintained drop-in fork (same binaries and entrypoints).
     image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
-    command: server /data --console-address ":9001"
+    command: server /data
     environment:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: password
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    ports: ["9000:9000"]
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 2s
       timeout: 5s
-      retries: 5
+      retries: 15
 
   create-bucket:
     image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
-      minio:
-        condition: service_healthy
+      minio: {condition: service_healthy}
     entrypoint: >
-      /bin/sh -c "
-      mc alias set myminio http://minio:9000 admin password;
-      mc mb --ignore-existing myminio/warehouse;
-      exit 0;
-      "
+      /bin/sh -c "mc alias set m http://minio:9000 admin password && mc mb --ignore-existing m/warehouse"
 
   iceberg-postgres:
     image: postgres:16-alpine
@@ -57,7 +50,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U iceberg"]
       interval: 2s
       timeout: 5s
-      retries: 10
+      retries: 15
 
   iceberg-rest:
     build: ./iceberg-rest
@@ -73,50 +66,32 @@ services:
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
-    ports:
-      - "8181:8181"
+    ports: ["8181:8181"]
     depends_on:
-      iceberg-postgres:
-        condition: service_healthy
-      create-bucket:
-        condition: service_completed_successfully
+      iceberg-postgres: {condition: service_healthy}
+      create-bucket: {condition: service_completed_successfully}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8181/v1/config || exit 1"]
       interval: 3s
       timeout: 5s
-      retries: 10
+      retries: 30
 
   pg2iceberg:
     build:
       context: ../..
       dockerfile: Dockerfile
-    # Dockerfile's ENTRYPOINT is the binary; pass the subcommand here.
-    # Config is sourced from environment variables (see below); no
-    # `--config` file needed for this example.
     command: ["run", "--config", "/etc/pg2iceberg/config.yaml"]
+    environment:
+      RUST_LOG: info
     volumes:
       - ./config.yaml:/etc/pg2iceberg/config.yaml:ro
-    environment:
-      POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/rideshare
-      TABLES: public.riders,public.drivers,public.rides,public.payments,public.ratings
-      ICEBERG_CATALOG_URL: http://iceberg-rest:8181
-      WAREHOUSE: s3://warehouse/
-      NAMESPACE: rideshare
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: admin
-      S3_SECRET_KEY: password
-    ports:
-      - "9091:9090"
     depends_on:
-      postgres:
-        condition: service_healthy
-      iceberg-rest:
-        condition: service_healthy
+      postgres: {condition: service_healthy}
+      iceberg-rest: {condition: service_healthy}
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.2
-    ports:
-      - "8123:8123"
+    image: clickhouse/clickhouse-server:26.8
+    ports: ["8123:8123"]
     environment:
       AWS_ACCESS_KEY_ID: admin
       AWS_SECRET_ACCESS_KEY: password
@@ -125,46 +100,16 @@ services:
       - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/iceberg.xml
       - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
     depends_on:
-      iceberg-rest:
-        condition: service_healthy
+      iceberg-rest: {condition: service_healthy}
 
-  prometheus:
-    image: prom/prometheus:v3.4.1
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-    ports:
-      - "9090:9090"
-    depends_on:
-      pg2iceberg:
-        condition: service_started
-
-  grafana:
-    image: grafana/grafana:11.6.0
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-    volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
-    ports:
-      - "3001:3000"
-    depends_on:
-      - prometheus
-
-  simulate:
+  workload:
     image: python:3.12-slim
-    depends_on:
-      postgres:
-        condition: service_healthy
+    profiles: ["workload"]
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/rideshare
+      DURATION: ${DURATION:-300}
     volumes:
       - ./simulate.py:/app/simulate.py
-      - ../../scripts/requirements.txt:/app/requirements.txt
+      - ./workload.py:/app/workload.py
     working_dir: /app
-    command: sh -c "pip install -q -r requirements.txt && python simulate.py --interval 5"
-
-volumes:
-  pgdata:
+    command: sh -c "pip install -q psycopg2-binary && python -u workload.py"

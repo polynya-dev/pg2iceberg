@@ -13,8 +13,6 @@ INSERT INTO e2e_mixed_ops (id, name, status) VALUES
     (4, 'diana', 'active'),
     (5, 'eve', 'active');
 
--- NOTE: ClickHouse 26.2 does not apply Iceberg equality deletes yet,
--- so the reference output includes both old and new rows for updates/deletes.
 UPDATE e2e_mixed_ops SET status = 'inactive' WHERE id IN (1, 3);
 DELETE FROM e2e_mixed_ops WHERE id = 5;
 INSERT INTO e2e_mixed_ops (id, name, status) VALUES (6, 'frank', 'active');
