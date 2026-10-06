@@ -130,6 +130,8 @@ pub struct CompactionOutcome {
     /// update its `FileIndex` without replaying the table. Bounded by the
     /// pass budget, like the rest of the pass.
     pub added_files: Vec<CompactedFile>,
+    /// The table's current snapshot after the pass's commit.
+    pub snapshot_id: Option<i64>,
 }
 
 /// One output file of a compaction pass.
@@ -341,7 +343,7 @@ where
             partition_values: f.partition_values.clone(),
         })
         .collect();
-    catalog
+    let committed = catalog
         .commit_compaction(PreparedCompaction {
             ident: ident.clone(),
             added_data_files: out.added,
@@ -361,6 +363,7 @@ where
         pending_files: plan.pending_files,
         rewritten_files: plan.inputs.into_iter().map(|(p, _)| p).collect(),
         added_files,
+        snapshot_id: committed.current_snapshot_id,
     }))
 }
 
@@ -583,6 +586,7 @@ mod tests {
             delete_files: deletes,
             removed_paths: removed.into_iter().map(String::from).collect(),
             timestamp_ms: id * 1000,
+            expired: false,
         }
     }
 

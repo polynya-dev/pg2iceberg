@@ -19,7 +19,7 @@ pub mod writer;
 pub use compact::{
     compact_table, CompactError, CompactedFile, CompactionConfig, CompactionOutcome,
 };
-pub use file_index::{rebuild_from_catalog, FileIndex};
+pub use file_index::{catch_up_from_catalog, rebuild_from_catalog, FileIndex};
 pub use fold::{fold_events, pk_key, MaterializedRow};
 pub use materialize::{promote_re_inserts, resolve_unchanged_cols};
 pub use orphan::{cleanup_orphans, CleanupError, CleanupOutcome};
@@ -132,6 +132,9 @@ pub struct Snapshot {
     /// `iceberg::spec::Snapshot::timestamp_ms()` in the prod path; the
     /// sim catalog populates it from its `Clock` source.
     pub timestamp_ms: i64,
+    /// A stand-in for an expired snapshot: only the files it added that
+    /// are still live, not what it removed (see [`Catalog::snapshots`]).
+    pub expired: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -473,7 +476,7 @@ pub trait Catalog: Send + Sync {
     /// its metadata, not the files it added, which stay live until a later
     /// snapshot removes them. Those files are reported under a stand-in
     /// snapshot per sequence number (`id` = the files' sequence number,
-    /// `timestamp_ms` = 0 when unknown).
+    /// `timestamp_ms` = 0 when unknown, `expired` set).
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>>;
 }
 
