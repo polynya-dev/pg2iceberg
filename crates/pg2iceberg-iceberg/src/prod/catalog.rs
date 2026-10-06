@@ -20,13 +20,13 @@
 //! See [`super::gap_audit`] for the full method-by-method status and the
 //! list of fork patches we depend on.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::spec::{
-    DataContentType, DataFile as IcebergDataFile, DataFileBuilder, DataFileFormat, Literal,
-    NestedField, PrimitiveLiteral, PrimitiveType, Schema as IcebergSchema, Struct, Type,
+    DataContentType, DataFile as IcebergDataFile, DataFileBuilder, DataFileFormat, FormatVersion,
+    Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema as IcebergSchema, Struct, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
@@ -128,10 +128,15 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         // called, so we have to choose at compile time which arm to
         // build. The `clone()` on `ice_schema` is the cost of avoiding
         // a more elaborate dynamic-build dance.
+        //
+        // Format v2, explicitly: what pg2iceberg writes and is tested
+        // against, and what every engine reads (v3 isn't yet — ClickHouse,
+        // open-source Trino).
         let creation = if schema.partition_spec.is_empty() {
             TableCreation::builder()
                 .name(schema.ident.name.clone())
                 .schema(ice_schema)
+                .format_version(FormatVersion::V2)
                 .build()
         } else {
             let unbound = to_iceberg_unbound_partition_spec(schema)?;
@@ -139,6 +144,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 .name(schema.ident.name.clone())
                 .schema(ice_schema)
                 .partition_spec(unbound)
+                .format_version(FormatVersion::V2)
                 .build()
         };
         let table = self
@@ -150,13 +156,15 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     }
 
     async fn commit_snapshot(&self, prepared: PreparedCommit) -> Result<TableMetadata> {
-        self.commit_snapshots(vec![prepared], None).await
+        self.commit_snapshots(vec![prepared], None, BTreeSet::new())
+            .await
     }
 
     async fn commit_snapshots(
         &self,
         steps: Vec<PreparedCommit>,
         log_range: Option<LogRange>,
+        remove_properties: BTreeSet<String>,
     ) -> Result<TableMetadata> {
         let ident = steps
             .first()
@@ -191,7 +199,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             // No work — match the sim-catalog noop semantics so the
             // materializer can flush "no data, no deletes" without a
             // snapshot bump.
-            0 => return metadata_from_table(&ident, &table),
+            0 if remove_properties.is_empty() => return metadata_from_table(&ident, &table),
+            0 => Ok(tx),
             1 => tx
                 .fast_append()
                 // The materializer guarantees unique file paths; skip
@@ -210,6 +219,17 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             .apply(tx),
         }
         .map_err(map_iceberg_err)?;
+        let tx = if remove_properties.is_empty() {
+            tx
+        } else {
+            remove_properties
+                .into_iter()
+                .fold(tx.update_table_properties(), |action, key| {
+                    action.remove(key)
+                })
+                .apply(tx)
+                .map_err(map_iceberg_err)?
+        };
         let updated = tx
             .commit(self.inner.as_ref())
             .await
@@ -334,8 +354,9 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         &self,
         ident: &TableIdent,
         changes: Vec<SchemaChange>,
+        set_properties: BTreeMap<String, String>,
     ) -> Result<TableMetadata> {
-        if changes.is_empty() {
+        if changes.is_empty() && set_properties.is_empty() {
             // Match the sim semantics: a no-op evolve still returns current
             // metadata rather than erroring.
             let it = to_iceberg_table_ident(ident)?;
@@ -356,9 +377,20 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         apply_schema_changes(&mut our_schema, &changes)?;
         let new_iceberg_schema = to_iceberg_schema(&our_schema)?;
 
-        let tx = Transaction::new(&table);
-        let action = tx.replace_schema().set_schema(new_iceberg_schema);
-        let tx = action.apply(tx).map_err(map_iceberg_err)?;
+        let mut tx = Transaction::new(&table);
+        if !changes.is_empty() {
+            let action = tx.replace_schema().set_schema(new_iceberg_schema);
+            tx = action.apply(tx).map_err(map_iceberg_err)?;
+        }
+        if !set_properties.is_empty() {
+            tx = set_properties
+                .into_iter()
+                .fold(tx.update_table_properties(), |action, (key, value)| {
+                    action.set(key, value)
+                })
+                .apply(tx)
+                .map_err(map_iceberg_err)?;
+        }
         let updated = tx
             .commit(self.inner.as_ref())
             .await
@@ -1020,6 +1052,12 @@ fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Res
         config,
         location: table.metadata().location().to_string(),
         log_ends: table_log_ends(table),
+        properties: table
+            .metadata()
+            .properties()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     })
 }
 
@@ -1880,6 +1918,7 @@ mod tests {
                     ty: IcebergType::String,
                     nullable: true,
                 }],
+                BTreeMap::new(),
             )
             .await
             .unwrap();
@@ -1913,6 +1952,7 @@ mod tests {
             .evolve_schema(
                 &ident(),
                 vec![SchemaChange::DropColumn { name: "qty".into() }],
+                BTreeMap::new(),
             )
             .await
             .unwrap();
@@ -1934,7 +1974,10 @@ mod tests {
         let c = fresh().await;
         c.ensure_namespace(&ident().namespace).await.unwrap();
         let original = c.create_table(&schema()).await.unwrap();
-        let after = c.evolve_schema(&ident(), vec![]).await.unwrap();
+        let after = c
+            .evolve_schema(&ident(), vec![], BTreeMap::new())
+            .await
+            .unwrap();
         assert_eq!(original.schema, after.schema);
     }
 
@@ -1951,6 +1994,7 @@ mod tests {
                     ty: IcebergType::Long,
                     nullable: true,
                 }],
+                BTreeMap::new(),
             )
             .await
             .unwrap_err();
@@ -1968,6 +2012,7 @@ mod tests {
                 vec![SchemaChange::DropColumn {
                     name: "ghost".into(),
                 }],
+                BTreeMap::new(),
             )
             .await
             .unwrap_err();
@@ -1992,6 +2037,7 @@ mod tests {
                 ty: IcebergType::Int,
                 nullable: true,
             }],
+            BTreeMap::new(),
         )
         .await
         .unwrap();
@@ -2013,6 +2059,63 @@ mod tests {
         let reloaded = c.load_table(&ident()).await.unwrap().unwrap();
         assert!(reloaded.schema.columns.iter().any(|c| c.name == "added"));
         assert!(reloaded.current_snapshot_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn properties_set_with_a_schema_change_and_removed_with_a_commit() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let set = BTreeMap::from([
+            ("pg2iceberg.a".to_string(), "1".to_string()),
+            ("pg2iceberg.b".to_string(), "2".to_string()),
+        ]);
+        let meta = c
+            .evolve_schema(
+                &ident(),
+                vec![SchemaChange::AddColumn {
+                    name: "added".into(),
+                    ty: IcebergType::Int,
+                    nullable: true,
+                }],
+                set,
+            )
+            .await
+            .unwrap();
+        assert!(meta.schema.columns.iter().any(|c| c.name == "added"));
+        assert_eq!(meta.properties.get("pg2iceberg.a").unwrap(), "1");
+
+        let step = |n: usize| PreparedCommit {
+            ident: ident(),
+            data_files: vec![DataFile {
+                path: format!("memory:///warehouse/public/orders/data-{n}.parquet"),
+                record_count: 1,
+                byte_size: 256,
+                equality_field_ids: vec![],
+                partition_values: Vec::new(),
+                sequence_number: None,
+            }],
+            equality_deletes: vec![],
+        };
+        // On a single-step commit, and a chained one.
+        let meta = c
+            .commit_snapshots(vec![step(0)], None, BTreeSet::from(["pg2iceberg.a".into()]))
+            .await
+            .unwrap();
+        assert!(!meta.properties.contains_key("pg2iceberg.a"));
+        assert_eq!(meta.properties.get("pg2iceberg.b").unwrap(), "2");
+        let meta = c
+            .commit_snapshots(
+                vec![step(1), step(2)],
+                None,
+                BTreeSet::from(["pg2iceberg.b".into()]),
+            )
+            .await
+            .unwrap();
+        assert!(!meta.properties.contains_key("pg2iceberg.b"));
+        let reloaded = c.load_table(&ident()).await.unwrap().unwrap();
+        assert_eq!(reloaded.properties, meta.properties);
+        assert_eq!(reloaded.current_snapshot_id, Some(3));
     }
 
     #[tokio::test]

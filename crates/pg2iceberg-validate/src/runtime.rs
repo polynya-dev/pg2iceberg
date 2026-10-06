@@ -422,6 +422,8 @@ where
     // It consumes the replication stream; a restart resumes past what
     // it staged.
     pipeline.track_replication();
+    // Staged with each schema change, for columns added with a default.
+    pipeline.read_column_defaults(Arc::new(Arc::clone(&lc.pg)));
     // Register per-table primary keys so the pipeline can split
     // `UPDATE` events that change the PK into `Delete(old)` +
     // `Update(new)` — otherwise the old PK would stay orphaned in

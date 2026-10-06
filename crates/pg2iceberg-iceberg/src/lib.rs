@@ -70,6 +70,9 @@ pub struct TableMetadata {
     /// the table's live snapshots record it (see [`LogRange`]).
     #[serde(default)]
     pub log_ends: std::collections::BTreeMap<String, u64>,
+    /// The table's properties.
+    #[serde(default)]
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 /// The change-log range a materializer commit applied for one cursor
@@ -538,7 +541,9 @@ pub trait Catalog: Send + Sync {
     /// steps — but readers of the table see none of them or all of them.
     /// Lets one source transaction be written in bounded-memory pieces
     /// and still become visible at once. Steps must share one table.
-    /// `log_range` is recorded on the last snapshot (see [`LogRange`]).
+    /// `log_range` is recorded on the last snapshot (see [`LogRange`]),
+    /// and the table properties `remove_properties` are removed in the
+    /// same update.
     ///
     /// The default handles a single step, and records no `log_range`; a
     /// catalog that can't make several atomic must error rather than
@@ -547,8 +552,14 @@ pub trait Catalog: Send + Sync {
         &self,
         steps: Vec<PreparedCommit>,
         log_range: Option<LogRange>,
+        remove_properties: std::collections::BTreeSet<String>,
     ) -> Result<TableMetadata> {
         let _ = log_range;
+        if !remove_properties.is_empty() {
+            return Err(IcebergError::Other(
+                "commit_snapshots: this catalog can't remove properties".into(),
+            ));
+        }
         let mut steps: Vec<PreparedCommit> = steps
             .into_iter()
             .filter(|s| !s.data_files.is_empty() || !s.equality_deletes.is_empty())
@@ -573,10 +584,13 @@ pub trait Catalog: Send + Sync {
             "commit_compaction not implemented for this Catalog impl".into(),
         ))
     }
+    /// Apply `changes` to the table's schema ([`apply_schema_changes`])
+    /// and set the table properties `set_properties`, in one update.
     async fn evolve_schema(
         &self,
         ident: &TableIdent,
         changes: Vec<SchemaChange>,
+        set_properties: std::collections::BTreeMap<String, String>,
     ) -> Result<TableMetadata>;
     /// Drop snapshots older than `retention` (in milliseconds since
     /// the most recent snapshot — *not* wall clock — so tests with

@@ -54,10 +54,18 @@ struct Col {
     sql: &'static str,
     pg: PgType,
     ice: IcebergType,
+    /// A constant `DEFAULT`, for a column added by `Op::AddColumn`.
+    default: Option<PgValue>,
 }
 
 fn col(name: &'static str, sql: &'static str, pg: PgType, ice: IcebergType) -> Col {
-    Col { name, sql, pg, ice }
+    Col {
+        name,
+        sql,
+        pg,
+        ice,
+        default: None,
+    }
 }
 
 /// Every table is keyed by `id int4`.
@@ -247,6 +255,24 @@ fn scenarios() -> Vec<Scenario> {
                     col("extra", "int8", PgType::Int8, IcebergType::Long),
                 )]),
                 tx(vec![Op::Update("t", 1, vec![("extra", PgValue::Int8(7))])]),
+            ],
+        },
+        Scenario {
+            // The ALTER sends nothing for rows already there; one updated
+            // after carries the default, as does a row inserted without it.
+            name: "column_default".into(),
+            tables: vec![table("t", orders())],
+            txs: vec![
+                tx(vec![ins("t", 1, text("a"), 1), ins("t", 2, text("b"), 2)]),
+                tx(vec![Op::AddColumn(
+                    "t",
+                    Col {
+                        default: Some(text("on")),
+                        ..col("flag", "text", PgType::Text, IcebergType::String)
+                    },
+                )]),
+                tx(vec![Op::Update("t", 1, vec![("qty", int(10))])]),
+                tx(vec![ins("t", 3, text("c"), 3)]),
             ],
         },
         Scenario {
@@ -492,7 +518,15 @@ async fn run_real(sc: &Scenario, ns: &str) -> Vec<Bytes> {
                 }
                 Op::AddColumn(tb, c) => {
                     types.insert((tb, c.name), c.sql);
-                    format!("ALTER TABLE {ns}.{tb} ADD COLUMN {} {}", c.name, c.sql)
+                    let default = c
+                        .default
+                        .as_ref()
+                        .map(|v| format!(" DEFAULT {}", literal(v, c.sql)))
+                        .unwrap_or_default();
+                    format!(
+                        "ALTER TABLE {ns}.{tb} ADD COLUMN {} {}{default}",
+                        c.name, c.sql
+                    )
                 }
                 Op::DropColumn(tb, c) => format!("ALTER TABLE {ns}.{tb} DROP COLUMN {c}"),
                 Op::Invalidate(tb) => format!("CREATE INDEX ON {ns}.{tb} (qty)"),
@@ -580,6 +614,8 @@ fn run_sim(sc: &Scenario, ns: &str) -> (Vec<Bytes>, Vec<DecodedMessage>) {
 
     // Rows as the source holds them, to build full rows for UPDATEs.
     let mut state: BTreeMap<(String, i32), Row> = BTreeMap::new();
+    // Columns' constant defaults: what an INSERT leaving them out gets.
+    let mut defaults: BTreeMap<(String, String), PgValue> = BTreeMap::new();
     let key = |r: &Row| match r.get(&ColumnName("id".into())) {
         Some(PgValue::Int4(n)) => *n,
         other => panic!("key {other:?}"),
@@ -590,10 +626,16 @@ fn run_sim(sc: &Scenario, ns: &str) -> (Vec<Bytes>, Vec<DecodedMessage>) {
         for op in &t.ops {
             match op {
                 Op::Insert(tb, vals) => {
-                    let row: Row = vals
+                    let mut row: Row = vals
                         .iter()
                         .map(|(c, v)| (ColumnName((*c).into()), v.clone()))
                         .collect();
+                    for ((t, c), v) in &defaults {
+                        if t == tb {
+                            row.entry(ColumnName(c.clone()))
+                                .or_insert_with(|| v.clone());
+                        }
+                    }
                     next.insert((tb.to_string(), key(&row)), row.clone());
                     handle.insert(&ident(tb), row);
                 }
@@ -636,17 +678,27 @@ fn run_sim(sc: &Scenario, ns: &str) -> (Vec<Bytes>, Vec<DecodedMessage>) {
                     handle.truncate_all(&idents);
                 }
                 Op::AddColumn(tb, c) => {
-                    db.alter_add_column(
-                        &ident(tb),
-                        ColumnSchema {
-                            name: c.name.into(),
-                            field_id: 0,
-                            ty: c.ice,
-                            nullable: true,
-                            is_primary_key: false,
-                        },
-                    )
-                    .unwrap();
+                    let column = ColumnSchema {
+                        name: c.name.into(),
+                        field_id: 0,
+                        ty: c.ice,
+                        nullable: true,
+                        is_primary_key: false,
+                    };
+                    match &c.default {
+                        // Rows already there read it, from the catalog.
+                        Some(v) => {
+                            db.alter_add_column_with_default(&ident(tb), column, v.clone())
+                                .unwrap();
+                            for ((t, _), row) in next.iter_mut() {
+                                if t == tb {
+                                    row.insert(ColumnName(c.name.into()), v.clone());
+                                }
+                            }
+                            defaults.insert((tb.to_string(), c.name.into()), v.clone());
+                        }
+                        None => db.alter_add_column(&ident(tb), column).unwrap(),
+                    }
                     db.set_pg_type(&ident(tb), c.name, c.pg);
                 }
                 Op::Invalidate(tb) => db.invalidate_relation(&ident(tb)).unwrap(),
@@ -1581,4 +1633,144 @@ async fn sim_resumes_replication_where_postgres_does() {
     let real = real_resumes().await;
     assert_eq!(real, [vec![1, 2, 3], vec![2, 3], vec![2, 3]], "Postgres");
     assert_eq!(sim_resumes(), real, "sim vs Postgres");
+}
+
+/// What Postgres's catalog says of columns' defaults — production's query
+/// against Postgres, and the sim — after each change that bears on it:
+/// constant defaults are stored for the rows already there, a volatile one
+/// rewrites the table (clearing every stored value), as does `VACUUM FULL`.
+#[tokio::test]
+async fn sim_reports_column_defaults_as_postgres_does() {
+    type SimStep = Box<dyn Fn(&SimPostgres, &TableIdent)>;
+    let ns = "defaults";
+    let (client, conn) = tokio_postgres::connect(dsn().await, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(conn);
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {ns}; \
+             CREATE TABLE {ns}.t (id int4 PRIMARY KEY, qty int4); \
+             INSERT INTO {ns}.t VALUES (1, 1), (2, 2)"
+        ))
+        .await
+        .unwrap();
+    let prod = PgClientImpl::connect_with(dsn().await, TlsMode::Disable)
+        .await
+        .expect("connect");
+
+    let t = TableIdent {
+        namespace: Namespace(vec![ns.into()]),
+        name: "t".into(),
+    };
+    let db = SimPostgres::new();
+    db.create_table(TableSchema {
+        ident: t.clone(),
+        columns: vec![
+            ColumnSchema {
+                name: "id".into(),
+                field_id: 1,
+                ty: IcebergType::Int,
+                nullable: false,
+                is_primary_key: true,
+            },
+            ColumnSchema {
+                name: "qty".into(),
+                field_id: 2,
+                ty: IcebergType::Int,
+                nullable: true,
+                is_primary_key: false,
+            },
+        ],
+        partition_spec: Vec::new(),
+        pg_schema: None,
+    })
+    .unwrap();
+    let mut tx = db.begin_tx();
+    for i in 1..=2 {
+        tx.insert(
+            &t,
+            [
+                (ColumnName("id".into()), int(i)),
+                (ColumnName("qty".into()), int(i)),
+            ]
+            .into(),
+        );
+    }
+    tx.commit(pg2iceberg_core::Timestamp(0)).unwrap();
+
+    let column = |name: &str, ty: IcebergType, nullable: bool| ColumnSchema {
+        name: name.into(),
+        field_id: 0,
+        ty,
+        nullable,
+        is_primary_key: false,
+    };
+    let steps: Vec<(String, SimStep)> = vec![
+        (
+            format!("ALTER TABLE {ns}.t ADD COLUMN c text DEFAULT 'x'"),
+            Box::new(move |db, t| {
+                db.alter_add_column_with_default(
+                    t,
+                    column("c", IcebergType::String, true),
+                    text("x"),
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            format!("ALTER TABLE {ns}.t ADD COLUMN n int4 NOT NULL DEFAULT 7"),
+            Box::new(move |db, t| {
+                db.alter_add_column_with_default(t, column("n", IcebergType::Int, false), int(7))
+                    .unwrap()
+            }),
+        ),
+        (
+            format!("ALTER TABLE {ns}.t ADD COLUMN plain int4"),
+            Box::new(move |db, t| {
+                db.alter_add_column(t, column("plain", IcebergType::Int, true))
+                    .unwrap()
+            }),
+        ),
+        (
+            format!("ALTER TABLE {ns}.t ADD COLUMN v float8 DEFAULT random()"),
+            Box::new(move |db, t| {
+                let mut n = 0.0;
+                db.alter_add_column_with_volatile_default(
+                    t,
+                    column("v", IcebergType::Double, true),
+                    move || {
+                        n += 1.0;
+                        PgValue::Float8(n)
+                    },
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            format!("ALTER TABLE {ns}.t ADD COLUMN d text DEFAULT 'y'"),
+            Box::new(move |db, t| {
+                db.alter_add_column_with_default(
+                    t,
+                    column("d", IcebergType::String, true),
+                    text("y"),
+                )
+                .unwrap()
+            }),
+        ),
+        (
+            format!("VACUUM FULL {ns}.t"),
+            Box::new(|db, t| db.rewrite_table(t).unwrap()),
+        ),
+        (
+            format!("ALTER TABLE {ns}.t DROP COLUMN c"),
+            Box::new(|db, t| db.alter_drop_column(t, "c").unwrap()),
+        ),
+    ];
+    for (sql, sim) in steps {
+        client.batch_execute(&sql).await.unwrap();
+        sim(&db, &t);
+        let real = prod.column_defaults(&t).await.expect("column_defaults");
+        assert_eq!(db.column_defaults(&t), real, "after {sql}");
+    }
 }

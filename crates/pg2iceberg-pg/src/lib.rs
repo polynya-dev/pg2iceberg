@@ -186,6 +186,35 @@ impl<P: PgClient + ?Sized> SlotMonitor for P {
     }
 }
 
+/// What Postgres's catalog says of a column's default.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ColumnDefault {
+    pub name: String,
+    /// The value rows that predate the column read for it, when Postgres
+    /// stores one instead of writing it into them: a column added with a
+    /// constant default, its table not rewritten since
+    /// (`pg_attribute.attmissingval`). Those rows carry no WAL for it.
+    pub stored: Option<pg2iceberg_core::PgValue>,
+    /// Whether the column has a default at all (`atthasdef`).
+    pub has_default: bool,
+}
+
+/// Postgres's catalog, asked for columns' defaults (see [`ColumnDefault`]).
+#[async_trait]
+pub trait ColumnDefaultSource: Send + Sync {
+    /// The columns of `table` (its source identity) that have a default
+    /// or a stored value.
+    async fn column_defaults(&self, table: &TableIdent) -> Result<Vec<ColumnDefault>>;
+}
+
+/// A client's [`PgClient::column_defaults`], as a source of its own.
+#[async_trait]
+impl ColumnDefaultSource for std::sync::Arc<dyn PgClient> {
+    async fn column_defaults(&self, table: &TableIdent) -> Result<Vec<ColumnDefault>> {
+        PgClient::column_defaults(self.as_ref(), table).await
+    }
+}
+
 #[async_trait]
 pub trait PgClient: Send + Sync {
     async fn create_publication(&self, name: &str, tables: &[TableIdent]) -> Result<()>;
@@ -282,4 +311,7 @@ pub trait PgClient: Send + Sync {
     /// for the table. Pre-existing rows must be backfilled via
     /// snapshot; the lifecycle handles that gating.
     async fn alter_publication_add_table(&self, name: &str, ident: &TableIdent) -> Result<()>;
+
+    /// See [`ColumnDefaultSource::column_defaults`].
+    async fn column_defaults(&self, table: &TableIdent) -> Result<Vec<ColumnDefault>>;
 }

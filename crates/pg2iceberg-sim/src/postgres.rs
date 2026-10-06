@@ -81,6 +81,14 @@ struct TableData {
     /// Postgres types of columns that don't have the default type for
     /// their Iceberg type ([`pgoutput::default_pg_type`]).
     pg_types: BTreeMap<String, PgType>,
+    /// Columns with a default (`atthasdef`), and its value for a
+    /// constant one: what an INSERT leaving the column out gets.
+    defaults: BTreeMap<String, Option<PgValue>>,
+    /// The values rows predating a column read for it, as Postgres stores
+    /// them when the column is added with a constant default
+    /// (`attmissingval`) instead of writing them into the rows. A table
+    /// rewrite writes them in, and clears them.
+    missing: BTreeMap<String, PgValue>,
 }
 
 impl TableData {
@@ -510,6 +518,8 @@ impl SimPostgres {
                 pg_oid,
                 replica_identity: ReplicaIdentity::Full,
                 pg_types: BTreeMap::new(),
+                defaults: BTreeMap::new(),
+                missing: BTreeMap::new(),
             },
         );
         let lsn = s.alloc_lsn();
@@ -532,6 +542,95 @@ impl SimPostgres {
         ident: &TableIdent,
         col: pg2iceberg_core::ColumnSchema,
     ) -> Result<()> {
+        // Existing rows read the new column as NULL (no DEFAULT).
+        self.add_column(ident, col, |_| PgValue::Null, |_, _| {})
+    }
+
+    /// `ALTER TABLE … ADD COLUMN … DEFAULT <constant>`: existing rows read
+    /// `value`. Postgres doesn't write it into them — it stores it once,
+    /// as the column's missing value — so the WAL carries nothing for
+    /// them; an INSERT leaving the column out gets it too.
+    pub fn alter_add_column_with_default(
+        &self,
+        ident: &TableIdent,
+        col: pg2iceberg_core::ColumnSchema,
+        value: PgValue,
+    ) -> Result<()> {
+        let stored = value.clone();
+        self.add_column(
+            ident,
+            col,
+            move |_| value.clone(),
+            move |t, name| {
+                t.defaults.insert(name.into(), Some(stored.clone()));
+                t.missing.insert(name.into(), stored.clone());
+            },
+        )
+    }
+
+    /// `ALTER TABLE … ADD COLUMN … DEFAULT <volatile>` (`clock_timestamp()`,
+    /// `gen_random_uuid()`): Postgres rewrites the table, each row getting
+    /// its own value from `value` — no stored value, and still nothing in
+    /// the WAL. The rewrite writes in every other column's stored value
+    /// too.
+    pub fn alter_add_column_with_volatile_default(
+        &self,
+        ident: &TableIdent,
+        col: pg2iceberg_core::ColumnSchema,
+        mut value: impl FnMut() -> PgValue,
+    ) -> Result<()> {
+        self.add_column(
+            ident,
+            col,
+            move |_| value(),
+            |t, name| {
+                t.defaults.insert(name.into(), None);
+                t.missing.clear();
+            },
+        )
+    }
+
+    /// A table rewrite — `VACUUM FULL`, `CLUSTER`, a column type change:
+    /// rows get their stored values written in, and the stored values are
+    /// cleared. Nothing in the WAL.
+    pub fn rewrite_table(&self, ident: &TableIdent) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| SimError::UnknownTable(ident.clone()))?;
+        table.missing.clear();
+        Ok(())
+    }
+
+    /// What Postgres's catalog says of `ident`'s columns' defaults (see
+    /// [`pg2iceberg_pg::ColumnDefault`]).
+    pub fn column_defaults(&self, ident: &TableIdent) -> Vec<pg2iceberg_pg::ColumnDefault> {
+        let s = self.state.lock().unwrap();
+        let Some(t) = s.tables.get(ident) else {
+            return Vec::new();
+        };
+        t.schema
+            .columns
+            .iter()
+            .filter(|c| t.defaults.contains_key(&c.name) || t.missing.contains_key(&c.name))
+            .map(|c| pg2iceberg_pg::ColumnDefault {
+                name: c.name.clone(),
+                stored: t.missing.get(&c.name).cloned(),
+                has_default: t.defaults.contains_key(&c.name),
+            })
+            .collect()
+    }
+
+    /// Add `col`, each existing row's value from `fill`; `catalog` records
+    /// its default.
+    fn add_column(
+        &self,
+        ident: &TableIdent,
+        col: pg2iceberg_core::ColumnSchema,
+        mut fill: impl FnMut(&Row) -> PgValue,
+        catalog: impl FnOnce(&mut TableData, &str),
+    ) -> Result<()> {
         let mut s = self.state.lock().unwrap();
         let table = s
             .tables
@@ -548,10 +647,11 @@ impl SimPostgres {
             + 1;
         let mut new_col = col;
         new_col.field_id = next_id;
-        // Existing rows read the new column as NULL (no DEFAULT).
         for row in table.rows.values_mut() {
-            row.insert(ColumnName(new_col.name.clone()), PgValue::Null);
+            let value = fill(row);
+            row.insert(ColumnName(new_col.name.clone()), value);
         }
+        catalog(table, &new_col.name);
         table.schema.columns.push(new_col);
         let columns = relation_columns_from_schema(&table.schema);
         let lsn = s.alloc_lsn();
@@ -582,6 +682,8 @@ impl SimPostgres {
         for row in table.rows.values_mut() {
             row.remove(&ColumnName(col_name.to_string()));
         }
+        table.defaults.remove(col_name);
+        table.missing.remove(col_name);
         let columns = relation_columns_from_schema(&table.schema);
         let lsn = s.alloc_lsn();
         s.wal.push(WalEntry {
@@ -676,6 +778,8 @@ impl SimPostgres {
                 pg_oid,
                 replica_identity: ReplicaIdentity::Full,
                 pg_types: BTreeMap::new(),
+                defaults: BTreeMap::new(),
+                missing: BTreeMap::new(),
             },
         );
         Ok(())
@@ -910,6 +1014,14 @@ impl SimPostgres {
         s.columns_at(ident, at)
             .map(|cols| cols.iter().map(|c| c.name.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// `ident`'s rows as of `at`: after its last commit or ALTER at or
+    /// before it — including values no WAL carries, like a column's
+    /// default given to the rows already there when it was added.
+    pub fn rows_at(&self, ident: &TableIdent, at: Lsn) -> Vec<Row> {
+        let s = self.state.lock().unwrap();
+        s.rows_at(ident, at).into_values().collect()
     }
 
     /// The columns `ident` had at `from` that it kept through `to`: a
@@ -1276,9 +1388,15 @@ impl TxHandle {
 
         for op in std::mem::take(&mut self.ops) {
             match op {
-                TxOp::Insert { table, row } => {
+                TxOp::Insert { table, mut row } => {
                     let lsn = s.alloc_lsn();
                     let t = s.tables.get_mut(&table).expect("validated above");
+                    for (name, default) in &t.defaults {
+                        if let Some(value) = default {
+                            row.entry(ColumnName(name.clone()))
+                                .or_insert_with(|| value.clone());
+                        }
+                    }
                     let key = t.pk_key(&row)?;
                     t.rows.insert(key, row.clone());
                     s.wal.push(WalEntry {
@@ -1826,6 +1944,16 @@ impl SnapshotSource for SimPostgres {
 }
 
 #[async_trait]
+impl pg2iceberg_pg::ColumnDefaultSource for SimPostgres {
+    async fn column_defaults(
+        &self,
+        table: &TableIdent,
+    ) -> std::result::Result<Vec<pg2iceberg_pg::ColumnDefault>, PgError> {
+        Ok(SimPostgres::column_defaults(self, table))
+    }
+}
+
+#[async_trait]
 impl SlotMonitor for SimPostgres {
     async fn confirmed_flush_lsn(&self, slot: &str) -> std::result::Result<Option<Lsn>, PgError> {
         match self.slot_state(slot) {
@@ -2023,5 +2151,12 @@ impl PgClient for SimPgClient {
         self.db
             .add_table_to_publication(name, ident)
             .map_err(|e| PgError::Other(e.to_string()))
+    }
+
+    async fn column_defaults(
+        &self,
+        table: &TableIdent,
+    ) -> std::result::Result<Vec<pg2iceberg_pg::ColumnDefault>, PgError> {
+        Ok(self.db.column_defaults(table))
     }
 }

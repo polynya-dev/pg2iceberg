@@ -14,7 +14,7 @@ use pg2iceberg_core::metrics::{names, Labels};
 use pg2iceberg_core::{
     ChangeEvent, ColumnName, Lsn, Metrics, NoopMetrics, Op, PgValue, TableIdent, Timestamp,
 };
-use pg2iceberg_pg::DecodedMessage;
+use pg2iceberg_pg::{ColumnDefaultSource, DecodedMessage, PgError};
 use pg2iceberg_stream::codec::EncodedChunk;
 use pg2iceberg_stream::{BlobStore, StreamError};
 use std::collections::BTreeMap;
@@ -30,6 +30,8 @@ pub enum PipelineError {
     Blob(#[from] StreamError),
     #[error("coord: {0}")]
     Coord(#[from] CoordError),
+    #[error("source: {0}")]
+    Source(#[from] PgError),
 }
 
 pub type Result<T> = std::result::Result<T, PipelineError>;
@@ -156,6 +158,9 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     open_tx: Option<(u32, Lsn)>,
     /// Each table's columns as last staged (see [`Self::stage_relation`]).
     relations: BTreeMap<TableIdent, relation_event::Columns>,
+    /// Where relation events' column defaults come from (see
+    /// [`Self::read_column_defaults`]).
+    column_defaults: Option<Arc<dyn ColumnDefaultSource>>,
 }
 
 impl<C: Coordinator + ?Sized> Pipeline<C> {
@@ -201,6 +206,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             replication: false,
             open_tx: None,
             relations: BTreeMap::new(),
+            column_defaults: None,
         }
     }
 
@@ -212,6 +218,14 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     /// table only.
     pub fn track_replication(&mut self) {
         self.replication = true;
+    }
+
+    /// Stage each changed table's column defaults with its columns, read
+    /// from `source`: the materializer fills a column added with a
+    /// default Postgres stores for the rows that predate it — which
+    /// carry no WAL for it — into those rows.
+    pub fn read_column_defaults(&mut self, source: Arc<dyn ColumnDefaultSource>) {
+        self.column_defaults = Some(source);
     }
 
     /// Register the primary-key columns for `table`. Required for
@@ -402,7 +416,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                 self.spill_if_full(xid).await?;
             }
             DecodedMessage::Relation { ident, columns } => {
-                self.stage_relation(ident, &columns)?;
+                self.stage_relation(ident, &columns).await?;
             }
             DecodedMessage::Keepalive { wal_end, .. } => {
                 // Only trustworthy between transactions: pgoutput sends a
@@ -424,12 +438,19 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     /// Applied when the message arrived instead, ahead of rows already
     /// staged under the old schema, a dropped and re-added column would
     /// take those rows' values for the dropped one.
-    fn stage_relation(
+    ///
+    /// The columns' defaults come from Postgres's catalog as it is now,
+    /// which may be past the change the message reports.
+    async fn stage_relation(
         &mut self,
         ident: TableIdent,
         columns: &[pg2iceberg_pg::RelationColumn],
     ) -> Result<()> {
-        let table = self.table_translation.get(&ident).cloned().unwrap_or(ident);
+        let table = self
+            .table_translation
+            .get(&ident)
+            .cloned()
+            .unwrap_or_else(|| ident.clone());
         if self.markers_table.as_ref() == Some(&table) {
             return Ok(());
         }
@@ -439,6 +460,18 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         // session and cache invalidation; those say nothing new.
         if self.relations.get(&table) == Some(&columns) {
             return Ok(());
+        }
+        let mut defaults = relation_event::Defaults::new();
+        if let Some(source) = &self.column_defaults {
+            for d in source.column_defaults(&ident).await? {
+                // A value the log can't hold is as good as not stored.
+                let stored = d
+                    .stored
+                    .filter(|v| relation_event::value_to_json(v).is_some());
+                if stored.is_some() || d.has_default {
+                    defaults.insert(d.name, stored);
+                }
+            }
         }
         let (xid, lsn) = match self.open_tx {
             Some((xid, lsn)) => (Some(xid), lsn),
@@ -451,7 +484,10 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             commit_ts: Timestamp(0),
             xid,
             before: None,
-            after: Some(relation_event::encode(&columns)),
+            after: Some(relation_event::encode(&relation_event::Relation {
+                columns: columns.clone(),
+                defaults,
+            })),
             unchanged_cols: Vec::new(),
         })?;
         self.relations.insert(table, columns);
@@ -636,6 +672,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             primary_keys: _,
             table_translation: _,
             replication: _,
+            column_defaults: _,
         } = self;
         *sink = Sink::new(*flush_threshold);
         spilled.clear();

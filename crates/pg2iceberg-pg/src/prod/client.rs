@@ -19,9 +19,11 @@
 //! takes a connection over for good.
 
 use crate::prod::tls::{build_rustls_connector, TlsMode};
-use crate::prod::typemap::Domain;
+use crate::prod::typemap::{column_type, Domain};
+use crate::prod::value_decode::decode_text;
 use crate::{
-    DecodedMessage, PgClient, PgError, ReplicationStream, Result, SlotHealth, SnapshotId, WalStatus,
+    ColumnDefault, DecodedMessage, PgClient, PgError, ReplicationStream, Result, SlotHealth,
+    SnapshotId, WalStatus,
 };
 use async_trait::async_trait;
 use pg2iceberg_core::{Lsn, TableIdent};
@@ -155,11 +157,11 @@ impl PgClientImpl {
     /// column's type by the domain's oid; the decoder types it as the
     /// domain's base type, as discovery does.
     pub async fn domains(&self) -> Result<HashMap<u32, Domain>> {
-        domains(&*self.client().await?).await
+        domains_of(&*self.client().await?).await
     }
 }
 
-async fn domains(client: &Client) -> Result<HashMap<u32, Domain>> {
+async fn domains_of(client: &Client) -> Result<HashMap<u32, Domain>> {
     let rows = client
         .simple_query("SELECT oid, typbasetype, typtypmod FROM pg_type WHERE typtype = 'd'")
         .await
@@ -583,7 +585,7 @@ impl PgClient for PgClientImpl {
         // takes it over for good. When it ends — Postgres restarting,
         // the network dropping it — calling this again reconnects.
         let conn = Conn::open(&self.config, self.tls).await?;
-        let domains = domains(&conn.client).await?;
+        let domains = domains_of(&conn.client).await?;
         let copy_stream = conn
             .client
             .copy_both_simple::<bytes::Bytes>(&q)
@@ -672,6 +674,71 @@ impl PgClient for PgClientImpl {
             }
             Err(e) => Err(e),
         }
+    }
+
+    async fn column_defaults(&self, table: &TableIdent) -> Result<Vec<ColumnDefault>> {
+        let qualified = format!(
+            "{}.{}",
+            quote_ident(&table.namespace.0.join(".")),
+            quote_ident(&table.name)
+        );
+        // `attmissingval` is a one-element array of the column's type; its
+        // element's text form is what pgoutput sends for the value. (An
+        // array column's would be an array of arrays: left unread.)
+        let q = format!(
+            "SELECT a.attname, a.atttypid::int8, a.atttypmod, a.atthasdef, \
+                    a.atthasmissing AND t.typcategory <> 'A', \
+                    array_to_string(a.attmissingval, '') \
+             FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = {}::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+               AND (a.atthasdef OR a.atthasmissing) \
+             ORDER BY a.attnum",
+            quote_lit(&qualified)
+        );
+        let client = self.client().await?;
+        let rows = client
+            .simple_query(&q)
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        let mut domains = None;
+        let mut out = Vec::new();
+        for msg in rows {
+            let SimpleQueryMessage::Row(row) = msg else {
+                continue;
+            };
+            let field = |i: usize| -> Result<Option<&str>> {
+                row.try_get(i).map_err(|e| PgError::Protocol(e.to_string()))
+            };
+            let number = |i: usize| -> Result<i64> {
+                let v = field(i)?.unwrap_or("0");
+                v.parse()
+                    .map_err(|e| PgError::Protocol(format!("parse pg_attribute value {v:?}: {e}")))
+            };
+            let name = field(0)?.unwrap_or_default().to_string();
+            let stored = match (field(4)?, field(5)?) {
+                (Some("t"), Some(text)) => {
+                    if domains.is_none() {
+                        domains = Some(domains_of(&client).await?);
+                    }
+                    let ty = column_type(
+                        number(1)? as u32,
+                        number(2)? as i32,
+                        domains.as_ref().expect("just read"),
+                    );
+                    let value = decode_text(ty, text.as_bytes()).map_err(|e| {
+                        PgError::Protocol(format!("decode {name}'s stored default: {e}"))
+                    })?;
+                    Some(value)
+                }
+                _ => None,
+            };
+            out.push(ColumnDefault {
+                name,
+                stored,
+                has_default: field(3)? == Some("t"),
+            });
+        }
+        Ok(out)
     }
 }
 

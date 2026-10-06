@@ -269,7 +269,7 @@ mod tests {
     fn relation(xid: u32, lsn: u64) -> ChangeEvent {
         ChangeEvent {
             op: Op::Relation,
-            after: Some(crate::relation_event::encode(&vec![])),
+            after: Some(crate::relation_event::encode(&Default::default())),
             ..insert(xid, lsn, 0)
         }
     }

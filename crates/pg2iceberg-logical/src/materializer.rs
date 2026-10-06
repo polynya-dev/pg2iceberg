@@ -36,10 +36,12 @@ use pg2iceberg_core::{
 use pg2iceberg_iceberg::meta::{
     self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
 };
+use pg2iceberg_iceberg::reader::RowBatches;
 use pg2iceberg_iceberg::{
-    catch_up_from_catalog, fold_events, promote_re_inserts, read_data_file, reconcile_columns,
-    resolve_unchanged_cols, toast_source, Catalog, DataFile, FileIndex, IcebergError, LogRange,
-    MaterializedRow, PkKey, PreparedCommit, TableWriter, WriterError,
+    apply_schema_changes, catch_up_from_catalog, fold_events, is_dropped_column,
+    promote_re_inserts, read_data_file, reconcile_columns, resolve_unchanged_cols, toast_source,
+    Catalog, DataFile, FileIndex, IcebergError, LogRange, MaterializedRow, PkKey, PreparedCommit,
+    SchemaChange, TableMetadata, TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -442,7 +444,19 @@ struct Unit {
     /// Snapshot rows of a backfill: committing advances the snapshot
     /// cursor (see [`Backfill`]).
     snapshot: bool,
+    /// Columns filled with their default ([`FILL_PROPERTY`]), by field id.
+    filled: BTreeSet<i32>,
+    /// Table properties the commit removes.
+    remove_properties: BTreeSet<String>,
 }
+
+/// Table property prefix marking a column — `pg2iceberg.fill.<field id>`
+/// — added with a default Postgres stores for the rows that predate it,
+/// which carry no WAL for it: the value, as JSON, to fill into the rows
+/// the table held when the column was added. Set with the column, and
+/// removed by the commit of the fill, so a crash between the two leaves
+/// the fill to do again, and a column is filled once.
+const FILL_PROPERTY: &str = "pg2iceberg.fill.";
 
 /// Whether a cut between `last` (end of what's buffered) and `next`
 /// (start of the next log entry) falls between transactions. A spilled
@@ -975,6 +989,10 @@ impl<C: Catalog> Materializer<C> {
     ///   column, and the dropped one keeps its values under another
     ///   name.
     ///
+    /// - A column added with a default Postgres stores for the rows that
+    ///   predate it is filled into the rows the table holds
+    ///   ([`FILL_PROPERTY`]): they carry no WAL for it.
+    ///
     /// Reconciles against the catalog's schema, not the in-memory one:
     /// the event may already have been applied — before a crash, whose
     /// retry re-reads it, or by another worker — and applying it again
@@ -982,26 +1000,167 @@ impl<C: Catalog> Materializer<C> {
     async fn apply_columns(
         &mut self,
         ident: &TableIdent,
-        columns: &relation_event::Columns,
+        unit: &mut Unit,
+        at: &MatEvent,
+        relation: &relation_event::Relation,
     ) -> Result<()> {
-        let current = self
+        let meta = self
             .catalog
             .load_table(ident)
             .await?
-            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?
-            .schema;
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        let changes = reconcile_columns(&meta.schema, &relation.columns)
+            .map_err(MaterializerError::Catalog)?;
+        let meta = if changes.is_empty() {
+            meta
+        } else {
+            let marks = self.fill_marks(ident, &meta.schema, &changes, &relation.defaults)?;
+            self.catalog.evolve_schema(ident, changes, marks).await?
+        };
         let entry = self
             .tables
             .get_mut(ident)
             .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
-        let changes = reconcile_columns(&current, columns).map_err(MaterializerError::Catalog)?;
-        let current = if changes.is_empty() {
-            current
-        } else {
-            self.catalog.evolve_schema(ident, changes).await?.schema
-        };
-        entry.schema.columns = current.columns;
+        entry.schema.columns = meta.schema.columns.clone();
         entry.writer = TableWriter::new(entry.schema.clone());
+        self.fill_marked(ident, unit, at, &meta).await
+    }
+
+    /// The [`FILL_PROPERTY`] marks for the columns `changes` add to
+    /// `schema` with a default Postgres stores, if the table holds rows to
+    /// fill. A column added with a default it doesn't store — a volatile
+    /// one, which rewrote the table with a value per row, or one whose
+    /// table was rewritten since — is reported instead: those rows keep
+    /// NULL, as nothing has their values.
+    fn fill_marks(
+        &self,
+        ident: &TableIdent,
+        schema: &TableSchema,
+        changes: &[SchemaChange],
+        defaults: &relation_event::Defaults,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut marks = BTreeMap::new();
+        let entry = self.tables.get(ident).expect("checked by caller");
+        if entry.file_index.live_pk_count() == 0 {
+            return Ok(marks);
+        }
+        let mut evolved = schema.clone();
+        apply_schema_changes(&mut evolved, changes).map_err(MaterializerError::Catalog)?;
+        let added = evolved
+            .columns
+            .iter()
+            .filter(|c| !schema.columns.iter().any(|old| old.field_id == c.field_id));
+        for col in added {
+            let Some(default) = defaults.get(&col.name) else {
+                continue;
+            };
+            match default.as_ref().and_then(relation_event::value_to_json) {
+                Some(json) => {
+                    marks.insert(format!("{FILL_PROPERTY}{}", col.field_id), json);
+                }
+                None => {
+                    tracing::warn!(
+                        table = %ident,
+                        column = %col.name,
+                        "column added with a default Postgres doesn't store for existing rows \
+                         (a volatile default, or the table was rewritten since): the rows \
+                         already in Iceberg keep NULL for it"
+                    );
+                    let mut labels = Labels::new();
+                    labels.insert("table".into(), ident.name.clone());
+                    labels.insert("column".into(), col.name.clone());
+                    self.metrics
+                        .counter(names::UNFILLED_COLUMN_DEFAULTS, &labels, 1);
+                }
+            }
+        }
+        Ok(marks)
+    }
+
+    /// Fill in each column marked for it ([`FILL_PROPERTY`]), unless
+    /// `unit` did already: the rows the table holds are staged again, with
+    /// the column set, as updates after the rows before `at`. The unit's
+    /// commit removes the marks. A mark on a column dropped since has
+    /// nothing to fill.
+    async fn fill_marked(
+        &mut self,
+        ident: &TableIdent,
+        unit: &mut Unit,
+        at: &MatEvent,
+        meta: &TableMetadata,
+    ) -> Result<()> {
+        for (key, json) in &meta.properties {
+            let Some(field_id) = key
+                .strip_prefix(FILL_PROPERTY)
+                .and_then(|id| id.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if unit.filled.contains(&field_id) {
+                continue;
+            }
+            let col = meta.schema.columns.iter().find(|c| c.field_id == field_id);
+            if let Some(col) = col.filter(|c| !is_dropped_column(c)) {
+                let value = relation_event::value_from_json(json).ok_or_else(|| {
+                    MaterializerError::Catalog(IcebergError::Other(format!(
+                        "{ident}: malformed table property {key}: {json}"
+                    )))
+                })?;
+                self.fill_column(ident, unit, at, ColumnName(col.name.clone()), value)
+                    .await?;
+                unit.filled.insert(field_id);
+            }
+            unit.remove_properties.insert(key.clone());
+        }
+        Ok(())
+    }
+
+    /// Stage every row the table holds again, with `column` set to
+    /// `value`, as updates after the rows before `at` — in steps of at most
+    /// `batch_rows`, like any transaction, and decoding as many at a time.
+    async fn fill_column(
+        &mut self,
+        ident: &TableIdent,
+        unit: &mut Unit,
+        at: &MatEvent,
+        column: ColumnName,
+        value: PgValue,
+    ) -> Result<()> {
+        let entry = self.tables.get(ident).expect("checked by caller");
+        let files: Vec<String> = entry
+            .file_index
+            .live_files()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let (columns, pk_cols) = (entry.schema.columns.clone(), entry.pk_cols.clone());
+        for path in files {
+            let bytes = self.blob_store.get(&path).await?;
+            for batch in RowBatches::new(bytes, &columns, self.batch_rows.max(1))? {
+                for mut row in batch? {
+                    // A row deleted or updated since lives elsewhere, or
+                    // nowhere.
+                    let entry = self.tables.get(ident).expect("checked by caller");
+                    let key = PkKey::from_row(&row, &pk_cols);
+                    if entry.file_index.lookup(&key) != Some(path.as_str()) {
+                        continue;
+                    }
+                    row.insert(column.clone(), value.clone());
+                    unit.buf.push(MatEvent {
+                        op: Op::Update,
+                        lsn: at.lsn,
+                        commit_ts: at.commit_ts,
+                        xid: at.xid,
+                        unchanged_cols: Vec::new(),
+                        row,
+                        moved_from: None,
+                    });
+                    if unit.buf.len() >= self.batch_rows {
+                        self.prepare_step(ident, unit).await?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1142,13 +1301,13 @@ impl<C: Catalog> Materializer<C> {
             if !unit.buf.is_empty() {
                 self.prepare_step(ident, unit).await?;
             }
-            let columns = relation_event::decode(&evt.row).ok_or_else(|| {
+            let relation = relation_event::decode(&evt.row).ok_or_else(|| {
                 MaterializerError::Blob(StreamError::Decode(format!(
                     "malformed relation event for {ident}: {:?}",
                     evt.row
                 )))
             })?;
-            self.apply_columns(ident, &columns).await?;
+            self.apply_columns(ident, unit, &evt, &relation).await?;
         }
         Ok(())
     }
@@ -1847,7 +2006,7 @@ impl<C: Catalog> Materializer<C> {
         } else {
             match self
                 .catalog
-                .commit_snapshots(unit.steps, Some(log_range))
+                .commit_snapshots(unit.steps, Some(log_range), unit.remove_properties)
                 .await
             {
                 Ok(meta) => {

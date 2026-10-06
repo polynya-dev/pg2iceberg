@@ -453,6 +453,26 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
             }
         }
 
+        // A column added with a default: rows already there read it, but
+        // Postgres writes nothing to the WAL for them — only the one row
+        // touched after carries it.
+        src.batch_execute(&format!(
+            "ALTER TABLE {table} ADD COLUMN flag text DEFAULT 'on'; \
+             UPDATE {table} SET note = note WHERE id = 4"
+        ))
+        .await
+        .expect("add a column with a default");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            match pg2iceberg::run::run_verify(cfg.clone(), 100).await {
+                Ok(()) => break,
+                Err(e) if tokio::time::Instant::now() >= deadline => {
+                    panic!("verify still failing after adding a column with a default: {e:#}")
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+
         let _ = shutdown_tx.send(());
     };
 
