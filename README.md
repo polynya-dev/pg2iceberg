@@ -198,7 +198,7 @@ Unconstrained `numeric` columns (no precision specified) default to `decimal(38,
 | Change | Iceberg behavior |
 |---|---|
 | `ADD COLUMN` (nullable) | Appends a column with the next field id |
-| `DROP COLUMN` | Soft-drop: column stays in schema, becomes nullable; older data files keep resolving |
+| `DROP COLUMN` | Renamed to `<name>__dropped_<field id>` and made nullable: its values stay readable, and a column later added with its name is a new one |
 | `ALTER COLUMN TYPE` (legal promotion: `int → long`, `float → double`, decimal precision increase) | Type-promote in place, field id preserved |
 | `ALTER COLUMN TYPE` (illegal: narrowing, cross-family) | Refuses with an actionable error; operator must re-snapshot |
 | `RENAME COLUMN` | Treated as drop + add (pgoutput doesn't carry attribute OIDs to detect renames) |

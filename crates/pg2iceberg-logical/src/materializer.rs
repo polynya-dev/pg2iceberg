@@ -387,10 +387,6 @@ struct TableEntry {
     /// [`Materializer::register_table`] entry, preserving existing
     /// behavior where the lifecycle gates the whole snapshot phase.
     gated_until_snapshot: bool,
-    /// Columns of `schema` the source was last seen without: soft-dropped.
-    /// One that comes back was re-added, so it's a new column (see
-    /// [`reconcile_columns`]).
-    dropped: BTreeSet<String>,
     /// A backfill staged alongside the table's changes.
     backfill: Backfill,
 }
@@ -917,7 +913,6 @@ impl<C: Catalog> Materializer<C> {
                 index_at,
                 writer,
                 gated_until_snapshot: false,
-                dropped: BTreeSet::new(),
                 backfill: Backfill::Unknown,
             },
         );
@@ -999,8 +994,7 @@ impl<C: Catalog> Materializer<C> {
             .tables
             .get_mut(ident)
             .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
-        let changes = reconcile_columns(&current, columns, &entry.dropped)
-            .map_err(MaterializerError::Catalog)?;
+        let changes = reconcile_columns(&current, columns).map_err(MaterializerError::Catalog)?;
         let current = if changes.is_empty() {
             current
         } else {
@@ -1008,7 +1002,6 @@ impl<C: Catalog> Materializer<C> {
         };
         entry.schema.columns = current.columns;
         entry.writer = TableWriter::new(entry.schema.clone());
-        entry.dropped = absent_from(&entry.schema, columns);
         Ok(())
     }
 
@@ -1968,12 +1961,27 @@ impl<C: Catalog> Materializer<C> {
     async fn sync_file_index(&mut self, ident: &TableIdent) -> Result<BTreeMap<String, u64>> {
         let meta = self.catalog.load_table(ident).await?;
         let current = meta.as_ref().and_then(|m| m.current_snapshot_id);
+        if let Some(meta) = &meta {
+            self.sync_schema(ident, &meta.schema);
+        }
         let log_ends = meta.map(|m| m.log_ends).unwrap_or_default();
         let entry = self.tables.get(ident).expect("checked by caller");
         if current != entry.index_at {
             self.catch_up_file_index(ident).await?;
         }
         Ok(log_ends)
+    }
+
+    /// Take up the table's columns as the catalog has them, if another
+    /// process changed them — a worker that applied a schema change this
+    /// one didn't read. Written with the old columns, a column's values
+    /// would land in whichever field had its name.
+    fn sync_schema(&mut self, ident: &TableIdent, catalog: &TableSchema) {
+        let entry = self.tables.get_mut(ident).expect("checked by caller");
+        if entry.schema.columns != catalog.columns {
+            entry.schema.columns = catalog.columns.clone();
+            entry.writer = TableWriter::new(entry.schema.clone());
+        }
     }
 
     async fn catch_up_file_index(&mut self, ident: &TableIdent) -> Result<()> {
@@ -2172,18 +2180,6 @@ fn expand_truncates(
 }
 
 /// The columns of `schema` that `source` doesn't have.
-fn absent_from(
-    schema: &TableSchema,
-    source: &[(String, pg2iceberg_core::IcebergType)],
-) -> BTreeSet<String> {
-    schema
-        .columns
-        .iter()
-        .filter(|c| !source.iter().any(|(name, _)| *name == c.name))
-        .map(|c| c.name.clone())
-        .collect()
-}
-
 fn collect_toast_paths(
     rows: &[MaterializedRow],
     file_index: &FileIndex,
