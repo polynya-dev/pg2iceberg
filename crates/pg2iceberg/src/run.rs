@@ -83,7 +83,7 @@ pub async fn build_rest_catalog(cfg: &Config) -> Result<iceberg_catalog_rest::Re
     use iceberg_catalog_rest::RestCatalogBuilder;
     use iceberg_storage_opendal::OpenDalStorageFactory;
     let props: HashMap<String, String> = cfg.rest_catalog_props().into_iter().collect();
-    // iceberg-rust 0.9's REST catalog requires a StorageFactory or
+    // iceberg-rust's REST catalog requires a StorageFactory or
     // every file-IO operation panics with "StorageFactory must be
     // provided". OpenDAL's S3 backend is what the upstream
     // integration tests use; it picks up endpoint / credentials
@@ -92,7 +92,6 @@ pub async fn build_rest_catalog(cfg: &Config) -> Result<iceberg_catalog_rest::Re
     // testcontainers integration test.
     RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load("pg2iceberg", props)

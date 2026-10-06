@@ -12,7 +12,7 @@
 //!   data and delete manifests at commit time.
 //! - **Schema evolution.** Translates our `Vec<SchemaChange>` to a target
 //!   `iceberg::Schema` (via [`crate::apply_schema_changes`]) and submits
-//!   via the forked `Transaction::update_schema()`.
+//!   via the forked `Transaction::replace_schema()`.
 //! - **`load_table` not-found.** Maps `ErrorKind::TableNotFound` and
 //!   `NamespaceNotFound` → `Ok(None)` (the materializer treats not-found
 //!   distinctly from transient errors).
@@ -102,7 +102,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             {
                 Ok(None)
             }
-            // iceberg-rust 0.9 REST catalog returns
+            // iceberg-rust's REST catalog (as of 0.9) returns
             // `ErrorKind::Unexpected` with this exact message on a
             // 404 from the REST server (instead of the expected
             // `TableNotFound`). Caught by the testcontainers
@@ -334,7 +334,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let new_iceberg_schema = to_iceberg_schema(&our_schema)?;
 
         let tx = Transaction::new(&table);
-        let action = tx.update_schema().set_schema(new_iceberg_schema);
+        let action = tx.replace_schema().set_schema(new_iceberg_schema);
         let tx = action.apply(tx).map_err(map_iceberg_err)?;
         let updated = tx
             .commit(self.inner.as_ref())
@@ -386,8 +386,9 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             let seq_num = snap.sequence_number();
             let parent_id = snap.parent_snapshot_id();
             let is_replace = matches!(snap.summary().operation, Operation::Replace);
-            let manifest_list = snap
-                .load_manifest_list(table.file_io(), table.metadata())
+            let manifest_list = table
+                .manifest_list_reader(&snap)
+                .load()
                 .await
                 .map_err(map_iceberg_err)?;
             let mut data_files: Vec<DataFile> = Vec::new();
@@ -603,10 +604,13 @@ impl TransactionAction for ChainedAppendAction {
             for update in &step_updates {
                 builder = update.clone().apply(builder)?;
             }
+            // `local`'s runtime isn't public; pg2iceberg always runs
+            // inside the tokio runtime iceberg-rust was given.
             let mut next = Table::builder()
                 .identifier(local.identifier().clone())
                 .file_io(local.file_io().clone())
-                .metadata(builder.build()?.metadata);
+                .metadata(builder.build()?.metadata)
+                .runtime(iceberg::Runtime::try_current()?);
             if let Some(location) = local.metadata_location() {
                 next = next.metadata_location(location);
             }

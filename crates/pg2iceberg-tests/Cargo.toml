@@ -33,7 +33,7 @@ tokio-postgres = { version = "0.7", optional = true, default-features = false, f
 object_store = { version = "0.11", optional = true, default-features = false, features = ["aws"] }
 # The DST's production backend reads a table's manifests directly, as
 # ground truth independent of pg2iceberg's own `snapshots()`.
-iceberg = { version = "0.9", optional = true }
+iceberg = { version = "0.10", optional = true }
 # Parses pgoutput in the sim-vs-Postgres conformance suite.
 postgres-replication = { version = "0.6", optional = true, default-features = false }
 async-trait = { workspace = true, optional = true }
@@ -67,7 +67,7 @@ proptest.workspace = true
 # chaos soak's lifecycle-driving DST: virtual time is the only way
 # to keep `run_logical_main_loop`'s scheduler-driven ticks
 # deterministic under proptest seeds.
-tokio = { version = "1", features = ["rt", "macros", "time", "test-util", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util", "sync"] }
 
 [features]
 # Enables the testcontainers-driven integration tests

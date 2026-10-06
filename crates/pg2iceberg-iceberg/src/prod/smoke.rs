@@ -1,4 +1,4 @@
-//! Smoke tests that exercise `iceberg-rust 0.9` end-to-end against the
+//! Smoke tests that exercise `iceberg-rust` end-to-end against the
 //! in-process `MemoryCatalog`. These confirm the upstream surface our
 //! `IcebergRustCatalog` wrapper relies on:
 //!
@@ -201,10 +201,7 @@ async fn fast_append_round_trip_creates_snapshot_with_data_file() {
         .expect("fast append must produce a snapshot");
     assert_eq!(snap.summary().operation, iceberg::spec::Operation::Append);
 
-    let manifest_list = snap
-        .load_manifest_list(table.file_io(), table.metadata())
-        .await
-        .unwrap();
+    let manifest_list = table.manifest_list_reader(snap).load().await.unwrap();
     assert_eq!(manifest_list.entries().len(), 1);
     let manifest = manifest_list.entries()[0]
         .load_manifest(table.file_io())
@@ -272,10 +269,7 @@ async fn fast_append_accepts_mixed_data_and_equality_delete_files() {
     let table = tx.commit(&catalog).await.unwrap();
 
     let snap = table.metadata().current_snapshot().unwrap();
-    let manifest_list = snap
-        .load_manifest_list(table.file_io(), table.metadata())
-        .await
-        .unwrap();
+    let manifest_list = table.manifest_list_reader(snap).load().await.unwrap();
     // Two manifests: one Data, one Deletes.
     assert_eq!(manifest_list.entries().len(), 2);
     let mut kinds: Vec<ManifestContentType> =

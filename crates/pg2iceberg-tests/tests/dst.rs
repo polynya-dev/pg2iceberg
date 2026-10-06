@@ -679,6 +679,19 @@ impl Storage {
         }
     }
 
+    /// The current snapshot's summary counts the files it holds. (The sim
+    /// catalog writes no summaries.)
+    #[cfg_attr(not(feature = "integration"), allow(unused_variables))]
+    async fn summary_counts_live_files(&self, ident: &TableIdent) -> Result<(), String> {
+        match &self.backend {
+            Backend::Sim { .. } => Ok(()),
+            #[cfg(feature = "integration")]
+            Backend::Prod { iceberg } => {
+                prod_backend::summary_counts_live_files(iceberg, ident).await
+            }
+        }
+    }
+
     /// Object keys of every stored blob.
     async fn blob_keys(&self) -> Result<BTreeSet<String>, String> {
         Ok(self
@@ -733,6 +746,63 @@ mod prod_backend {
         }
     }
 
+    /// The current snapshot's summary totals equal what its manifests
+    /// hold. Engines take them as the table's size: ClickHouse 26.2
+    /// answered `count()` with `total-records`.
+    pub async fn summary_counts_live_files(
+        iceberg: &iceberg::memory::MemoryCatalog,
+        ident: &TableIdent,
+    ) -> Result<(), String> {
+        use iceberg::Catalog as _;
+        let err = |e: iceberg::Error| e.to_string();
+        let ns = NamespaceIdent::from_strs(&ident.namespace.0).map_err(err)?;
+        let table = iceberg
+            .load_table(&iceberg::TableIdent::new(ns, ident.name.clone()))
+            .await
+            .map_err(err)?;
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(());
+        };
+        let list = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(err)?;
+        let mut held: HashMap<&str, u64> = HashMap::new();
+        for manifest_file in list.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(err)?;
+            for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
+                let df = entry.data_file();
+                let (files, records) = match df.content_type() {
+                    DataContentType::Data => ("total-data-files", "total-records"),
+                    _ => ("total-delete-files", "total-equality-deletes"),
+                };
+                *held.entry(files).or_default() += 1;
+                *held.entry(records).or_default() += df.record_count();
+            }
+        }
+        let summary = &snapshot.summary().additional_properties;
+        for key in [
+            "total-records",
+            "total-data-files",
+            "total-delete-files",
+            "total-equality-deletes",
+        ] {
+            let claims = summary.get(key).map(String::as_str).unwrap_or("none");
+            let holds = held.get(key).copied().unwrap_or(0);
+            if claims != holds.to_string() {
+                return Err(format!(
+                    "snapshot {} summary: {key} = {claims}, its files hold {holds}",
+                    snapshot.sequence_number()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The live files of the table's current snapshot, straight from
     /// its manifests.
     pub async fn live_files(
@@ -749,8 +819,9 @@ mod prod_backend {
         let Some(snapshot) = table.metadata().current_snapshot() else {
             return Ok(Vec::new());
         };
-        let list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
+        let list = table
+            .manifest_list_reader(snapshot)
+            .load()
             .await
             .map_err(err)?;
         let mut out = Vec::new();
@@ -916,6 +987,26 @@ struct DstHarness {
     /// A compaction pass another process (a `pg2iceberg compact` job)
     /// has planned and written but not yet committed.
     pending_external: Option<PreparedCompaction>,
+    /// The tokio runtime prod-backend cases run iceberg-rust on (see
+    /// [`tokio_runtime`]), entered for the case. Dropped last.
+    #[cfg(feature = "integration")]
+    _tokio: Option<tokio::runtime::EnterGuard<'static>>,
+}
+
+/// iceberg-rust runs its work on a tokio runtime — the catalog defaults
+/// to the current one, and spawns onto it — but the harness drives futures
+/// with `pollster`. Prod-backend cases enter this runtime, whose worker
+/// threads run what iceberg-rust spawns.
+#[cfg(feature = "integration")]
+fn tokio_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    })
 }
 
 impl DstHarness {
@@ -950,6 +1041,8 @@ impl DstHarness {
             CoordSchema::default_name(),
             arc_clock,
         ));
+        #[cfg(feature = "integration")]
+        let tokio = PROD_BACKEND.get().then(|| tokio_runtime().enter());
         let storage = Storage::for_case();
         let blob_store = storage.blob.clone();
         let catalog = storage.catalog.clone();
@@ -1020,6 +1113,8 @@ impl DstHarness {
             next_bulk_id: 1000,
             id_gen,
             pending_external: None,
+            #[cfg(feature = "integration")]
+            _tokio: tokio,
             backfilling: false,
             backfill_pipeline: None,
             other_live: BTreeSet::new(),
@@ -1074,6 +1169,8 @@ impl DstHarness {
             CoordSchema::default_name(),
             arc_clock,
         ));
+        #[cfg(feature = "integration")]
+        let tokio = PROD_BACKEND.get().then(|| tokio_runtime().enter());
         let storage = Storage::for_case();
         let blob_store = storage.blob.clone();
         let catalog = storage.catalog.clone();
@@ -1144,6 +1241,8 @@ impl DstHarness {
             next_bulk_id: 1000,
             id_gen,
             pending_external: None,
+            #[cfg(feature = "integration")]
+            _tokio: tokio,
             backfilling: false,
             backfill_pipeline: None,
             other_live: BTreeSet::new(),
@@ -1211,8 +1310,11 @@ impl DstHarness {
     }
 
     /// Worker "b"'s cycle, in distributed mode.
+    /// `Some(0)` without one; `None` if its commit's response was lost.
     fn materialize_other(&mut self) -> Option<usize> {
-        let mut other = self.other.take()?;
+        let Some(mut other) = self.other.take() else {
+            return Some(0);
+        };
         let before = self.current_snapshot();
         let n = cycle(&mut other);
         if self.current_snapshot() != before {
@@ -2100,10 +2202,11 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     h.drive();
     h.flush_and_ack();
     // Drain materializer; safety bound to catch infinite loops.
+    // A cycle whose commit response was lost (`None`) did work: retry.
     for _ in 0..1000 {
         let a = h.materialize();
-        let b = h.materialize_other().unwrap_or(0);
-        if a == Some(0) && b == 0 {
+        let b = h.materialize_other();
+        if a == Some(0) && b == Some(0) {
             break;
         }
     }
@@ -2364,6 +2467,11 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
             "invariant 13 (verify == engine): verify reads {verify_rows:?}\n  engines read {iceberg_rows:?}"
         ));
     }
+
+    // 15. The snapshot summary's totals count the table's files: engines
+    //     plan with them, and some answer `count()` from them.
+    block_on(h.storage.summary_counts_live_files(&ident()))
+        .map_err(|e| format!("invariant 15: {e}"))?;
 
     Ok(())
 }
@@ -2709,6 +2817,26 @@ fn compaction_with_no_surviving_rows_commits_on_iceberg() {
     PROD_BACKEND.set(true);
     let mut h = DstHarness::boot();
     h.run_step(&Step::BigTx { inserts: 1, qty: 0 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Compact);
+    check_invariants(&mut h).unwrap();
+}
+
+/// The current snapshot's summary counts the table's files, after
+/// updates, deletes and a compaction.
+#[cfg(feature = "integration")]
+#[test]
+fn snapshot_summary_counts_the_live_files_on_iceberg() {
+    PROD_BACKEND.set(true);
+    let mut h = DstHarness::boot();
+    for id in 1..=4 {
+        h.run_step(&Step::Insert { id, qty: 10 });
+    }
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::Update { id: 1, qty: 11 });
+    h.run_step(&Step::Delete { id: 2 });
     h.run_step(&Step::DriveFlush);
     h.run_step(&Step::MaterializerCycle);
     h.run_step(&Step::Compact);
@@ -3122,6 +3250,21 @@ fn table_mapped_into_the_sink_namespace_replicates() {
     let mut h = DstHarness::boot();
     h.run_step(&Step::Insert { id: 1, qty: 10 });
     h.run_step(&Step::OtherInsert { id: 1, qty: 99 });
+    check_invariants(&mut h).unwrap();
+}
+
+/// Worker "b" loses its commit's response, as the harness drains to
+/// quiescence: the drain retries it rather than stop with the rows staged.
+#[test]
+fn draining_retries_a_second_workers_lost_commit() {
+    DISTRIBUTED.set(true);
+    SECOND_TABLE.set(1);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::LoseCommitResponse);
+    h.run_step(&Step::OtherInsert { id: 1, qty: 0 });
+    h.run_step(&Step::OtherInsert { id: 2, qty: 0 });
+    h.run_step(&Step::TruncateBoth);
+    h.run_step(&Step::OtherWorkerCycle);
     check_invariants(&mut h).unwrap();
 }
 
