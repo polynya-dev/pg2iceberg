@@ -569,9 +569,8 @@ impl SimPostgres {
 
     /// Test hook: `ALTER TABLE … DROP COLUMN`. Removes the named
     /// column from the table's schema and emits a fresh Relation
-    /// event. Iceberg-side this is a soft-drop (column stays in
-    /// the schema as nullable), so subsequent reads are
-    /// backward-compatible.
+    /// event. Iceberg-side the column stays, renamed out of the way and
+    /// nullable, so older data files keep their values.
     pub fn alter_drop_column(&self, ident: &TableIdent, col_name: &str) -> Result<()> {
         let mut s = self.state.lock().unwrap();
         let table = s

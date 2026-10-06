@@ -267,12 +267,16 @@ pub enum SchemaChange {
     RenameColumn { from: String, to: String },
 }
 
-/// The name a dropped column takes when the source re-adds a column with
-/// its name: the re-added column is new (Postgres gives it no values), so
-/// it gets a new field id, and the dropped one's values stay readable
-/// under this name.
+/// The name a column takes once the source drops it. Its values stay
+/// readable under it, and its name is free for a column the source adds
+/// later — a new one (Postgres gives it no values), with a new field id.
 pub fn dropped_column_name(name: &str, field_id: i32) -> String {
     format!("{name}__dropped_{field_id}")
+}
+
+/// Whether `col` is a column the source dropped ([`dropped_column_name`]).
+pub fn is_dropped_column(col: &pg2iceberg_core::ColumnSchema) -> bool {
+    col.name.ends_with(&format!("__dropped_{}", col.field_id))
 }
 
 /// True if `to` is a spec-legal Iceberg promotion of `from`. Reference:
@@ -397,33 +401,32 @@ pub fn apply_schema_changes(
 /// source table's current columns, `source` (name and type, in the
 /// source's column order).
 ///
-/// Columns match by name — Iceberg field ids stay with their columns —
-/// except one the source dropped and re-added: Postgres gives that a new,
-/// empty column, so it becomes a new Iceberg column (new field id) and
-/// the dropped one is renamed out of its way ([`dropped_column_name`]),
-/// its values intact. A re-add shows either way:
+/// Columns match by name — Iceberg field ids stay with their columns.
+/// One the source no longer has is renamed out of the way
+/// ([`dropped_column_name`]), its values intact, so a column the source
+/// adds with its name later is a new one (new field id). The schema then
+/// says which columns are dropped, for every process that reads it.
 ///
-/// - the column was seen dropped: it's in `dropped`;
-/// - it's out of order: Postgres appends a re-added column after every
-///   surviving one and never reorders columns otherwise, while `table`
-///   keeps the order columns were added in. So from the first column
-///   that comes before one it used to follow, the rest were re-added.
+/// A drop shows with the table's next change. A drop and re-add with no
+/// change between shows only by order: Postgres appends a re-added column
+/// after every surviving one and never reorders columns otherwise, while
+/// `table` keeps the order columns were added in. So from the first
+/// column that comes before one it used to follow, the rest were
+/// re-added. A column re-added while it was already last, with no change
+/// to the table in between, can't be told from one that was never
+/// dropped.
 ///
-/// A column re-added while it was already last, with no change to the
-/// table in between, can't be told from one that was never dropped.
-///
-/// Columns the source no longer has are soft-dropped (kept, nullable);
-/// type changes must be legal promotions, and never of a key column.
+/// Type changes must be legal promotions, and never of a key column.
 pub fn reconcile_columns(
     table: &TableSchema,
     source: &[(String, pg2iceberg_core::IcebergType)],
-    dropped: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<SchemaChange>> {
     use std::collections::{BTreeMap, BTreeSet};
     let position: BTreeMap<&str, (usize, &pg2iceberg_core::ColumnSchema)> = table
         .columns
         .iter()
         .enumerate()
+        .filter(|(_, c)| !is_dropped_column(c))
         .map(|(i, c)| (c.name.as_str(), (i, c)))
         .collect();
 
@@ -438,7 +441,7 @@ pub fn reconcile_columns(
             continue;
         }
         out_of_order |= last_kept.is_some_and(|last| at < last);
-        if out_of_order || dropped.contains(name) {
+        if out_of_order {
             readded.insert(name);
         } else {
             last_kept = Some(at);
@@ -501,13 +504,22 @@ pub fn reconcile_columns(
         }
     }
     for col in &table.columns {
-        // Key columns are never dropped; a dropped column already
-        // nullable needs nothing.
-        if !col.is_primary_key && !col.nullable && !source.iter().any(|(n, _)| *n == col.name) {
+        // Key columns are never dropped.
+        if col.is_primary_key
+            || is_dropped_column(col)
+            || source.iter().any(|(n, _)| *n == col.name)
+        {
+            continue;
+        }
+        if !col.nullable {
             changes.push(SchemaChange::DropColumn {
                 name: col.name.clone(),
             });
         }
+        changes.push(SchemaChange::RenameColumn {
+            from: col.name.clone(),
+            to: dropped_column_name(&col.name, col.field_id),
+        });
     }
     Ok(changes)
 }
@@ -880,7 +892,6 @@ mod schema_change_tests {
 mod reconcile_tests {
     use super::*;
     use pg2iceberg_core::{ColumnSchema, IcebergType as T};
-    use std::collections::BTreeSet;
 
     /// `id` (key), `note`, `qty` — field ids 1, 2, 3.
     fn table() -> TableSchema {
@@ -930,21 +941,31 @@ mod reconcile_tests {
     #[test]
     fn unchanged_columns_need_nothing() {
         let src = source(&[("id", T::Int), ("note", T::String), ("qty", T::Int)]);
-        assert!(reconcile_columns(&table(), &src, &BTreeSet::new())
-            .unwrap()
-            .is_empty());
+        assert!(reconcile_columns(&table(), &src).unwrap().is_empty());
     }
 
     #[test]
-    fn columns_keep_their_field_ids_after_one_is_dropped() {
+    fn a_dropped_column_is_renamed_out_of_the_way() {
         // Discovery after `DROP COLUMN note` numbers qty 2 by position;
-        // it keeps field id 3, and note stays, soft-dropped.
+        // it keeps field id 3, and note keeps its values, renamed.
         let src = source(&[("id", T::Int), ("qty", T::Int)]);
-        let changes = reconcile_columns(&table(), &src, &BTreeSet::new()).unwrap();
+        let changes = reconcile_columns(&table(), &src).unwrap();
         assert_eq!(
             after(&changes),
-            cols(&[("id", 1, false), ("note", 2, true), ("qty", 3, true)])
+            cols(&[
+                ("id", 1, false),
+                ("note__dropped_2", 2, true),
+                ("qty", 3, true)
+            ])
         );
+    }
+
+    #[test]
+    fn a_dropped_column_stays_dropped() {
+        let src = source(&[("id", T::Int), ("qty", T::Int)]);
+        let mut dropped = table();
+        apply_schema_changes(&mut dropped, &reconcile_columns(&table(), &src).unwrap()).unwrap();
+        assert!(reconcile_columns(&dropped, &src).unwrap().is_empty());
     }
 
     #[test]
@@ -955,7 +976,7 @@ mod reconcile_tests {
             ("qty", T::Int),
             ("tag", T::String),
         ]);
-        let changes = reconcile_columns(&table(), &src, &BTreeSet::new()).unwrap();
+        let changes = reconcile_columns(&table(), &src).unwrap();
         assert_eq!(after(&changes).last(), Some(&("tag".into(), 4, true)));
     }
 
@@ -963,7 +984,7 @@ mod reconcile_tests {
     fn a_column_re_added_out_of_order_is_new() {
         // `DROP COLUMN note; ADD COLUMN note`: Postgres appends it.
         let src = source(&[("id", T::Int), ("qty", T::Int), ("note", T::String)]);
-        let changes = reconcile_columns(&table(), &src, &BTreeSet::new()).unwrap();
+        let changes = reconcile_columns(&table(), &src).unwrap();
         assert_eq!(
             after(&changes),
             cols(&[
@@ -977,12 +998,22 @@ mod reconcile_tests {
 
     #[test]
     fn a_column_seen_dropped_and_back_is_new() {
-        // qty was last, so its re-add keeps the order; it was seen gone.
-        let src = source(&[("id", T::Int), ("note", T::String), ("qty", T::Int)]);
-        let dropped = BTreeSet::from(["qty".to_string()]);
-        let changes = reconcile_columns(&table(), &src, &dropped).unwrap();
+        // qty was last, so its re-add keeps the order; the schema shows
+        // it was dropped.
+        let mut s = table();
+        let gone = source(&[("id", T::Int), ("note", T::String)]);
+        let changes = reconcile_columns(&s, &gone).unwrap();
+        apply_schema_changes(&mut s, &changes).unwrap();
+        let back = source(&[("id", T::Int), ("note", T::String), ("qty", T::Int)]);
+        let changes = reconcile_columns(&s, &back).unwrap();
+        apply_schema_changes(&mut s, &changes).unwrap();
+        let columns: Vec<_> = s
+            .columns
+            .into_iter()
+            .map(|c| (c.name, c.field_id, c.nullable))
+            .collect();
         assert_eq!(
-            after(&changes),
+            columns,
             cols(&[
                 ("id", 1, false),
                 ("note", 2, false),
@@ -995,15 +1026,15 @@ mod reconcile_tests {
     #[test]
     fn type_changes_must_be_legal_promotions_of_non_key_columns() {
         let promote = source(&[("id", T::Int), ("note", T::String), ("qty", T::Long)]);
-        let changes = reconcile_columns(&table(), &promote, &BTreeSet::new()).unwrap();
+        let changes = reconcile_columns(&table(), &promote).unwrap();
         assert!(matches!(
             changes.as_slice(),
             [SchemaChange::PromoteColumnType { name, new_ty: T::Long }] if name == "qty"
         ));
         let narrow = source(&[("id", T::Int), ("note", T::Int), ("qty", T::Int)]);
-        assert!(reconcile_columns(&table(), &narrow, &BTreeSet::new()).is_err());
+        assert!(reconcile_columns(&table(), &narrow).is_err());
         let key = source(&[("id", T::Long), ("note", T::String), ("qty", T::Int)]);
-        let err = reconcile_columns(&table(), &key, &BTreeSet::new()).unwrap_err();
+        let err = reconcile_columns(&table(), &key).unwrap_err();
         assert!(err.to_string().contains("primary-key"));
     }
 }

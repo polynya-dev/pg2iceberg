@@ -471,9 +471,16 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
     );
     h.drive_then_materialize();
     let after_drop = h.iceberg_schema(&s.ident);
-    let a_after = after_drop.columns.iter().find(|c| c.name == "a").unwrap();
-    assert!(a_after.nullable, "soft-dropped column becomes nullable");
-    assert_eq!(a_after.field_id, a_id, "soft-drop preserves field id");
+    let a_after = after_drop
+        .columns
+        .iter()
+        .find(|c| c.name == pg2iceberg_iceberg::dropped_column_name("a", a_id))
+        .unwrap();
+    assert!(a_after.nullable, "a dropped column becomes nullable");
+    assert_eq!(
+        a_after.field_id, a_id,
+        "a dropped column keeps its field id"
+    );
 
     h.db.alter_add_column(&s.ident, add("c", IcebergType::Long))
         .unwrap();
@@ -490,11 +497,17 @@ fn sequential_evolution_allocates_field_ids_monotonically() {
         .unwrap()
         .field_id;
 
-    // Strict monotonic ordering: a < b < c. (a survived as soft-drop
-    // but still has its original id, which must be lower than b's
-    // and c's.)
+    // Strict monotonic ordering: a < b < c. (a survived, renamed, but
+    // still has its original id, which must be lower than b's and c's.)
     assert!(a_id < b_id, "b allocated after a");
     assert!(b_id < c_id, "c allocated after b (no reuse of a's id)");
+}
+
+/// The name a dropped column had, if `c` is one.
+fn dropped_base(c: &ColumnSchema) -> Option<&str> {
+    pg2iceberg_iceberg::is_dropped_column(c)
+        .then(|| c.name.strip_suffix(&format!("__dropped_{}", c.field_id)))
+        .flatten()
 }
 
 // ── ADD then DROP without values ─────────────────────────────────────
@@ -510,11 +523,11 @@ fn tmp_column() -> ColumnSchema {
 }
 
 #[test]
-fn add_then_drop_with_no_values_leaves_soft_dropped_column() {
+fn add_then_drop_with_no_values_leaves_a_dropped_column() {
     // ALTER ADD COLUMN tmp, a write that leaves it NULL, ALTER DROP
     // COLUMN tmp, another write. The write after the ADD brings a
     // Relation with tmp, the one after the DROP a Relation without it:
-    // tmp ends up soft-dropped (nullable=true) with no value ever
+    // tmp ends up dropped (renamed, nullable) with no value ever
     // written for it.
     let s = schema_with("orders", "qty", IcebergType::Int);
     let mut h = Harness::boot(std::slice::from_ref(&s));
@@ -534,8 +547,13 @@ fn add_then_drop_with_no_values_leaves_soft_dropped_column() {
     h.drive_then_materialize();
 
     let evolved = h.iceberg_schema(&s.ident);
-    let tmp = evolved.columns.iter().find(|c| c.name == "tmp").unwrap();
-    assert!(tmp.nullable, "tmp should be soft-dropped to nullable");
+    assert!(!evolved.columns.iter().any(|c| c.name == "tmp"));
+    let tmp = evolved
+        .columns
+        .iter()
+        .find(|c| dropped_base(c) == Some("tmp"))
+        .unwrap();
+    assert!(tmp.nullable, "tmp should be dropped to nullable");
     assert!(!tmp.is_primary_key);
 }
 
@@ -665,8 +683,12 @@ fn schema_evolution_across_two_tables_is_independent() {
         !b.columns.iter().any(|c| c.name == "tax"),
         "B did not get A's new column"
     );
-    let email_b = b.columns.iter().find(|c| c.name == "email").unwrap();
-    assert!(email_b.nullable, "B's email is soft-dropped");
+    let email_b = b
+        .columns
+        .iter()
+        .find(|c| dropped_base(c) == Some("email"))
+        .unwrap();
+    assert!(email_b.nullable, "B's email is dropped");
     let qty_a = a.columns.iter().find(|c| c.name == "qty").unwrap();
     assert!(!qty_a.nullable, "A's qty unaffected by B's drop");
 }
@@ -764,9 +786,9 @@ fn add_column_then_insert_uses_new_column() {
 // - Every column currently in PG must exist in Iceberg with the same
 //   `IcebergType`. (Promotions are applied to both sides simultaneously,
 //   so they should match exactly, not just be promotion-compatible.)
-// - Every Iceberg column NOT in PG must be a soft-drop (we tracked the
-//   drop, and Iceberg keeps it as `nullable = true` for backward
-//   compatibility with prior data files that still carry it).
+// - Every Iceberg column NOT in PG must be a dropped one (we tracked the
+//   drop, and Iceberg keeps it, renamed and `nullable = true`, for prior
+//   data files that still carry it).
 // - The PK column `id` is never dropped or retyped — its `field_id`
 //   must stay stable across the whole run.
 //
@@ -874,7 +896,7 @@ fn long_running_evolution_keeps_pg_and_iceberg_in_sync() {
         .map(|c| (c.name.clone(), c.ty))
         .collect();
     // Names that have ever been dropped. Used to confirm Iceberg-side
-    // soft-drops are accounted for.
+    // drops are accounted for.
     let mut dropped_cols: BTreeSet<String> = BTreeSet::new();
     // Field id of `id`; should never change across the run.
     let id_field_id = 1;
@@ -1007,27 +1029,27 @@ fn long_running_evolution_keeps_pg_and_iceberg_in_sync() {
         }
 
         // Every Iceberg column not currently in PG must be a tracked
-        // soft-drop AND must be nullable. Anything else means schema
+        // drop AND must be nullable. Anything else means schema
         // bookkeeping has drifted.
         for (name, ic) in &ice_by_name {
             if pg_cols.contains_key(*name) {
                 continue;
             }
             assert!(
-                dropped_cols.contains(*name),
+                dropped_base(ic).is_some_and(|base| dropped_cols.contains(base)),
                 "step {step} ({op:?}): Iceberg has unknown column {name}, \
                  not in pg_cols and never dropped"
             );
             assert!(
                 ic.nullable,
-                "step {step} ({op:?}): soft-dropped {name} should be nullable"
+                "step {step} ({op:?}): dropped {name} should be nullable"
             );
         }
     }
 
     // Sanity: the final Iceberg schema should have at least all of
-    // `id` + every currently-live PG column + every soft-dropped name
-    // we ever saw. (The per-step asserts above already prove this; we
+    // `id` + every currently-live PG column + every dropped name we
+    // ever saw. (The per-step asserts above already prove this; we
     // restate it post-loop for grep-ability when this test fails on
     // refactor.)
     let final_schema = h.iceberg_schema(&initial_ident);
@@ -1042,8 +1064,11 @@ fn long_running_evolution_keeps_pg_and_iceberg_in_sync() {
     }
     for n in &dropped_cols {
         assert!(
-            final_names.contains(n),
-            "final schema missing soft-dropped col {n}"
+            final_schema
+                .columns
+                .iter()
+                .any(|c| dropped_base(c) == Some(n.as_str())),
+            "final schema missing dropped col {n}"
         );
     }
 

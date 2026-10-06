@@ -447,7 +447,8 @@ enum Step {
     /// Backfill one chunk (one row) of the initial snapshot, read as of
     /// the snapshot's LSN — rows may have changed since.
     BackfillChunk,
-    /// `ALTER TABLE DROP COLUMN note` — Iceberg keeps it, soft-dropped.
+    /// `ALTER TABLE DROP COLUMN note` — Iceberg keeps it, renamed out of
+    /// the way.
     DropNote,
     /// `ALTER TABLE ADD COLUMN note text` — a new column that happens to
     /// reuse a dropped one's name; its old values must not come back.
@@ -3667,6 +3668,87 @@ fn backfill_rows_wait_for_the_backfill_to_complete() {
     h.run_step(&Step::BackfillChunk);
     h.materializer.mark_snapshot_complete(&ident());
     h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
+/// A column dropped and re-added while it's the last one — order can't
+/// show the re-add — across a materializer restart: the restarted
+/// materializer must still know it was dropped, or row 3 gets its old
+/// value back under the re-added column.
+#[test]
+fn re_adding_the_last_column_after_a_restart_keeps_old_values_out() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 1 },
+        // Drop and re-add: `note` moves last.
+        Step::DropNote,
+        Step::AddNote,
+        Step::Update { id: 1, qty: 2 },
+        // Written before the next drop, and not after.
+        Step::Insert { id: 3, qty: 5 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        // Again, now that it's last: only having seen the drop tells.
+        Step::DropNote,
+        Step::Update { id: 1, qty: 3 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::RestartMaterializer,
+        Step::AddNote,
+        Step::Insert { id: 2, qty: 4 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// Worker b applies a column's drop and re-add; worker a, which didn't,
+/// writes the table next. With the columns it had, a's value for the
+/// re-added column would land in the dropped one's field.
+#[test]
+fn worker_writing_after_anothers_schema_change_uses_the_new_columns() {
+    DISTRIBUTED.set(true);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::DropNote,
+        Step::AddNote,
+        Step::Insert { id: 1, qty: 0 },
+        Step::DriveFlush,
+        Step::OtherWorkerCycle,
+        Step::Invalidate,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// As above, with rows on both sides of the schema change.
+#[test]
+fn worker_writing_after_anothers_schema_change_keeps_old_rows_apart() {
+    DISTRIBUTED.set(true);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 0 },
+        Step::DropNote,
+        Step::AddNote,
+        Step::Insert { id: 2, qty: 0 },
+        Step::DriveFlush,
+        Step::OtherWorkerCycle,
+        Step::Insert { id: 3, qty: 0 },
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
     check_invariants(&mut h).unwrap();
 }
 

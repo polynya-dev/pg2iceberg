@@ -36,6 +36,14 @@ The staged Parquet files use a fixed schema regardless of the source table struc
 
 Each column is assigned a monotonically increasing field ID that is never reused, even after a column is dropped. This is the Iceberg convention for safe schema evolution: dropped columns can be re-added later without ambiguity, and query engines can distinguish a missing column from a newly added one.
 
+## Dropped columns
+
+A column dropped in PostgreSQL stays in the Iceberg table — older data files hold its values — renamed to `<name>__dropped_<field id>` and made nullable. Its name is then free: a column the source adds with that name later is a new column, with a new field ID and no values, just as PostgreSQL gives a re-added column none. (Kept under its old name, the re-added column would read the dropped one's values.)
+
+The rename is what records the drop, in the table's schema, so every process that loads the table — a restarted materializer, another distributed worker — knows which columns are dropped.
+
+pgoutput reports a schema change only with the table's next change. A drop shows then. A column dropped and re-added with no change in between shows only by order: PostgreSQL appends a re-added column after every other, so a column that comes before one it used to follow was re-added. One re-added while it was already the last column, with no change between, can't be told from one never dropped.
+
 ## Type changes
 
 Not every PostgreSQL type change produces an Iceberg schema change. Some aliases (`integer` → `int4`) normalise to the same Iceberg type and are transparent. Only changes that produce a different Iceberg type (e.g. `varchar(100)` → `text`, or `numeric(10,2)` → `numeric(20,4)`) result in a catalog update.

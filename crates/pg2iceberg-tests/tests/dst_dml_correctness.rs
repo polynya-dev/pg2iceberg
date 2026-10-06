@@ -363,11 +363,11 @@ fn alter_table_add_column_mid_stream_propagates_to_iceberg() {
 }
 
 #[test]
-fn alter_table_drop_column_is_soft_drop() {
-    // DROP COLUMN doesn't physically remove data — Iceberg
-    // soft-drops by keeping the column nullable. Pre-drop rows
-    // still have the column populated; post-drop rows write null
-    // (or the column is just absent from new data files).
+fn alter_table_drop_column_keeps_its_values_renamed() {
+    // DROP COLUMN doesn't physically remove data: Iceberg keeps the
+    // column, renamed out of the way of a column the source may add
+    // with its name later, and nullable. Pre-drop rows keep their
+    // values under the new name; post-drop rows have none.
     let mut h = Harness::boot();
 
     let mut tx = h.db.begin_tx();
@@ -385,16 +385,39 @@ fn alter_table_drop_column_is_soft_drop() {
     tx.commit(Timestamp(0)).unwrap();
     h.drive_then_materialize();
 
-    // Iceberg side: schema still has `qty` (soft-drop), nullable=true.
-    // Read with the original schema — pre-drop row keeps qty=10,
-    // post-drop row has qty=null.
-    let visible = block_on(read_materialized_state(
+    let table = block_on(pg2iceberg_iceberg::Catalog::load_table(
+        h.catalog.as_ref(),
+        &ident(),
+    ))
+    .unwrap()
+    .unwrap();
+    let qty_id = schema()
+        .columns
+        .iter()
+        .find(|c| c.name == "qty")
+        .unwrap()
+        .field_id;
+    let dropped = pg2iceberg_iceberg::dropped_column_name("qty", qty_id);
+    assert!(!table.schema.columns.iter().any(|c| c.name == "qty"));
+    let qty = table
+        .schema
+        .columns
+        .iter()
+        .find(|c| c.name == dropped)
+        .unwrap();
+    assert!(qty.nullable);
+    let mut visible = block_on(read_materialized_state(
         h.catalog.as_ref(),
         h.blob.as_ref(),
         &ident(),
-        &schema(),
+        &table.schema,
         &[ColumnName("id".into())],
     ))
     .unwrap();
-    assert_eq!(visible.len(), 2);
+    visible.sort_by_key(|r| format!("{:?}", r.get(&ColumnName("id".into()))));
+    let values: Vec<_> = visible
+        .iter()
+        .map(|r| r.get(&ColumnName(dropped.clone())).cloned())
+        .collect();
+    assert_eq!(values, [Some(PgValue::Int4(10)), Some(PgValue::Null)]);
 }
