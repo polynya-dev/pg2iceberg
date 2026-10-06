@@ -98,6 +98,7 @@ pub async fn run_watcher_tick(
     watcher: &InvariantWatcher,
     pipeline_flushed_lsn: Lsn,
     slot_confirmed_flush_lsn: Lsn,
+    coord_flushed_lsn: Lsn,
     slot_wal_status: Option<pg2iceberg_pg::WalStatus>,
     slot_safe_wal_size: Option<i64>,
     slot_restart_lsn: Lsn,
@@ -109,6 +110,7 @@ pub async fn run_watcher_tick(
     let inputs = WatcherInputs {
         pipeline_flushed_lsn,
         slot_confirmed_flush_lsn,
+        coord_flushed_lsn,
         group: group.to_string(),
         watched_tables: watched_tables.to_vec(),
         slot_wal_status,
@@ -689,6 +691,11 @@ where
             .map_err(|e| LifecycleError::Coord(e.to_string()))?;
         stream.send_standby(snapshot_lsn, snapshot_lsn).await?;
     }
+    let recorded_lsn = lc
+        .coord
+        .flushed_lsn()
+        .await
+        .map_err(|e| LifecycleError::Coord(e.to_string()))?;
 
     // 8-9. Main loop + drain.
     let watched_tables = table_idents.clone();
@@ -701,6 +708,7 @@ where
         pg: Arc::clone(&lc.pg),
         publication_name: lc.publication_name,
         snapshot_lsn: snap_lsn,
+        recorded_lsn,
         coord: Arc::clone(&lc.coord),
         slot_monitor,
         watcher,
@@ -819,6 +827,9 @@ pub struct LogicalLoop<C: Coordinator + ?Sized + 'static, Cat: Catalog + 'static
     /// The snapshot LSN `stream` started at, if the snapshot phase just
     /// ran: a reopened stream starts past it too.
     pub snapshot_lsn: Option<Lsn>,
+    /// [`Coordinator::flushed_lsn`] as this process last stamped or read
+    /// it: how far the slot may be acked (see [`record_and_ack`]).
+    pub recorded_lsn: Lsn,
     pub coord: Arc<dyn Coordinator>,
     pub slot_monitor: Arc<dyn SlotMonitor>,
     pub watcher: InvariantWatcher,
@@ -1108,23 +1119,9 @@ where
             loop_state.pipeline.flush().await?;
         }
         Handler::Standby => {
-            let lsn = loop_state.pipeline.flushed_lsn();
-            // Stamp the durable record *before* acking the slot.
-            // Crash between the two: slot lags our record, slot
-            // replays, fold absorbs duplicates — safe. Reverse
-            // order would let a successful slot ack lose its
-            // record on crash, then look like external advancement
-            // on next startup.
-            //
-            // Failures here are logged but not fatal: a transient
-            // coord blip shouldn't stop the standby ack (which is
-            // what advances the slot and lets PG recycle WAL). The
-            // next tick will retry the stamp; a persistent failure
-            // shows up in metrics.
-            if let Err(e) = loop_state.coord.set_flushed_lsn(lsn).await {
-                tracing::warn!(error = %e, "set_flushed_lsn failed; will retry next tick");
-            }
-            let _ = loop_state.stream.send_standby(lsn, lsn).await;
+            // A failed ack is retried next tick; a dropped stream, the
+            // next recv reopens.
+            let _ = record_and_ack(loop_state).await;
         }
         Handler::Materialize => {
             // `cycle` failure is fatal (propagates); compaction
@@ -1139,7 +1136,7 @@ where
         Handler::Watcher => {
             // One combined slot probe per tick covers every health
             // field the watcher needs:
-            //   - confirmed_flush_lsn → invariant 1 (PipelineAheadOfSlot)
+            //   - confirmed_flush_lsn → invariant 1 (SlotAheadOfRecord)
             //   - wal_status=Unreserved → invariant 4 (warn-only)
             //   - wal_status=Lost → invariant 5 (fatal)
             //   - conflicting=true → invariant 6 (fatal)
@@ -1161,10 +1158,14 @@ where
             let safe_wal_size = health.as_ref().and_then(|h| h.safe_wal_size);
             let restart_lsn = health.as_ref().map(|h| h.restart_lsn).unwrap_or(Lsn::ZERO);
             let conflicting = health.as_ref().map(|h| h.conflicting).unwrap_or(false);
+            // The durable record, unread if the coordinator is down: the
+            // invariant then skips.
+            let recorded = loop_state.coord.flushed_lsn().await.unwrap_or(Lsn::ZERO);
             let violations = run_watcher_tick(
                 &loop_state.watcher,
                 loop_state.pipeline.flushed_lsn(),
                 confirmed,
+                recorded,
                 wal_status,
                 safe_wal_size,
                 restart_lsn,
@@ -1184,6 +1185,44 @@ where
         }
     }
     Ok(())
+}
+
+/// Record how far the pipeline has staged, then ack the slot up to the
+/// record — never past it. Every ack is recorded first, so the slot never
+/// leads the record, and a slot that does was advanced by something else:
+/// the next start refuses (`SlotAdvancedExternally`), and so does the
+/// watcher meanwhile. An ack past an LSN whose stamp failed would make
+/// pg2iceberg's own ack look like that.
+///
+/// The record only moves forward: it's the highest LSN ever acked, and a
+/// restarted pipeline's flushed LSN starts at zero.
+///
+/// Returns the LSN acked (zero: nothing recorded yet, no ack) and how
+/// the ack went.
+async fn record_and_ack<C, Cat>(
+    loop_state: &mut LogicalLoop<C, Cat>,
+) -> (Lsn, pg2iceberg_pg::Result<()>)
+where
+    C: Coordinator + ?Sized + 'static,
+    Cat: Catalog + 'static,
+{
+    let lsn = loop_state.pipeline.flushed_lsn();
+    if lsn > loop_state.recorded_lsn {
+        match loop_state.coord.set_flushed_lsn(lsn).await {
+            Ok(()) => loop_state.recorded_lsn = lsn,
+            // Retried next tick. Meanwhile the slot holds the WAL past
+            // the record, as it would without the ack.
+            Err(e) => tracing::warn!(
+                error = %e,
+                "set_flushed_lsn failed; acking the slot only as far as recorded"
+            ),
+        }
+    }
+    let acked = loop_state.recorded_lsn;
+    if acked == Lsn::ZERO {
+        return (acked, Ok(()));
+    }
+    (acked, loop_state.stream.send_standby(acked, acked).await)
 }
 
 /// Final flush + send_standby + unregister. Used by
@@ -1209,13 +1248,8 @@ where
     if let Err(e) = loop_state.materializer.cycle().await {
         tracing::warn!(error = %e, "final materializer cycle failed");
     }
-    let final_lsn = loop_state.pipeline.flushed_lsn();
-    // Stamp the final acked LSN before the standby ack — same write-
-    // before-ack discipline as the periodic Standby handler.
-    if let Err(e) = loop_state.coord.set_flushed_lsn(final_lsn).await {
-        tracing::warn!(error = %e, "final set_flushed_lsn failed");
-    }
-    if let Err(e) = loop_state.stream.send_standby(final_lsn, final_lsn).await {
+    let (final_lsn, acked) = record_and_ack(&mut loop_state).await;
+    if let Err(e) = acked {
         tracing::warn!(error = %e, "final send_standby failed");
     }
     // Update each completed table's `snapshot_lsn` to the final

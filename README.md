@@ -263,7 +263,7 @@ Configuration is YAML-first; see [`config.example.yaml`](config.example.yaml) fo
 State persisted in `_pg2iceberg`:
 
 - **Cluster fingerprint** (`pipeline_meta.system_identifier`): stamped at first startup. A different `IDENTIFY_SYSTEM` value on subsequent runs (e.g. accidental DSN swap, blue-green cutover) returns `SystemIdMismatch` and refuses to start.
-- **Slot-tamper baseline** (`flushed_lsn`): the highest LSN we've ever acked. Compared against `slot.confirmed_flush_lsn` at startup to catch external advancement (`pg_replication_slot_advance`, drop-recreate, stray `pg_recvlogical`).
+- **Slot-tamper baseline** (`flushed_lsn`): the highest LSN we've ever acked — every ack is recorded first, and never past the record. Compared against `slot.confirmed_flush_lsn` at startup and by the runtime watcher to catch external advancement (`pg_replication_slot_advance`, drop-recreate, stray `pg_recvlogical`).
 - **Per-table snapshot state** (`tables`, `snapshot_progress`): `snapshot_complete` + `pg_oid` per table; mid-snapshot resume cursor cleared on completion.
 
 To resume from where the previous process left off, just restart with the same config — coord cursors + slot LSN are sufficient.

@@ -9,8 +9,12 @@
 //! Three checks (a subset of plan §9 — the ones doable without snapshot
 //! readback, which would be too expensive to run continuously):
 //!
-//! - **Invariant 1**: `pipeline.flushed_lsn ≤ slot.confirmed_flush_lsn`. The
-//!   slot must never be ahead of what the pipeline acknowledges.
+//! - **Invariant 1**: `slot.confirmed_flush_lsn ≤ coord.flushed_lsn`. The
+//!   slot must never be ahead of what pg2iceberg recorded acknowledging —
+//!   every ack is recorded first — or something else advanced it, and
+//!   the WAL in between was never staged. (The slot lagging what's staged
+//!   is normal: it's acked on the standby tick, after the flush. That
+//!   lag is a gauge, [`names::SLOT_ACK_LAG`].)
 //! - **Invariant 2**: `mat_cursor[t] ≤ max(log_index.end_offset[t])`. The
 //!   materializer cursor must never point past committed offsets.
 //! - **Invariant 3**: `pipeline.flushed_lsn` monotonic across watcher
@@ -27,12 +31,15 @@ use thiserror::Error;
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum InvariantViolation {
     #[error(
-        "invariant 1: pipeline.flushed_lsn ({pipeline_flushed}) > slot.confirmed_flush_lsn \
-         ({slot_confirmed}); the standby ack hasn't caught up to what the pipeline thinks"
+        "invariant 1: slot {slot_name}'s confirmed_flush_lsn ({slot_confirmed}) is past \
+         the LSN pg2iceberg recorded acking ({recorded}): something else advanced the slot \
+         (`pg_replication_slot_advance`, another consumer), and the WAL in between was never \
+         staged. Run `pg2iceberg cleanup` and re-snapshot to recover."
     )]
-    PipelineAheadOfSlot {
-        pipeline_flushed: Lsn,
+    SlotAheadOfRecord {
+        slot_name: String,
         slot_confirmed: Lsn,
+        recorded: Lsn,
     },
 
     #[error(
@@ -95,14 +102,16 @@ pub enum InvariantViolation {
 impl InvariantViolation {
     /// `true` for violations the main loop should treat as fatal —
     /// i.e. propagate as [`LifecycleError::SlotHealth`] rather than
-    /// log-and-continue. Currently: `SlotWalLost` and
-    /// `SlotConflicting` (both signal an unrecoverable upstream
-    /// state). The other variants are healthy-pipeline alerts that
-    /// don't warrant tearing the loop down.
+    /// log-and-continue. Currently: `SlotAheadOfRecord`, `SlotWalLost`
+    /// and `SlotConflicting` (each signals WAL the pipeline will never
+    /// see). The other variants are healthy-pipeline alerts that don't
+    /// warrant tearing the loop down.
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            InvariantViolation::SlotWalLost { .. } | InvariantViolation::SlotConflicting { .. }
+            InvariantViolation::SlotAheadOfRecord { .. }
+                | InvariantViolation::SlotWalLost { .. }
+                | InvariantViolation::SlotConflicting { .. }
         )
     }
 }
@@ -113,7 +122,11 @@ impl InvariantViolation {
 #[derive(Clone, Debug, Default)]
 pub struct WatcherInputs {
     pub pipeline_flushed_lsn: Lsn,
+    /// `Lsn::ZERO` if the slot couldn't be read: invariant 1 skips.
     pub slot_confirmed_flush_lsn: Lsn,
+    /// [`Coordinator::flushed_lsn`]: the highest LSN pg2iceberg recorded
+    /// acking. `Lsn::ZERO` if none (or unreadable): invariant 1 skips.
+    pub coord_flushed_lsn: Lsn,
     /// `(table, mat_cursor_value)` for each watched group/table. The
     /// watcher cross-checks against `coord.read_log` to derive
     /// `max(end_offset)`.
@@ -163,12 +176,22 @@ impl InvariantWatcher {
     pub async fn check(&self, inputs: &WatcherInputs) -> Vec<InvariantViolation> {
         let mut violations = Vec::new();
 
-        // 1. pipeline.flushed_lsn ≤ slot.confirmed_flush_lsn.
-        if inputs.pipeline_flushed_lsn > inputs.slot_confirmed_flush_lsn {
-            violations.push(InvariantViolation::PipelineAheadOfSlot {
-                pipeline_flushed: inputs.pipeline_flushed_lsn,
-                slot_confirmed: inputs.slot_confirmed_flush_lsn,
+        // 1. slot.confirmed_flush_lsn ≤ coord.flushed_lsn.
+        let slot = inputs.slot_confirmed_flush_lsn;
+        let recorded = inputs.coord_flushed_lsn;
+        if slot > Lsn::ZERO && recorded > Lsn::ZERO && slot > recorded {
+            violations.push(InvariantViolation::SlotAheadOfRecord {
+                slot_name: inputs.slot_name.clone(),
+                slot_confirmed: slot,
+                recorded,
             });
+        }
+        if slot > Lsn::ZERO {
+            self.metrics.gauge(
+                names::SLOT_ACK_LAG,
+                &Labels::new(),
+                inputs.pipeline_flushed_lsn.0.saturating_sub(slot.0) as f64,
+            );
         }
 
         // 2. mat_cursor[t] ≤ max(log_index.end_offset[t]).
@@ -241,7 +264,7 @@ impl InvariantWatcher {
         for v in &violations {
             let mut labels = Labels::new();
             let invariant_id = match v {
-                InvariantViolation::PipelineAheadOfSlot { .. } => "pipeline_ahead_of_slot",
+                InvariantViolation::SlotAheadOfRecord { .. } => "slot_ahead_of_record",
                 InvariantViolation::CursorAheadOfLogIndex { .. } => "cursor_ahead_of_log_index",
                 InvariantViolation::FlushedLsnRegressed { .. } => "flushed_lsn_regressed",
                 InvariantViolation::SlotWalUnreserved { .. } => "slot_wal_unreserved",
@@ -305,29 +328,60 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_ahead_of_slot_caught() {
+    fn slot_lagging_what_is_staged_is_no_violation() {
         let (_coord, metrics, watcher) = boot();
         let inputs = WatcherInputs {
             pipeline_flushed_lsn: Lsn(200),
             slot_confirmed_flush_lsn: Lsn(100),
+            coord_flushed_lsn: Lsn(200),
+            group: "default".into(),
+            watched_tables: vec![],
+            ..Default::default()
+        };
+        assert!(block_on(watcher.check(&inputs)).is_empty());
+        assert_eq!(
+            metrics.gauge_value(names::SLOT_ACK_LAG, &Labels::new()),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn slot_ahead_of_its_record_caught() {
+        let (_coord, metrics, watcher) = boot();
+        let inputs = WatcherInputs {
+            pipeline_flushed_lsn: Lsn(200),
+            slot_confirmed_flush_lsn: Lsn(300),
+            coord_flushed_lsn: Lsn(200),
             group: "default".into(),
             watched_tables: vec![],
             ..Default::default()
         };
         let v = block_on(watcher.check(&inputs));
         assert_eq!(v.len(), 1);
-        assert!(matches!(
-            v[0],
-            InvariantViolation::PipelineAheadOfSlot { .. }
-        ));
+        assert!(matches!(v[0], InvariantViolation::SlotAheadOfRecord { .. }));
+        assert!(v[0].is_fatal());
 
         // Counter should have ticked once for this invariant.
         let mut labels = Labels::new();
-        labels.insert("invariant".into(), "pipeline_ahead_of_slot".into());
+        labels.insert("invariant".into(), "slot_ahead_of_record".into());
         assert_eq!(
             metrics.counter_value(names::INVARIANT_VIOLATIONS_TOTAL, &labels),
             1
         );
+    }
+
+    #[test]
+    fn an_unread_slot_or_record_is_no_violation() {
+        let (_coord, _metrics, watcher) = boot();
+        for (slot, recorded) in [(Lsn::ZERO, Lsn(200)), (Lsn(300), Lsn::ZERO)] {
+            let inputs = WatcherInputs {
+                slot_confirmed_flush_lsn: slot,
+                coord_flushed_lsn: recorded,
+                group: "default".into(),
+                ..Default::default()
+            };
+            assert!(block_on(watcher.check(&inputs)).is_empty());
+        }
     }
 
     #[test]

@@ -78,6 +78,9 @@ pub mod ops {
     pub const COORD_READ_LOG: &str = "coord.read_log";
     pub const COORD_TRUNCATE: &str = "coord.truncate_log";
     pub const COORD_SET_CURSOR: &str = "coord.set_cursor";
+    /// Fault key for `Coordinator::set_flushed_lsn`: the record a
+    /// standby ack must never get ahead of.
+    pub const COORD_SET_FLUSHED_LSN: &str = "coord.set_flushed_lsn";
     /// Fault key for `Coordinator::set_snapshot_progress`. The
     /// snapshot phase calls this after every chunk; injecting here
     /// drives the resumability fault DSTs (mid-chunk crash → resume
@@ -342,6 +345,9 @@ impl Coordinator for FaultyCoordinator {
     }
 
     async fn set_flushed_lsn(&self, lsn: Lsn) -> CoordResult<()> {
+        if self.plan.tick(ops::COORD_SET_FLUSHED_LSN) {
+            return Err(CoordError::Pg("injected fault: set_flushed_lsn".into()));
+        }
         self.inner.set_flushed_lsn(lsn).await
     }
 
