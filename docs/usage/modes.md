@@ -4,10 +4,18 @@ icon: lucide/layers
 
 # Operational Modes
 
-pg2iceberg's CLI is organized as subcommands. Each one is a separate entry point that takes the same `--config` YAML.
+pg2iceberg's CLI is organized as subcommands. Each one is a separate entry point that reads the same settings: environment variables, and an optional config file (`--config`, else `PG2ICEBERG_CONFIG`, else `pg2iceberg.yaml` if present) — see [Configuration](configuration.md). The examples pass `--config` explicitly.
 
 ```sh
-pg2iceberg <SUBCOMMAND> --config /etc/pg2iceberg/config.yaml [flags...]
+pg2iceberg <SUBCOMMAND> [--config /etc/pg2iceberg/config.yaml] [flags...]
+```
+
+## `init` — write a config
+
+Inspects the source database (`POSTGRES_URL`), checks what replication needs of it, and writes `pg2iceberg.yaml`: every table pg2iceberg can replicate, the settings the environment gives, secrets as `${VAR}` references. `--output -` prints it; `--force` overwrites an existing file.
+
+```bash
+pg2iceberg init
 ```
 
 ## `run` — single-process default

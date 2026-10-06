@@ -9,7 +9,9 @@
 //! `main.rs` is the CLI entrypoint and re-uses these via the lib.
 
 pub mod config;
+pub mod init;
 pub mod realio;
 pub mod run;
 pub mod setup;
 pub mod snapshot_src;
+pub mod tables;

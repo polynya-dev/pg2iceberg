@@ -268,15 +268,15 @@ discover_tests() {
     printf '%s\n' "${names[@]}" | sort -u
 }
 
-# Generate a test-specific config YAML.
+# Generate a test-specific config YAML: the case's table and tuning.
+# Connection, catalog and storage settings come from the environment
+# (see `run_pg2iceberg`), as a deployment's would.
 # If an __extra.yaml file exists for the test, its contents are appended
 # to the table entry (indented under the table).
 gen_config() {
     local table="$1"
-    local publication="$2"
-    local slot="$3"
-    local config_path="$4"
-    local extra_file="$5"
+    local config_path="$2"
+    local extra_file="$3"
 
     cat > "$config_path" <<YAML
 tables:
@@ -288,32 +288,11 @@ YAML
         cat "$extra_file" >> "$config_path"
     fi
 
-    # Coord state lives in the source PG by default in the Rust port —
-    # there is no file-based store (`state.path`). The Go suite's
-    # `state.path` field is ignored here; coord schema is per-table to
+    # Coord state lives in the source PG; its schema is per-table to
     # keep parallel runs isolated.
     cat >> "$config_path" <<YAML
 
-source:
-  mode: logical
-  postgres:
-    host: ${PG_HOST}
-    port: ${PG_PORT}
-    database: ${PG_DB}
-    user: ${PG_USER}
-    password: ${PG_PASSWORD}
-  logical:
-    publication_name: ${publication}
-    slot_name: ${slot}
-
 sink:
-  catalog_uri: ${CATALOG_URI}
-  warehouse: s3://warehouse/
-  namespace: ${NAMESPACE}
-  s3_endpoint: ${S3_ENDPOINT}
-  s3_access_key: ${S3_ACCESS_KEY}
-  s3_secret_key: ${S3_SECRET_KEY}
-  s3_region: us-east-1
   flush_interval: ${FLUSH_INTERVAL}
   flush_rows: ${FLUSH_ROWS}
   materializer_interval: 5s
@@ -321,6 +300,28 @@ sink:
 state:
   coordinator_schema: _pg2iceberg_${table}
 YAML
+}
+
+# Start pg2iceberg in the background with the test stack's settings in
+# its environment. Ambient AWS session settings are dropped: the stack's
+# MinIO takes its own keys only.
+run_pg2iceberg() {
+    local config_path="$1"
+    local publication="$2"
+    local slot="$3"
+    local log="$4"
+    env -u AWS_SESSION_TOKEN -u AWS_PROFILE \
+        POSTGRES_URL="postgres://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/${PG_DB}" \
+        PG2ICEBERG_PUBLICATION="$publication" \
+        PG2ICEBERG_SLOT="$slot" \
+        ICEBERG_CATALOG_URL="$CATALOG_URI" \
+        ICEBERG_WAREHOUSE="s3://warehouse/" \
+        ICEBERG_NAMESPACE="$NAMESPACE" \
+        AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" \
+        AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
+        AWS_ENDPOINT_URL_S3="$S3_ENDPOINT" \
+        AWS_REGION=us-east-1 \
+        "$PG2ICEBERG_BIN" run --config "$config_path" > "$log" 2>&1 &
 }
 
 # Wait for pg2iceberg replication slot to become active.
@@ -454,8 +455,8 @@ run_test() {
             # Start pg2iceberg on first DATA step.
             if [ "$replication_started" = false ]; then
                 local extra_file="$CASES_DIR/${test_name}__extra.yaml"
-                gen_config "$table" "$publication" "$slot" "$config_path" "$extra_file"
-                "$PG2ICEBERG_BIN" run --config "$config_path" > "$pg2iceberg_log" 2>&1 &
+                gen_config "$table" "$config_path" "$extra_file"
+                run_pg2iceberg "$config_path" "$publication" "$slot" "$pg2iceberg_log"
                 pg2iceberg_pid=$!
 
                 if ! wait_for_replication "$slot"; then

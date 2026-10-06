@@ -663,6 +663,110 @@ async fn discover_schema_against_real_pg() {
     assert!(bio.nullable);
 }
 
+/// What table discovery finds in a database: the tables a publication
+/// can hold — not a partition, an unlogged table or a view — and, with
+/// no tables configured, the binary replicates those it can.
+#[tokio::test]
+async fn table_discovery_against_real_pg() {
+    use pg2iceberg_pg::prod::SourceTable;
+
+    let pg = shared_pg().await;
+    let admin = regular_client(&pg.dsn).await;
+    let db = format!("disc_{}", uniq());
+    let role = format!("r_{}", uniq());
+    // CREATE DATABASE runs in a statement of its own.
+    admin
+        .batch_execute(&format!("CREATE DATABASE {db}"))
+        .await
+        .expect("create database");
+    admin
+        .batch_execute(&format!(
+            "CREATE ROLE {role} LOGIN REPLICATION PASSWORD 'pw'"
+        ))
+        .await
+        .expect("create role");
+    let dsn = pg.dsn.replace("dbname=postgres", &format!("dbname={db}"));
+    let regular = regular_client(&dsn).await;
+    regular
+        .batch_execute(&format!(
+            "CREATE TABLE orders (id int PRIMARY KEY); \
+             INSERT INTO orders SELECT generate_series(1, 10); \
+             CREATE TABLE events (id int); \
+             CREATE TABLE m (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at); \
+             CREATE TABLE m_2026 PARTITION OF m FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
+             INSERT INTO m VALUES (1, '2026-03-01'), (2, '2026-04-01'), (3, '2026-05-01'); \
+             CREATE UNLOGGED TABLE scratch (id int PRIMARY KEY); \
+             CREATE VIEW v AS SELECT * FROM orders; \
+             CREATE TABLE wide (id int PRIMARY KEY, amount numeric(50, 2)); \
+             CREATE SCHEMA sales; \
+             CREATE TABLE sales.invoices (id int PRIMARY KEY); \
+             ANALYZE; \
+             GRANT USAGE ON SCHEMA sales TO {role}; \
+             GRANT SELECT ON orders TO {role}"
+        ))
+        .await
+        .expect("create tables");
+
+    let table = |schema: &str, name: &str, pk: bool, partitioned: bool, rows: i64| SourceTable {
+        schema: schema.into(),
+        name: name.into(),
+        has_primary_key: pk,
+        partitioned,
+        readable: true,
+        row_estimate: rows,
+    };
+    let client = PgClientImpl::connect_with(&dsn, TlsMode::Disable)
+        .await
+        .expect("connect");
+    assert_eq!(
+        client.list_tables().await.expect("list tables"),
+        [
+            table("public", "events", false, false, 0),
+            table("public", "m", true, true, 3),
+            table("public", "orders", true, false, 10),
+            table("public", "wide", true, false, 0),
+            table("sales", "invoices", true, false, 0),
+        ]
+    );
+
+    // A role reads only what it's been granted.
+    let restricted = PgClientImpl::connect_with(
+        &dsn.replace(
+            "user=postgres password=postgres",
+            &format!("user={role} password=pw"),
+        ),
+        TlsMode::Disable,
+    )
+    .await
+    .expect("connect as the restricted role");
+    let readable: Vec<(String, bool)> = restricted
+        .list_tables()
+        .await
+        .expect("list tables")
+        .into_iter()
+        .map(|t| (format!("{}.{}", t.schema, t.name), t.readable))
+        .collect();
+    assert!(
+        readable.contains(&("public.orders".into(), true)),
+        "{readable:?}"
+    );
+    assert!(
+        readable.contains(&("public.events".into(), false)),
+        "{readable:?}"
+    );
+
+    // No tables configured: every one pg2iceberg can replicate.
+    let mut cfg = pg2iceberg::config::Config::from_env(&|name: &str| {
+        (name == "POSTGRES_URL").then(|| dsn.clone())
+    })
+    .expect("config");
+    pg2iceberg::tables::resolve(&mut cfg)
+        .await
+        .expect("resolve tables");
+    let names: Vec<&str> = cfg.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["public.m", "public.orders", "sales.invoices"]);
+}
+
 #[tokio::test]
 async fn drop_slot_and_publication_against_real_pg() {
     // End-to-end: create slot + publication, then drop both via

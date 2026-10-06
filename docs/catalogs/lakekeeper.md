@@ -10,9 +10,7 @@ icon: lucide/layers
 
 ```yaml
 source:
-  postgres_url: "postgres://user:pass@host:5432/db?sslmode=disable"
-  publication: pg2iceberg
-  slot: pg2iceberg
+  postgres_url: "postgres://user:pass@host:5432/db"
 
 sink:
   catalog_uri: "https://lakekeeper.example.com"
@@ -24,6 +22,8 @@ sink:
 tables:
   - name: public.orders
 ```
+
+The same with environment variables: `ICEBERG_CATALOG_URL`, `ICEBERG_CATALOG_TOKEN` (a token implies `bearer`), and `ICEBERG_CREDENTIAL_MODE=vended`.
 
 | Field | Value |
 |-------|-------|

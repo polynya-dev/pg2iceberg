@@ -268,6 +268,7 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
         }],
         source: SourceConfig {
             mode: "logical".into(),
+            postgres_url: String::new(),
             postgres: PostgresConfig::default(),
             logical: LogicalConfig::default(),
         },

@@ -121,11 +121,14 @@ Coordinator write amplification is negligible: a few small PG writes per flush r
 ## CLI subcommands
 
 ```sh
-pg2iceberg <SUBCOMMAND> --config /etc/pg2iceberg/config.yaml [flags...]
+pg2iceberg <SUBCOMMAND> [--config pg2iceberg.yaml] [flags...]
 ```
+
+Every subcommand takes its settings from environment variables and an optional config file (see [Configuration](#configuration)).
 
 | Subcommand | Purpose |
 |---|---|
+| `init` | Inspect the source database and write `pg2iceberg.yaml`: every table pg2iceberg can replicate, the settings the environment gives, secrets as `${VAR}` references. Checks what replication needs of the database too (`wal_level`, the replication privilege, a free slot, table ownership for the publication). |
 | `run` | Long-running pipeline: initial snapshot, then CDC via logical replication. |
 | `snapshot` | One-shot: run the initial snapshot phase per configured table, then exit. Auto-creates the slot first so a later `run` doesn't lose WAL. |
 | `cleanup` | Drop the replication slot, drop the publication, and `DROP SCHEMA … CASCADE` on the coordinator. Resets PG-side state ahead of a re-bootstrap. **Doesn't drop Iceberg tables** — do that out-of-band. |
@@ -232,32 +235,48 @@ SELECT * FROM rideshare.`rideshare.rides`
 
 You should see new rows appearing as the workload drives PG.
 
+Against your own database and catalog, environment variables are enough:
+
+```sh
+export POSTGRES_URL=postgres://user:password@db.example.com:5432/app
+export ICEBERG_CATALOG_URL=https://catalog.example.com
+export ICEBERG_WAREHOUSE=s3://my-bucket/warehouse/
+pg2iceberg init   # optional: check the database, and write pg2iceberg.yaml to edit
+pg2iceberg run
+```
+
+With no tables configured, pg2iceberg replicates every table with a primary key. S3 credentials come from the AWS default chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, a profile, an instance or task role).
+
 `./run.sh` in the same directory runs it as a smoke test: the mixed workload — deletes, large and rolled-back transactions, key changes, TOAST, schema changes — with a crash, external compactions and snapshot expiry alongside, then a row-by-row comparison of Postgres with ClickHouse. See [`example/single`](example/single).
 
 ## Configuration
 
-Configuration is YAML-first; see [`config.example.yaml`](config.example.yaml) for the full surface. CLI flags and env vars override individual fields.
+Settings come from environment variables and an optional YAML file: `--config`, else `PG2ICEBERG_CONFIG`, else `pg2iceberg.yaml` in the current directory if it exists. Environment variables override the file, and the file can read them: `${VAR}` in a string value is replaced by the variable. See [`config.example.yaml`](config.example.yaml) for the full surface, and [Configuration](docs/usage/configuration.md) for the details.
 
-| Env var | YAML field | Description |
+| Env var | Config field | Description |
 |---|---|---|
-| `POSTGRES_URL` | `source.postgres.dsn` | PostgreSQL connection URL |
-| `TABLES` | `tables` | List of source tables to replicate |
-| `SLOT_NAME` | `source.logical.slot_name` | Replication slot (default: `pg2iceberg_slot`) |
-| `PUBLICATION_NAME` | `source.logical.publication_name` | Publication (default: `pg2iceberg_pub`) |
-| `ICEBERG_CATALOG_URL` | `sink.catalog_uri` | Iceberg REST catalog URL |
-| `WAREHOUSE` | `sink.warehouse` | Iceberg warehouse path (`s3://bucket/prefix/`) |
-| `NAMESPACE` | `sink.namespace` | Iceberg namespace |
-| `S3_ENDPOINT` | `sink.s3_endpoint` | S3 endpoint URL |
-| `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_REGION` | `sink.s3_*` | S3 credentials and region |
-| `STATE_POSTGRES_URL` | `state.postgres_url` | Optional separate Postgres for coord state |
+| `POSTGRES_URL` | `source.postgres_url` | Source database: a URL or `key=value` connection string (required) |
+| `PG2ICEBERG_TABLES` | `tables` | Comma-separated `schema.table` or `schema.*`. Default: every table with a primary key |
+| `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.logical.slot_name` / `publication_name` | Default `pg2iceberg_slot` / `pg2iceberg_pub` |
+| `PG2ICEBERG_STATE_URL` | `state.postgres_url` | A separate Postgres for pg2iceberg's state. Default: the source |
+| `PG2ICEBERG_CONFIG` | — | The config file |
+| `ICEBERG_CATALOG_URL` | `sink.catalog_uri` | Iceberg REST catalog (required) |
+| `ICEBERG_CATALOG_TOKEN` | `sink.catalog_token` | Bearer token |
+| `ICEBERG_CATALOG_CLIENT_ID` / `_SECRET` | `sink.catalog_client_id` / `_secret` | OAuth2 client credentials |
+| `ICEBERG_CATALOG_AUTH` | `sink.catalog_auth` | `none` / `bearer` / `oauth2` / `sigv4`. Default: inferred |
+| `ICEBERG_WAREHOUSE` | `sink.warehouse` | `s3://bucket/prefix/` |
+| `ICEBERG_NAMESPACE` | `sink.namespace` | One namespace for every table. Default: each table's Postgres schema |
+| `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` | `static` / `iam` / `vended`. Default: inferred |
+| `AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, ... | `sink.s3_*` | Read as AWS tools read them; the file's `sink.s3_*` take precedence |
 
-### Credential modes (`sink.credential_mode`)
+### Inferred settings
 
-| Mode | Description |
+| Setting | Inferred |
 |---|---|
-| `static` (default) | Operator-supplied S3 keys in YAML / env |
-| `iam` | AWS SDK env / IMDS / EC2-metadata credential chain |
-| `vended` | Per-table credentials from the catalog (Polaris / Snowflake / Tabular). Requires `header.x-iceberg-access-delegation: vended-credentials` in the REST request, which pg2iceberg sets automatically when `credential_mode: vended`. |
+| Catalog auth | `bearer` with a token, `oauth2` with client credentials, `sigv4` for an AWS endpoint (S3 Tables, Glue), else none |
+| Credential mode | `static` with `sink.s3_access_key` set; `iam` with an `s3://` warehouse: the AWS default credential chain — `AWS_*` variables, a profile, an instance or task role; otherwise (no warehouse, or a catalog-side name like Polaris's) `vended`: temporary credentials from the catalog |
+| Region | `sink.s3_region` / `AWS_REGION`, else an AWS catalog endpoint's, else `us-east-1` |
+| Tables | Every table with a primary key, outside pg2iceberg's own schema; those without one are skipped with a warning |
 
 ## Coordinator state and recovery
 

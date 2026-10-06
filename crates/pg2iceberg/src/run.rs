@@ -62,9 +62,7 @@ impl<I: IdGen + 'static> BlobNamer for UuidBlobNamer<I> {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
-    if cfg.sink.catalog_uri.is_empty() {
-        anyhow::bail!("sink.catalog_uri is required");
-    }
+    cfg.require_catalog()?;
     let catalog = build_rest_catalog(&cfg).await?;
     let catalog = IcebergRustCatalog::new(Arc::new(catalog));
     let blob = build_blob_for_run(&cfg, &catalog)
@@ -100,7 +98,7 @@ pub async fn build_rest_catalog(cfg: &Config) -> Result<iceberg_catalog_rest::Re
 }
 
 fn build_blob(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
-    match cfg.sink.credential_mode.as_str() {
+    match cfg.sink.resolved_credential_mode() {
         "static" => build_s3_static(cfg),
         "iam" => build_s3_iam(cfg),
         "vended" => Err(anyhow::anyhow!(
@@ -130,35 +128,26 @@ pub async fn build_blob_for_run<C>(
 where
     C: iceberg::Catalog + Send + Sync + 'static,
 {
-    if cfg.sink.credential_mode != "vended" {
+    if cfg.sink.resolved_credential_mode() != "vended" {
         return build_blob(cfg);
     }
     use pg2iceberg_iceberg::prod::{VendedBlobStoreRouter, VendedRouterConfig};
     use pg2iceberg_iceberg::Catalog;
 
-    // Resolve table idents from YAML — we need each table's
-    // namespace/name to call `load_table` and extract per-table
-    // creds. Discovery isn't required at this level; only the
-    // operator-supplied identity matters.
+    // Each table's Iceberg identity, to `load_table` it and extract its
+    // credentials. Discovery isn't required at this level.
     let mut idents: Vec<pg2iceberg_core::TableIdent> = Vec::with_capacity(cfg.tables.len());
     for t in &cfg.tables {
-        let (ns, name) = t.qualified()?;
-        idents.push(pg2iceberg_core::TableIdent {
-            namespace: pg2iceberg_core::Namespace(vec![ns]),
-            name,
-        });
+        idents.push(t.iceberg_ident(&cfg.sink.namespace)?);
     }
     if idents.is_empty() {
-        anyhow::bail!(
-            "credential_mode=vended requires at least one configured table; \
-             tables: [] in YAML"
-        );
+        anyhow::bail!("credential_mode=vended requires at least one table to replicate");
     }
 
-    let mut router_cfg = VendedRouterConfig::default();
-    if !cfg.sink.s3_region.is_empty() {
-        router_cfg.default_region = cfg.sink.s3_region.clone();
-    }
+    let router_cfg = VendedRouterConfig {
+        default_region: cfg.sink.resolved_region(),
+        ..VendedRouterConfig::default()
+    };
     let arc_catalog: Arc<dyn Catalog> = Arc::new(catalog.clone());
     let router = VendedBlobStoreRouter::build(arc_catalog, &idents, router_cfg)
         .await
@@ -172,10 +161,7 @@ where
 
 fn build_s3_static(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
     if cfg.sink.warehouse.is_empty() {
-        anyhow::bail!("sink.warehouse is required for credential_mode=static");
-    }
-    if cfg.sink.s3_endpoint.is_empty() {
-        anyhow::bail!("sink.s3_endpoint is required for credential_mode=static");
+        anyhow::bail!("sink.warehouse (ICEBERG_WAREHOUSE) is required for credential_mode=static");
     }
     let bucket = bucket_from_warehouse(&cfg.sink.warehouse)?;
     // object_store defaults `allow_http=false`. With the default,
@@ -184,20 +170,21 @@ fn build_s3_static(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
     // network call is made. We allow plain HTTP when the operator
     // configured an `http://` endpoint (MinIO, LocalStack, on-prem
     // S3-compatible setups). HTTPS endpoints retain the strict default.
-    let allow_http = cfg.sink.s3_endpoint.starts_with("http://");
-    let inner = object_store::aws::AmazonS3Builder::new()
+    let mut builder = object_store::aws::AmazonS3Builder::new()
         .with_bucket_name(&bucket)
-        .with_region(&cfg.sink.s3_region)
-        .with_endpoint(&cfg.sink.s3_endpoint)
+        .with_region(cfg.sink.resolved_region())
         .with_access_key_id(&cfg.sink.s3_access_key)
-        .with_secret_access_key(&cfg.sink.s3_secret_key)
-        .with_allow_http(allow_http)
-        // Path-style is the safe default for non-AWS S3 (MinIO, LocalStack).
-        // AWS itself accepts both; it's only newer endpoints that are
-        // virtual-hosted-only, and we'd flip this when we hit one.
-        .with_virtual_hosted_style_request(false)
-        .build()
-        .context("AmazonS3Builder build")?;
+        .with_secret_access_key(&cfg.sink.s3_secret_key);
+    if !cfg.sink.s3_endpoint.is_empty() {
+        let allow_http = cfg.sink.s3_endpoint.starts_with("http://");
+        builder = builder
+            .with_endpoint(&cfg.sink.s3_endpoint)
+            .with_allow_http(allow_http)
+            // Path-style is the safe default for non-AWS S3 (MinIO,
+            // LocalStack). Without an endpoint it's AWS, and its default.
+            .with_virtual_hosted_style_request(false);
+    }
+    let inner = builder.build().context("AmazonS3Builder build")?;
     // No `PrefixStore`: namers and the Iceberg catalog emit full
     // `s3://<bucket>/<warehouse-subpath>/...` paths, and `parse_path`
     // strips only `s3://<bucket>/` — so the bucket-relative key already
@@ -210,12 +197,12 @@ fn build_s3_static(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
 
 fn build_s3_iam(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
     if cfg.sink.warehouse.is_empty() {
-        anyhow::bail!("sink.warehouse is required for credential_mode=iam");
+        anyhow::bail!("sink.warehouse (ICEBERG_WAREHOUSE) is required for credential_mode=iam");
     }
     let bucket = bucket_from_warehouse(&cfg.sink.warehouse)?;
     let mut builder = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
-        .with_region(&cfg.sink.s3_region);
+        .with_region(cfg.sink.resolved_region());
     if !cfg.sink.s3_endpoint.is_empty() {
         // See the matching comment in `build_s3_static` for why
         // `allow_http` flips with the endpoint scheme.
@@ -254,9 +241,7 @@ fn bucket_from_warehouse(warehouse: &str) -> Result<String> {
 /// cadences so the slot stays advanced and invariants stay
 /// monitored.
 pub async fn run_stream_only(cfg: Config) -> Result<()> {
-    if cfg.sink.catalog_uri.is_empty() {
-        anyhow::bail!("sink.catalog_uri is required");
-    }
+    cfg.require_catalog()?;
     let catalog = build_rest_catalog(&cfg).await?;
     let catalog = IcebergRustCatalog::new(Arc::new(catalog));
     let blob = build_blob_for_run(&cfg, &catalog)
@@ -540,9 +525,7 @@ async fn build_one_shot_materializer(
     cfg: Config,
 ) -> Result<Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>>> {
     let blob = build_blob(&cfg).context("build blob store")?;
-    if cfg.sink.catalog_uri.is_empty() {
-        anyhow::bail!("sink.catalog_uri is required");
-    }
+    cfg.require_catalog()?;
     let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(
         build_rest_catalog(&cfg).await?,
     )));
@@ -645,9 +628,7 @@ async fn build_one_shot_materializer(
 /// cron can detect drift.
 pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
     let blob = build_blob(&cfg).context("build blob store")?;
-    if cfg.sink.catalog_uri.is_empty() {
-        anyhow::bail!("sink.catalog_uri is required");
-    }
+    cfg.require_catalog()?;
     let catalog: Arc<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> = Arc::new(
         IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?)),
     );
@@ -845,9 +826,7 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
 
     let id_gen = Arc::new(crate::realio::RealIdGen::new());
     let blob = build_blob(&cfg).context("build blob store")?;
-    if cfg.sink.catalog_uri.is_empty() {
-        anyhow::bail!("sink.catalog_uri is required");
-    }
+    cfg.require_catalog()?;
     let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(
         build_rest_catalog(&cfg).await?,
     )));

@@ -31,9 +31,7 @@ S3 Tables is AWS's managed Iceberg service — tables are stored directly in a d
 
 ```yaml
 source:
-  postgres_url: "postgres://user:pass@host:5432/db?sslmode=disable"
-  publication: pg2iceberg
-  slot: pg2iceberg
+  postgres_url: "postgres://user:pass@host:5432/db"
 
 sink:
   catalog_uri: "https://s3tables.us-east-1.amazonaws.com/iceberg"
