@@ -323,6 +323,7 @@ mod tests {
                 removed_paths: Vec::new(),
                 timestamp_ms: snap_id * 1000,
                 expired: false,
+                log_range: None,
             });
     }
 

@@ -21,7 +21,7 @@ pub use compact::{
 };
 pub use file_index::{catch_up_from_catalog, rebuild_from_catalog, FileIndex};
 pub use fold::{fold_events, pk_key, MaterializedRow};
-pub use materialize::{promote_re_inserts, resolve_unchanged_cols};
+pub use materialize::{promote_re_inserts, resolve_unchanged_cols, toast_source};
 pub use orphan::{cleanup_orphans, CleanupError, CleanupOutcome};
 pub use pk::PkKey;
 pub use reader::{read_data_file, read_data_file_by_field_id};
@@ -66,6 +66,89 @@ pub struct TableMetadata {
     /// the response `config` map even though it sets it in
     /// `metadata`).
     pub location: String,
+    /// Per cursor group, how far commits have applied the change log, as
+    /// the table's live snapshots record it (see [`LogRange`]).
+    #[serde(default)]
+    pub log_ends: std::collections::BTreeMap<String, u64>,
+}
+
+/// The change-log range a materializer commit applied for one cursor
+/// group: offsets `[start, end)`. Recorded on the commit's last snapshot,
+/// so a commit whose cursor update never happened — the process died in
+/// between, or the commit's response was lost — is known to have landed,
+/// and isn't applied again.
+///
+/// Every snapshot pg2iceberg commits — compactions too — also carries
+/// each group's end so far forward, so the current snapshot, which
+/// expiry never removes, has them all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRange {
+    pub group: String,
+    pub start: u64,
+    pub end: u64,
+}
+
+impl LogRange {
+    const GROUP: &'static str = "pg2iceberg.log-group";
+    const START: &'static str = "pg2iceberg.log-start";
+    const END: &'static str = "pg2iceberg.log-end";
+    const ENDS: &'static str = "pg2iceberg.log-ends";
+
+    /// As snapshot summary properties.
+    pub fn to_properties(&self) -> Vec<(String, String)> {
+        vec![
+            (Self::GROUP.into(), self.group.clone()),
+            (Self::START.into(), self.start.to_string()),
+            (Self::END.into(), self.end.to_string()),
+        ]
+    }
+
+    /// From a snapshot's summary properties, if they record one.
+    pub fn from_properties<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<Self> {
+        Some(Self {
+            group: get(Self::GROUP)?.to_string(),
+            start: get(Self::START)?.parse().ok()?,
+            end: get(Self::END)?.parse().ok()?,
+        })
+    }
+}
+
+/// Merge `from` into `into`, keeping each group's furthest end.
+pub fn merge_log_ends(
+    into: &mut std::collections::BTreeMap<String, u64>,
+    from: impl IntoIterator<Item = (String, u64)>,
+) {
+    for (group, end) in from {
+        let at = into.entry(group).or_insert(end);
+        *at = (*at).max(end);
+    }
+}
+
+/// How far commits had applied the log, per group, as a snapshot's
+/// summary properties record it: the ends carried forward, and its own
+/// commit's range.
+pub fn recorded_log_ends<'a>(
+    get: impl Fn(&str) -> Option<&'a str>,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut ends: std::collections::BTreeMap<String, u64> = get(LogRange::ENDS)
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    if let Some(range) = LogRange::from_properties(&get) {
+        merge_log_ends(&mut ends, [(range.group, range.end)]);
+    }
+    ends
+}
+
+/// The summary property carrying `ends` forward, unless there are none.
+pub fn log_ends_property(
+    ends: &std::collections::BTreeMap<String, u64>,
+) -> Option<(String, String)> {
+    (!ends.is_empty()).then(|| {
+        (
+            LogRange::ENDS.to_string(),
+            serde_json::to_string(ends).expect("a map of numbers serializes"),
+        )
+    })
 }
 
 /// Built by the materializer (combining `TableWriter::prepare` output with
@@ -155,6 +238,9 @@ pub struct Snapshot {
     /// A stand-in for an expired snapshot: only the files it added that
     /// are still live, not what it removed (see [`Catalog::snapshots`]).
     pub expired: bool,
+    /// The log range the commit this snapshot ends applied, if it
+    /// recorded one. `None` for a stand-in.
+    pub log_range: Option<LogRange>,
 }
 
 #[derive(Clone, Debug)]
@@ -440,10 +526,17 @@ pub trait Catalog: Send + Sync {
     /// steps — but readers of the table see none of them or all of them.
     /// Lets one source transaction be written in bounded-memory pieces
     /// and still become visible at once. Steps must share one table.
+    /// `log_range` is recorded on the last snapshot (see [`LogRange`]).
     ///
-    /// The default handles a single step; a catalog that can't make
-    /// several atomic must error rather than commit them one by one.
-    async fn commit_snapshots(&self, steps: Vec<PreparedCommit>) -> Result<TableMetadata> {
+    /// The default handles a single step, and records no `log_range`; a
+    /// catalog that can't make several atomic must error rather than
+    /// commit them one by one.
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<PreparedCommit>,
+        log_range: Option<LogRange>,
+    ) -> Result<TableMetadata> {
+        let _ = log_range;
         let mut steps: Vec<PreparedCommit> = steps
             .into_iter()
             .filter(|s| !s.data_files.is_empty() || !s.equality_deletes.is_empty())
@@ -498,6 +591,73 @@ pub trait Catalog: Send + Sync {
     /// snapshot per sequence number (`id` = the files' sequence number,
     /// `timestamp_ms` = 0 when unknown, `expired` set).
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>>;
+}
+
+#[cfg(test)]
+mod log_range_tests {
+    use super::*;
+
+    fn range(group: &str, start: u64, end: u64) -> LogRange {
+        LogRange {
+            group: group.into(),
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn round_trips_through_snapshot_properties() {
+        let r = range("default", 3, 9);
+        let props: std::collections::HashMap<String, String> =
+            r.to_properties().into_iter().collect();
+        assert_eq!(
+            LogRange::from_properties(|k| props.get(k).map(String::as_str)),
+            Some(r)
+        );
+    }
+
+    #[test]
+    fn needs_every_property() {
+        let props: std::collections::HashMap<String, String> = range("default", 3, 9)
+            .to_properties()
+            .into_iter()
+            .filter(|(k, _)| k != LogRange::END)
+            .collect();
+        assert_eq!(
+            LogRange::from_properties(|k| props.get(k).map(String::as_str)),
+            None
+        );
+    }
+
+    #[test]
+    fn merging_keeps_each_groups_furthest_end() {
+        let mut ends = std::collections::BTreeMap::new();
+        merge_log_ends(
+            &mut ends,
+            [("default".to_string(), 4), ("default#snapshot".into(), 2)],
+        );
+        merge_log_ends(
+            &mut ends,
+            [("default".to_string(), 7), ("default#snapshot".into(), 1)],
+        );
+        assert_eq!(ends.get("default"), Some(&7));
+        assert_eq!(ends.get("default#snapshot"), Some(&2));
+    }
+
+    #[test]
+    fn recorded_ends_combine_the_carried_and_the_own() {
+        let carried = std::collections::BTreeMap::from([
+            ("default".to_string(), 4),
+            ("default#snapshot".to_string(), 2),
+        ]);
+        let mut props: std::collections::HashMap<String, String> =
+            range("default", 4, 9).to_properties().into_iter().collect();
+        props.extend(log_ends_property(&carried));
+        let ends = recorded_log_ends(|k| props.get(k).map(String::as_str));
+        assert_eq!(ends.get("default"), Some(&9));
+        assert_eq!(ends.get("default#snapshot"), Some(&2));
+        assert_eq!(log_ends_property(&Default::default()), None);
+    }
 }
 
 #[cfg(test)]

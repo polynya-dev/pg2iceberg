@@ -613,6 +613,7 @@ mod tests {
             current_snapshot_id: None,
             config,
             location: location.into(),
+            log_ends: BTreeMap::new(),
         }
     }
 

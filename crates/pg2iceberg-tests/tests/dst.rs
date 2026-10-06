@@ -55,7 +55,7 @@ use pg2iceberg_core::{
 };
 use pg2iceberg_iceberg::{read_materialized_state, CompactionConfig};
 use pg2iceberg_iceberg::{
-    Catalog, PreparedCommit, PreparedCompaction, SchemaChange, Snapshot, TableMetadata,
+    Catalog, LogRange, PreparedCommit, PreparedCompaction, SchemaChange, Snapshot, TableMetadata,
 };
 use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
@@ -466,6 +466,10 @@ enum Step {
     /// response is lost). The materializer must not lose or duplicate
     /// anything when it retries.
     LoseCommitResponse,
+    /// The materializer process dies after a catalog commit lands, before
+    /// it records its cursor: the restarted one reads the log from the
+    /// old cursor, and must not apply what landed again.
+    CrashAfterCommit,
     /// `maintain`'s first half: expire every snapshot but the current
     /// one. Readers still see the whole table; the files those snapshots
     /// added stay live.
@@ -505,6 +509,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         2 => Just(Step::Compact),
         1 => Just(Step::Expire),
         1 => Just(Step::LoseCommitResponse),
+        1 => Just(Step::CrashAfterCommit),
         2 => Just(Step::BackfillChunk),
         2 => Just(Step::OtherWorkerCycle),
         2 => (id.clone(), qty.clone()).prop_map(|(id, qty)| Step::OtherInsert { id, qty }),
@@ -1067,6 +1072,7 @@ impl DstHarness {
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
             land_before_next_commit: Default::default(),
+            applied: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -1195,6 +1201,7 @@ impl DstHarness {
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
             land_before_next_commit: Default::default(),
+            applied: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -1428,10 +1435,14 @@ impl DstHarness {
         };
         let before = state(self);
         // Compaction errors are non-fatal in the lifecycle; a pass whose
-        // commit response was lost applied anyway.
+        // commit response was lost applied anyway, and one that lost to
+        // another process's pass over the same files plans again next time.
         match block_on(self.materializer.compact_table(&ident(), &cfg)) {
             Ok(_) => {}
             Err(e) if e.to_string().contains("response lost") => {}
+            Err(e)
+                if e.to_string()
+                    .contains("rewrite removes files no longer in the table") => {}
             Err(e) => panic!("compaction: {e}"),
         }
         // The materializer updates its FileIndex from what the pass
@@ -1480,6 +1491,32 @@ impl DstHarness {
             materializer.enable_distributed_mode(worker("a"), WORKER_TTL);
         }
         self.materializer = materializer;
+    }
+
+    /// A cycle whose commits land but whose cursor updates don't: the
+    /// process dies after committing, before recording how far it got.
+    fn crash_after_commit(&mut self) {
+        let mut tables = vec![ident()];
+        if SECOND_TABLE.get() > 0 {
+            tables.push(other_ident());
+        }
+        let cursors: Vec<_> = tables
+            .iter()
+            .flat_map(|t| ["default", "default#snapshot"].map(|g| (t.clone(), g)))
+            .map(|(t, g)| {
+                let cursor = block_on(self.coord.get_cursor(g, &t)).unwrap();
+                (t, g, cursor)
+            })
+            .collect();
+        self.materialize();
+        for (t, g, cursor) in cursors {
+            let now = block_on(self.coord.get_cursor(g, &t)).unwrap();
+            if now != cursor {
+                // No cursor reads as -1: from the log's start.
+                block_on(self.coord.set_cursor(g, &t, cursor.unwrap_or(-1))).unwrap();
+            }
+        }
+        self.restart_materializer();
     }
 
     fn crash_and_restart(&mut self) {
@@ -1724,6 +1761,7 @@ impl DstHarness {
                 .audited
                 .lose_next_response
                 .store(true, std::sync::atomic::Ordering::SeqCst),
+            Step::CrashAfterCommit => self.crash_after_commit(),
             Step::Expire => {
                 block_on(self.materializer.expire_cycle(0)).unwrap();
             }
@@ -1933,18 +1971,23 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
     // Each boundary's rows, with the source's columns then.
     let mut boundaries: Vec<(Vec<Row>, Vec<String>)> = vec![(Vec::new(), Vec::new())];
     let mut i = 0;
+    let mut last_lsn = None;
     while i < events.len() {
         let xid = events[i].xid;
         // A column dropped since the last transaction takes its values
         // with it: one re-added later starts out NULL. Iceberg can show
         // that state too, once it has applied the drop.
         let columns = db.columns_at(&ident(), events[i].lsn);
+        let kept = match last_lsn {
+            Some(from) => db.columns_kept(&ident(), from, events[i].lsn),
+            None => columns.clone(),
+        };
         let dropped = state
             .values()
-            .any(|r| r.keys().any(|c| !columns.contains(&c.0)));
+            .any(|r| r.keys().any(|c| !kept.contains(&c.0)));
         if dropped {
             for row in state.values_mut() {
-                row.retain(|c, _| columns.contains(&c.0));
+                row.retain(|c, _| kept.contains(&c.0));
             }
             boundaries.push((state.values().cloned().collect(), columns.clone()));
         }
@@ -1973,6 +2016,7 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
                 }
                 _ => state.clear(),
             }
+            last_lsn = Some(e.lsn);
             i += 1;
         }
         boundaries.push((state.values().cloned().collect(), columns));
@@ -2066,6 +2110,9 @@ struct AuditedCatalog {
     /// Another process's compaction pass, committed first when the next
     /// commit — data or compaction — is.
     land_before_next_commit: Mutex<Option<PreparedCompaction>>,
+    /// Per table and cursor group, how far commits that landed applied
+    /// the log (invariant 16).
+    applied: Mutex<BTreeMap<(TableIdent, String), u64>>,
 }
 
 impl AuditedCatalog {
@@ -2141,6 +2188,7 @@ impl Catalog for AuditedCatalog {
     async fn commit_snapshots(
         &self,
         steps: Vec<PreparedCommit>,
+        log_range: Option<LogRange>,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
         if self
             .fail_next_commit
@@ -2151,7 +2199,27 @@ impl Catalog for AuditedCatalog {
             ));
         }
         self.land_other_pass().await?;
-        let meta = self.inner.commit_snapshots(steps).await?;
+        let ident = steps.first().map(|s| s.ident.clone());
+        let meta = self
+            .inner
+            .commit_snapshots(steps, log_range.clone())
+            .await?;
+        // 16. Each log entry is applied at most once: a commit's range
+        //     starts where the last one that landed ended, or later.
+        if let (Some(ident), Some(range)) = (ident, log_range) {
+            let mut applied = self.applied.lock().unwrap();
+            let end = applied
+                .entry((ident.clone(), range.group.clone()))
+                .or_default();
+            if range.start < *end {
+                self.violations.lock().unwrap().push(format!(
+                    "invariant 16 (log applied at most once): {ident} ({}) commits log [{}, {}), \
+                     but commits already applied it up to {end}",
+                    range.group, range.start, range.end
+                ));
+            }
+            *end = (*end).max(range.end);
+        }
         self.audit().await;
         let meta = self.respond(meta)?;
         Ok(meta)
@@ -2226,6 +2294,11 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
         if a == Some(0) && b == Some(0) {
             break;
         }
+    }
+
+    // 10, 16. Every commit along the way.
+    if let Some(v) = h.audited.violations.lock().unwrap().first() {
+        return Err(v.clone());
     }
 
     // 6. No WAL retention at quiescence: the slot is acked up to the end
@@ -2900,6 +2973,258 @@ fn retry_after_a_lost_commit_response_applies_once() {
     check_invariants(&mut h).unwrap();
 }
 
+/// A key change leaving a TOASTed value unchanged, whose commit applies
+/// but whose response is lost. The retry must not fail resolving the
+/// value from the old key — a key the applied commit deleted.
+#[test]
+fn retry_after_a_lost_response_resolves_a_key_changes_toast() {
+    DEFAULT_IDENTITY.set(true);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 3, qty: 0 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::ChangePk {
+            from: 3,
+            to: 4,
+            toast: true,
+        },
+        Step::LoseCommitResponse,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A commit whose response is lost but which landed is no failure: the
+/// cycle carries on as committed. (The lifecycle stops on a failed cycle.)
+#[test]
+fn lost_response_to_a_commit_that_landed_is_not_an_error() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 0 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::LoseCommitResponse);
+    let cycle = block_on(h.materializer.cycle());
+    assert!(cycle.is_ok(), "{cycle:?}");
+    check_invariants(&mut h).unwrap();
+}
+
+/// As above, with the old key inserted again in the same unit. The retry
+/// would resolve the moved row's value from the row now at the old key:
+/// silently wrong.
+#[test]
+fn retry_after_a_lost_response_keeps_a_moved_rows_toast() {
+    lost_response_after_a_moved_row(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn retry_after_a_lost_response_keeps_a_moved_rows_toast_on_iceberg() {
+    lost_response_after_a_moved_row(true);
+}
+
+fn lost_response_after_a_moved_row(prod: bool) {
+    DEFAULT_IDENTITY.set(true);
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 3, qty: 0 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::ChangePk {
+            from: 3,
+            to: 4,
+            toast: true,
+        },
+        Step::Insert { id: 3, qty: 7 },
+        Step::LoseCommitResponse,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A materializer crash between a commit landing and its cursor update:
+/// the restarted materializer must not apply the commit again — here,
+/// resolving the moved row's value from the row now at the old key.
+#[test]
+fn crash_after_a_commit_does_not_apply_it_again() {
+    crash_after_a_commit(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn crash_after_a_commit_does_not_apply_it_again_on_iceberg() {
+    crash_after_a_commit(true);
+}
+
+fn crash_after_a_commit(prod: bool) {
+    DEFAULT_IDENTITY.set(true);
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 3, qty: 0 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::ChangePk {
+            from: 3,
+            to: 4,
+            toast: true,
+        },
+        Step::Insert { id: 3, qty: 7 },
+        Step::DriveFlush,
+        Step::CrashAfterCommit,
+        // Past the commit: applied once the restarted materializer has
+        // skipped it.
+        Step::Update { id: 4, qty: 9 },
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// As above, with the commit's snapshot expired before the restart: a
+/// compaction — the materializer's own, or a `compact` job's — went on
+/// top, and `maintain` expired every snapshot but that one. The
+/// compaction carries the log position forward.
+#[test]
+fn crash_after_a_commit_survives_its_snapshot_expiring() {
+    expiry_after_a_crash_after_a_commit(false, false);
+    expiry_after_a_crash_after_a_commit(false, true);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn crash_after_a_commit_survives_its_snapshot_expiring_on_iceberg() {
+    expiry_after_a_crash_after_a_commit(true, false);
+    expiry_after_a_crash_after_a_commit(true, true);
+}
+
+fn expiry_after_a_crash_after_a_commit(prod: bool, external: bool) {
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    let compact: &[Step] = if external {
+        &[Step::ExternalCompactPlan, Step::ExternalCompactCommit]
+    } else {
+        &[Step::Compact]
+    };
+    let steps = [
+        &[
+            Step::BigTx { inserts: 1, qty: 0 },
+            Step::DriveFlush,
+            Step::CrashAfterCommit,
+        ][..],
+        compact,
+        &[Step::Expire],
+    ]
+    .concat();
+    for step in steps {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("external={external}: after {step:?}: {e}");
+        }
+    }
+    if let Err(e) = check_invariants(&mut h) {
+        panic!("external={external}: {e}");
+    }
+}
+
+/// As above, with a column dropped and re-added in what landed: applying
+/// those schema changes again, on top of the schema they produced, reads
+/// as more columns moving — `qty` among them — and renames them away.
+#[test]
+fn crash_after_a_commit_does_not_apply_its_schema_changes_again() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::BigTx { inserts: 1, qty: 0 },
+        Step::DropNote,
+        Step::AddNote,
+        Step::BigTx { inserts: 1, qty: 0 },
+        Step::DriveFlush,
+        Step::CrashAfterCommit,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// As above, for a transaction committed in several steps at once: the
+/// log range goes on the last of their snapshots.
+#[cfg(feature = "integration")]
+#[test]
+fn crash_after_a_multi_step_commit_does_not_apply_it_again_on_iceberg() {
+    PROD_BACKEND.set(true);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 1 },
+        Step::BigTx { inserts: 6, qty: 2 },
+        Step::DriveFlush,
+        Step::CrashAfterCommit,
+        Step::Update { id: 1, qty: 3 },
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A materializer crash after a backfill's rows commit, before they're
+/// marked applied: the restarted materializer must not apply them again
+/// — and goes on to the changes after them.
+#[test]
+fn crash_after_a_backfill_commit_does_not_apply_it_again() {
+    BACKFILL.set(true);
+    let mut h = DstHarness::boot();
+    while h.backfilling {
+        h.run_step(&Step::BackfillChunk);
+    }
+    h.run_step(&Step::Insert { id: 5, qty: 50 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::CrashAfterCommit);
+    check_invariants(&mut h).unwrap();
+}
+
+/// A key change with a TOASTed column unchanged, replayed after a crash
+/// between its claim and the slot ack, with its first copy already in
+/// Iceberg: the replayed copy can't resolve the value from the old key —
+/// the first copy moved the row off it.
+#[test]
+fn replayed_key_change_with_toast_resolves_after_its_first_copy_landed() {
+    DEFAULT_IDENTITY.set(true);
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 0 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ChangePk {
+        from: 1,
+        to: 5,
+        toast: true,
+    });
+    // Its Begin, change and Commit, claimed before any keepalive: the
+    // restart resends the transaction committing at the claimed LSN.
+    h.run_step(&Step::DrivePartial { n: 3 });
+    block_on(h.pipeline.flush()).unwrap();
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::CrashMidStream);
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
 /// A pipeline crash partway through staging a transaction, then a replay
 /// from the slot, must never make part of that transaction visible.
 #[test]
@@ -3107,6 +3432,27 @@ fn a_compaction_landing_on_another_keeps_the_index_true() {
         h.audited.land_before_next_commit.lock().unwrap().is_none(),
         "the job's pass landed"
     );
+    check_invariants(&mut h).unwrap();
+}
+/// A `compact` job's pass lands while the materializer compacts the same
+/// files: the materializer's pass loses, as a conflict, and plans again
+/// on its next one — not a failure.
+#[test]
+fn compaction_losing_to_a_compact_job_is_no_failure() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::BigTx { inserts: 1, qty: 0 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::ExternalCompactPlan,
+        Step::ExternalCompactMidCommit,
+        Step::Compact,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
     check_invariants(&mut h).unwrap();
 }
 
