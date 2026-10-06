@@ -479,6 +479,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 delete_files,
                 removed_paths,
                 timestamp_ms: snap.timestamp_ms(),
+                expired: false,
             });
         }
         // One stand-in snapshot per sequence number: MoR ordering only
@@ -491,6 +492,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 delete_files: Vec::new(),
                 removed_paths: Vec::new(),
                 timestamp_ms: 0,
+                expired: true,
             });
             match content {
                 DataContentType::Data => snap.data_files.push(df),

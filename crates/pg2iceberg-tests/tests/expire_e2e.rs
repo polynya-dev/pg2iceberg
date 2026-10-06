@@ -11,7 +11,8 @@ use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::value::PgValue;
 use pg2iceberg_core::{ColumnName, ColumnSchema, Namespace, Op, Row, TableIdent, TableSchema};
 use pg2iceberg_iceberg::{
-    fold::MaterializedRow, Catalog, DataFile, FileIndex, PreparedCommit, TableWriter,
+    catch_up_from_catalog, fold::MaterializedRow, rebuild_from_catalog, Catalog, DataFile,
+    FileIndex, PreparedCommit, PreparedCompaction, TableWriter,
 };
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
@@ -74,28 +75,80 @@ impl Harness {
         }
     }
 
-    fn commit(&self, schema: &TableSchema, rows: Vec<MaterializedRow>) {
+    /// Commit `rows` as one snapshot; returns its files' paths.
+    fn commit(&self, schema: &TableSchema, rows: Vec<MaterializedRow>) -> Vec<String> {
         let writer = TableWriter::new(schema.clone());
         let prepared = writer.prepare(&rows, &FileIndex::new()).unwrap();
-        let mut data_files = Vec::new();
-        for chunk in prepared.data {
-            let n = self.counter.fetch_add(1, Ordering::SeqCst);
-            let path = format!("test/data-{n}.parquet");
-            block_on(self.blob.put(&path, Bytes::clone(&chunk.chunk.bytes))).unwrap();
-            data_files.push(DataFile {
-                path,
-                record_count: chunk.chunk.record_count,
-                byte_size: chunk.chunk.bytes.len() as u64,
-                equality_field_ids: vec![],
-                partition_values: chunk.partition_values,
-            });
-        }
+        let data_files = self.put(prepared.data, vec![]);
+        let equality_deletes = self.put(prepared.equality_deletes, prepared.pk_field_ids);
+        let paths = data_files
+            .iter()
+            .chain(&equality_deletes)
+            .map(|f| f.path.clone())
+            .collect();
         block_on(self.cat.commit_snapshot(PreparedCommit {
             ident: schema.ident.clone(),
             data_files,
-            equality_deletes: vec![],
+            equality_deletes,
         }))
         .unwrap();
+        paths
+    }
+
+    /// Commit a compaction pass rewriting `removed` as one file of `rows`.
+    fn compact(&self, schema: &TableSchema, removed: Vec<String>, rows: Vec<Row>) -> Vec<String> {
+        let writer = TableWriter::new(schema.clone());
+        let rows: Vec<MaterializedRow> = rows.into_iter().map(inserted).collect();
+        let prepared = writer.prepare(&rows, &FileIndex::new()).unwrap();
+        let added_data_files = self.put(prepared.data, vec![]);
+        let paths = added_data_files.iter().map(|f| f.path.clone()).collect();
+        block_on(self.cat.commit_compaction(PreparedCompaction {
+            ident: schema.ident.clone(),
+            added_data_files,
+            removed_paths: removed,
+        }))
+        .unwrap();
+        paths
+    }
+
+    fn put(
+        &self,
+        chunks: Vec<pg2iceberg_iceberg::PreparedChunk>,
+        equality_field_ids: Vec<i32>,
+    ) -> Vec<DataFile> {
+        chunks
+            .into_iter()
+            .map(|chunk| {
+                let n = self.counter.fetch_add(1, Ordering::SeqCst);
+                let path = format!("test/data-{n}.parquet");
+                block_on(self.blob.put(&path, Bytes::clone(&chunk.chunk.bytes))).unwrap();
+                DataFile {
+                    path,
+                    record_count: chunk.chunk.record_count,
+                    byte_size: chunk.chunk.bytes.len() as u64,
+                    equality_field_ids: equality_field_ids.clone(),
+                    partition_values: chunk.partition_values,
+                }
+            })
+            .collect()
+    }
+}
+
+fn inserted(r: Row) -> MaterializedRow {
+    MaterializedRow {
+        op: Op::Insert,
+        row: r,
+        unchanged_cols: vec![],
+        unchanged_from: None,
+    }
+}
+
+fn deleted(id: i32) -> MaterializedRow {
+    MaterializedRow {
+        op: Op::Delete,
+        row: BTreeMap::from([(ColumnName("id".into()), PgValue::Int4(id))]),
+        unchanged_cols: vec![],
+        unchanged_from: None,
     }
 }
 
@@ -105,15 +158,32 @@ fn ensure(h: &Harness, s: &TableSchema) {
 }
 
 fn insert(h: &Harness, s: &TableSchema, r: Row) {
-    h.commit(
+    h.commit(s, vec![inserted(r)]);
+}
+
+/// Bring `fi`, the table's FileIndex as of snapshot `at`, up to date.
+fn catch_up(h: &Harness, s: &TableSchema, fi: &mut FileIndex, at: Option<i64>) -> Option<i64> {
+    block_on(catch_up_from_catalog(
+        fi,
+        at,
+        &h.cat,
+        h.blob.as_ref(),
+        &ident(),
         s,
-        vec![MaterializedRow {
-            op: Op::Insert,
-            row: r,
-            unchanged_cols: vec![],
-            unchanged_from: None,
-        }],
-    );
+        &[ColumnName("id".into())],
+    ))
+    .unwrap()
+}
+
+fn rebuilt(h: &Harness, s: &TableSchema) -> FileIndex {
+    block_on(rebuild_from_catalog(
+        &h.cat,
+        h.blob.as_ref(),
+        &ident(),
+        s,
+        &[ColumnName("id".into())],
+    ))
+    .unwrap()
 }
 
 #[test]
@@ -215,4 +285,75 @@ fn expire_then_more_inserts_keeps_state_consistent() {
 
     // Every row stays visible: expiry dropped only snapshot metadata.
     assert_eq!(visible_rows(&h, &s), 6);
+}
+
+/// A FileIndex catches up with the table by replaying the snapshots after
+/// its own, not the whole table.
+#[test]
+fn file_index_catches_up_on_new_snapshots_only() {
+    let h = Harness::new();
+    let s = schema();
+    ensure(&h, &s);
+    for i in 1..=3 {
+        insert(&h, &s, row(i, i));
+    }
+    let mut fi = FileIndex::new();
+    let at = catch_up(&h, &s, &mut fi, None);
+    insert(&h, &s, row(4, 4));
+
+    let reads = h.blob.gets();
+    assert_eq!(catch_up(&h, &s, &mut fi, at), Some(4));
+    assert_eq!(h.blob.gets() - reads, 1, "reads only the new file");
+    assert_eq!(fi, rebuilt(&h, &s));
+}
+
+/// An expired snapshot's stand-in lists the files it added that are still
+/// live, not what it removed: catching up past one rebuilds.
+#[test]
+fn file_index_catching_up_past_an_expired_snapshot_rebuilds() {
+    let h = Harness::new();
+    let s = schema();
+    ensure(&h, &s);
+    let first = h.commit(&s, vec![inserted(row(1, 1)), inserted(row(2, 2))]);
+    let mut fi = FileIndex::new();
+    let at = catch_up(&h, &s, &mut fi, None);
+    // Row 2 deleted; row 5's file stays live.
+    let mut changed = h.commit(&s, vec![deleted(2), inserted(row(5, 5))]);
+    let delete = changed.split_off(1);
+    // The first file rewritten without row 2, retiring its delete.
+    h.compact(&s, [first, delete].concat(), vec![row(1, 1)]);
+    insert(&h, &s, row(6, 6));
+    // Snapshots 1–3 expire (cutoff 4000 - 500): 2 and 3 become stand-ins.
+    assert_eq!(block_on(h.cat.expire_snapshots(&ident(), 500)).unwrap(), 3);
+
+    assert_eq!(catch_up(&h, &s, &mut fi, at), Some(4));
+    assert_eq!(fi, rebuilt(&h, &s));
+}
+
+/// Expired snapshots whose files are all gone are missing from history
+/// altogether: catching up across the gap rebuilds.
+#[test]
+fn file_index_catching_up_across_missing_snapshots_rebuilds() {
+    let h = Harness::new();
+    let s = schema();
+    ensure(&h, &s);
+    let first = h.commit(&s, vec![inserted(row(1, 1)), inserted(row(2, 2))]);
+    let mut fi = FileIndex::new();
+    let at = catch_up(&h, &s, &mut fi, None);
+    let delete = h.commit(&s, vec![deleted(2)]);
+    let second = h.compact(&s, [first, delete].concat(), vec![row(1, 1)]);
+    h.compact(&s, second, vec![row(1, 1)]);
+    insert(&h, &s, row(6, 6));
+    // Snapshots 1–3 expire (cutoff 5000 - 1500), every file they added
+    // gone: history starts at 4.
+    assert_eq!(block_on(h.cat.expire_snapshots(&ident(), 1500)).unwrap(), 3);
+    let ids: Vec<i64> = block_on(h.cat.snapshots(&ident()))
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(ids, vec![4, 5]);
+
+    assert_eq!(catch_up(&h, &s, &mut fi, at), Some(5));
+    assert_eq!(fi, rebuilt(&h, &s));
 }

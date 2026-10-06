@@ -151,6 +151,7 @@ impl Catalog for MemoryCatalog {
             delete_files: prepared.equality_deletes,
             removed_paths: Vec::new(),
             timestamp_ms: id * 1000,
+            expired: false,
         });
         table.metadata.current_snapshot_id = Some(id);
         Ok(table.metadata.clone())
@@ -184,6 +185,7 @@ impl Catalog for MemoryCatalog {
                 delete_files: step.equality_deletes,
                 removed_paths: Vec::new(),
                 timestamp_ms: id * 1000,
+                expired: false,
             });
             table.metadata.current_snapshot_id = Some(id);
         }
@@ -213,6 +215,7 @@ impl Catalog for MemoryCatalog {
             delete_files: Vec::new(),
             removed_paths: prepared.removed_paths,
             timestamp_ms: id * 1000,
+            expired: false,
         });
         table.metadata.current_snapshot_id = Some(id);
         Ok(table.metadata.clone())
@@ -298,14 +301,16 @@ impl Catalog for MemoryCatalog {
                 if !t.expired.contains(&snap.id) {
                     return Some(snap.clone());
                 }
+                // Like a real catalog's: what the snapshot removed is gone
+                // with its metadata.
                 let stand_in = Snapshot {
                     data_files: live(&snap.data_files),
                     delete_files: live(&snap.delete_files),
+                    removed_paths: Vec::new(),
+                    expired: true,
                     ..snap.clone()
                 };
-                let empty = stand_in.data_files.is_empty()
-                    && stand_in.delete_files.is_empty()
-                    && stand_in.removed_paths.is_empty();
+                let empty = stand_in.data_files.is_empty() && stand_in.delete_files.is_empty();
                 (!empty).then_some(stand_in)
             })
             .collect())

@@ -453,6 +453,10 @@ enum Step {
     /// That process commits the pass it planned — after whatever happened
     /// to the table in between.
     ExternalCompactCommit,
+    /// That process commits the pass while the materializer's next commit
+    /// is in flight, which then lands on top of it (iceberg-rust retries a
+    /// commit that lost the race).
+    ExternalCompactMidCommit,
     /// The next catalog commit applies, then reports failure (its
     /// response is lost). The materializer must not lose or duplicate
     /// anything when it retries.
@@ -505,6 +509,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => Just(Step::AddNote),
         2 => Just(Step::ExternalCompactPlan),
         2 => Just(Step::ExternalCompactCommit),
+        1 => Just(Step::ExternalCompactMidCommit),
         1 => Just(Step::CleanupOrphans),
     ]
 }
@@ -911,9 +916,6 @@ struct DstHarness {
     /// A compaction pass another process (a `pg2iceberg compact` job)
     /// has planned and written but not yet committed.
     pending_external: Option<PreparedCompaction>,
-    /// Whether another process's compaction has committed: the running
-    /// materializer's FileIndex can't know which files it rewrote.
-    external_compaction_seen: bool,
 }
 
 impl DstHarness {
@@ -965,6 +967,7 @@ impl DstHarness {
             fail_commit_after_schema_change: Default::default(),
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
+            land_before_next_commit: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -1017,7 +1020,6 @@ impl DstHarness {
             next_bulk_id: 1000,
             id_gen,
             pending_external: None,
-            external_compaction_seen: false,
             backfilling: false,
             backfill_pipeline: None,
             other_live: BTreeSet::new(),
@@ -1089,6 +1091,7 @@ impl DstHarness {
             fail_commit_after_schema_change: Default::default(),
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
+            land_before_next_commit: Default::default(),
         });
         let mut materializer = Materializer::new(
             coord.clone() as Arc<dyn Coordinator>,
@@ -1141,7 +1144,6 @@ impl DstHarness {
             next_bulk_id: 1000,
             id_gen,
             pending_external: None,
-            external_compaction_seen: false,
             backfilling: false,
             backfill_pipeline: None,
             other_live: BTreeSet::new(),
@@ -1189,21 +1191,32 @@ impl DstHarness {
     /// One materializer cycle; `None` if it failed because a commit's
     /// response was lost — the lifecycle just runs the next cycle.
     fn materialize(&mut self) -> Option<usize> {
+        let before = self.current_snapshot();
         let n = cycle(&mut self.materializer);
-        if DISTRIBUTED.get() && n.is_some_and(|n| n > 0) {
-            if let Err(e) = file_index_matches_catalog(self, &self.materializer) {
+        if self.current_snapshot() != before {
+            if let Err(e) = file_index_matches_catalog(self, &self.materializer, true) {
                 panic!("worker a: {e}");
             }
         }
         n
     }
 
+    /// The table's current snapshot. A worker's FileIndex is checked once
+    /// it has written the table: one that doesn't hold the table catches
+    /// up only when it takes it over.
+    fn current_snapshot(&self) -> Option<i64> {
+        block_on(self.audited.load_table(&ident()))
+            .unwrap()
+            .and_then(|m| m.current_snapshot_id)
+    }
+
     /// Worker "b"'s cycle, in distributed mode.
     fn materialize_other(&mut self) -> Option<usize> {
         let mut other = self.other.take()?;
+        let before = self.current_snapshot();
         let n = cycle(&mut other);
-        if n.is_some_and(|n| n > 0) {
-            if let Err(e) = file_index_matches_catalog(self, &other) {
+        if self.current_snapshot() != before {
+            if let Err(e) = file_index_matches_catalog(self, &other, true) {
                 panic!("worker b: {e}");
             }
         }
@@ -1238,7 +1251,15 @@ impl DstHarness {
     /// would — its own FileIndex rebuilt from the catalog, its own file
     /// namer — and hold the commit for `ExternalCompactCommit`.
     fn external_compact_plan(&mut self) {
-        if self.pending_external.is_some() {
+        // One job at a time.
+        if self.pending_external.is_some()
+            || self
+                .audited
+                .land_before_next_commit
+                .lock()
+                .unwrap()
+                .is_some()
+        {
             return;
         }
         let cfg = CompactionConfig {
@@ -1308,7 +1329,7 @@ impl DstHarness {
         // The materializer updates its FileIndex from what the pass
         // rewrote; it must match a rebuild from catalog history.
         if !DISTRIBUTED.get() {
-            if let Err(e) = file_index_matches_catalog(self, &self.materializer) {
+            if let Err(e) = file_index_matches_catalog(self, &self.materializer, true) {
                 panic!("after compaction: {e}");
             }
         }
@@ -1570,7 +1591,11 @@ impl DstHarness {
                         Err(e) if e.to_string().contains("response lost") => {}
                         Err(e) => panic!("external compaction commit: {e}"),
                     }
-                    self.external_compaction_seen = true;
+                }
+            }
+            Step::ExternalCompactMidCommit => {
+                if let Some(pass) = self.pending_external.take() {
+                    *self.audited.land_before_next_commit.lock().unwrap() = Some(pass);
                 }
             }
             Step::LoseCommitResponse => self
@@ -1656,10 +1681,11 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     }
 
     // 11. The materializer's FileIndex is what the catalog holds. (A
-    //     distributed worker's is checked after each cycle it does work
-    //     in: a worker that doesn't own the table can't know its files.)
+    //     distributed worker's is checked after each cycle it writes the
+    //     table in: one that doesn't hold the table catches up on taking
+    //     it over.)
     if !DISTRIBUTED.get() {
-        file_index_matches_catalog(h, &h.materializer)?;
+        file_index_matches_catalog(h, &h.materializer, false)?;
     }
 
     // 12. The catalog's history replays to the table readers see —
@@ -1704,13 +1730,26 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
 /// catalog, and each file's live count equals the PKs pointing at it —
 /// compaction picks dirty files by those counts, and a file's count
 /// running high would make a dirty file look clean.
+///
+/// The index may lag behind a `compact` job's commit, which moves rows
+/// between files but keeps their keys and partitions: it catches up
+/// before it's next used. Not once `wrote` — the materializer just
+/// committed to the table, and it takes in every commit before its own.
 fn file_index_matches_catalog(
     h: &DstHarness,
     m: &Materializer<AuditedCatalog>,
+    wrote: bool,
 ) -> Result<(), String> {
     let Some(index) = m.file_index(&ident()) else {
         return Ok(());
     };
+    let at = m.file_index_snapshot(&ident());
+    let current = h.current_snapshot();
+    if wrote && at != current {
+        return Err(format!(
+            "invariant 11: after a commit, the FileIndex reflects snapshot {at:?}, the table is at {current:?}"
+        ));
+    }
     let mut pks_per_file: BTreeMap<&str, u64> = BTreeMap::new();
     for pk in index.all_pks() {
         let path = index.lookup(pk).expect("an indexed PK has a file");
@@ -1730,9 +1769,7 @@ fn file_index_matches_catalog(
         &[ColumnName("id".into())],
     ))
     .map_err(|e| format!("rebuild_from_catalog: {e}"))?;
-    // Another process's compaction moves rows to files this process's
-    // index can't know about; the keys and their partitions still match.
-    let drifted = if h.external_compaction_seen {
+    let drifted = if at != current {
         let keys = |fi: &pg2iceberg_iceberg::FileIndex| -> BTreeMap<String, String> {
             fi.all_pks()
                 .map(|pk| {
@@ -1904,6 +1941,9 @@ struct AuditedCatalog {
     /// reports failure, as a REST catalog does when the response is lost
     /// (a timeout, a 502/504): "commit state unknown".
     lose_next_response: std::sync::atomic::AtomicBool,
+    /// Another process's compaction pass, committed first when the next
+    /// commit — data or compaction — is.
+    land_before_next_commit: Mutex<Option<PreparedCompaction>>,
 }
 
 impl AuditedCatalog {
@@ -1923,6 +1963,15 @@ impl AuditedCatalog {
 }
 
 impl AuditedCatalog {
+    /// Commit [`Self::land_before_next_commit`]'s pass, if one is held.
+    async fn land_other_pass(&self) -> pg2iceberg_iceberg::Result<()> {
+        let pass = self.land_before_next_commit.lock().unwrap().take();
+        if let Some(pass) = pass {
+            self.inner.commit_compaction(pass).await?;
+        }
+        Ok(())
+    }
+
     async fn audit(&self) {
         if self.audit_paused.load(std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -1974,6 +2023,7 @@ impl Catalog for AuditedCatalog {
                 "injected: commit_snapshots".into(),
             ));
         }
+        self.land_other_pass().await?;
         let meta = self.inner.commit_snapshots(steps).await?;
         self.audit().await;
         let meta = self.respond(meta)?;
@@ -1983,6 +2033,7 @@ impl Catalog for AuditedCatalog {
         &self,
         prepared: PreparedCompaction,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        self.land_other_pass().await?;
         let meta = self.inner.commit_compaction(prepared).await?;
         self.audit().await;
         let meta = self.respond(meta)?;
@@ -2761,6 +2812,62 @@ fn external_compaction_racing_an_update_keeps_the_new_row() {
     check_invariants(&mut h).unwrap();
 }
 
+/// A `compact` job's commit lands while the materializer's is in flight,
+/// and the materializer's goes on top: its FileIndex must take in both.
+#[test]
+fn a_commit_landing_on_a_compaction_keeps_the_index_true() {
+    let mut h = DstHarness::boot();
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::Insert { id: 2, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    // Row 2 moves on: the first file now holds a dead row, so it's worth
+    // rewriting.
+    h.run_step(&Step::Update { id: 2, qty: 11 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    h.run_step(&Step::ExternalCompactPlan);
+    h.run_step(&Step::ExternalCompactMidCommit);
+    // Leaves row 1, which the pass rewrites, alone.
+    h.run_step(&Step::Insert { id: 3, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    check_invariants(&mut h).unwrap();
+}
+
+/// As above, with the materializer's own compaction pass going on top:
+/// the two passes rewrite different partitions.
+#[test]
+fn a_compaction_landing_on_another_keeps_the_index_true() {
+    PARTITIONED.set(true);
+    let mut h = DstHarness::boot();
+    let cycle = |h: &mut DstHarness| {
+        h.run_step(&Step::DriveFlush);
+        h.run_step(&Step::MaterializerCycle);
+    };
+    // The oldest file, in partition 50..100.
+    h.run_step(&Step::Insert { id: 3, qty: 60 });
+    cycle(&mut h);
+    // A file in partition 0..50, made dirty: the job takes it.
+    h.run_step(&Step::Insert { id: 1, qty: 10 });
+    h.run_step(&Step::Insert { id: 2, qty: 10 });
+    cycle(&mut h);
+    h.run_step(&Step::Update { id: 2, qty: 20 });
+    cycle(&mut h);
+    h.run_step(&Step::ExternalCompactPlan);
+    assert!(h.pending_external.is_some(), "the job planned a pass");
+    // The oldest file made dirty: the materializer's pass takes it.
+    h.run_step(&Step::Update { id: 3, qty: 70 });
+    cycle(&mut h);
+    h.run_step(&Step::ExternalCompactMidCommit);
+    h.run_step(&Step::Compact);
+    assert!(
+        h.audited.land_before_next_commit.lock().unwrap().is_none(),
+        "the job's pass landed"
+    );
+    check_invariants(&mut h).unwrap();
+}
+
 /// Dropping a column and adding one with the same name gives a new,
 /// empty column: the dropped column's values must not come back.
 #[test]
@@ -2946,6 +3053,7 @@ fn worker_taking_over_a_table_knows_its_rows() {
     // Worker "b" cycles first, alone: it owns the table and writes row 1.
     h.run_step(&Step::OtherWorkerCycle);
     h.run_step(&Step::Insert { id: 2, qty: 20 });
+    h.run_step(&Step::ToastUpdate { id: 1, qty: 11 });
     h.run_step(&Step::DriveFlush);
     // Worker "a" joins and takes the table over.
     h.run_step(&Step::MaterializerCycle);

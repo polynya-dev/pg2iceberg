@@ -37,7 +37,7 @@ use pg2iceberg_iceberg::meta::{
     self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
 };
 use pg2iceberg_iceberg::{
-    fold_events, promote_re_inserts, read_data_file, rebuild_from_catalog, reconcile_columns,
+    catch_up_from_catalog, fold_events, promote_re_inserts, read_data_file, reconcile_columns,
     resolve_unchanged_cols, Catalog, DataFile, FileIndex, IcebergError, MaterializedRow, PkKey,
     PreparedCommit, TableWriter, WriterError,
 };
@@ -368,6 +368,9 @@ struct TableEntry {
     schema: TableSchema,
     pk_cols: Vec<ColumnName>,
     file_index: FileIndex,
+    /// The table's snapshot `file_index` reflects (`None`: before its
+    /// first). Another process committing moves the table past it.
+    index_at: Option<i64>,
     /// Cached writer; `TableWriter::new` precomputes Arrow schemas once.
     writer: TableWriter,
     /// When `true`, `cycle()` skips this table — its CDC events
@@ -884,7 +887,10 @@ impl<C: Catalog> Materializer<C> {
             .collect();
         let writer = TableWriter::new(schema.clone());
 
-        let file_index = rebuild_from_catalog(
+        let mut file_index = FileIndex::new();
+        let index_at = catch_up_from_catalog(
+            &mut file_index,
+            None,
             self.catalog.as_ref(),
             self.blob_store.as_ref(),
             &ident,
@@ -900,6 +906,7 @@ impl<C: Catalog> Materializer<C> {
                 schema,
                 pk_cols,
                 file_index,
+                index_at,
                 writer,
                 gated_until_snapshot: false,
                 dropped: BTreeSet::new(),
@@ -1396,15 +1403,24 @@ impl<C: Catalog> Materializer<C> {
         self.tables.get(ident).map(|t| &t.file_index)
     }
 
+    /// The table's snapshot its FileIndex reflects (`None`: before its
+    /// first). Behind the table's current one, the index hasn't caught up
+    /// with another process's commits yet — it does before it's used.
+    pub fn file_index_snapshot(&self, ident: &TableIdent) -> Option<i64> {
+        self.tables.get(ident).and_then(|t| t.index_at)
+    }
+
     pub async fn compact_table(
         &mut self,
         ident: &TableIdent,
         config: &pg2iceberg_iceberg::CompactionConfig,
     ) -> Result<Option<pg2iceberg_iceberg::CompactionOutcome>> {
-        let entry = self
-            .tables
-            .get(ident)
-            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        if !self.tables.contains_key(ident) {
+            return Err(MaterializerError::UnknownTable(ident.clone()));
+        }
+        // The pass picks files by the index's live counts.
+        self.sync_file_index(ident).await?;
+        let entry = self.tables.get(ident).expect("checked above");
         let schema = entry.schema.clone();
         let pk_cols = entry.pk_cols.clone();
 
@@ -1431,25 +1447,41 @@ impl<C: Catalog> Materializer<C> {
             Some(&entry.file_index),
             config,
         )
-        .await
-        .map_err(|e| MaterializerError::Compact(e.to_string()))?;
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // The commit may have applied all the same (its response
+                // lost). If the index can't learn that now, the next sync
+                // will.
+                if let Err(sync) = self.sync_file_index(ident).await {
+                    tracing::warn!(error = %sync, table = %ident, "FileIndex sync failed");
+                }
+                return Err(MaterializerError::Compact(e.to_string()));
+            }
+        };
 
         if let Some(o) = &outcome {
-            // Remap what the pass rewrote rather than rebuilding FileIndex
-            // from catalog history, which would re-read the whole table
-            // (and briefly hold a second full index) on every pass.
-            // Outputs first: they take over every live PK of the inputs,
-            // so removing the inputs then has nothing left to scan for.
             let entry_mut = self.tables.get_mut(ident).expect("checked above");
-            for f in &o.added_files {
-                entry_mut.file_index.add_file(
-                    f.path.clone(),
-                    f.pk_keys.clone(),
-                    f.partition_values.clone(),
-                );
-            }
-            for path in &o.rewritten_files {
-                entry_mut.file_index.remove_file(path);
+            if o.snapshot_id == Some(entry_mut.index_at.unwrap_or(0) + 1) {
+                // Remap what the pass rewrote rather than replaying its
+                // snapshot, which would re-read the outputs. Outputs
+                // first: they take over every live PK of the inputs, so
+                // removing the inputs then has nothing left to scan for.
+                for f in &o.added_files {
+                    entry_mut.file_index.add_file(
+                        f.path.clone(),
+                        f.pk_keys.clone(),
+                        f.partition_values.clone(),
+                    );
+                }
+                for path in &o.rewritten_files {
+                    entry_mut.file_index.remove_file(path);
+                }
+                entry_mut.index_at = o.snapshot_id;
+            } else {
+                // Another process committed during the pass.
+                self.catch_up_file_index(ident).await?;
             }
 
             // Record + flush a meta `compactions` row. Best-effort:
@@ -1594,14 +1626,20 @@ impl<C: Catalog> Materializer<C> {
     }
 
     /// Fold the buffered events into one snapshot step: upload its data
-    /// and equality-delete files and add the step to `unit`. FileIndex is
-    /// updated now, as if committed, so later steps of the same unit
-    /// promote re-inserts and resolve TOAST against these rows;
+    /// and equality-delete files and add the step to `unit`. FileIndex
+    /// first catches up with other processes' commits, then is updated
+    /// now, as if committed, so later steps of the same unit promote
+    /// re-inserts and resolve TOAST against these rows;
     /// [`Self::commit_unit`] rebuilds it if the commit fails.
     async fn prepare_step(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<()> {
         let events = std::mem::take(&mut unit.buf);
         if events.is_empty() {
             return Ok(());
+        }
+        if unit.steps.is_empty() {
+            // The unit's first step: the index is untouched since
+            // `index_at`.
+            self.sync_file_index(ident).await?;
         }
         // Observability stats come from the raw events, before the fold
         // collapses them to one row per PK.
@@ -1730,13 +1768,35 @@ impl<C: Catalog> Materializer<C> {
             .map(|f| f.byte_size as i64)
             .sum();
 
+        // The commit adds one snapshot per step with files.
+        let snapshots = unit
+            .steps
+            .iter()
+            .filter(|s| !s.data_files.is_empty() || !s.equality_deletes.is_empty())
+            .count() as i64;
+
         // Commit catalog snapshots — durability gate.
         let started_micros = now_micros();
         let committed = if unit.steps.is_empty() {
             None
         } else {
             match self.catalog.commit_snapshots(unit.steps).await {
-                Ok(meta) => Some(meta),
+                Ok(meta) => {
+                    // FileIndex holds the steps on top of `index_at`; their
+                    // snapshots must follow it directly, or another process
+                    // committed in between.
+                    let entry = self.tables.get_mut(ident).expect("checked by caller");
+                    let expected = match snapshots {
+                        0 => entry.index_at,
+                        n => Some(entry.index_at.unwrap_or(0) + n),
+                    };
+                    if meta.current_snapshot_id == expected {
+                        entry.index_at = expected;
+                    } else {
+                        self.rebuild_file_index(ident).await?;
+                    }
+                    Some(meta)
+                }
                 Err(e) => {
                     // FileIndex already reflects the uncommitted steps;
                     // restore it to the catalog's truth before surfacing
@@ -1812,7 +1872,33 @@ impl<C: Catalog> Materializer<C> {
 
     async fn rebuild_file_index(&mut self, ident: &TableIdent) -> Result<()> {
         let entry = self.tables.get_mut(ident).expect("checked by caller");
-        entry.file_index = rebuild_from_catalog(
+        entry.file_index = FileIndex::new();
+        entry.index_at = None;
+        self.catch_up_file_index(ident).await
+    }
+
+    /// Catch the table's FileIndex up with commits this materializer
+    /// didn't make, or didn't learn the outcome of: the worker that owned
+    /// the table before it, a `compact` job, a commit whose response was
+    /// lost. The index must be untouched since `index_at`.
+    async fn sync_file_index(&mut self, ident: &TableIdent) -> Result<()> {
+        let current = self
+            .catalog
+            .load_table(ident)
+            .await?
+            .and_then(|m| m.current_snapshot_id);
+        let entry = self.tables.get(ident).expect("checked by caller");
+        if current == entry.index_at {
+            return Ok(());
+        }
+        self.catch_up_file_index(ident).await
+    }
+
+    async fn catch_up_file_index(&mut self, ident: &TableIdent) -> Result<()> {
+        let entry = self.tables.get_mut(ident).expect("checked by caller");
+        entry.index_at = catch_up_from_catalog(
+            &mut entry.file_index,
+            entry.index_at,
             self.catalog.as_ref(),
             self.blob_store.as_ref(),
             ident,

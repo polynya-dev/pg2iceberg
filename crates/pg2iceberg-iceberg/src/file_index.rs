@@ -274,12 +274,52 @@ pub async fn rebuild_from_catalog(
     schema: &pg2iceberg_core::TableSchema,
     pk_cols: &[pg2iceberg_core::ColumnName],
 ) -> std::result::Result<FileIndex, crate::verify::VerifyError> {
+    let mut fi = FileIndex::new();
+    catch_up_from_catalog(&mut fi, None, catalog, blob_store, ident, schema, pk_cols).await?;
+    Ok(fi)
+}
+
+/// Bring `fi` — `ident`'s index as of its snapshot `at` (`None`: before
+/// the first, so `fi` is empty) — up to the catalog's current snapshot,
+/// and return that snapshot.
+///
+/// Replays only the snapshots after `at`, while history holds every one
+/// of them. Past an expired one it rebuilds instead: a stand-in lists the
+/// files its snapshot added that are still live, not what it removed.
+pub async fn catch_up_from_catalog(
+    fi: &mut FileIndex,
+    at: Option<i64>,
+    catalog: &dyn pg2iceberg_iceberg_dyn::DynCatalog,
+    blob_store: &dyn pg2iceberg_stream::BlobStore,
+    ident: &pg2iceberg_core::TableIdent,
+    schema: &pg2iceberg_core::TableSchema,
+    pk_cols: &[pg2iceberg_core::ColumnName],
+) -> std::result::Result<Option<i64>, crate::verify::VerifyError> {
     use crate::verify::VerifyError;
 
     let snapshots = catalog
         .snapshots(ident)
         .await
         .map_err(VerifyError::from_dyn)?;
+    let current = snapshots.last().map(|s| s.id);
+    let newer = match at {
+        Some(at) => snapshots
+            .iter()
+            .position(|s| s.id > at)
+            .unwrap_or(snapshots.len()),
+        None => 0,
+    };
+    // Sequence numbers count snapshots: one missing is expired too.
+    let whole = snapshots[newer..]
+        .iter()
+        .zip(at.unwrap_or(0) + 1..)
+        .all(|(s, seq)| s.id == seq && !s.expired);
+    let replay = if at.is_some() && whole && current >= at {
+        &snapshots[newer..]
+    } else {
+        *fi = FileIndex::new();
+        &snapshots[..]
+    };
 
     let pk_schema: Vec<pg2iceberg_core::ColumnSchema> = schema
         .columns
@@ -290,13 +330,12 @@ pub async fn rebuild_from_catalog(
 
     // Same compaction-aware skipping as the verifier — files superseded
     // by a Replace snapshot don't contribute to the FileIndex.
-    let removed_paths: BTreeSet<&str> = snapshots
+    let removed_paths: BTreeSet<&str> = replay
         .iter()
         .flat_map(|s| s.removed_paths.iter().map(String::as_str))
         .collect();
 
-    let mut fi = FileIndex::new();
-    for snap in &snapshots {
+    for snap in replay {
         for df in &snap.delete_files {
             if !removed_paths.contains(df.path.as_str()) {
                 for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
@@ -314,7 +353,12 @@ pub async fn rebuild_from_catalog(
             }
         }
     }
-    Ok(fi)
+    // Files indexed before `at` that a later snapshot removed. Their rows
+    // that live on moved to the files replacing them, above.
+    for path in removed_paths {
+        fi.remove_file(path);
+    }
+    Ok(current)
 }
 
 /// Calls `f` with the PKs of each batch of rows in the file at `path`.

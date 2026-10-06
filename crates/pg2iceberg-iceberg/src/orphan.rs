@@ -158,6 +158,7 @@ mod tests {
             delete_files: deletes.iter().map(to_df).collect(),
             removed_paths: removed.into_iter().map(String::from).collect(),
             timestamp_ms: id * 1000,
+            expired: false,
         }
     }
 
