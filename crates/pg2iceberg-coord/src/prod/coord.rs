@@ -582,6 +582,38 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
+    async fn bump_table_epoch(&self, table: &TableIdent) -> Result<i64> {
+        let key = table_key(table);
+        let client = self.client().await?;
+        let row = client
+            .query_one(&sql::bump_table_epoch(&self.schema), &[&key])
+            .await
+            .map_err(pg)?;
+        Ok(row.get(0))
+    }
+
+    async fn table_epochs(
+        &self,
+        tables: &[TableIdent],
+    ) -> Result<std::collections::BTreeMap<TableIdent, i64>> {
+        let by_key: std::collections::BTreeMap<String, &TableIdent> =
+            tables.iter().map(|t| (table_key(t), t)).collect();
+        let keys: Vec<&String> = by_key.keys().collect();
+        let client = self.client().await?;
+        let rows = client
+            .query(&sql::select_table_epochs(&self.schema), &[&keys])
+            .await
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let key: String = r.get(0);
+                let epoch: i64 = r.get(1);
+                by_key.get(&key).map(|t| ((*t).clone(), epoch))
+            })
+            .collect())
+    }
+
     async fn snapshot_progress(&self, ident: &TableIdent) -> Result<Option<String>> {
         let key = table_key(ident);
         let client = self.client().await?;

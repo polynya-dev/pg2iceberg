@@ -29,6 +29,8 @@ use std::time::Duration;
 struct State {
     /// `log_seq.next_offset`. Bumped by `claim_offsets`; never decreases.
     next_offset: BTreeMap<TableIdent, u64>,
+    /// `table_epoch.epoch`. Bumped by `bump_table_epoch`.
+    table_epochs: BTreeMap<TableIdent, i64>,
     /// `log_index` rows in insert order. The `(table, end_offset)` PK is
     /// enforced on insert.
     log: Vec<LogEntry>,
@@ -384,6 +386,21 @@ impl Coordinator for MemoryCoordinator {
             },
         );
         Ok(())
+    }
+
+    async fn bump_table_epoch(&self, table: &TableIdent) -> Result<i64> {
+        let mut s = self.state.lock().unwrap();
+        let epoch = s.table_epochs.entry(table.clone()).or_insert(0);
+        *epoch += 1;
+        Ok(*epoch)
+    }
+
+    async fn table_epochs(&self, tables: &[TableIdent]) -> Result<BTreeMap<TableIdent, i64>> {
+        let s = self.state.lock().unwrap();
+        Ok(tables
+            .iter()
+            .filter_map(|t| s.table_epochs.get(t).map(|e| (t.clone(), *e)))
+            .collect())
     }
 
     async fn snapshot_progress(&self, ident: &TableIdent) -> Result<Option<String>> {

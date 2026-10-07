@@ -310,6 +310,25 @@ async fn truncate_log_returns_paths_and_drops_rows() {
 }
 
 #[tokio::test]
+async fn table_epochs_count_writes_per_table() {
+    let coord = fresh_coord().await;
+    let orders = ident("public", "orders");
+    let items = ident("public", "items");
+    let never = ident("public", "never");
+    let all = [orders.clone(), items.clone(), never.clone()];
+
+    assert!(coord.table_epochs(&all).await.unwrap().is_empty());
+    assert_eq!(coord.bump_table_epoch(&orders).await.unwrap(), 1);
+    assert_eq!(coord.bump_table_epoch(&orders).await.unwrap(), 2);
+    assert_eq!(coord.bump_table_epoch(&items).await.unwrap(), 1);
+
+    let epochs = coord.table_epochs(&all).await.unwrap();
+    assert_eq!(epochs.get(&orders), Some(&2));
+    assert_eq!(epochs.get(&items), Some(&1));
+    assert_eq!(epochs.get(&never), None);
+}
+
+#[tokio::test]
 async fn cursor_round_trip() {
     let coord = fresh_coord().await;
     let t = ident("public", "orders");

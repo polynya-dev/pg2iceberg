@@ -86,6 +86,10 @@ pub mod ops {
     /// drives the resumability fault DSTs (mid-chunk crash → resume
     /// at next PK).
     pub const COORD_SAVE_CP: &str = "coord.set_snapshot_progress";
+    /// Fault key for `Coordinator::bump_table_epoch`: a process that
+    /// wrote a table dies, or loses the coordinator, before it records
+    /// the write.
+    pub const COORD_BUMP_EPOCH: &str = "coord.bump_table_epoch";
 
     // Catalog.
     pub const CAT_LOAD_TABLE: &str = "cat.load_table";
@@ -368,6 +372,20 @@ impl Coordinator for FaultyCoordinator {
         self.inner
             .mark_table_snapshot_complete(ident, pg_oid, snapshot_lsn)
             .await
+    }
+
+    async fn bump_table_epoch(&self, table: &TableIdent) -> CoordResult<i64> {
+        if self.plan.tick(ops::COORD_BUMP_EPOCH) {
+            return Err(CoordError::Pg("injected fault: bump_table_epoch".into()));
+        }
+        self.inner.bump_table_epoch(table).await
+    }
+
+    async fn table_epochs(
+        &self,
+        tables: &[TableIdent],
+    ) -> CoordResult<std::collections::BTreeMap<TableIdent, i64>> {
+        self.inner.table_epochs(tables).await
     }
 
     async fn snapshot_progress(&self, ident: &TableIdent) -> CoordResult<Option<String>> {

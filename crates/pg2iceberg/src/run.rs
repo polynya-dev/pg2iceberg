@@ -400,6 +400,12 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
         anyhow::bail!("--worker-id is required for materializer-only mode");
     }
     let mut materializer = build_one_shot_materializer(cfg.clone()).await?;
+    materializer.set_catalog_cache_ttl(
+        Arc::new(crate::realio::RealClock),
+        pg2iceberg_logical::CachingCatalog::<
+            IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>,
+        >::DEFAULT_TTL,
+    );
 
     // Heartbeat TTL mirrors Go's `lockTTL = 30 * time.Second` in
     // `logical/materializer.go:222`. The lifecycle's main-loop

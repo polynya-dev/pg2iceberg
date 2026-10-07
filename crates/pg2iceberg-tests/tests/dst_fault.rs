@@ -885,6 +885,131 @@ fn binary_materialize_tick_compaction_disabled_skips_compaction() {
     );
 }
 
+/// Once the materializer knows a table's state, an idle tick — nothing
+/// new to commit, the table below compaction's thresholds — asks the
+/// catalog nothing. pg2iceberg is its tables' only writer, and its
+/// processes tell each other of their commits through the coordinator;
+/// each catalog call is a round trip to a catalog and object store that
+/// may be across the internet, every tick, for every table.
+#[test]
+fn idle_materializer_ticks_ask_the_catalog_nothing() {
+    let mut h = FaultHarness::boot();
+    h.insert(1, 10);
+    h.try_flush().unwrap();
+    let compaction = CompactionConfig::default();
+    let tick = |h: &mut FaultHarness| {
+        let outcome =
+            block_on(run_materialize_tick(&mut h.materializer, Some(&compaction))).unwrap();
+        assert!(outcome.compaction_error.is_none(), "{outcome:?}");
+    };
+    tick(&mut h);
+    let calls = |h: &FaultHarness| {
+        (
+            h.plan.counter(ops::CAT_LOAD_TABLE),
+            h.plan.counter(ops::CAT_SNAPSHOTS),
+        )
+    };
+    let before = calls(&h);
+    for _ in 0..5 {
+        tick(&mut h);
+    }
+    assert_eq!(
+        calls(&h),
+        before,
+        "(load_table, snapshots) calls across five idle ticks"
+    );
+}
+
+/// Three commits, the materializer knowing the table's state after them.
+fn three_commits_known() -> FaultHarness {
+    let mut h = FaultHarness::boot();
+    for i in 1..=3 {
+        h.insert(i, i * 10);
+        h.try_flush().unwrap();
+        h.try_materialize().unwrap();
+    }
+    block_on(run_materialize_tick(
+        &mut h.materializer,
+        Some(&CompactionConfig::default()),
+    ))
+    .unwrap();
+    h
+}
+
+/// A `pg2iceberg compact` job — a process of its own, over the same
+/// catalog and coordinator — compacts the table, then dies before it
+/// records the write.
+fn unrecorded_compaction(h: &FaultHarness) {
+    let mut job = Materializer::new(
+        h.coord.clone() as Arc<dyn Coordinator>,
+        h.blob.clone(),
+        h.catalog.clone(),
+        Arc::new(CounterMaterializerNamer::new("s3://table")),
+        "default",
+        128,
+    );
+    block_on(job.register_table(schema())).unwrap();
+    h.set_fault(
+        ops::COORD_BUMP_EPOCH,
+        [h.plan.counter(ops::COORD_BUMP_EPOCH)],
+    );
+    let eager = CompactionConfig {
+        data_file_threshold: 2,
+        delete_file_threshold: 1,
+        target_size_bytes: 1 << 20,
+        max_input_bytes_per_pass: u64::MAX,
+    };
+    let compacted = block_on(job.compact_cycle(&eager)).unwrap();
+    assert!(!compacted.is_empty(), "the job compacts");
+    assert_eq!(h.injected(), 1, "its write goes unrecorded");
+    h.clear_faults();
+}
+
+/// The running materializer has the table's history from before an
+/// unrecorded compaction. Its orphan cleanup must not go by it: to that
+/// history, the compaction's output is an orphan.
+#[test]
+fn orphan_cleanup_after_an_unrecorded_compaction_keeps_its_output() {
+    let mut h = three_commits_known();
+    unrecorded_compaction(&h);
+    block_on(h.materializer.cleanup_orphans_cycle(i64::MAX, 0)).unwrap();
+    assert_recovery(&mut h).unwrap();
+}
+
+/// What the running materializer read of a table expires: a write that
+/// went unrecorded is seen within the TTL.
+#[test]
+fn an_unrecorded_write_is_seen_once_the_cache_expires() {
+    use std::time::Duration;
+
+    let mut h = three_commits_known();
+    let clock = TestClock::at(0);
+    h.materializer
+        .set_catalog_cache_ttl(Arc::new(clock.clone()), Duration::from_secs(60));
+    let tick = |h: &mut FaultHarness| {
+        block_on(run_materialize_tick(
+            &mut h.materializer,
+            Some(&CompactionConfig::default()),
+        ))
+        .unwrap();
+    };
+    tick(&mut h);
+    unrecorded_compaction(&h);
+    let current = block_on(pg2iceberg_iceberg::Catalog::load_table(
+        &*h.catalog_inner,
+        &ident(),
+    ))
+    .unwrap()
+    .unwrap()
+    .current_snapshot_id;
+
+    tick(&mut h);
+    assert_ne!(h.materializer.file_index_snapshot(&ident()), current);
+    clock.advance(Duration::from_secs(61));
+    tick(&mut h);
+    assert_eq!(h.materializer.file_index_snapshot(&ident()), current);
+}
+
 // ── End-to-end: full library main loop under fault ───────────────
 //
 // Exercises `pg2iceberg_validate::run_logical_main_loop` — the

@@ -12,12 +12,14 @@
 //! consumes a receipt by value, and the receipt cannot be constructed outside
 //! a coord impl. See the compile_fail doctest below.
 
+pub mod catalog_cache;
 pub mod materializer;
 pub mod pipeline;
 pub mod relation_event;
 pub mod runner;
 pub mod sink;
 
+pub use catalog_cache::CachingCatalog;
 pub use materializer::{
     CounterMaterializerNamer, Materializer, MaterializerError, MaterializerNamer,
 };
