@@ -41,7 +41,8 @@ pub type Result<T> = std::result::Result<T, PipelineError>;
 /// so DST runs are reproducible.
 #[async_trait]
 pub trait BlobNamer: Send + Sync {
-    async fn next_blob_path(&self, table: &str) -> String;
+    /// A new path for a chunk staged for `table`.
+    async fn next_blob_path(&self, table: &TableIdent) -> String;
 }
 
 /// Deterministic blob namer for sim/test paths. Uses a monotonic counter.
@@ -62,9 +63,9 @@ impl CounterBlobNamer {
 
 #[async_trait]
 impl BlobNamer for CounterBlobNamer {
-    async fn next_blob_path(&self, table: &str) -> String {
+    async fn next_blob_path(&self, table: &TableIdent) -> String {
         let n = self.counter.fetch_add(1, Ordering::SeqCst);
-        format!("{}/{}/{:010}.parquet", self.base, table, n)
+        format!("{}/{}/{:010}.parquet", self.base, table.name, n)
     }
 }
 
@@ -619,7 +620,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
 
     /// Upload one encoded chunk; returns the claim that registers it.
     async fn stage(&self, table: TableIdent, chunk: EncodedChunk) -> Result<OffsetClaim> {
-        let path = self.namer.next_blob_path(&table.name).await;
+        let path = self.namer.next_blob_path(&table).await;
         let byte_size = chunk.bytes.len() as u64;
         self.blob_store.put(&path, chunk.bytes).await?;
         let mut labels = Labels::new();

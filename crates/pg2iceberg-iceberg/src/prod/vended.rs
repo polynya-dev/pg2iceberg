@@ -165,15 +165,68 @@ pub fn bucket_from_location(location: &str) -> Option<String> {
 /// blocking concurrent reads.
 struct VendedEntry {
     ident: TableIdent,
+    /// The table's location, `s3://<bucket>/<base_path>`, no trailing
+    /// slash.
+    location: String,
+    bucket: String,
     /// Warehouse-relative prefix, no trailing slash. Used for
     /// longest-prefix matching against incoming op paths.
     base_path: String,
     inner: RwLock<EntryInner>,
 }
 
+impl VendedEntry {
+    /// Whether `bucket`'s `key` lies in this table's directory.
+    fn covers(&self, bucket: Option<&str>, key: &str) -> bool {
+        bucket.is_none_or(|b| b == self.bucket)
+            && (self.base_path.is_empty()
+                || key == self.base_path
+                || key
+                    .strip_prefix(self.base_path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/')))
+    }
+}
+
+/// `(bucket, key)` of a path: a full `s3://bucket/key` URI, or a
+/// bucket-relative key (bucket `None`).
+fn split_path(path: &str) -> (Option<&str>, &str) {
+    match path
+        .strip_prefix("s3://")
+        .or_else(|| path.strip_prefix("s3a://"))
+    {
+        Some(rest) => match rest.split_once('/') {
+            Some((bucket, key)) => (Some(bucket), key),
+            None => (Some(rest), ""),
+        },
+        None => (None, path),
+    }
+}
+
 struct EntryInner {
     object_store: Arc<dyn ObjectStore>,
     expires_at: SystemTime,
+}
+
+/// A table's object store from its vended credentials, bucket and
+/// default region.
+pub type StoreBuilder =
+    dyn Fn(&VendedCreds, &str, &str) -> IcebergResult<Arc<dyn ObjectStore>> + Send + Sync;
+
+/// Builds a table's object store. Production uses
+/// [`build_per_table_object_store`]; tests substitute an in-memory store.
+#[derive(Clone)]
+pub struct MakeStore(pub Arc<StoreBuilder>);
+
+impl std::fmt::Debug for MakeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MakeStore")
+    }
+}
+
+impl Default for MakeStore {
+    fn default() -> Self {
+        Self(Arc::new(build_per_table_object_store))
+    }
 }
 
 /// Configuration for the router. `default_ttl` and `refresh_buffer`
@@ -186,6 +239,11 @@ pub struct VendedRouterConfig {
     /// Default S3 region used when the catalog doesn't return one in
     /// the per-table config.
     pub default_region: String,
+    /// S3 endpoint used when the catalog doesn't return one in the
+    /// per-table config (an S3-compatible store the catalog takes for
+    /// granted, such as R2).
+    pub default_endpoint: Option<String>,
+    pub make_store: MakeStore,
 }
 
 impl Default for VendedRouterConfig {
@@ -194,7 +252,23 @@ impl Default for VendedRouterConfig {
             default_ttl: DEFAULT_VENDED_TTL,
             refresh_buffer: DEFAULT_REFRESH_BUFFER,
             default_region: "us-east-1".to_string(),
+            default_endpoint: None,
+            make_store: MakeStore::default(),
         }
+    }
+}
+
+impl VendedRouterConfig {
+    /// `table`'s object store, from the credentials its catalog vended.
+    fn store_for(
+        &self,
+        mut creds: VendedCreds,
+        bucket: &str,
+    ) -> IcebergResult<Arc<dyn ObjectStore>> {
+        if creds.endpoint.as_deref().is_none_or(str::is_empty) {
+            creds.endpoint = self.default_endpoint.clone();
+        }
+        (self.make_store.0)(&creds, bucket, &self.default_region)
     }
 }
 
@@ -317,10 +391,17 @@ impl VendedBlobStoreRouter {
             ))
         })?;
         let base_path = warehouse_relative_path(&location).unwrap_or_default();
-        let object_store = build_per_table_object_store(&creds, &bucket, &cfg.default_region)?;
+        let object_store = cfg.store_for(creds, &bucket)?;
         let expires_at = SystemTime::now() + cfg.default_ttl;
+        let location = if base_path.is_empty() {
+            format!("s3://{bucket}")
+        } else {
+            format!("s3://{bucket}/{base_path}")
+        };
         Ok(Some(Arc::new(VendedEntry {
             ident: ident.clone(),
+            location,
+            bucket,
             base_path,
             inner: RwLock::new(EntryInner {
                 object_store,
@@ -355,19 +436,35 @@ impl VendedBlobStoreRouter {
         Ok(())
     }
 
-    /// Locate the entry whose `base_path` is a prefix of `key`. Returns
-    /// `None` for keys that fall outside every registered table. Empty
-    /// `base_path` entries (table at bucket root) match everything;
-    /// they're sorted last so they only catch keys that didn't match
-    /// any more-specific entry.
-    async fn lookup(&self, key: &str) -> Option<Arc<VendedEntry>> {
+    /// Locate the entry whose directory holds `path` — a full
+    /// `s3://bucket/key` URI or a bucket-relative key. Returns `None`
+    /// for paths that fall outside every registered table. Empty
+    /// `base_path` entries (table at bucket root) match everything in
+    /// their bucket; they're sorted last so they only catch keys that
+    /// didn't match any more-specific entry.
+    async fn lookup(&self, path: &str) -> Option<Arc<VendedEntry>> {
+        let (bucket, key) = split_path(path);
         let entries = self.entries.read().await;
-        for e in entries.iter() {
-            if e.base_path.is_empty() || key.starts_with(&e.base_path) {
-                return Some(Arc::clone(e));
-            }
+        entries.iter().find(|e| e.covers(bucket, key)).cloned()
+    }
+
+    /// `ident`'s location, as its catalog has it (`s3://bucket/path`, no
+    /// trailing slash) — where its files go, under the credentials the
+    /// catalog vends for it. Registers the table if it isn't yet.
+    pub async fn table_location(&self, ident: &TableIdent) -> IcebergResult<String> {
+        if let Some(e) = self.entries.read().await.iter().find(|e| e.ident == *ident) {
+            return Ok(e.location.clone());
         }
-        None
+        self.register_table_lazy(ident).await?;
+        self.entries
+            .read()
+            .await
+            .iter()
+            .find(|e| e.ident == *ident)
+            .map(|e| e.location.clone())
+            .ok_or_else(|| {
+                IcebergError::NotFound(format!("vended-router: no location for {ident}"))
+            })
     }
 
     /// Return the active store for `entry`, refreshing creds if
@@ -421,7 +518,7 @@ impl VendedBlobStoreRouter {
                 entry.ident
             ))
         })?;
-        let store = build_per_table_object_store(&creds, &bucket, &self.cfg.default_region)?;
+        let store = self.cfg.store_for(creds, &bucket)?;
         g.object_store = Arc::clone(&store);
         g.expires_at = SystemTime::now() + self.cfg.default_ttl;
         tracing::info!(table = %entry.ident, "vended creds refreshed");
@@ -442,8 +539,10 @@ impl VendedBlobStoreRouter {
     }
 }
 
+/// The object store key for `input`: a store is bound to one bucket.
 fn parse_path(input: &str) -> StreamResult<Path> {
-    Path::parse(input).map_err(|e| StreamError::Io(format!("invalid object path {input:?}: {e}")))
+    let (_, key) = split_path(input);
+    Path::parse(key).map_err(|e| StreamError::Io(format!("invalid object path {input:?}: {e}")))
 }
 
 #[async_trait]
@@ -839,6 +938,118 @@ mod tests {
         assert!(router.lookup("other/path.parquet").await.is_none());
     }
 
+    /// A router whose stores are in memory, one per bucket, shared
+    /// across refreshes.
+    fn in_memory_config() -> VendedRouterConfig {
+        let stores: Arc<Mutex<BTreeMap<String, Arc<dyn ObjectStore>>>> = Arc::default();
+        VendedRouterConfig {
+            make_store: MakeStore(Arc::new(move |_creds, bucket, _region| {
+                let mut stores = stores.lock().unwrap();
+                Ok(Arc::clone(stores.entry(bucket.to_string()).or_insert_with(
+                    || Arc::new(object_store::memory::InMemory::new()) as Arc<dyn ObjectStore>,
+                )))
+            })),
+            ..VendedRouterConfig::default()
+        }
+    }
+
+    /// The materializer writes, and Iceberg manifests record, full
+    /// `s3://bucket/...` URIs: the router must route them, and every
+    /// operation must work by them.
+    #[tokio::test]
+    async fn router_routes_operations_by_full_uri() {
+        let cat = Arc::new(StubCatalog::new());
+        let orders = ident("orders");
+        cat.add(
+            orders.clone(),
+            meta_with("s3://bucket/wh/db/orders", orders.clone(), true),
+        );
+        let router = VendedBlobStoreRouter::build(cat, &[orders], in_memory_config())
+            .await
+            .unwrap();
+        let path = "s3://bucket/wh/db/orders/data/data-1.parquet";
+        router.put(path, Bytes::from_static(b"rows")).await.unwrap();
+        assert_eq!(router.get(path).await.unwrap(), Bytes::from_static(b"rows"));
+        let listed = router.list("s3://bucket/wh/db/orders/data/").await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        // Orphan cleanup deletes by the listed path.
+        router.delete(&listed[0].path).await.unwrap();
+        assert!(router
+            .list("s3://bucket/wh/db/orders/data/")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Namers place files under a table's location, which registers the
+    /// table if it isn't yet.
+    #[tokio::test]
+    async fn router_reports_table_locations_registering_as_needed() {
+        let cat = Arc::new(StubCatalog::new());
+        let orders = ident("orders");
+        let late = ident("late");
+        cat.add(
+            orders.clone(),
+            meta_with("s3://bucket/wh/db/orders/", orders.clone(), true),
+        );
+        let router = VendedBlobStoreRouter::build(
+            Arc::clone(&cat) as Arc<dyn Catalog>,
+            &[orders.clone(), late.clone()],
+            in_memory_config(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            router.table_location(&orders).await.unwrap(),
+            "s3://bucket/wh/db/orders"
+        );
+        assert!(router.table_location(&late).await.is_err());
+        cat.add(
+            late.clone(),
+            meta_with("s3://bucket/wh/db/late", late.clone(), true),
+        );
+        assert_eq!(
+            router.table_location(&late).await.unwrap(),
+            "s3://bucket/wh/db/late"
+        );
+        assert!(router
+            .lookup("s3://bucket/wh/db/late/data/f.parquet")
+            .await
+            .is_some());
+    }
+
+    /// A table's prefix covers its own directory only: `orders2` isn't
+    /// under `orders`, and gets none of its credentials.
+    #[tokio::test]
+    async fn router_lookup_respects_directory_boundaries() {
+        let cat = Arc::new(StubCatalog::new());
+        let orders = ident("orders");
+        cat.add(
+            orders.clone(),
+            meta_with("s3://bucket/wh/db/orders", orders.clone(), true),
+        );
+        let router =
+            VendedBlobStoreRouter::build(cat, std::slice::from_ref(&orders), in_memory_config())
+                .await
+                .unwrap();
+        assert_eq!(
+            router
+                .lookup("wh/db/orders/data/f.parquet")
+                .await
+                .unwrap()
+                .ident,
+            orders
+        );
+        assert!(router
+            .lookup("wh/db/orders2/data/f.parquet")
+            .await
+            .is_none());
+        assert!(router
+            .lookup("s3://other-bucket/wh/db/orders/data/f.parquet")
+            .await
+            .is_none());
+    }
+
     #[tokio::test]
     async fn router_refresh_reloads_from_catalog_when_near_expiry() {
         let cat = Arc::new(StubCatalog::new());
@@ -855,6 +1066,7 @@ mod tests {
             default_ttl: Duration::from_secs(0),
             refresh_buffer: Duration::from_secs(10),
             default_region: "us-east-1".into(),
+            ..VendedRouterConfig::default()
         };
         let router = VendedBlobStoreRouter::build(
             Arc::clone(&cat) as Arc<dyn Catalog>,
@@ -893,6 +1105,7 @@ mod tests {
             default_ttl: Duration::from_secs(3600),
             refresh_buffer: Duration::from_secs(60),
             default_region: "us-east-1".into(),
+            ..VendedRouterConfig::default()
         };
         let router = VendedBlobStoreRouter::build(
             Arc::clone(&cat) as Arc<dyn Catalog>,

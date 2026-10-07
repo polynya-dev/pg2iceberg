@@ -216,7 +216,7 @@ Any catalog implementing the [Iceberg REST Catalog spec](https://iceberg.apache.
 |---|---|---|
 | Apache Polaris | OAuth2 / Bearer | Yes (`credential_mode: vended`) |
 | Apache REST reference (testcontainers) | None | No |
-| Cloudflare R2 Data Catalog | Bearer | Yes (not yet re-verified end-to-end) |
+| Cloudflare R2 Data Catalog | Bearer | Yes ([setup](docs/catalogs/r2.md)) |
 | AWS Glue | SigV4 with IAM | No (not yet re-verified end-to-end) |
 
 ## Quickstart
