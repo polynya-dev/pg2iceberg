@@ -42,7 +42,14 @@ connections() {
 
 case "${1:-}" in
     down)
-        wrangler delete --force
+        # The Worker first, so its cron trigger can't start the container
+        # again; then the container application, which `wrangler delete`
+        # leaves behind — its instance still running.
+        app="$(wrangler containers list --json | python3 -c '
+import json, sys
+print(next((a["id"] for a in json.load(sys.stdin) if a["name"] == "pg2iceberg-pg2iceberg"), ""))')"
+        wrangler delete --force || echo "(no Worker to delete)"
+        [ -z "$app" ] || yes | wrangler containers delete "$app"
         echo "Deleted. The Neon database expires on its own (see .env.neon)."
         exit 0
         ;;
