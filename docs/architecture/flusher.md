@@ -47,6 +47,7 @@ The coordinator role is filled by the **source PostgreSQL database** itself. Thi
 | `tables` | Per-table snapshot status + `pg_class.oid` |
 | `snapshot_progress` | Per-table mid-snapshot resume cursor |
 | `pending_markers` / `marker_emissions` | Blue-green marker bookkeeping |
+| `table_epoch` | Per-table write epoch, for the materializer's [catalog cache](materializer.md#catalog-cache) |
 
 **Append** (flusher → log):
 

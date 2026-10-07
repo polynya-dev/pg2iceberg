@@ -23,6 +23,7 @@
 //! 7. `Coordinator::set_cursor` to the highest end_offset processed.
 //! 8. Update FileIndex with the new data file + removed PKs.
 
+use crate::catalog_cache::CachingCatalog;
 use crate::relation_event;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -473,7 +474,9 @@ fn is_tx_boundary(last: Option<&MatEvent>, next: Option<&MatEvent>) -> bool {
 pub struct Materializer<C: Catalog> {
     coord: Arc<dyn Coordinator>,
     blob_store: Arc<dyn BlobStore>,
-    catalog: Arc<C>,
+    /// Every read and write of the tables' Iceberg metadata goes through
+    /// it: see [`CachingCatalog`].
+    catalog: Arc<CachingCatalog<C>>,
     namer: Arc<dyn MaterializerNamer>,
     tables: BTreeMap<TableIdent, TableEntry>,
     group: String,
@@ -620,9 +623,9 @@ impl<C: Catalog> Materializer<C> {
     ) -> Self {
         assert!(batch_rows > 0);
         Self {
+            catalog: Arc::new(CachingCatalog::new(catalog, coord.clone())),
             coord,
             blob_store,
-            catalog,
             namer,
             tables: BTreeMap::new(),
             group: group.into(),
@@ -1375,7 +1378,21 @@ impl<C: Catalog> Materializer<C> {
         }
     }
 
+    /// Keep nothing longer than `ttl` by `clock` of what was read of the
+    /// tables' Iceberg metadata, besides dropping it once another process
+    /// writes them: the bound on staleness should a writer die before
+    /// recording its write. See [`CachingCatalog`].
+    pub fn set_catalog_cache_ttl(
+        &self,
+        clock: Arc<dyn pg2iceberg_core::Clock>,
+        ttl: std::time::Duration,
+    ) {
+        self.catalog.set_ttl(clock, ttl);
+    }
+
     pub async fn cycle(&mut self) -> Result<usize> {
+        // Forget what other processes changed since the last cycle.
+        self.catalog.sync().await;
         // 1. Default path: process every registered table whose
         //    backfill-snapshot gate is open. Tables registered via
         //    [`Self::register_table_pending`] (mid-stream additions
@@ -1476,6 +1493,7 @@ impl<C: Catalog> Materializer<C> {
         &mut self,
         config: &pg2iceberg_iceberg::CompactionConfig,
     ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CompactionOutcome)>> {
+        self.catalog.sync().await;
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
         for ident in idents {
@@ -1505,14 +1523,16 @@ impl<C: Catalog> Materializer<C> {
         now_ms: i64,
         grace_period_ms: i64,
     ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CleanupOutcome)>> {
+        self.catalog.sync().await;
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
         for ident in idents {
             // Trailing `/`: `ns.orders/` must not match `ns.orders2/`.
             let table_prefix = format!("{}/", self.namer.table_dir(&ident));
             let started_micros = now_micros();
+            // Uncached: it deletes what the table doesn't reference.
             let outcome = pg2iceberg_iceberg::cleanup_orphans(
-                self.catalog.as_ref(),
+                self.catalog.uncached(),
                 self.blob_store.as_ref(),
                 &ident,
                 &table_prefix,
@@ -1554,6 +1574,7 @@ impl<C: Catalog> Materializer<C> {
     /// when meta recording is enabled, with `operation =
     /// "expire_snapshots"`.
     pub async fn expire_cycle(&mut self, retention_ms: i64) -> Result<Vec<(TableIdent, usize)>> {
+        self.catalog.sync().await;
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
         for ident in idents {

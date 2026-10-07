@@ -59,7 +59,7 @@ use pg2iceberg_iceberg::{
 };
 use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
-use pg2iceberg_logical::{replication_start_lsn, Materializer, Pipeline};
+use pg2iceberg_logical::{replication_start_lsn, CachingCatalog, Materializer, Pipeline};
 use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
@@ -1099,6 +1099,7 @@ impl DstHarness {
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
             land_before_next_commit: Default::default(),
+            coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
         });
         let mut materializer = Materializer::with_metrics(
@@ -1231,6 +1232,7 @@ impl DstHarness {
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
             land_before_next_commit: Default::default(),
+            coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
         });
         let mut materializer = Materializer::with_metrics(
@@ -1798,7 +1800,12 @@ impl DstHarness {
             Step::ExternalCompactPlan => self.external_compact_plan(),
             Step::ExternalCompactCommit => {
                 if let Some(pass) = self.pending_external.take() {
-                    match block_on(self.audited.commit_compaction(pass)) {
+                    // The job's own process, as `pg2iceberg compact` is.
+                    let job = CachingCatalog::new(
+                        self.audited.clone(),
+                        self.coord.clone() as Arc<dyn Coordinator>,
+                    );
+                    match block_on(job.commit_compaction(pass)) {
                         Ok(_) => {}
                         Err(e) if e.to_string().contains("response lost") => {}
                         // Another pass rewrote its files first; the job
@@ -2204,6 +2211,9 @@ struct AuditedCatalog {
     /// Another process's compaction pass, committed first when the next
     /// commit — data or compaction — is.
     land_before_next_commit: Mutex<Option<PreparedCompaction>>,
+    /// Where that process records its writes, as every pg2iceberg
+    /// process does (see `CachingCatalog`).
+    coord: Arc<dyn Coordinator>,
     /// Per table and cursor group, how far commits that landed applied
     /// the log (invariant 16).
     applied: Mutex<BTreeMap<(TableIdent, String), u64>>,
@@ -2230,7 +2240,10 @@ impl AuditedCatalog {
     async fn land_other_pass(&self) -> pg2iceberg_iceberg::Result<()> {
         let pass = self.land_before_next_commit.lock().unwrap().take();
         if let Some(pass) = pass {
-            match self.inner.commit_compaction(pass).await {
+            let table = pass.ident.clone();
+            let result = self.inner.commit_compaction(pass).await;
+            self.coord.bump_table_epoch(&table).await.unwrap();
+            match result {
                 // The job's pass lost to a newer rewrite of its files: the
                 // job fails, not this commit.
                 Ok(_) | Err(pg2iceberg_iceberg::IcebergError::Conflict(_)) => {}

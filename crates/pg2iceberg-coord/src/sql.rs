@@ -184,6 +184,15 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
             )",
             schema.qualify("marker_emissions")
         ),
+        // Per-table write epoch: bumped by every write to the table's
+        // Iceberg metadata, so processes caching it know to reload.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                table_name TEXT   PRIMARY KEY,
+                epoch      BIGINT NOT NULL
+            )",
+            schema.qualify("table_epoch")
+        ),
     ]
 }
 
@@ -472,6 +481,26 @@ pub fn mark_table_complete(schema: &CoordSchema) -> String {
     )
 }
 
+// ── Per-table write epochs ────────────────────────────────────────────
+
+/// Bump a table's epoch, creating it at 1. One arg: `table_name`.
+pub fn bump_table_epoch(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {} AS t (table_name, epoch) VALUES ($1, 1) \
+         ON CONFLICT (table_name) DO UPDATE SET epoch = t.epoch + 1 \
+         RETURNING epoch",
+        schema.qualify("table_epoch")
+    )
+}
+
+/// The epochs of the tables named in `$1` (a `TEXT[]`).
+pub fn select_table_epochs(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT table_name, epoch FROM {} WHERE table_name = ANY($1)",
+        schema.qualify("table_epoch")
+    )
+}
+
 // ── Per-table mid-snapshot resume ─────────────────────────────────────
 
 pub fn select_snapshot_progress(schema: &CoordSchema) -> String {
@@ -511,9 +540,10 @@ mod tests {
         // + 1 ALTER TABLE (log_index.flushable_lsn)
         // + 5 new per-concern tables (pipeline_meta, flushed_lsn,
         //   replicated_lsn, tables, snapshot_progress)
-        // = 13. Each statement is idempotent (CREATE TABLE IF NOT
+        // + table_epoch
+        // = 14. Each statement is idempotent (CREATE TABLE IF NOT
         // EXISTS or ADD COLUMN IF NOT EXISTS).
-        assert_eq!(stmts.len(), 13);
+        assert_eq!(stmts.len(), 14);
         for stmt in &stmts {
             assert!(
                 stmt.contains("IF NOT EXISTS"),
@@ -528,6 +558,7 @@ mod tests {
             "replicated_lsn",
             "tables",
             "snapshot_progress",
+            "table_epoch",
         ] {
             assert!(
                 stmts

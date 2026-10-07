@@ -314,6 +314,21 @@ pub trait Coordinator: Send + Sync {
         snapshot_lsn: Lsn,
     ) -> Result<()>;
 
+    // ── Per-table write epochs ──────────────────────────────
+    /// Record that a pg2iceberg process wrote `table`'s Iceberg metadata
+    /// — a commit, a schema change, an expiry, or an attempt whose
+    /// outcome it doesn't know — and return the table's new epoch (1 the
+    /// first time). pg2iceberg is its tables' only writer, so a process
+    /// caches what it read of a table until the epoch moves past what it
+    /// last knew (see `pg2iceberg_logical::CachingCatalog`).
+    async fn bump_table_epoch(&self, table: &TableIdent) -> Result<i64>;
+
+    /// The epochs of `tables`; one never bumped is absent.
+    async fn table_epochs(
+        &self,
+        tables: &[TableIdent],
+    ) -> Result<std::collections::BTreeMap<TableIdent, i64>>;
+
     // ── Per-table mid-snapshot resume cursor ────────────────
     /// Read the per-chunk resume cursor for a table. Returns the
     /// canonical-PK JSON of the last successfully staged row, or

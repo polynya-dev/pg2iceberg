@@ -36,6 +36,14 @@ Steps bound the materializer's memory, but a source transaction is never split a
 
 Atomicity is per table. A transaction touching several tables is committed table by table, since Iceberg has no multi-table commit yet.
 
+### Catalog cache
+
+Each catalog call is a round trip, often to a catalog and object store across the internet, and a cycle makes several per table: loading its metadata, reading its snapshot history for the compaction check. pg2iceberg is its tables' only writer, so the materializer keeps what it read until a pg2iceberg process writes the table — an idle cycle asks the catalog nothing.
+
+Every pg2iceberg process that writes a table's Iceberg metadata — `run`, the workers of a distributed deployment, `compact` and `maintain` jobs — bumps the table's epoch in the coordinator's `table_epoch`. At the start of each cycle the materializer reads the epochs and forgets the tables another process wrote; its own commits update what it holds, since a commit answers with the table's new metadata. A write that fails may have landed, so its table is read again.
+
+A writer that dies between its commit and the bump leaves the epoch behind: long-running processes keep nothing longer than a minute, well inside `maintenance_grace`. Orphan cleanup, which deletes what the table doesn't reference, always reads the catalog.
+
 ## Merge-on-read
 
 pg2iceberg uses Iceberg's **merge-on-read** write mode. Rather than rewriting existing data files on every update or delete, it appends:

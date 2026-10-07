@@ -457,6 +457,10 @@ where
         &lc.group,
         lc.mat_batch_rows,
     );
+    materializer.set_catalog_cache_ttl(
+        Arc::clone(&lc.clock),
+        pg2iceberg_logical::CachingCatalog::<Cat>::DEFAULT_TTL,
+    );
     // Tables that need a backfill snapshot before any of their CDC
     // events are applied to Iceberg. Computed here so we can register
     // each schema with the right gate (`register_table_pending` vs
