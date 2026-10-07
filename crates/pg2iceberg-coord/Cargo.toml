@@ -27,7 +27,7 @@ serde_json = { version = "1", optional = true }
 tokio = { version = "1", optional = true, features = ["macros", "rt", "sync"] }
 # TLS support — see the symmetric block in `pg2iceberg-pg/Cargo.toml`
 # for the rationale on `ring`.
-tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true, default-features = false, features = ["ring"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = { version = "0.26", optional = true }
 

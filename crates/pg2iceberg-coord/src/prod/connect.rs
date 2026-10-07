@@ -6,8 +6,9 @@
 //! isn't available in replication-mode connections.
 //!
 //! Supports either plaintext (`TlsMode::Disable`) or rustls + Mozilla
-//! webpki roots (`TlsMode::Webpki`). Custom CA bundles, mTLS, and
-//! channel binding are deferred.
+//! webpki roots (`TlsMode::Webpki`), with SCRAM channel binding (see
+//! `pg2iceberg_pg`'s TLS module). Custom CA bundles and mTLS are
+//! deferred.
 
 use crate::CoordError;
 use tokio::task::AbortHandle;
