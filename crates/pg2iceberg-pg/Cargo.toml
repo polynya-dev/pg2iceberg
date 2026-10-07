@@ -66,6 +66,6 @@ prod = [
 ]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time", "net", "io-util", "test-util"] }
 # The server side of `prod::tls`'s channel-binding test.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
