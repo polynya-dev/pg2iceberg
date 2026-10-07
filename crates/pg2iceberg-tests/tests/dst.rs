@@ -41,6 +41,14 @@
 //! rebuild, compaction, orphan cleanup and `verify` replay, still matches
 //! it.
 //!
+//! In `MANAGED` cases the catalog maintains the table too, as S3 Tables,
+//! R2 Data Catalog and Glue do: it compacts it (as Iceberg's Java rewrite
+//! does), expires its snapshots and deletes what only expired ones held,
+//! and drops delete files nothing is left for. Its commits come from
+//! another engine — nothing of pg2iceberg's in them, no pg2iceberg
+//! process told — and pg2iceberg leaves that maintenance to it
+//! (invariant 17) but keeps delete files from piling up (18).
+//!
 //! Each case runs on the sims or — under the `integration` feature — on
 //! production's catalog and blob store (`IcebergRustCatalog` over
 //! iceberg-rust's memory catalog, `ObjectStoreBlobStore` over
@@ -485,6 +493,27 @@ enum Step {
     /// `maintain`'s second half: delete every blob in the table's
     /// directory that the table doesn't reference, with no grace period.
     CleanupOrphans,
+    /// A managed catalog's own compaction (`MANAGED` cases only) plans a
+    /// pass and writes its output files next to pg2iceberg's, as the
+    /// table's location holds both, but doesn't commit yet. As Iceberg's
+    /// Java rewrite does: it rewrites data files and leaves delete files
+    /// alone, and its outputs keep the sequence number of the snapshot it
+    /// read — or, with `own_sequence_number`, take the commit's, which it
+    /// then refuses should a delete file land in between.
+    CatalogCompactPlan {
+        own_sequence_number: bool,
+    },
+    /// The catalog commits that pass — telling no pg2iceberg process.
+    CatalogCompactCommit,
+    /// The catalog commits that pass while the materializer's next commit
+    /// is in flight, which then lands on top of it.
+    CatalogCompactMidCommit,
+    /// The catalog expires every snapshot but the current one, and deletes
+    /// the files only the expired ones held.
+    CatalogExpire,
+    /// The catalog drops the delete files no data file is left for them to
+    /// apply to, in a `delete` snapshot.
+    CatalogRemoveDanglingDeletes,
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
@@ -531,6 +560,12 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         2 => Just(Step::ExternalCompactCommit),
         1 => Just(Step::ExternalCompactMidCommit),
         1 => Just(Step::CleanupOrphans),
+        2 => any::<bool>()
+            .prop_map(|own_sequence_number| Step::CatalogCompactPlan { own_sequence_number }),
+        2 => Just(Step::CatalogCompactCommit),
+        1 => Just(Step::CatalogCompactMidCommit),
+        1 => Just(Step::CatalogExpire),
+        1 => Just(Step::CatalogRemoveDanglingDeletes),
     ]
 }
 
@@ -591,6 +626,12 @@ thread_local! {
     /// Whether this case's table has Postgres's default replica identity
     /// (a DELETE sends only the key) rather than FULL.
     static DEFAULT_IDENTITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the catalog maintains the table itself — compacts it,
+    /// expires its snapshots, drops its dangling deletes — as managed
+    /// catalogs (S3 Tables, R2 Data Catalog, Glue) do. Its commits come
+    /// from another engine: they carry nothing of pg2iceberg's, and no
+    /// pg2iceberg process hears of them.
+    static MANAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -736,6 +777,93 @@ impl Storage {
             .into_iter()
             .map(|b| object_key(&b.path).to_string())
             .collect())
+    }
+
+    /// Commit `pass` as the catalog's own compaction (see
+    /// [`Step::CatalogCompactPlan`]).
+    async fn commit_catalog_rewrite(
+        &self,
+        pass: PreparedCompaction,
+        own_sequence_number: bool,
+    ) -> pg2iceberg_iceberg::Result<()> {
+        match &self.backend {
+            Backend::Sim { catalog, .. } => catalog
+                .commit_foreign_rewrite(pass, own_sequence_number)
+                .map(drop),
+            #[cfg(feature = "integration")]
+            Backend::Prod { iceberg } => {
+                let read = pass.data_sequence_number;
+                prod_backend::commit_foreign(
+                    iceberg,
+                    &pass.ident,
+                    iceberg::spec::Operation::Replace,
+                    pass.added_data_files,
+                    if own_sequence_number { None } else { read },
+                    pass.removed_paths.into_iter().collect(),
+                    if own_sequence_number { read } else { None },
+                )
+                .await
+            }
+        }
+    }
+
+    /// The catalog drops `paths` from the table without rewriting
+    /// anything, in a `delete` snapshot.
+    async fn commit_catalog_removal(
+        &self,
+        ident: &TableIdent,
+        paths: Vec<String>,
+    ) -> pg2iceberg_iceberg::Result<()> {
+        match &self.backend {
+            Backend::Sim { catalog, .. } => catalog.commit_foreign_removal(ident, paths).map(drop),
+            #[cfg(feature = "integration")]
+            Backend::Prod { iceberg } => {
+                prod_backend::commit_foreign(
+                    iceberg,
+                    ident,
+                    iceberg::spec::Operation::Delete,
+                    Vec::new(),
+                    None,
+                    paths.into_iter().collect(),
+                    None,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The catalog expires every snapshot but the current one, then
+    /// deletes the files only the expired ones held — as Iceberg's
+    /// `expireSnapshots` does, and as S3 Tables does after a while.
+    async fn catalog_expire(&self, ident: &TableIdent) -> Result<(), String> {
+        let dead: BTreeSet<String> = match &self.backend {
+            Backend::Sim { catalog, .. } => {
+                catalog
+                    .expire_snapshots(ident, 0)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // Every snapshot but the current one is gone: the files it
+                // doesn't hold are held by none.
+                let history = catalog.history(ident);
+                let live: BTreeSet<String> = live_files_from_history(&history)
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect();
+                history
+                    .iter()
+                    .flat_map(|s| s.data_files.iter().chain(&s.delete_files))
+                    .map(|f| f.path.clone())
+                    .filter(|p| !live.contains(p))
+                    .collect()
+            }
+            #[cfg(feature = "integration")]
+            Backend::Prod { iceberg } => prod_backend::expire(iceberg, ident).await?,
+        };
+        for path in dead {
+            // Gone already: deleted by an earlier expiry.
+            let _ = self.blob.delete(&path).await;
+        }
+        Ok(())
     }
 
     /// The sim blob store, for tests that count its reads.
@@ -903,6 +1031,333 @@ mod prod_backend {
         }
     }
 
+    /// A commit by another engine, made the way Iceberg's Java
+    /// implementation makes one: each manifest holding a file in
+    /// `removed` is rewritten with that file as a `DELETED` entry and the
+    /// rest as `EXISTING`; `added` goes in a manifest of its own, at data
+    /// sequence number `added_seq` (`None`: the commit's own); the summary
+    /// counts the table and holds nothing of pg2iceberg's. With
+    /// `no_deletes_since`, the commit fails if a live delete file is newer
+    /// than that sequence number, as Java's rewrite validates when its
+    /// outputs take the commit's own number.
+    pub async fn commit_foreign(
+        iceberg: &Arc<iceberg::memory::MemoryCatalog>,
+        ident: &TableIdent,
+        operation: iceberg::spec::Operation,
+        added: Vec<pg2iceberg_iceberg::DataFile>,
+        added_seq: Option<i64>,
+        removed: BTreeSet<String>,
+        no_deletes_since: Option<i64>,
+    ) -> pg2iceberg_iceberg::Result<()> {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::Catalog as _;
+        let err = |e: iceberg::Error| match e.kind() {
+            iceberg::ErrorKind::CatalogCommitConflicts => {
+                pg2iceberg_iceberg::IcebergError::Conflict(e.to_string())
+            }
+            _ => pg2iceberg_iceberg::IcebergError::Other(e.to_string()),
+        };
+        let ns = NamespaceIdent::from_strs(&ident.namespace.0).map_err(err)?;
+        let table = iceberg
+            .load_table(&iceberg::TableIdent::new(ns, ident.name.clone()))
+            .await
+            .map_err(err)?;
+        let action = ForeignCommit {
+            operation,
+            added,
+            added_seq,
+            removed,
+            no_deletes_since,
+        };
+        action
+            .apply(Transaction::new(&table))
+            .map_err(err)?
+            .commit(iceberg.as_ref())
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    struct ForeignCommit {
+        operation: iceberg::spec::Operation,
+        added: Vec<pg2iceberg_iceberg::DataFile>,
+        added_seq: Option<i64>,
+        removed: BTreeSet<String>,
+        no_deletes_since: Option<i64>,
+    }
+
+    /// The `total-*` summary properties of a table holding the files
+    /// `add`ed.
+    #[derive(Default)]
+    struct Totals {
+        data_files: u64,
+        records: u64,
+        delete_files: u64,
+        equality_deletes: u64,
+        bytes: u64,
+    }
+
+    impl Totals {
+        fn add(&mut self, df: &iceberg::spec::DataFile) {
+            self.bytes += df.file_size_in_bytes();
+            if df.content_type() == DataContentType::Data {
+                self.data_files += 1;
+                self.records += df.record_count();
+            } else {
+                self.delete_files += 1;
+                self.equality_deletes += df.record_count();
+            }
+        }
+
+        fn properties(&self) -> HashMap<String, String> {
+            [
+                ("total-records", self.records),
+                ("total-files-size", self.bytes),
+                ("total-data-files", self.data_files),
+                ("total-delete-files", self.delete_files),
+                ("total-position-deletes", 0),
+                ("total-equality-deletes", self.equality_deletes),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl iceberg::transaction::TransactionAction for ForeignCommit {
+        async fn commit(
+            self: Arc<Self>,
+            table: &iceberg::table::Table,
+        ) -> iceberg::Result<iceberg::transaction::ActionCommit> {
+            use iceberg::spec::{
+                ManifestContentType, ManifestListWriter, ManifestWriter, ManifestWriterBuilder,
+                SnapshotReference, SnapshotRetention, Summary,
+            };
+            let conflict = |msg: String| {
+                iceberg::Error::new(iceberg::ErrorKind::CatalogCommitConflicts, msg)
+                    .with_retryable(false)
+            };
+            let meta = table.metadata();
+            let current = meta.current_snapshot().ok_or_else(|| {
+                iceberg::Error::new(iceberg::ErrorKind::DataInvalid, "no snapshot to change")
+            })?;
+            let seq = meta.next_sequence_number();
+            // Unique within the table: pg2iceberg's are random 63-bit.
+            let snapshot_id = 1_000_000_000_000 + seq;
+            let file_io = table.file_io();
+            let schema = meta.current_schema().clone();
+            let spec = meta.default_partition_spec().as_ref().clone();
+            let mut written = 0;
+            let mut new_manifest = |content| -> iceberg::Result<ManifestWriter> {
+                written += 1;
+                let path = format!(
+                    "{}/metadata/foreign-{snapshot_id}-m{written}.avro",
+                    meta.location()
+                );
+                let builder = ManifestWriterBuilder::new(
+                    file_io.new_output(path)?,
+                    Some(snapshot_id),
+                    schema.clone(),
+                    spec.clone(),
+                );
+                Ok(match content {
+                    ManifestContentType::Data => builder.build_v2_data(),
+                    ManifestContentType::Deletes => builder.build_v2_deletes(),
+                })
+            };
+
+            let mut manifests = Vec::new();
+            let mut found = BTreeSet::new();
+            let mut totals = Totals::default();
+            let list = table.manifest_list_reader(current).load().await?;
+            for manifest_file in list.entries() {
+                let manifest = manifest_file.load_manifest(file_io).await?;
+                // A rewrite drops the entries earlier commits left `DELETED`.
+                let alive: Vec<_> = manifest.entries().iter().filter(|e| e.is_alive()).collect();
+                if let Some(read) = self.no_deletes_since {
+                    if alive.iter().any(|e| {
+                        e.data_file().content_type() != DataContentType::Data
+                            && e.sequence_number().is_some_and(|s| s > read)
+                    }) {
+                        return Err(conflict(format!(
+                            "delete files landed since the rewrite read sequence number {read}"
+                        )));
+                    }
+                }
+                if !alive
+                    .iter()
+                    .any(|e| self.removed.contains(e.data_file().file_path()))
+                {
+                    alive.iter().for_each(|e| totals.add(e.data_file()));
+                    manifests.push(manifest_file.clone());
+                    continue;
+                }
+                let mut writer = new_manifest(manifest_file.content)?;
+                for e in alive {
+                    let df = e.data_file().clone();
+                    let entry_seq = e.sequence_number().expect("inherited on load");
+                    if self.removed.contains(df.file_path()) {
+                        found.insert(df.file_path().to_string());
+                        writer.add_delete_file(df, entry_seq, e.file_sequence_number)?;
+                    } else {
+                        totals.add(&df);
+                        let added_by = e.snapshot_id().expect("inherited on load");
+                        writer.add_existing_file(
+                            df,
+                            added_by,
+                            entry_seq,
+                            e.file_sequence_number,
+                        )?;
+                    }
+                }
+                manifests.push(writer.write_manifest_file().await?);
+            }
+            if found != self.removed {
+                return Err(conflict(format!(
+                    "removes files no longer in the table: {:?}",
+                    self.removed.difference(&found).collect::<Vec<_>>()
+                )));
+            }
+            if !self.added.is_empty() {
+                let mut writer = new_manifest(ManifestContentType::Data)?;
+                for f in &self.added {
+                    let df = iceberg_data_file(f, meta.default_partition_spec_id())?;
+                    totals.add(&df);
+                    writer.add_file(df, self.added_seq.unwrap_or(-1))?;
+                }
+                manifests.push(writer.write_manifest_file().await?);
+            }
+
+            let list_path = format!(
+                "{}/metadata/snap-foreign-{snapshot_id}.avro",
+                meta.location()
+            );
+            let mut list_writer = ManifestListWriter::v2(
+                file_io.new_output(&list_path)?.writer().await?,
+                snapshot_id,
+                Some(current.snapshot_id()),
+                seq,
+            );
+            list_writer.add_manifests(manifests.into_iter())?;
+            list_writer.close().await?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_millis() as i64;
+            let snapshot = iceberg::spec::Snapshot::builder()
+                .with_manifest_list(list_path)
+                .with_snapshot_id(snapshot_id)
+                .with_parent_snapshot_id(Some(current.snapshot_id()))
+                .with_sequence_number(seq)
+                .with_summary(Summary {
+                    operation: self.operation.clone(),
+                    additional_properties: totals.properties(),
+                })
+                .with_schema_id(meta.current_schema_id())
+                .with_timestamp_ms(now_ms)
+                .build();
+            Ok(iceberg::transaction::ActionCommit::new(
+                vec![
+                    iceberg::TableUpdate::AddSnapshot { snapshot },
+                    iceberg::TableUpdate::SetSnapshotRef {
+                        ref_name: "main".into(),
+                        reference: SnapshotReference::new(
+                            snapshot_id,
+                            SnapshotRetention::branch(None, None, None),
+                        ),
+                    },
+                ],
+                vec![
+                    iceberg::TableRequirement::UuidMatch { uuid: meta.uuid() },
+                    iceberg::TableRequirement::RefSnapshotIdMatch {
+                        r#ref: "main".into(),
+                        snapshot_id: Some(current.snapshot_id()),
+                    },
+                ],
+            ))
+        }
+    }
+
+    /// `f` as a manifest's data file. The harness partitions by
+    /// `truncate(qty)`: an int, or null.
+    fn iceberg_data_file(
+        f: &pg2iceberg_iceberg::DataFile,
+        spec_id: i32,
+    ) -> iceberg::Result<iceberg::spec::DataFile> {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat, Literal, Struct};
+        use pg2iceberg_core::partition::PartitionLiteral;
+        let partition = if f.partition_values.is_empty() {
+            Struct::empty()
+        } else {
+            Struct::from_iter(f.partition_values.iter().map(|v| match v {
+                PartitionLiteral::Int(n) => Some(Literal::int(*n)),
+                _ => None,
+            }))
+        };
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(f.path.clone())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(f.byte_size)
+            .record_count(f.record_count)
+            .partition(partition)
+            .partition_spec_id(spec_id)
+            .build()
+            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string()))
+    }
+
+    /// Expire every snapshot but the current one, as another engine does,
+    /// and return the files only the expired ones held.
+    pub async fn expire(
+        iceberg: &Arc<iceberg::memory::MemoryCatalog>,
+        ident: &TableIdent,
+    ) -> Result<BTreeSet<String>, String> {
+        let before = held_files(iceberg, ident).await?;
+        IcebergRustCatalog::new(iceberg.clone())
+            .expire_snapshots(ident, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+        let after = held_files(iceberg, ident).await?;
+        Ok(before.difference(&after).cloned().collect())
+    }
+
+    /// The files any of the table's snapshots holds.
+    async fn held_files(
+        iceberg: &iceberg::memory::MemoryCatalog,
+        ident: &TableIdent,
+    ) -> Result<BTreeSet<String>, String> {
+        use iceberg::Catalog as _;
+        let err = |e: iceberg::Error| e.to_string();
+        let ns = NamespaceIdent::from_strs(&ident.namespace.0).map_err(err)?;
+        let table = iceberg
+            .load_table(&iceberg::TableIdent::new(ns, ident.name.clone()))
+            .await
+            .map_err(err)?;
+        let mut out = BTreeSet::new();
+        for snapshot in table.metadata().snapshots() {
+            let list = table
+                .manifest_list_reader(snapshot)
+                .load()
+                .await
+                .map_err(err)?;
+            for manifest_file in list.entries() {
+                let manifest = manifest_file
+                    .load_manifest(table.file_io())
+                    .await
+                    .map_err(err)?;
+                out.extend(
+                    manifest
+                        .entries()
+                        .iter()
+                        .filter(|e| e.is_alive())
+                        .map(|e| e.data_file().file_path().to_string()),
+                );
+            }
+        }
+        Ok(out)
+    }
+
     /// Refuses to overwrite an object, like the sim blob store: every path
     /// pg2iceberg writes must be new.
     struct WriteOnce(ObjectStoreBlobStore);
@@ -937,6 +1392,15 @@ const WORKER_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn worker(name: &str) -> pg2iceberg_core::WorkerId {
     pg2iceberg_core::WorkerId(format!("worker-{name}"))
+}
+
+/// Keep `m`'s reads of the catalog as long as production does: until a
+/// pg2iceberg process writes the table, or a minute by `clock`.
+fn cache_like_production(m: &Materializer<AuditedCatalog>, clock: &TestClock) {
+    m.set_catalog_cache_ttl(
+        Arc::new(clock.clone()),
+        CachingCatalog::<AuditedCatalog>::DEFAULT_TTL,
+    );
 }
 
 /// One materializer cycle; `None` if it failed because a commit's
@@ -1024,6 +1488,10 @@ struct DstHarness {
     /// A compaction pass another process (a `pg2iceberg compact` job)
     /// has planned and written but not yet committed.
     pending_external: Option<PreparedCompaction>,
+    /// A pass the catalog's own compaction has planned and written but not
+    /// yet committed, and whether its outputs take the commit's sequence
+    /// number (see [`Step::CatalogCompactPlan`]).
+    pending_catalog: Option<(PreparedCompaction, bool)>,
     /// The tokio runtime prod-backend cases run iceberg-rust on (see
     /// [`tokio_runtime`]), entered for the case. Dropped last.
     #[cfg(feature = "integration")]
@@ -1101,6 +1569,7 @@ impl DstHarness {
             land_before_next_commit: Default::default(),
             coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
+            managed: MANAGED.get(),
         });
         let mut materializer = Materializer::with_metrics(
             coord.clone() as Arc<dyn Coordinator>,
@@ -1111,6 +1580,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
+        cache_like_production(&materializer, &clock);
         block_on(materializer.register_table(schema())).unwrap();
         register_other(&mut materializer);
         let other = DISTRIBUTED.get().then(|| {
@@ -1124,6 +1594,7 @@ impl DstHarness {
                 MAT_BATCH,
                 metrics(),
             );
+            cache_like_production(&b, &clock);
             block_on(b.register_table(schema())).unwrap();
             register_other(&mut b);
             b.enable_distributed_mode(worker("b"), WORKER_TTL);
@@ -1155,6 +1626,7 @@ impl DstHarness {
             next_bulk_id: 1000,
             id_gen,
             pending_external: None,
+            pending_catalog: None,
             #[cfg(feature = "integration")]
             _tokio: tokio,
             backfilling: false,
@@ -1234,6 +1706,7 @@ impl DstHarness {
             land_before_next_commit: Default::default(),
             coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
+            managed: MANAGED.get(),
         });
         let mut materializer = Materializer::with_metrics(
             coord.clone() as Arc<dyn Coordinator>,
@@ -1244,6 +1717,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
+        cache_like_production(&materializer, &clock);
         block_on(materializer.register_table(schema())).unwrap();
         register_other(&mut materializer);
         let other = DISTRIBUTED.get().then(|| {
@@ -1257,6 +1731,7 @@ impl DstHarness {
                 MAT_BATCH,
                 metrics(),
             );
+            cache_like_production(&b, &clock);
             block_on(b.register_table(schema())).unwrap();
             register_other(&mut b);
             b.enable_distributed_mode(worker("b"), WORKER_TTL);
@@ -1288,6 +1763,7 @@ impl DstHarness {
             next_bulk_id: 1000,
             id_gen,
             pending_external: None,
+            pending_catalog: None,
             #[cfg(feature = "integration")]
             _tokio: tokio,
             backfilling: false,
@@ -1449,6 +1925,95 @@ impl DstHarness {
         self.pending_external = held.held.into_inner().unwrap();
     }
 
+    /// Plan and write a pass as the catalog's own compaction does (see
+    /// [`Step::CatalogCompactPlan`]), and hold its commit.
+    fn catalog_compact_plan(&mut self, own_sequence_number: bool) {
+        // One pass at a time.
+        if !MANAGED.get()
+            || self.pending_catalog.is_some()
+            || self
+                .audited
+                .land_before_next_commit
+                .lock()
+                .unwrap()
+                .is_some()
+        {
+            return;
+        }
+        let cfg = CompactionConfig {
+            data_file_threshold: 1,
+            delete_file_threshold: 1,
+            target_size_bytes: 1024,
+            max_input_bytes_per_pass: 1,
+        };
+        // The table as the catalog has it: nothing pg2iceberg holds in
+        // memory, the current schema.
+        let schema = block_on(self.storage.catalog.load_table(&ident()))
+            .unwrap()
+            .expect("table exists")
+            .schema;
+        let held = HeldCompaction {
+            inner: self.audited.clone(),
+            held: Mutex::new(None),
+        };
+        let namer = mat_namer(&self.id_gen);
+        block_on(pg2iceberg_iceberg::compact_table(
+            &held,
+            self.blob_store.as_ref(),
+            |t, _| {
+                let namer = namer.clone();
+                let t = t.clone();
+                async move { namer.next_path(&t, "catalog", "").await }
+            },
+            &ident(),
+            &schema,
+            &[ColumnName("id".into())],
+            None,
+            &cfg,
+        ))
+        .unwrap();
+        let Some(mut pass) = held.held.into_inner().unwrap() else {
+            return;
+        };
+        // Java's rewrite leaves delete files to an action of their own.
+        let deletes: BTreeSet<String> = block_on(self.storage.live_files(&ident()))
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.equality_ids.is_some())
+            .map(|f| f.path)
+            .collect();
+        pass.removed_paths.retain(|p| !deletes.contains(p));
+        if !pass.removed_paths.is_empty() {
+            self.pending_catalog = Some((pass, own_sequence_number));
+        }
+    }
+
+    /// The catalog drops each delete file older than every data file:
+    /// none is left for it to apply to.
+    fn catalog_remove_dangling_deletes(&mut self) {
+        if !MANAGED.get() {
+            return;
+        }
+        let live = block_on(self.storage.live_files(&ident())).unwrap();
+        let oldest_data = live
+            .iter()
+            .filter(|f| f.equality_ids.is_none())
+            .map(|f| f.seq)
+            .min();
+        let dangling: Vec<String> = live
+            .iter()
+            .filter(|f| f.equality_ids.is_some() && oldest_data.is_none_or(|s| f.seq <= s))
+            .map(|f| f.path.clone())
+            .collect();
+        if dangling.is_empty() {
+            return;
+        }
+        match block_on(self.storage.commit_catalog_removal(&ident(), dangling)) {
+            Ok(()) | Err(pg2iceberg_iceberg::IcebergError::Conflict(_)) => {}
+            Err(e) => panic!("catalog removal commit: {e}"),
+        }
+    }
+
     /// A partial compaction pass must not change what readers see. The
     /// audited catalog checks the commit against transaction boundaries;
     /// this checks the stronger before == after.
@@ -1472,7 +2037,29 @@ impl DstHarness {
         // commit response was lost applied anyway, and one that lost to
         // another process's pass over the same files plans again next time.
         match block_on(self.materializer.compact_table(&ident(), &cfg)) {
-            Ok(_) => {}
+            Ok(_) => {
+                // 18. Delete files don't pile up: past a pass, none is
+                //     older than every data file — nothing is left for it
+                //     to apply to. Even where the catalog compacts, and
+                //     leaves them.
+                let live = block_on(self.storage.live_files(&ident())).unwrap();
+                let oldest_data = live
+                    .iter()
+                    .filter(|f| f.equality_ids.is_none())
+                    .map(|f| f.seq)
+                    .min();
+                let dangling: Vec<&str> = live
+                    .iter()
+                    .filter(|f| f.equality_ids.is_some() && oldest_data.is_none_or(|s| f.seq <= s))
+                    .map(|f| f.path.as_str())
+                    .collect();
+                if !dangling.is_empty() {
+                    self.audited.violations.lock().unwrap().push(format!(
+                        "invariant 18 (no dangling deletes): after a compaction pass, delete \
+                         files {dangling:?} are older than every data file"
+                    ));
+                }
+            }
             Err(e) if e.to_string().contains("response lost") => {}
             Err(e)
                 if e.to_string()
@@ -1515,6 +2102,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
+        cache_like_production(&materializer, &self.clock);
         // As the lifecycle restarts: a table still backfilling is gated.
         if self.backfilling {
             block_on(materializer.register_table_pending(discovered_schema(&self.db))).unwrap();
@@ -1817,9 +2405,38 @@ impl DstHarness {
             }
             Step::ExternalCompactMidCommit => {
                 if let Some(pass) = self.pending_external.take() {
-                    *self.audited.land_before_next_commit.lock().unwrap() = Some(pass);
+                    *self.audited.land_before_next_commit.lock().unwrap() =
+                        Some(HeldPass::Job(pass));
                 }
             }
+            Step::CatalogCompactPlan {
+                own_sequence_number,
+            } => self.catalog_compact_plan(*own_sequence_number),
+            Step::CatalogCompactCommit => {
+                if let Some((pass, own_sequence_number)) = self.pending_catalog.take() {
+                    match block_on(
+                        self.storage
+                            .commit_catalog_rewrite(pass, own_sequence_number),
+                    ) {
+                        // Lost to another rewrite of its files, or to a
+                        // delete: the catalog plans again next time.
+                        Ok(()) | Err(pg2iceberg_iceberg::IcebergError::Conflict(_)) => {}
+                        Err(e) => panic!("catalog compaction commit: {e}"),
+                    }
+                }
+            }
+            Step::CatalogCompactMidCommit => {
+                if let Some((pass, own_sequence_number)) = self.pending_catalog.take() {
+                    *self.audited.land_before_next_commit.lock().unwrap() =
+                        Some(HeldPass::Catalog(pass, own_sequence_number));
+                }
+            }
+            Step::CatalogExpire => {
+                if MANAGED.get() {
+                    block_on(self.storage.catalog_expire(&ident())).unwrap();
+                }
+            }
+            Step::CatalogRemoveDanglingDeletes => self.catalog_remove_dangling_deletes(),
             Step::LoseCommitResponse => self
                 .audited
                 .lose_next_response
@@ -1829,7 +2446,17 @@ impl DstHarness {
                 block_on(self.materializer.expire_cycle(0)).unwrap();
             }
             Step::CleanupOrphans => {
-                block_on(self.materializer.cleanup_orphans_cycle(i64::MAX, 0)).unwrap();
+                let cleaned =
+                    block_on(self.materializer.cleanup_orphans_cycle(i64::MAX, 0)).unwrap();
+                // 17. The catalog removes orphans itself: it alone knows
+                //     which unreferenced files are its in-flight writes.
+                let deleted: usize = cleaned.iter().map(|(_, o)| o.deleted).sum();
+                if MANAGED.get() && deleted > 0 {
+                    self.audited.violations.lock().unwrap().push(format!(
+                        "invariant 17 (managed catalog): pg2iceberg's orphan cleanup deletes \
+                         {deleted} files"
+                    ));
+                }
             }
         }
     }
@@ -1944,6 +2571,27 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     if history != readers {
         return Err(format!(
             "invariant 12: Catalog::snapshots replays to {history:?}, readers see {readers:?}"
+        ));
+    }
+    // ... and to the very files readers read, at their sequence numbers:
+    // the rows alone can't tell a file that applies nothing (a delete
+    // older than every data file) from no file at all.
+    let files = |files: Vec<LiveFile>| -> BTreeSet<(String, i64, bool)> {
+        files
+            .into_iter()
+            .map(|f| (f.path, f.seq, f.equality_ids.is_some()))
+            .collect()
+    };
+    let readers = files(
+        block_on(h.storage.live_files(&ident()))
+            .map_err(|e| format!("invariant 12: readers' files: {e}"))?,
+    );
+    let history = files(live_files_from_history(
+        &block_on(h.audited.snapshots(&ident())).map_err(|e| e.to_string())?,
+    ));
+    if history != readers {
+        return Err(format!(
+            "invariant 12: Catalog::snapshots replays to files {history:?}, readers read {readers:?}"
         ));
     }
     Ok(())
@@ -2210,13 +2858,24 @@ struct AuditedCatalog {
     lose_next_response: std::sync::atomic::AtomicBool,
     /// Another process's compaction pass, committed first when the next
     /// commit — data or compaction — is.
-    land_before_next_commit: Mutex<Option<PreparedCompaction>>,
-    /// Where that process records its writes, as every pg2iceberg
-    /// process does (see `CachingCatalog`).
+    land_before_next_commit: Mutex<Option<HeldPass>>,
+    /// Where a pg2iceberg process records its writes, as every one does
+    /// (see `CachingCatalog`).
     coord: Arc<dyn Coordinator>,
     /// Per table and cursor group, how far commits that landed applied
     /// the log (invariant 16).
     applied: Mutex<BTreeMap<(TableIdent, String), u64>>,
+    /// Whether the catalog maintains the table itself (`MANAGED`).
+    managed: bool,
+}
+
+/// A compaction pass held for [`AuditedCatalog::land_before_next_commit`].
+enum HeldPass {
+    /// A `pg2iceberg compact` job's.
+    Job(PreparedCompaction),
+    /// The catalog's own, and whether its outputs take the commit's
+    /// sequence number.
+    Catalog(PreparedCompaction, bool),
 }
 
 impl AuditedCatalog {
@@ -2239,18 +2898,60 @@ impl AuditedCatalog {
     /// Commit [`Self::land_before_next_commit`]'s pass, if one is held.
     async fn land_other_pass(&self) -> pg2iceberg_iceberg::Result<()> {
         let pass = self.land_before_next_commit.lock().unwrap().take();
-        if let Some(pass) = pass {
-            let table = pass.ident.clone();
-            let result = self.inner.commit_compaction(pass).await;
-            self.coord.bump_table_epoch(&table).await.unwrap();
-            match result {
-                // The job's pass lost to a newer rewrite of its files: the
-                // job fails, not this commit.
-                Ok(_) | Err(pg2iceberg_iceberg::IcebergError::Conflict(_)) => {}
-                Err(e) => return Err(e),
+        let result = match pass {
+            None => return Ok(()),
+            Some(HeldPass::Job(pass)) => {
+                let table = pass.ident.clone();
+                let result = self.inner.commit_compaction(pass).await.map(drop);
+                self.coord.bump_table_epoch(&table).await.unwrap();
+                result
             }
+            // Another engine's: no pg2iceberg process hears of it.
+            Some(HeldPass::Catalog(pass, own_sequence_number)) => {
+                self.storage
+                    .commit_catalog_rewrite(pass, own_sequence_number)
+                    .await
+            }
+        };
+        match result {
+            // The pass lost to a newer rewrite of its files, or (the
+            // catalog's, at its own sequence number) to a delete: its
+            // process fails, not this commit.
+            Ok(()) | Err(pg2iceberg_iceberg::IcebergError::Conflict(_)) => Ok(()),
+            Err(e) => Err(e),
         }
-        Ok(())
+    }
+
+    /// 17. Where the catalog maintains the table, pg2iceberg leaves the
+    ///     data files and the snapshots to it: rewriting them too doubles
+    ///     the work and races the catalog's own passes.
+    async fn check_leaves_maintenance_to_the_catalog(&self, prepared: &PreparedCompaction) {
+        if !self.managed {
+            return;
+        }
+        let data: BTreeSet<String> = match self.storage.live_files(&prepared.ident).await {
+            Ok(files) => files
+                .into_iter()
+                .filter(|f| f.equality_ids.is_none())
+                .map(|f| f.path)
+                .collect(),
+            Err(e) => {
+                self.violations.lock().unwrap().push(e);
+                return;
+            }
+        };
+        let rewritten: Vec<&String> = prepared
+            .removed_paths
+            .iter()
+            .filter(|p| data.contains(*p))
+            .collect();
+        if !prepared.added_data_files.is_empty() || !rewritten.is_empty() {
+            self.violations.lock().unwrap().push(format!(
+                "invariant 17 (managed catalog): pg2iceberg rewrites data files {rewritten:?} \
+                 into {} new ones",
+                prepared.added_data_files.len()
+            ));
+        }
     }
 
     async fn audit(&self) {
@@ -2337,6 +3038,8 @@ impl Catalog for AuditedCatalog {
         prepared: PreparedCompaction,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
         self.land_other_pass().await?;
+        self.check_leaves_maintenance_to_the_catalog(&prepared)
+            .await;
         let meta = self.inner.commit_compaction(prepared).await?;
         self.audit().await;
         let meta = self.respond(meta)?;
@@ -2366,6 +3069,11 @@ impl Catalog for AuditedCatalog {
         ident: &TableIdent,
         retention_ms: i64,
     ) -> pg2iceberg_iceberg::Result<usize> {
+        if self.managed {
+            self.violations.lock().unwrap().push(format!(
+                "invariant 17 (managed catalog): pg2iceberg expires {ident}'s snapshots"
+            ));
+        }
         self.inner.expire_snapshots(ident, retention_ms).await
     }
     async fn snapshots(&self, ident: &TableIdent) -> pg2iceberg_iceberg::Result<Vec<Snapshot>> {
@@ -2772,7 +3480,9 @@ proptest! {
         backfill in any::<bool>(),
         distributed in any::<bool>(),
         second_table in 0u8..3,
+        managed in any::<bool>(),
     ) {
+        MANAGED.set(managed);
         SECOND_TABLE.set(second_table);
         DISTRIBUTED.set(distributed);
         BACKFILL.set(backfill);
@@ -3243,6 +3953,219 @@ fn expiry_after_a_crash_after_a_commit(prod: bool, external: bool) {
     }
     if let Err(e) = check_invariants(&mut h) {
         panic!("external={external}: {e}");
+    }
+}
+
+// ---------- a managed catalog maintaining the table ----------
+
+/// Run `steps` on a table the catalog maintains itself (`MANAGED`),
+/// checking the invariants after each step and at quiescence.
+fn managed_case(prod: bool, steps: &[Step]) {
+    MANAGED.set(true);
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in steps {
+        h.run_step(step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    if let Err(e) = check_invariants(&mut h) {
+        panic!("at quiescence: {e}");
+    }
+}
+
+/// Leave the table with a data file holding a row a later delete hides,
+/// next to one that doesn't — the file the catalog's compaction rewrites,
+/// keeping row 2.
+fn dirty_file() -> Vec<Step> {
+    vec![
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Update { id: 1, qty: 11 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]
+}
+
+/// The catalog's compaction pass, planned and committed.
+fn catalog_compaction() -> [Step; 2] {
+    [
+        Step::CatalogCompactPlan {
+            own_sequence_number: false,
+        },
+        Step::CatalogCompactCommit,
+    ]
+}
+
+/// The process dies after a commit lands, before recording its cursor;
+/// then the catalog compacts the table and expires every snapshot but
+/// its own — which records nothing of pg2iceberg's. The restarted
+/// materializer must still know how far the table applied the log.
+#[test]
+fn crash_after_a_commit_survives_the_catalogs_compaction_and_expiry() {
+    crash_after_a_commit_then_the_catalogs_maintenance(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn crash_after_a_commit_survives_the_catalogs_compaction_and_expiry_on_iceberg() {
+    crash_after_a_commit_then_the_catalogs_maintenance(true);
+}
+
+fn crash_after_a_commit_then_the_catalogs_maintenance(prod: bool) {
+    let steps = [
+        &dirty_file()[..],
+        &[
+            Step::Update { id: 2, qty: 21 },
+            Step::DriveFlush,
+            Step::CrashAfterCommit,
+        ],
+        &catalog_compaction(),
+        &[Step::CatalogExpire],
+    ]
+    .concat();
+    managed_case(prod, &steps);
+}
+
+/// The catalog writes its compaction's output into the table's location,
+/// where pg2iceberg writes its files, and commits once it's done. Until
+/// then the outputs are unreferenced: orphan cleanup must leave them be.
+#[test]
+fn orphan_cleanup_leaves_the_catalogs_compaction_be() {
+    let steps = [
+        &dirty_file()[..],
+        &[
+            Step::CatalogCompactPlan {
+                own_sequence_number: false,
+            },
+            Step::CleanupOrphans,
+            Step::CatalogCompactCommit,
+        ],
+    ]
+    .concat();
+    managed_case(false, &steps);
+}
+
+/// Where the catalog compacts the table, pg2iceberg leaves its data files
+/// and snapshots to it.
+#[test]
+fn pg2iceberg_leaves_a_managed_tables_files_and_snapshots_to_the_catalog() {
+    let steps = [&dirty_file()[..], &[Step::Compact, Step::Expire]].concat();
+    managed_case(false, &steps);
+}
+
+/// Java's rewrite leaves the delete files it applied behind; pg2iceberg
+/// retires them, or they pile up, one per commit.
+#[test]
+fn deletes_the_catalogs_compaction_leaves_behind_are_retired() {
+    let steps = [&dirty_file()[..], &catalog_compaction(), &[Step::Compact]].concat();
+    managed_case(false, &steps);
+}
+
+/// Java writes the files a rewrite removes into its manifests, as
+/// `DELETED` entries: pg2iceberg's view of the table's history must not
+/// take them for files the rewrite added.
+#[cfg(feature = "integration")]
+#[test]
+fn history_reads_the_catalogs_compaction_on_iceberg() {
+    let steps = [&dirty_file()[..], &catalog_compaction()].concat();
+    managed_case(true, &steps);
+}
+
+/// A snapshot that removes files without rewriting any — a `delete`, as
+/// the catalog commits to drop delete files nothing is left for — must
+/// take them out of pg2iceberg's view of the table too.
+#[test]
+fn history_reads_the_catalog_dropping_dangling_deletes() {
+    let steps = [
+        &dirty_file()[..],
+        &catalog_compaction(),
+        &[Step::CatalogRemoveDanglingDeletes],
+    ]
+    .concat();
+    managed_case(false, &steps);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn history_reads_the_catalog_dropping_dangling_deletes_on_iceberg() {
+    let steps = [
+        &dirty_file()[..],
+        &catalog_compaction(),
+        &[Step::CatalogRemoveDanglingDeletes],
+    ]
+    .concat();
+    managed_case(true, &steps);
+}
+
+/// The catalog compacts the file a row lives in and expires it away, with
+/// no word to pg2iceberg; then the row's TOASTed column comes unchanged.
+/// pg2iceberg must take the value from where the row is now.
+#[test]
+fn toast_resolves_after_the_catalog_moves_the_row() {
+    toast_after_the_catalog_moves_the_row(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn toast_resolves_after_the_catalog_moves_the_row_on_iceberg() {
+    toast_after_the_catalog_moves_the_row(true);
+}
+
+fn toast_after_the_catalog_moves_the_row(prod: bool) {
+    let steps = [
+        &dirty_file()[..],
+        &catalog_compaction(),
+        &[
+            Step::CatalogExpire,
+            Step::ToastUpdate { id: 2, qty: 21 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat();
+    managed_case(prod, &steps);
+}
+
+/// pg2iceberg changes a row the catalog's compaction is rewriting. At the
+/// sequence number its pass read, the rewrite stays under the change's
+/// delete; at its own, Java's rewrite refuses to commit. Either way, the
+/// change holds — including when the rewrite lands just before the
+/// change's commit.
+#[test]
+fn the_catalogs_compaction_keeps_a_change_made_meanwhile() {
+    the_catalogs_compaction_racing_a_change(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn the_catalogs_compaction_keeps_a_change_made_meanwhile_on_iceberg() {
+    the_catalogs_compaction_racing_a_change(true);
+}
+
+fn the_catalogs_compaction_racing_a_change(prod: bool) {
+    for own_sequence_number in [false, true] {
+        for mid_commit in [false, true] {
+            let mut steps = dirty_file();
+            steps.push(Step::CatalogCompactPlan {
+                own_sequence_number,
+            });
+            if mid_commit {
+                steps.push(Step::CatalogCompactMidCommit);
+            }
+            steps.extend([
+                Step::Update { id: 2, qty: 21 },
+                Step::DriveFlush,
+                Step::MaterializerCycle,
+            ]);
+            if !mid_commit {
+                steps.push(Step::CatalogCompactCommit);
+            }
+            managed_case(prod, &steps);
+        }
     }
 }
 
