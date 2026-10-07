@@ -3633,6 +3633,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "typetag",
 ]
 
 [[package]]
