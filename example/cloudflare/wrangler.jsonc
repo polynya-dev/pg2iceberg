@@ -19,10 +19,12 @@
   "containers": [
     {
       "class_name": "Pg2Iceberg",
-      // Published by .github/workflows/docker.yml from main. To deploy
-      // your own build instead: "image": "../../Dockerfile" (wrangler
-      // builds it with Docker, for linux/amd64).
-      "image": "docker.io/polynyadev/pg2iceberg:latest",
+      // Published by .github/workflows/docker.yml. Cloudflare refuses
+      // `latest`: pin a published tag — `sha-<commit>` from main, or a
+      // release's `X.Y.Z`. To deploy your own build instead:
+      // "image": "../../Dockerfile" (wrangler builds it with Docker, for
+      // linux/amd64).
+      "image": "docker.io/polynyadev/pg2iceberg:sha-36ff3fc",
       // ¼ vCPU, 1 GiB: pg2iceberg peaked at under 100 MB on the workload.
       "instance_type": "basic",
       "max_instances": 1,
