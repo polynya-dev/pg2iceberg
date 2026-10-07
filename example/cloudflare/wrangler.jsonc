@@ -1,0 +1,37 @@
+// pg2iceberg on Cloudflare Containers, writing to an R2 bucket's Iceberg
+// catalog (Basin Catalog, formerly R2 Data Catalog). See README.md.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pg2iceberg",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-06",
+  // Container output in the dashboard (Containers, Observability).
+  "observability": { "enabled": true },
+  // Starts the container, and starts it again after Cloudflare stops it.
+  "triggers": { "crons": ["* * * * *"] },
+  // run.sh sets these with `--var` from the bucket's catalog
+  // (`wrangler r2 bucket catalog get <bucket>`).
+  "vars": {
+    "ICEBERG_CATALOG_URL": "https://catalog.cloudflarestorage.com/<ACCOUNT_ID>/<BUCKET>",
+    "ICEBERG_WAREHOUSE": "<ACCOUNT_ID>_<BUCKET>",
+    "ICEBERG_NAMESPACE": "rideshare"
+  },
+  "containers": [
+    {
+      "class_name": "Pg2Iceberg",
+      // Published by .github/workflows/docker.yml from main. To deploy
+      // your own build instead: "image": "../../Dockerfile" (wrangler
+      // builds it with Docker, for linux/amd64).
+      "image": "docker.io/polynyadev/pg2iceberg:latest",
+      // ¼ vCPU, 1 GiB: pg2iceberg peaked at under 100 MB on the workload.
+      "instance_type": "basic",
+      "max_instances": 1,
+      // Near the database: neon.new's are in us-east-2 (Ohio).
+      "constraints": { "regions": ["ENAM"] }
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "PG2ICEBERG", "class_name": "Pg2Iceberg" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Pg2Iceberg"] }]
+}
