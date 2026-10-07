@@ -235,7 +235,8 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             s3_access_key: "minioadmin".into(),
             s3_secret_key: "minioadmin".into(),
             s3_region: "us-east-1".into(),
-            flush_interval: String::new(),
+            // Short, so the test runs quickly — and checks `run` keeps them.
+            flush_interval: "1s".into(),
             // 1000 is a reasonable default. Sink::new asserts
             // `flush_threshold > 0`, so 0 would crash the pipeline on
             // startup.
@@ -244,7 +245,7 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             // commit against a real REST catalog.
             flush_rows: 2,
             materializer_batch_rows: 1,
-            materializer_interval: String::new(),
+            materializer_interval: "1s".into(),
             compaction_data_files: 8,
             compaction_delete_files: 4,
             target_file_size: 0, // disable compaction for this test
@@ -385,6 +386,12 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
     let lifecycle = pg2iceberg::setup::build_logical_lifecycle(&cfg, lifecycle_catalog, storage)
         .await
         .expect("build lifecycle");
+    let second = std::time::Duration::from_secs(1);
+    assert_eq!(
+        (lifecycle.schedule.flush, lifecycle.schedule.materialize),
+        (second, second),
+        "the configured intervals"
+    );
 
     // Drive the lifecycle inline (rather than via tokio::spawn —
     // tracing's `Arguments<'_>` / `dyn Value` aren't Send so the

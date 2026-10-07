@@ -126,7 +126,7 @@ where
         slot_name: cfg.source.logical.slot_name.clone(),
         publication_name: cfg.source.logical.publication_name.clone(),
         group: cfg.state.group.clone(),
-        schedule: pg2iceberg_logical::Schedule::default(),
+        schedule: cfg.sink.schedule()?,
         compaction: if cfg.sink.target_file_size > 0 {
             Some(cfg.sink.compaction_config())
         } else {

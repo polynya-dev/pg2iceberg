@@ -415,17 +415,7 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
     let consumer_ttl = std::time::Duration::from_secs(30);
     materializer.enable_distributed_mode(WorkerId(worker_id.clone()), consumer_ttl);
 
-    // Cycle interval. Default 10s if not configured.
-    let cycle_interval = if cfg.sink.materializer_interval.is_empty() {
-        std::time::Duration::from_secs(10)
-    } else {
-        humantime::parse_duration(&cfg.sink.materializer_interval).with_context(|| {
-            format!(
-                "parse sink.materializer_interval `{}`",
-                cfg.sink.materializer_interval
-            )
-        })?
-    };
+    let cycle_interval = cfg.sink.schedule()?.materialize;
 
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;

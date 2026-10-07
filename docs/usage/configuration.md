@@ -142,9 +142,10 @@ sink:
   # Flush thresholds — flush when any threshold is reached
   flush_rows: 10000              # also caps change events held in memory
   materializer_batch_rows: 50000 # change events per materializer step
-  flush_interval: 10s            # default standby cadence
+  flush_interval: 10s            # how often changes are staged
 
-  # Materializer cycle (only consulted by `pg2iceberg materializer-only`)
+  # How often the materializer commits staged changes to Iceberg
+  # (`run` and `materializer-only`)
   materializer_interval: 10s
 
   # Compaction. Runs as part of every materializer cycle, gated by these
@@ -186,6 +187,7 @@ snapshot_only: false             # legacy field; prefer the `snapshot` subcomman
 - **`source.logical.snapshot_concurrency` / `snapshot_chunk_pages` / `snapshot_target_file_size`** — not yet exposed; snapshot uses fixed defaults.
 - **`sink.flush_rows`** — the most change events pg2iceberg holds in memory before staging them. A transaction bigger than this is staged in chunks of this size as it streams in, and claimed in one step when it commits, so readers never see part of it. Larger values mean fewer, larger staged files.
 - **`sink.materializer_batch_rows`** — the most change events the materializer folds into one Iceberg snapshot, which bounds its memory. A transaction larger than this is written as several snapshots committed in one atomic catalog update, so readers of the table never see part of it.
+- **`sink.flush_interval` / `sink.materializer_interval`** — the micro-batch cadence: changes are staged every `flush_interval` (or sooner, once `flush_rows` are buffered) and committed to Iceberg every `materializer_interval`. A change typically reaches Iceberg within about the two added together. Shorter intervals mean fresher tables, and more, smaller Iceberg snapshots and files for compaction to merge.
 - **`sink.flush_bytes`** — not yet exposed; flush threshold is `flush_rows` + `flush_interval` only.
 - **`sink.materializer_target_file_size` / `materializer_concurrency`** — not yet exposed; uses `target_file_size` + a fixed concurrency.
 - **`sink.materializer_worker_id`** — replaced by the `--worker-id` flag on `pg2iceberg materializer-only`.
