@@ -50,3 +50,6 @@ pollster = "0.4"
 # Smoke tests under `--features prod` therefore need a tokio runtime; the
 # non-prod tests still run on pollster.
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+# A counting `iceberg::io::Storage` in the prod catalog's tests: iceberg's
+# storage traits are `#[typetag::serde]`.
+typetag = "0.2"

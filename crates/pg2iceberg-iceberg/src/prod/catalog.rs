@@ -48,11 +48,15 @@ use crate::{
 /// `GlueCatalog`) and exposes it as our [`Catalog`] trait.
 pub struct IcebergRustCatalog<C: IcebergCatalogTrait> {
     inner: Arc<C>,
+    manifests: Arc<ManifestCache>,
 }
 
 impl<C: IcebergCatalogTrait> IcebergRustCatalog<C> {
     pub fn new(inner: Arc<C>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            manifests: Arc::default(),
+        }
     }
 }
 
@@ -60,7 +64,38 @@ impl<C: IcebergCatalogTrait> Clone for IcebergRustCatalog<C> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            manifests: Arc::clone(&self.manifests),
         }
+    }
+}
+
+/// Each table's manifest lists and manifests, by path, as
+/// [`Catalog::snapshots`] last read its history. They never change once
+/// written — a commit writes new ones — so a read of the history only
+/// fetches what's new since; without it, every call fetched each
+/// snapshot's manifest list and every manifest it names, a round trip
+/// each to object storage, and their number grows with every commit.
+/// Holds only what the table's history still names.
+#[derive(Default)]
+struct ManifestCache {
+    tables: std::sync::Mutex<HashMap<TableIdent, TableManifests>>,
+}
+
+#[derive(Clone, Default)]
+struct TableManifests {
+    lists: HashMap<String, Arc<iceberg::spec::ManifestList>>,
+    manifests: HashMap<String, Arc<iceberg::spec::Manifest>>,
+}
+
+impl ManifestCache {
+    fn get(&self, ident: &TableIdent) -> TableManifests {
+        let tables = self.tables.lock().expect("manifest cache poisoned");
+        tables.get(ident).cloned().unwrap_or_default()
+    }
+
+    fn put(&self, ident: &TableIdent, read: TableManifests) {
+        let mut tables = self.tables.lock().expect("manifest cache poisoned");
+        tables.insert(ident.clone(), read);
     }
 }
 
@@ -430,6 +465,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let retained: std::collections::BTreeSet<i64> =
             snaps.iter().map(|s| s.snapshot_id()).collect();
         let mut expired_adds: BTreeMap<String, (i64, DataFile, DataContentType)> = BTreeMap::new();
+        let cached = self.manifests.get(ident);
+        let mut read = TableManifests::default();
         for snap in snaps {
             // Use the iceberg snapshot_id for manifest filtering (matches the
             // `added_snapshot_id` field stored in manifest entries), but report
@@ -441,11 +478,19 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             let seq_num = snap.sequence_number();
             let parent_id = snap.parent_snapshot_id();
             let is_replace = matches!(snap.summary().operation, Operation::Replace);
-            let manifest_list = table
-                .manifest_list_reader(&snap)
-                .load()
-                .await
-                .map_err(map_iceberg_err)?;
+            let list_path = snap.manifest_list();
+            let manifest_list = match cached.lists.get(list_path) {
+                Some(list) => Arc::clone(list),
+                None => Arc::new(
+                    table
+                        .manifest_list_reader(&snap)
+                        .load()
+                        .await
+                        .map_err(map_iceberg_err)?,
+                ),
+            };
+            read.lists
+                .insert(list_path.to_string(), Arc::clone(&manifest_list));
             let mut data_files: Vec<DataFile> = Vec::new();
             let mut delete_files: Vec<DataFile> = Vec::new();
             // All file paths reachable in this snapshot's manifest list,
@@ -455,10 +500,18 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             let mut all_paths_this_snap: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
             for entry in manifest_list.entries() {
-                let manifest = entry
-                    .load_manifest(table.file_io())
-                    .await
-                    .map_err(map_iceberg_err)?;
+                // Each manifest list names every manifest before it.
+                let path = &entry.manifest_path;
+                let manifest = match read.manifests.get(path).or(cached.manifests.get(path)) {
+                    Some(manifest) => Arc::clone(manifest),
+                    None => Arc::new(
+                        entry
+                            .load_manifest(table.file_io())
+                            .await
+                            .map_err(map_iceberg_err)?,
+                    ),
+                };
+                read.manifests.insert(path.clone(), Arc::clone(&manifest));
                 for me in manifest.entries() {
                     let df = me.data_file();
                     all_paths_this_snap.insert(df.file_path().to_string());
@@ -569,6 +622,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         }
         out.extend(stand_ins.into_values());
         out.sort_by_key(|s| s.id);
+        self.manifests.put(ident, read);
         Ok(out)
     }
 }
@@ -1903,6 +1957,174 @@ mod tests {
         let c = fresh().await;
         let snaps = c.snapshots(&ident()).await.unwrap();
         assert!(snaps.is_empty());
+    }
+
+    /// In-memory storage that records the path of every read.
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct CountingStorage {
+        #[serde(skip)]
+        inner: iceberg::io::MemoryStorage,
+        #[serde(skip)]
+        reads: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl CountingStorage {
+        /// The paths read since the last call.
+        fn take_reads(&self) -> Vec<String> {
+            std::mem::take(&mut *self.reads.lock().unwrap())
+        }
+    }
+
+    #[async_trait]
+    #[typetag::serde]
+    impl iceberg::io::Storage for CountingStorage {
+        async fn exists(&self, path: &str) -> iceberg::Result<bool> {
+            self.inner.exists(path).await
+        }
+
+        async fn metadata(&self, path: &str) -> iceberg::Result<iceberg::io::FileMetadata> {
+            self.inner.metadata(path).await
+        }
+
+        async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
+            self.reads.lock().unwrap().push(path.to_string());
+            self.inner.read(path).await
+        }
+
+        async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn iceberg::io::FileRead>> {
+            self.reads.lock().unwrap().push(path.to_string());
+            self.inner.reader(path).await
+        }
+
+        async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
+            self.inner.write(path, bs).await
+        }
+
+        async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn iceberg::io::FileWrite>> {
+            self.inner.writer(path).await
+        }
+
+        async fn delete(&self, path: &str) -> iceberg::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
+            self.inner.delete_prefix(path).await
+        }
+
+        async fn delete_stream(
+            &self,
+            paths: futures::stream::BoxStream<'static, String>,
+        ) -> iceberg::Result<()> {
+            self.inner.delete_stream(paths).await
+        }
+
+        fn new_input(&self, path: &str) -> iceberg::Result<iceberg::io::InputFile> {
+            Ok(iceberg::io::InputFile::new(
+                Arc::new(self.clone()),
+                path.to_string(),
+            ))
+        }
+
+        fn new_output(&self, path: &str) -> iceberg::Result<iceberg::io::OutputFile> {
+            Ok(iceberg::io::OutputFile::new(
+                Arc::new(self.clone()),
+                path.to_string(),
+            ))
+        }
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct CountingStorageFactory {
+        #[serde(skip)]
+        storage: CountingStorage,
+    }
+
+    #[typetag::serde]
+    impl iceberg::io::StorageFactory for CountingStorageFactory {
+        fn build(
+            &self,
+            _config: &iceberg::io::StorageConfig,
+        ) -> iceberg::Result<Arc<dyn iceberg::io::Storage>> {
+            Ok(Arc::new(self.storage.clone()))
+        }
+    }
+
+    /// A memory catalog whose files are in `storage`.
+    async fn fresh_on(
+        storage: CountingStorage,
+    ) -> IcebergRustCatalog<iceberg::memory::MemoryCatalog> {
+        let inner = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(CountingStorageFactory { storage }))
+            .load(
+                "test",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory:///warehouse".to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        IcebergRustCatalog::new(Arc::new(inner))
+    }
+
+    async fn append(c: &IcebergRustCatalog<iceberg::memory::MemoryCatalog>, i: usize) {
+        c.commit_snapshot(PreparedCommit {
+            ident: ident(),
+            data_files: vec![DataFile {
+                path: format!("memory:///warehouse/public/orders/data-{i}.parquet"),
+                record_count: 1,
+                byte_size: 100,
+                equality_field_ids: vec![],
+                partition_values: Vec::new(),
+                sequence_number: None,
+            }],
+            equality_deletes: vec![],
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Manifest lists and manifests never change once written: each
+    /// commit writes new ones, its manifest list naming every manifest
+    /// before it. Reading the history again reads only what's new since —
+    /// re-reading the rest costs a round trip each to object storage, on
+    /// every compaction check of every table, and grows with every commit.
+    #[tokio::test]
+    async fn snapshots_reads_each_manifest_file_once() {
+        let storage = CountingStorage::default();
+        let c = fresh_on(storage.clone()).await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        for i in 0..4 {
+            append(&c, i).await;
+        }
+        let avro = |paths: Vec<String>| -> Vec<String> {
+            paths.into_iter().filter(|p| p.ends_with(".avro")).collect()
+        };
+
+        storage.take_reads();
+        let first = c.snapshots(&ident()).await.unwrap();
+        let first_reads = avro(storage.take_reads());
+        assert_eq!(first.len(), 4);
+        // Four manifest lists and four manifests, though the lists name
+        // ten between them.
+        assert_eq!(first_reads.len(), 8, "{first_reads:?}");
+
+        append(&c, 4).await;
+        storage.take_reads();
+        let second = c.snapshots(&ident()).await.unwrap();
+        let second_reads = avro(storage.take_reads());
+        assert_eq!(second.len(), 5);
+        assert_eq!(live_files(&second).len(), 5);
+
+        let again: Vec<&String> = second_reads
+            .iter()
+            .filter(|p| first_reads.contains(p))
+            .collect();
+        assert!(again.is_empty(), "read again: {again:?}");
+        // The new snapshot's manifest list and its one new manifest.
+        assert_eq!(second_reads.len(), 2, "{second_reads:?}");
     }
 
     #[tokio::test]
