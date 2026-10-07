@@ -1,0 +1,6 @@
+# Local secrets: wrangler dev reads .dev.vars; the example scripts read both.
+.dev.vars
+.env*
+node_modules/
+.wrangler/
+.venv/

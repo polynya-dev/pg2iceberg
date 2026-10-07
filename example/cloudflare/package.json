@@ -1,0 +1,16 @@
+{
+  "name": "pg2iceberg-cloudflare",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261004.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.147.0"
+  }
+}

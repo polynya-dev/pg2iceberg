@@ -79,10 +79,10 @@ Dedicated `/healthz` / `/ready` endpoints are **not yet wired**. For k8s deploym
 ```yaml
 initContainers:
   - name: connect-pg
-    image: ghcr.io/polynya-dev/pg2iceberg:latest
+    image: polynyadev/pg2iceberg:latest
     command: ["pg2iceberg", "connect-pg", "--config", "/etc/pg2iceberg/config.yaml"]
   - name: connect-iceberg
-    image: ghcr.io/polynya-dev/pg2iceberg:latest
+    image: polynyadev/pg2iceberg:latest
     command: ["pg2iceberg", "connect-iceberg", "--config", "/etc/pg2iceberg/config.yaml"]
 ```
 

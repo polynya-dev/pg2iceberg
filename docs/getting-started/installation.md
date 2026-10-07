@@ -6,16 +6,16 @@ icon: lucide/package
 
 ## Docker
 
-The repository ships a multi-stage Dockerfile that builds the binary and publishes a slim runtime image. To build locally:
+Images for linux/amd64 and linux/arm64 are published to Docker Hub: `latest` from `main`, `X.Y.Z` from each release.
+
+```bash
+docker pull polynyadev/pg2iceberg:latest
+```
+
+To build one yourself from the repository's multi-stage Dockerfile:
 
 ```bash
 docker build -t pg2iceberg-rust:dev .
-```
-
-Pre-built images are not yet published. Once a release pipeline is in place, the image will be available as:
-
-```bash
-docker pull ghcr.io/polynya-dev/pg2iceberg:latest
 ```
 
 The image's entrypoint is the `pg2iceberg` binary; pass a subcommand, and the settings as environment variables (or mount a config file):
@@ -25,7 +25,7 @@ docker run --rm \
   -e POSTGRES_URL=postgres://user:password@db:5432/app \
   -e ICEBERG_CATALOG_URL=https://catalog.example.com \
   -e ICEBERG_WAREHOUSE=s3://my-bucket/warehouse/ \
-  pg2iceberg-rust:dev run
+  polynyadev/pg2iceberg:latest run
 ```
 
 ## Build from source
