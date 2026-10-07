@@ -134,6 +134,9 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,pg2iceberg=debug".into()),
         )
+        // Plain text: log collectors (Cloudflare's, CloudWatch, `docker
+        // logs` piped to a file) show color codes as raw escapes.
+        .with_ansi(false)
         .init();
 
     let cli = Cli::parse();
