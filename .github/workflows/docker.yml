@@ -2,7 +2,8 @@ name: Docker
 
 # pg2iceberg's image on Docker Hub, docker.io/polynyadev/pg2iceberg, for
 # linux/amd64 and linux/arm64: `latest` and `sha-<short>` from main,
-# `X.Y.Z` and `X.Y` from a `vX.Y.Z` tag. example/cloudflare deploys `latest`.
+# `X.Y.Z` and `X.Y` from a `vX.Y.Z` tag. (Cloudflare Containers refuse
+# `latest`: example/cloudflare pins one of the others.)
 #
 # Needs the repository secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (a
 # Docker Hub access token that can push to polynyadev/pg2iceberg).

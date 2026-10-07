@@ -50,10 +50,10 @@ reads from the catalog, and times how long one change takes to get there.
   is in `.env.neon`). pg2iceberg connects to its direct host, not the pooler:
   replication can't go through PgBouncer.
 - **pg2iceberg**: one container ([`src/index.ts`](src/index.ts)) running
-  pg2iceberg's published image, `docker.io/polynyadev/pg2iceberg:latest`,
-  in Eastern North America with the database and the bucket (see
-  `constraints` in [`wrangler.jsonc`](wrangler.jsonc)). It runs `pg2iceberg
-  run` with this configuration, from Worker secrets and vars:
+  pg2iceberg's published image, in Eastern North America with the database
+  and the bucket. [`wrangler.jsonc`](wrangler.jsonc) pins the image's tag
+  (Cloudflare refuses `latest`) and the region (`constraints`). It runs
+  `pg2iceberg run` with this configuration, from Worker secrets and vars:
 
   | Variable | Value |
   |---|---|
