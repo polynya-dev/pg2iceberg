@@ -112,6 +112,20 @@ impl Ticker {
         out
     }
 
+    /// Start `h`'s next interval at `now`, when its run ended. Without
+    /// it, a run that outlasts its interval — a materializer tick against
+    /// a distant catalog — leaves `h` due as soon as it returns, and the
+    /// loop reads one replication message between back-to-back runs.
+    pub fn finished(&mut self, h: Handler, now: Timestamp) {
+        let last = match h {
+            Handler::Flush => &mut self.last_flush,
+            Handler::Standby => &mut self.last_standby,
+            Handler::Materialize => &mut self.last_materialize,
+            Handler::Watcher => &mut self.last_watcher,
+        };
+        *last = now;
+    }
+
     /// Absolute timestamp at which the next handler will be due. Binary
     /// uses this to size the next `Clock::sleep` so it doesn't busy-wait.
     pub fn next_due(&self) -> Timestamp {
@@ -208,6 +222,17 @@ mod tests {
         // elapsed once more.
         let due2 = tk.fire_due(t(3610));
         assert!(due2.contains(&Handler::Flush));
+    }
+
+    #[test]
+    fn a_run_past_its_interval_waits_an_interval_from_its_end() {
+        let mut tk = Ticker::new(t(0), schedule_secs(60, 60, 10, 60));
+        assert_eq!(tk.fire_due(t(10)), vec![Handler::Materialize]);
+        // The run took 25s.
+        tk.finished(Handler::Materialize, t(35));
+        assert!(tk.fire_due(t(36)).is_empty());
+        assert_eq!(tk.next_due(), t(45));
+        assert_eq!(tk.fire_due(t(45)), vec![Handler::Materialize]);
     }
 
     #[test]

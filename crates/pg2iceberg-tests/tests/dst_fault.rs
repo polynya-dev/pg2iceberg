@@ -1596,6 +1596,17 @@ fn sim_lifecycle_on(
     stores: &SimStores,
     schedule: pg2iceberg_logical::Schedule,
 ) -> pg2iceberg_validate::LogicalLifecycle<MemoryCatalog> {
+    sim_lifecycle_with(db, stores, schedule, stores.catalog.clone())
+}
+
+/// A lifecycle run over `db` and `stores`, reaching their catalog through
+/// `catalog`.
+fn sim_lifecycle_with<Cat: pg2iceberg_iceberg::Catalog + 'static>(
+    db: &SimPostgres,
+    stores: &SimStores,
+    schedule: pg2iceberg_logical::Schedule,
+    catalog: Arc<Cat>,
+) -> pg2iceberg_validate::LogicalLifecycle<Cat> {
     use pg2iceberg_core::{IdGen, InMemoryMetrics, WorkerId};
     use pg2iceberg_sim::postgres::SimPgClient;
 
@@ -1618,7 +1629,7 @@ fn sim_lifecycle_on(
             stores.coord.clone(),
             stores.plan.clone(),
         )),
-        catalog: stores.catalog.clone(),
+        catalog,
         blob: stores.blob.clone() as Arc<dyn pg2iceberg_stream::BlobStore>,
         clock: stores.clock.clone(),
         id_gen: Arc::new(ZeroIdGen),
@@ -1766,6 +1777,153 @@ async fn a_restart_keeps_the_acked_lsn_on_record() {
     .await
     .unwrap();
     assert_eq!(stores.coord.flushed_lsn().await.unwrap(), recorded);
+}
+
+// ── A slow catalog ───────────────────────────────────────────────
+
+/// `MemoryCatalog` with every call taking `latency` of (virtual) time,
+/// as a catalog and object store across the internet do.
+struct SlowCatalog {
+    inner: Arc<MemoryCatalog>,
+    latency: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl pg2iceberg_iceberg::Catalog for SlowCatalog {
+    async fn ensure_namespace(&self, ns: &Namespace) -> pg2iceberg_iceberg::Result<()> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.ensure_namespace(ns).await
+    }
+
+    async fn load_table(
+        &self,
+        ident: &TableIdent,
+    ) -> pg2iceberg_iceberg::Result<Option<pg2iceberg_iceberg::TableMetadata>> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.load_table(ident).await
+    }
+
+    async fn create_table(
+        &self,
+        schema: &TableSchema,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.create_table(schema).await
+    }
+
+    async fn commit_snapshot(
+        &self,
+        prepared: pg2iceberg_iceberg::PreparedCommit,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.commit_snapshot(prepared).await
+    }
+
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<pg2iceberg_iceberg::PreparedCommit>,
+        log_range: Option<pg2iceberg_iceberg::LogRange>,
+        remove_properties: BTreeSet<String>,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        tokio::time::sleep(self.latency).await;
+        self.inner
+            .commit_snapshots(steps, log_range, remove_properties)
+            .await
+    }
+
+    async fn commit_compaction(
+        &self,
+        prepared: pg2iceberg_iceberg::PreparedCompaction,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.commit_compaction(prepared).await
+    }
+
+    async fn evolve_schema(
+        &self,
+        ident: &TableIdent,
+        changes: Vec<pg2iceberg_iceberg::SchemaChange>,
+        set_properties: BTreeMap<String, String>,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        tokio::time::sleep(self.latency).await;
+        self.inner
+            .evolve_schema(ident, changes, set_properties)
+            .await
+    }
+
+    async fn expire_snapshots(
+        &self,
+        ident: &TableIdent,
+        retention_ms: i64,
+    ) -> pg2iceberg_iceberg::Result<usize> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.expire_snapshots(ident, retention_ms).await
+    }
+
+    async fn snapshots(
+        &self,
+        ident: &TableIdent,
+    ) -> pg2iceberg_iceberg::Result<Vec<pg2iceberg_iceberg::Snapshot>> {
+        tokio::time::sleep(self.latency).await;
+        self.inner.snapshots(ident).await
+    }
+}
+
+/// A catalog slow enough that a materializer tick outlasts its interval.
+/// Replication must keep up all the same: the next tick is due an
+/// interval after this one ends, not after it started — or the loop reads
+/// one message between back-to-back ticks, the slot falls behind without
+/// bound, and its WAL piles up on the source.
+#[tokio::test(start_paused = true)]
+async fn replication_keeps_up_while_materializer_ticks_outlast_their_interval() {
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let catalog = Arc::new(SlowCatalog {
+        inner: stores.catalog.clone(),
+        latency: Duration::from_secs(3),
+    });
+    let mut lifecycle = sim_lifecycle_with(&db, &stores, every_second(), catalog);
+    // As in production: every tick checks every table for compaction,
+    // which costs catalog calls even when there's nothing to commit.
+    lifecycle.compaction = Some(CompactionConfig::default());
+    // Its own task: the source keeps committing while a tick runs.
+    let script = db.clone();
+    let workload = tokio::spawn(async move {
+        // Past the snapshot phase.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Ten transactions a second for a minute, while a tick that
+        // commits takes 3s or more.
+        for i in 5..605 {
+            let mut tx = script.begin_tx();
+            tx.insert(&ident(), row(i, i * 10));
+            tx.commit(Timestamp(0)).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        script.current_lsn()
+    });
+    let script = db.clone();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let record = seen.clone();
+    let shutdown = Box::pin(async move {
+        let end = workload.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let acked = script
+            .slot_state(LIFECYCLE_SLOT)
+            .unwrap()
+            .confirmed_flush_lsn;
+        *record.lock().unwrap() = Some((end, acked));
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let (end, acked) = seen.lock().unwrap().expect("the script ran");
+    assert!(
+        acked >= end,
+        "a minute after the workload, the slot is acked to {acked:?} of {end:?}"
+    );
 }
 
 fn note_column() -> ColumnSchema {

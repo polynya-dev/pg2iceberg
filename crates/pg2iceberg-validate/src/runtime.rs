@@ -960,6 +960,7 @@ where
         let now = loop_state.clock.now();
         for h in ticker.fire_due(now) {
             dispatch_handler(&mut loop_state, h).await?;
+            ticker.finished(h, loop_state.clock.now());
         }
     }
 
