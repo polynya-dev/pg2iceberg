@@ -1545,7 +1545,36 @@ async fn real_session(
         stream.send_standby(lsn, lsn).await.expect("ack");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
+    drop(stream);
+    drop(client);
+    slot_released(slot).await;
     inserted(msgs)
+}
+
+/// Wait for `slot`'s walsender to exit after its client disconnected: it
+/// does so on its own time, and until then the slot is active — the next
+/// session's start, or dropping it, fails with "replication slot is
+/// active".
+async fn slot_released(slot: &str) {
+    let (client, conn) = tokio_postgres::connect(dsn().await, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(conn);
+    for _ in 0..100 {
+        let active: bool = client
+            .query_one(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .expect("slot exists")
+            .get(0);
+        if !active {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("slot {slot} still active 10s after its client disconnected");
 }
 
 /// Which transactions a restarted stream sends, as `[ids]` for: starting
