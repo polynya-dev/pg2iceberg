@@ -285,6 +285,8 @@ pub struct SinkConfig {
     #[serde(default)]
     pub s3_region: String,
 
+    /// How often `run` stages buffered changes. Empty = 10s. Staging
+    /// also happens sooner, once `flush_rows` changes are buffered.
     #[serde(default)]
     pub flush_interval: String,
     /// Most change events the WAL writer holds in memory before staging
@@ -296,10 +298,9 @@ pub struct SinkConfig {
     /// still committed atomically.
     #[serde(default = "default_materializer_batch_rows")]
     pub materializer_batch_rows: usize,
-    /// Materializer cycle interval. Matches Go's `materializer_interval`.
-    /// Empty = use the lifecycle's default (10s). Only consulted by the
-    /// `materializer-only` subcommand; the integrated `run` mode uses
-    /// `Schedule::materialize` from the runner module.
+    /// How often the materializer commits staged changes to Iceberg —
+    /// in `run` and `materializer-only`. Matches Go's
+    /// `materializer_interval`. Empty = 10s.
     #[serde(default)]
     pub materializer_interval: String,
 
@@ -442,6 +443,21 @@ impl SinkConfig {
         }
     }
 
+    /// The main loop's cadence: `flush_interval` for staging,
+    /// `materializer_interval` for committing; each 10s when empty.
+    pub fn schedule(&self) -> Result<pg2iceberg_logical::Schedule> {
+        let default = pg2iceberg_logical::Schedule::default();
+        Ok(pg2iceberg_logical::Schedule {
+            flush: interval("flush_interval", &self.flush_interval, default.flush)?,
+            materialize: interval(
+                "materializer_interval",
+                &self.materializer_interval,
+                default.materialize,
+            )?,
+            ..default
+        })
+    }
+
     /// Parse `maintenance_retention` ("168h", "7d", "30m", etc.) into
     /// milliseconds. Returns `Ok(None)` when the field is empty.
     pub fn maintenance_retention_ms(&self) -> Result<Option<i64>> {
@@ -456,6 +472,20 @@ impl SinkConfig {
         })?;
         Ok(Some(dur.as_millis().try_into().unwrap_or(i64::MAX)))
     }
+}
+
+/// The interval `value` ("10s", "1m", ...) of the setting `name`, or
+/// `default` when empty.
+fn interval(name: &str, value: &str, default: std::time::Duration) -> Result<std::time::Duration> {
+    if value.is_empty() {
+        return Ok(default);
+    }
+    let d =
+        humantime::parse_duration(value).with_context(|| format!("parse sink.{name} `{value}`"))?;
+    if d.is_zero() {
+        anyhow::bail!("sink.{name} must be longer than zero");
+    }
+    Ok(d)
 }
 
 /// `(service, region)` of an AWS endpoint URL, such as
@@ -575,6 +605,7 @@ impl Config {
         }
         self.validate_mode()?;
         self.validate_tables()?;
+        self.sink.schedule()?;
         Ok(self)
     }
 
@@ -1345,6 +1376,54 @@ sink:
         assert_eq!(cfg.sink.materializer_batch_rows, 50_000);
         assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
         assert_eq!(cfg.state.group, "default");
+    }
+
+    const INTERVALS: &str = r#"
+tables: []
+source:
+  postgres:
+    host: h
+    database: d
+    user: u
+sink:
+  catalog_uri: x
+  namespace: ns
+  flush_interval: 2s
+  materializer_interval: 1m
+"#;
+
+    #[test]
+    fn run_stages_and_commits_on_the_configured_intervals() {
+        let cfg = Config::parse(INTERVALS, &vars(&[])).unwrap();
+        let schedule = cfg.sink.schedule().unwrap();
+        assert_eq!(schedule.flush, std::time::Duration::from_secs(2));
+        assert_eq!(schedule.materialize, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn intervals_left_out_are_ten_seconds() {
+        let yaml = INTERVALS
+            .replace("  flush_interval: 2s\n", "")
+            .replace("  materializer_interval: 1m\n", "");
+        let cfg = Config::parse(&yaml, &vars(&[])).unwrap();
+        let schedule = cfg.sink.schedule().unwrap();
+        assert_eq!(schedule.flush, std::time::Duration::from_secs(10));
+        assert_eq!(schedule.materialize, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_bad_interval_fails_the_config_load() {
+        for (line, bad) in [
+            ("flush_interval: 2s", "flush_interval: soon"),
+            ("materializer_interval: 1m", "materializer_interval: 0s"),
+        ] {
+            let env = vars(&[]);
+            let err = Config::parse(&INTERVALS.replace(line, bad), &env)
+                .and_then(|cfg| cfg.finish(&env))
+                .unwrap_err();
+            let field = line.split(':').next().unwrap();
+            assert!(format!("{err:#}").contains(field), "{bad}: {err:#}");
+        }
     }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
