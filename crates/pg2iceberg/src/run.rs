@@ -22,9 +22,13 @@ use pg2iceberg_coord::{
     schema::CoordSchema,
     Coordinator,
 };
-use pg2iceberg_core::{IdGen, TableSchema};
-use pg2iceberg_iceberg::prod::IcebergRustCatalog;
-use pg2iceberg_logical::{materializer::UuidMaterializerNamer, pipeline::BlobNamer, Materializer};
+use pg2iceberg_core::{IdGen, TableIdent, TableSchema};
+use pg2iceberg_iceberg::prod::{IcebergRustCatalog, VendedBlobStoreRouter};
+use pg2iceberg_logical::{
+    materializer::{MaterializerNamer, UuidMaterializerNamer},
+    pipeline::BlobNamer,
+    Materializer,
+};
 use pg2iceberg_pg::prod::{PgClientImpl, TlsMode as PgTls};
 use pg2iceberg_stream::{prod::ObjectStoreBlobStore, BlobStore};
 use std::collections::HashMap;
@@ -49,15 +53,126 @@ impl<I: IdGen> UuidBlobNamer<I> {
 
 #[async_trait]
 impl<I: IdGen + 'static> BlobNamer for UuidBlobNamer<I> {
-    async fn next_blob_path(&self, table: &str) -> String {
-        let bytes = self.id_gen.new_uuid();
-        let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    async fn next_blob_path(&self, table: &TableIdent) -> String {
         format!(
             "{}/{}/{}.parquet",
             self.base.trim_end_matches('/'),
-            table,
-            hex
+            table.name,
+            uuid_hex(self.id_gen.as_ref())
         )
+    }
+}
+
+fn uuid_hex(id_gen: &dyn IdGen) -> String {
+    id_gen
+        .new_uuid()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Where pg2iceberg's files go: the blob store, and how staged and
+/// materialized files are named in it.
+pub struct Storage {
+    pub blob: Arc<dyn BlobStore>,
+    pub blob_namer: Arc<dyn BlobNamer>,
+    pub materializer_namer: Arc<dyn MaterializerNamer>,
+}
+
+/// The storage `cfg` describes. With static or AWS-chain credentials,
+/// files go under `sink.warehouse`. With vended credentials they go
+/// under each table's location, as its catalog has it — what the
+/// catalog vends credentials for (see [`LocationNamer`]).
+pub async fn build_storage<C>(cfg: &Config, catalog: &IcebergRustCatalog<C>) -> Result<Storage>
+where
+    C: iceberg::Catalog + Send + Sync + 'static,
+{
+    let id_gen = Arc::new(crate::realio::RealIdGen::new());
+    if cfg.sink.resolved_credential_mode() != "vended" {
+        let warehouse = cfg.sink.warehouse.trim_end_matches('/');
+        return Ok(Storage {
+            blob: build_blob(cfg)?,
+            blob_namer: Arc::new(UuidBlobNamer::new(
+                id_gen.clone(),
+                format!("{warehouse}/staged"),
+            )),
+            materializer_namer: Arc::new(UuidMaterializerNamer::new(
+                id_gen,
+                format!("{warehouse}/materialized"),
+            )),
+        });
+    }
+    let router = Arc::new(build_vended_router(cfg, catalog).await?);
+    let namer = Arc::new(LocationNamer {
+        router: Arc::clone(&router),
+        id_gen,
+    });
+    Ok(Storage {
+        blob: router,
+        blob_namer: namer.clone(),
+        materializer_namer: namer,
+    })
+}
+
+/// Names files under each table's location (for vended credentials,
+/// which the catalog scopes to it): staged chunks in `staged/`, data,
+/// delete and compacted files in `data/` — orphan cleanup's scope, which
+/// leaves the catalog's `metadata/` alone.
+struct LocationNamer {
+    router: Arc<VendedBlobStoreRouter>,
+    id_gen: Arc<crate::realio::RealIdGen>,
+}
+
+impl LocationNamer {
+    /// `table`'s location. It's registered with the router before
+    /// anything writes to it; failing that, a path no store serves, so
+    /// the write fails naming it.
+    async fn location(&self, table: &TableIdent) -> String {
+        self.router.table_location(table).await.unwrap_or_else(|e| {
+            tracing::error!(%table, error = %e, "no catalog location for the table");
+            format!("s3://no-location-for/{table}")
+        })
+    }
+}
+
+#[async_trait]
+impl BlobNamer for LocationNamer {
+    async fn next_blob_path(&self, table: &TableIdent) -> String {
+        staged_path(&self.location(table).await, &uuid_hex(self.id_gen.as_ref()))
+    }
+}
+
+#[async_trait]
+impl MaterializerNamer for LocationNamer {
+    async fn next_path(&self, table: &TableIdent, kind: &str, partition_segment: &str) -> String {
+        let id = uuid_hex(self.id_gen.as_ref());
+        data_path(&self.location(table).await, kind, partition_segment, &id)
+    }
+
+    async fn table_dir(&self, table: &TableIdent) -> String {
+        data_dir(&self.location(table).await)
+    }
+}
+
+/// A staged chunk's path under a table's `location`.
+fn staged_path(location: &str, id: &str) -> String {
+    format!("{location}/staged/{id}.parquet")
+}
+
+/// Where everything materialized for a table at `location` goes.
+fn data_dir(location: &str) -> String {
+    format!("{location}/data")
+}
+
+/// A materialized file's path under a table's `location`: data and
+/// delete files by partition, other kinds (compaction output, meta and
+/// marker rows) in a directory of their own.
+fn data_path(location: &str, kind: &str, partition_segment: &str, id: &str) -> String {
+    let dir = data_dir(location);
+    match (kind, partition_segment) {
+        ("data" | "eq-delete", "") => format!("{dir}/{kind}-{id}.parquet"),
+        ("data" | "eq-delete", segment) => format!("{dir}/{segment}/{kind}-{id}.parquet"),
+        (other, _) => format!("{dir}/{other}/{other}-{id}.parquet"),
     }
 }
 
@@ -65,10 +180,10 @@ pub async fn run(cfg: Config) -> Result<()> {
     cfg.require_catalog()?;
     let catalog = build_rest_catalog(&cfg).await?;
     let catalog = IcebergRustCatalog::new(Arc::new(catalog));
-    let blob = build_blob_for_run(&cfg, &catalog)
+    let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
-    run_inner(cfg, catalog, blob).await
+    run_inner(cfg, catalog, storage).await
 }
 
 /// Build a REST `iceberg::Catalog` from sink config. We default to the
@@ -112,11 +227,7 @@ fn build_blob(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
     }
 }
 
-/// Async blob-store builder used by [`run`].
-/// Routes to [`build_blob`] for `static` / `iam` modes, and to the
-/// vended-credentials path for `vended`. The latter requires the
-/// catalog because it has to load each registered table to obtain
-/// per-table S3 credentials.
+/// The blob store [`build_storage`] builds.
 ///
 /// `pub` so the integration tests can drive the exact same path the
 /// binary takes for vended credentials, rather than reconstructing
@@ -128,15 +239,24 @@ pub async fn build_blob_for_run<C>(
 where
     C: iceberg::Catalog + Send + Sync + 'static,
 {
-    if cfg.sink.resolved_credential_mode() != "vended" {
-        return build_blob(cfg);
-    }
-    use pg2iceberg_iceberg::prod::{VendedBlobStoreRouter, VendedRouterConfig};
+    Ok(build_storage(cfg, catalog).await?.blob)
+}
+
+/// The router over each table's vended credentials. It loads each
+/// table from the catalog for them.
+async fn build_vended_router<C>(
+    cfg: &Config,
+    catalog: &IcebergRustCatalog<C>,
+) -> Result<VendedBlobStoreRouter>
+where
+    C: iceberg::Catalog + Send + Sync + 'static,
+{
+    use pg2iceberg_iceberg::prod::VendedRouterConfig;
     use pg2iceberg_iceberg::Catalog;
 
     // Each table's Iceberg identity, to `load_table` it and extract its
     // credentials. Discovery isn't required at this level.
-    let mut idents: Vec<pg2iceberg_core::TableIdent> = Vec::with_capacity(cfg.tables.len());
+    let mut idents: Vec<TableIdent> = Vec::with_capacity(cfg.tables.len());
     for t in &cfg.tables {
         idents.push(t.iceberg_ident(&cfg.sink.namespace)?);
     }
@@ -146,6 +266,8 @@ where
 
     let router_cfg = VendedRouterConfig {
         default_region: cfg.sink.resolved_region(),
+        // For a catalog whose credentials don't say where the storage is.
+        default_endpoint: (!cfg.sink.s3_endpoint.is_empty()).then(|| cfg.sink.s3_endpoint.clone()),
         ..VendedRouterConfig::default()
     };
     let arc_catalog: Arc<dyn Catalog> = Arc::new(catalog.clone());
@@ -156,7 +278,7 @@ where
         tables = idents.len(),
         "vended-credentials S3 router built (per-table object stores)"
     );
-    Ok(Arc::new(router))
+    Ok(router)
 }
 
 fn build_s3_static(cfg: &Config) -> Result<Arc<dyn BlobStore>> {
@@ -244,13 +366,13 @@ pub async fn run_stream_only(cfg: Config) -> Result<()> {
     cfg.require_catalog()?;
     let catalog = build_rest_catalog(&cfg).await?;
     let catalog = IcebergRustCatalog::new(Arc::new(catalog));
-    let blob = build_blob_for_run(&cfg, &catalog)
+    let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
     run_inner_with_schedule(
         cfg,
         catalog,
-        blob,
+        storage,
         // 100 years — fire_due never matches, so the materializer
         // handler is effectively disabled. Picked over Duration::MAX
         // because some duration math saturates to MAX and would
@@ -345,21 +467,17 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
     Ok(())
 }
 
-async fn run_inner<C>(
-    cfg: Config,
-    catalog: IcebergRustCatalog<C>,
-    blob: Arc<dyn BlobStore>,
-) -> Result<()>
+async fn run_inner<C>(cfg: Config, catalog: IcebergRustCatalog<C>, storage: Storage) -> Result<()>
 where
     C: iceberg::Catalog + Send + Sync + 'static,
 {
-    run_inner_with_schedule(cfg, catalog, blob, None).await
+    run_inner_with_schedule(cfg, catalog, storage, None).await
 }
 
 async fn run_inner_with_schedule<C>(
     cfg: Config,
     catalog: IcebergRustCatalog<C>,
-    blob: Arc<dyn BlobStore>,
+    storage: Storage,
     materialize_override: Option<std::time::Duration>,
 ) -> Result<()>
 where
@@ -373,11 +491,7 @@ where
     // main loop, drain. The fault-DST exercises the same lifecycle
     // helper with sim plumbing, so any change to lifecycle behavior
     // gets fault-tested.
-    let id_gen = Arc::new(crate::realio::RealIdGen::new());
-    let staged_base = format!("{}/staged", cfg.sink.warehouse.trim_end_matches('/'));
-    let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
-        Arc::new(UuidBlobNamer::new(id_gen.clone(), staged_base));
-    let mut lifecycle = crate::setup::build_logical_lifecycle(&cfg, catalog, blob, blob_namer)
+    let mut lifecycle = crate::setup::build_logical_lifecycle(&cfg, catalog, storage)
         .await
         .context("build logical lifecycle")?;
     if let Some(d) = materialize_override {
@@ -524,11 +638,13 @@ pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Re
 async fn build_one_shot_materializer(
     cfg: Config,
 ) -> Result<Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>>> {
-    let blob = build_blob(&cfg).context("build blob store")?;
     cfg.require_catalog()?;
     let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(
         build_rest_catalog(&cfg).await?,
     )));
+    let storage = build_storage(&cfg, &catalog)
+        .await
+        .context("build blob store")?;
 
     let coord_dsn = cfg.coord_dsn();
     let coord_tls = match cfg.source.postgres.tls_label() {
@@ -598,17 +714,12 @@ async fn build_one_shot_materializer(
         resolved_schemas.push(schema);
     }
 
-    let mat_base = format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/'));
-    let mat_namer = Arc::new(UuidMaterializerNamer::new(
-        Arc::new(crate::realio::RealIdGen::new()),
-        mat_base,
-    ));
     let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
         Materializer::new(
             coord,
-            blob,
+            storage.blob,
             catalog,
-            mat_namer,
+            storage.materializer_namer,
             &cfg.state.group,
             cfg.sink.materializer_batch_rows,
         );
@@ -627,11 +738,14 @@ async fn build_one_shot_materializer(
 /// PK-by-PK. Returns non-zero exit on any non-empty diff so CI /
 /// cron can detect drift.
 pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
-    let blob = build_blob(&cfg).context("build blob store")?;
     cfg.require_catalog()?;
     let catalog: Arc<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> = Arc::new(
         IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?)),
     );
+    let blob = build_storage(&cfg, &catalog)
+        .await
+        .context("build blob store")?
+        .blob;
 
     // Resolve schemas (mirrors `build_one_shot_materializer`). Verify
     // needs the same column-aware schema as the snapshot to know
@@ -824,12 +938,17 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome};
     use pg2iceberg_validate::LifecycleError;
 
-    let id_gen = Arc::new(crate::realio::RealIdGen::new());
-    let blob = build_blob(&cfg).context("build blob store")?;
     cfg.require_catalog()?;
     let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(
         build_rest_catalog(&cfg).await?,
     )));
+    let Storage {
+        blob,
+        blob_namer,
+        materializer_namer,
+    } = build_storage(&cfg, &catalog)
+        .await
+        .context("build blob store")?;
 
     // ── coord ──────────────────────────────────────────────────────
     let coord_dsn = cfg.coord_dsn();
@@ -922,9 +1041,6 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     }
 
     // ── pipeline + materializer ────────────────────────────────────
-    let staged_base = format!("{}/staged", cfg.sink.warehouse.trim_end_matches('/'));
-    let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
-        Arc::new(UuidBlobNamer::new(id_gen.clone(), staged_base));
     let mut pipeline: Pipeline<dyn Coordinator> = Pipeline::new(
         Arc::clone(&coord),
         Arc::clone(&blob),
@@ -948,14 +1064,12 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
         }
     }
 
-    let mat_base = format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/'));
-    let mat_namer = Arc::new(UuidMaterializerNamer::new(id_gen.clone(), mat_base));
     let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
         Materializer::new(
             Arc::clone(&coord),
             Arc::clone(&blob),
             Arc::clone(&catalog),
-            mat_namer,
+            materializer_namer,
             &cfg.state.group,
             cfg.sink.materializer_batch_rows,
         );
@@ -1027,6 +1141,36 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With vended credentials, a table's files go under its location:
+    /// materialized files under `data/` — orphan cleanup's scope, which
+    /// must never reach the catalog's `metadata/` — and staged chunks
+    /// beside it, where cleanup doesn't look.
+    #[test]
+    fn location_layout_keeps_data_apart_from_staging_and_metadata() {
+        let location = "s3://bucket/__r2_data_catalog/abc";
+        let dir = data_dir(location);
+        assert_eq!(dir, "s3://bucket/__r2_data_catalog/abc/data");
+        let paths = [
+            data_path(location, "data", "", "1"),
+            data_path(location, "eq-delete", "status=active", "2"),
+            data_path(location, "compact", "", "3"),
+        ];
+        assert_eq!(
+            paths,
+            [
+                "s3://bucket/__r2_data_catalog/abc/data/data-1.parquet",
+                "s3://bucket/__r2_data_catalog/abc/data/status=active/eq-delete-2.parquet",
+                "s3://bucket/__r2_data_catalog/abc/data/compact/compact-3.parquet",
+            ]
+        );
+        for path in &paths {
+            assert!(path.starts_with(&format!("{dir}/")), "{path}");
+        }
+        let staged = staged_path(location, "4");
+        assert_eq!(staged, "s3://bucket/__r2_data_catalog/abc/staged/4.parquet");
+        assert!(!staged.starts_with(&format!("{dir}/")));
+    }
 
     #[test]
     fn bucket_from_warehouse_strips_scheme() {

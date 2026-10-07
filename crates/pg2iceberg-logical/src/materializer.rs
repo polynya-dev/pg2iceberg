@@ -138,7 +138,7 @@ pub trait MaterializerNamer: Send + Sync {
     /// `table` lies under, and that holds nothing else — so orphan
     /// cleanup can treat any file in it that `table` doesn't reference
     /// as its own leftover.
-    fn table_dir(&self, table: &TableIdent) -> String;
+    async fn table_dir(&self, table: &TableIdent) -> String;
 }
 
 /// Deterministic counter-based namer for the sim and tests. Never use it
@@ -175,7 +175,7 @@ impl MaterializerNamer for CounterMaterializerNamer {
         )
     }
 
-    fn table_dir(&self, table: &TableIdent) -> String {
+    async fn table_dir(&self, table: &TableIdent) -> String {
         table_dir(&self.base, table)
     }
 }
@@ -208,7 +208,7 @@ impl MaterializerNamer for UuidMaterializerNamer {
         file_path(&self.base, table, kind, partition_segment, &id)
     }
 
-    fn table_dir(&self, table: &TableIdent) -> String {
+    async fn table_dir(&self, table: &TableIdent) -> String {
         table_dir(&self.base, table)
     }
 }
@@ -1509,7 +1509,7 @@ impl<C: Catalog> Materializer<C> {
         let mut out = Vec::new();
         for ident in idents {
             // Trailing `/`: `ns.orders/` must not match `ns.orders2/`.
-            let table_prefix = format!("{}/", self.namer.table_dir(&ident));
+            let table_prefix = format!("{}/", self.namer.table_dir(&ident).await);
             let started_micros = now_micros();
             let outcome = pg2iceberg_iceberg::cleanup_orphans(
                 self.catalog.as_ref(),

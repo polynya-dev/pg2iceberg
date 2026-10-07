@@ -27,14 +27,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use pg2iceberg::config::{
     Config, LogicalConfig, PostgresConfig, SinkConfig, SourceConfig, StateConfig, TableConfig,
 };
 use pg2iceberg::run::build_rest_catalog;
 use pg2iceberg_core::{ColumnName, Namespace, PgValue, TableIdent};
 use pg2iceberg_iceberg::{prod::IcebergRustCatalog, read_materialized_state};
-use pg2iceberg_stream::prod::ObjectStoreBlobStore;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::core::WaitFor;
 use testcontainers::{GenericImage, ImageExt};
@@ -378,35 +376,15 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         .await
         .expect("rest catalog (assertions)");
     let assert_catalog = IcebergRustCatalog::new(Arc::new(rest_for_assertions));
-    // Build blob through the binary's helper so we exercise the
-    // exact prod path. Re-importing it here would cycle the dep
-    // graph, so we replicate the small wiring inline — the only
-    // thing we'd lose differential-test coverage on is the
-    // bucket/prefix parsing, which is unit-tested in run.rs.
-    let s3 = object_store::aws::AmazonS3Builder::new()
-        .with_bucket_name(&stack.bucket)
-        .with_region("us-east-1")
-        .with_endpoint(format!("http://{}:{}", stack.minio_host, stack.minio_port))
-        .with_access_key_id("minioadmin")
-        .with_secret_access_key("minioadmin")
-        .with_virtual_hosted_style_request(false)
-        .with_allow_http(true)
-        .build()
-        .expect("AmazonS3Builder");
-    let blob: Arc<dyn pg2iceberg_stream::BlobStore> =
-        Arc::new(ObjectStoreBlobStore::new(Arc::new(s3)));
+    // Storage as the binary builds it.
+    let storage = pg2iceberg::run::build_storage(&cfg, &lifecycle_catalog)
+        .await
+        .expect("build storage");
+    let blob = storage.blob.clone();
 
-    let blob_namer: Arc<dyn pg2iceberg_logical::pipeline::BlobNamer> =
-        Arc::new(UuidBlobNamer::new("staged"));
-
-    let lifecycle = pg2iceberg::setup::build_logical_lifecycle(
-        &cfg,
-        lifecycle_catalog,
-        blob.clone(),
-        blob_namer,
-    )
-    .await
-    .expect("build lifecycle");
+    let lifecycle = pg2iceberg::setup::build_logical_lifecycle(&cfg, lifecycle_catalog, storage)
+        .await
+        .expect("build lifecycle");
 
     // Drive the lifecycle inline (rather than via tokio::spawn —
     // tracing's `Arguments<'_>` / `dyn Value` aren't Send so the
@@ -601,33 +579,5 @@ async fn wait_for_iceberg(
             panic!("timed out waiting for Iceberg to read {expected:?}; last read {last:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-/// Trivial UUID-based blob namer for the lifecycle. The binary uses
-/// a real-IO version that pulls in `RealIdGen`; we don't need that
-/// here — any unique-name function works.
-struct UuidBlobNamer {
-    prefix: String,
-}
-
-impl UuidBlobNamer {
-    fn new(prefix: &str) -> Self {
-        Self {
-            prefix: prefix.to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl pg2iceberg_logical::pipeline::BlobNamer for UuidBlobNamer {
-    async fn next_blob_path(&self, table: &str) -> String {
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        format!(
-            "{}/{}/{}.parquet",
-            self.prefix.trim_end_matches('/'),
-            table,
-            suffix
-        )
     }
 }

@@ -18,12 +18,10 @@ use pg2iceberg_coord::{
 };
 use pg2iceberg_core::{InMemoryMetrics, TableIdent, TableSchema};
 use pg2iceberg_iceberg::prod::IcebergRustCatalog;
-use pg2iceberg_logical::{materializer::UuidMaterializerNamer, pipeline::BlobNamer};
 use pg2iceberg_pg::{
     prod::{PgClientImpl, TlsMode as PgTls},
     PgClient, SlotMonitor,
 };
-use pg2iceberg_stream::BlobStore;
 use pg2iceberg_validate::{LifecycleError, LogicalLifecycle, SnapshotSourceFactoryFut};
 use std::sync::Arc;
 
@@ -35,18 +33,18 @@ use std::sync::Arc;
 pub async fn build_logical_lifecycle<C>(
     cfg: &Config,
     catalog: IcebergRustCatalog<C>,
-    blob: Arc<dyn BlobStore>,
-    blob_namer: Arc<dyn BlobNamer>,
+    storage: crate::run::Storage,
 ) -> Result<LogicalLifecycle<IcebergRustCatalog<C>>>
 where
     C: iceberg::Catalog + Send + Sync + 'static,
 {
     let clock = Arc::new(RealClock);
     let id_gen = Arc::new(RealIdGen::new());
-    let materializer_namer = Arc::new(UuidMaterializerNamer::new(
-        id_gen.clone(),
-        format!("{}/materialized", cfg.sink.warehouse.trim_end_matches('/')),
-    ));
+    let crate::run::Storage {
+        blob,
+        blob_namer,
+        materializer_namer,
+    } = storage;
 
     // ── coord ──────────────────────────────────────────────────────
     let coord_dsn = cfg.coord_dsn();
@@ -218,7 +216,7 @@ async fn discover_schemas(
 mod tests {
     use super::*;
     use pg2iceberg_core::Namespace;
-    use pg2iceberg_logical::materializer::MaterializerNamer;
+    use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
 
     /// Every process builds its own namer. A restarted process must never
     /// hand out a path an earlier one used: uploading to it would
