@@ -1569,7 +1569,7 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
     // SimReplicationStream; wrap it in AsyncSimStream so it
     // satisfies the ReplicationStream trait.
     let metrics: Arc<dyn Metrics> = Arc::new(InMemoryMetrics::new());
-    let watcher = InvariantWatcher::new(h.coord.clone() as Arc<dyn Coordinator>, metrics);
+    let watcher = InvariantWatcher::new(h.coord.clone() as Arc<dyn Coordinator>, metrics.clone());
     let async_stream = Box::new(AsyncSimStream::new(
         h.db.start_replication("slot-fault").unwrap(),
     ));
@@ -1610,6 +1610,7 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
         compaction: None,
         pending_snapshot_rx: None,
         pending_snapshot_handle: None,
+        metrics,
     };
 
     // Shutdown future fires immediately so the loop runs zero
@@ -2049,6 +2050,326 @@ async fn replication_keeps_up_while_materializer_ticks_outlast_their_interval() 
         acked >= end,
         "a minute after the workload, the slot is acked to {acked:?} of {end:?}"
     );
+}
+
+// ── Observability ────────────────────────────────────────────────
+
+/// What a run records, as `/metrics` serves it: what it received, staged
+/// and committed, how far behind it is, what its requests took, and what
+/// it's doing.
+#[tokio::test(start_paused = true)]
+async fn a_run_records_what_it_did() {
+    use pg2iceberg_core::metrics::{labels, names, Labels, CATALOG};
+    use pg2iceberg_core::{Phase, Registry};
+    use std::time::Duration;
+
+    // Empty when the slot is created: every row arrives as a change.
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let stores = SimStores::new();
+    let registry = Arc::new(Registry::new(stores.clock.clone()));
+    let mut lifecycle = sim_lifecycle_on(&db, &stores, every_second());
+    lifecycle.metrics = registry.clone();
+    // Unix seconds 1_700_000_000 and on, in micros.
+    let at = |s: i64| Timestamp((1_700_000_000 + s) * 1_000_000);
+    let script = db.clone();
+    let observed = registry.clone();
+    let mid_run = Arc::new(std::sync::Mutex::new(None));
+    let record = mid_run.clone();
+    let shutdown = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut tx = script.begin_tx();
+        for i in 1..=3 {
+            tx.insert(&ident(), row(i, i * 10));
+        }
+        tx.commit(at(1)).unwrap();
+        let mut tx = script.begin_tx();
+        tx.update(&ident(), row(1, 11));
+        tx.delete(&ident(), row(2, 20));
+        tx.commit(at(2)).unwrap();
+        // Staged, committed, and watched since.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        *record.lock().unwrap() = Some(observed.phase());
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let m = registry.as_ref();
+    let table = ident().to_string();
+    let table_labels = labels([("table", &table)]);
+    let op = |op| labels([("table", &table), ("op", op)]);
+    let none = Labels::new();
+    assert_eq!(*mid_run.lock().unwrap(), Some(Some(Phase::Running)));
+    assert_eq!(m.phase(), Some(Phase::Stopping));
+
+    // Received, staged and materialized: five changes in two
+    // transactions.
+    assert_eq!(
+        m.counter_value(names::PIPELINE_CHANGES_TOTAL, &op("insert")),
+        3
+    );
+    assert_eq!(
+        m.counter_value(names::PIPELINE_CHANGES_TOTAL, &op("update")),
+        1
+    );
+    assert_eq!(
+        m.counter_value(names::PIPELINE_CHANGES_TOTAL, &op("delete")),
+        1
+    );
+    assert_eq!(
+        m.counter_value(names::PIPELINE_CHANGES_TOTAL, &op("truncate")),
+        0
+    );
+    assert_eq!(
+        m.counter_value(names::PIPELINE_TRANSACTIONS_TOTAL, &none),
+        2
+    );
+    assert_eq!(
+        m.counter_value(names::PIPELINE_ROWS_STAGED_TOTAL, &table_labels),
+        5
+    );
+    assert!(m.counter_value(names::PIPELINE_STAGED_BYTES_TOTAL, &table_labels) > 0);
+    // Caught up as of the watcher's last tick: each of the three keys
+    // written once per step it changed in.
+    let written = m.counter_value(names::MATERIALIZER_ROWS_TOTAL, &table_labels);
+    assert!((3..=5).contains(&written), "{written}");
+    assert!(m.counter_value(names::MATERIALIZER_COMMITS_TOTAL, &table_labels) >= 1);
+    assert_eq!(
+        m.gauge_value(names::MATERIALIZER_BACKLOG_ROWS, &table_labels),
+        Some(0.0)
+    );
+    assert_eq!(
+        m.gauge_value(names::MATERIALIZER_SOURCE_TIMESTAMP, &table_labels),
+        Some(1_700_000_002.0)
+    );
+    assert!(m.histogram_count(names::MATERIALIZER_CYCLE_DURATION, &none) > 0);
+    assert!(m.histogram_count(names::MATERIALIZER_COMMIT_DURATION, &none) >= 1);
+    // The slot, as the watcher read it.
+    assert!(m.gauge_value(names::REPLICATION_LAG, &none).is_some());
+    let reserved = labels([("status", "reserved")]);
+    assert_eq!(m.gauge_value(names::SLOT_WAL_STATUS, &reserved), Some(1.0));
+    // Each handler completed, by the lifecycle's clock.
+    for stage in ["flush", "ack", "materialize", "watch"] {
+        let at = m.gauge_value(names::LAST_SUCCESS, &labels([("stage", stage)]));
+        assert!(at.is_some_and(|s| s > 0.0), "{stage}: {at:?}");
+    }
+    // Every request to the three stores.
+    for (name, op) in [
+        (names::CATALOG_REQUEST_DURATION, "commit_snapshots"),
+        (names::BLOB_REQUEST_DURATION, "put"),
+        (names::BLOB_REQUEST_DURATION, "get"),
+        (names::COORD_REQUEST_DURATION, "claim_offsets"),
+        (names::COORD_REQUEST_DURATION, "set_cursor"),
+    ] {
+        assert!(
+            m.histogram_count(name, &labels([("op", op)])) > 0,
+            "{name} {op}"
+        );
+    }
+    assert!(m.counter_value(names::BLOB_BYTES_TOTAL, &labels([("op", "put")])) > 0);
+    // Nothing undeclared, and the exposition says so.
+    for name in m.names() {
+        assert!(CATALOG.iter().any(|d| d.name == name), "{name}");
+    }
+    let text = m.render();
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let (_, value) = line.rsplit_once(' ').expect("name and value");
+        assert!(
+            value.parse::<f64>().is_ok() || ["NaN", "+Inf", "-Inf"].contains(&value),
+            "{line}"
+        );
+    }
+}
+
+/// Liveness through a catalog whose every request takes two minutes, as a
+/// distant catalog's might under load: materializer ticks run for many
+/// minutes, but requests keep completing, so the process never looks
+/// stuck to `/healthz`. A slow process is not a stuck one; restarting it
+/// would only lose its progress.
+#[tokio::test(start_paused = true)]
+async fn liveness_holds_through_a_slow_catalog() {
+    use pg2iceberg_core::metrics::{labels, names};
+    use pg2iceberg_core::Registry;
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let catalog = Arc::new(SlowCatalog {
+        inner: stores.catalog.clone(),
+        latency: Duration::from_secs(120),
+    });
+    let registry = Arc::new(Registry::new(stores.clock.clone()));
+    let mut lifecycle = sim_lifecycle_with(&db, &stores, every_second(), catalog);
+    lifecycle.metrics = registry.clone();
+    lifecycle.compaction = Some(CompactionConfig::default());
+    let script = db.clone();
+    let workload = tokio::spawn(async move {
+        for i in 5..65 {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let mut tx = script.begin_tx();
+            tx.insert(&ident(), row(i, i * 10));
+            tx.commit(Timestamp(0)).unwrap();
+        }
+    });
+    let longest_idle = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+    let sampler = {
+        let registry = registry.clone();
+        let longest_idle = longest_idle.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut longest = longest_idle.lock().unwrap();
+                *longest = (*longest).max(registry.idle_for());
+            }
+        })
+    };
+    let shutdown = Box::pin(async move {
+        workload.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(600)).await;
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+    sampler.abort();
+
+    let longest = *longest_idle.lock().unwrap();
+    assert!(
+        longest <= Duration::from_secs(150),
+        "nothing completed for {longest:?} while the catalog was merely slow"
+    );
+    let table = labels([("table", &ident().to_string())]);
+    assert!(registry.counter_value(names::MATERIALIZER_COMMITS_TOTAL, &table) > 1);
+    let commits = labels([("op", "commit_snapshots")]);
+    assert!(registry.histogram_count(names::CATALOG_REQUEST_DURATION, &commits) > 1);
+}
+
+/// `MemoryCatalog` whose commits never return once `hang` is set: a
+/// request on a connection the network silently dropped.
+struct HangingCatalog {
+    inner: Arc<MemoryCatalog>,
+    hang: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HangingCatalog {
+    async fn hang_if_set(&self) {
+        if self.hang.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl pg2iceberg_iceberg::Catalog for HangingCatalog {
+    async fn ensure_namespace(&self, ns: &Namespace) -> pg2iceberg_iceberg::Result<()> {
+        self.inner.ensure_namespace(ns).await
+    }
+
+    async fn load_table(
+        &self,
+        ident: &TableIdent,
+    ) -> pg2iceberg_iceberg::Result<Option<pg2iceberg_iceberg::TableMetadata>> {
+        self.inner.load_table(ident).await
+    }
+
+    async fn create_table(
+        &self,
+        schema: &TableSchema,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        self.inner.create_table(schema).await
+    }
+
+    async fn commit_snapshot(
+        &self,
+        prepared: pg2iceberg_iceberg::PreparedCommit,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        self.hang_if_set().await;
+        self.inner.commit_snapshot(prepared).await
+    }
+
+    async fn commit_snapshots(
+        &self,
+        steps: Vec<pg2iceberg_iceberg::PreparedCommit>,
+        log_range: Option<pg2iceberg_iceberg::LogRange>,
+        remove_properties: BTreeSet<String>,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        self.hang_if_set().await;
+        self.inner
+            .commit_snapshots(steps, log_range, remove_properties)
+            .await
+    }
+
+    async fn evolve_schema(
+        &self,
+        ident: &TableIdent,
+        changes: Vec<pg2iceberg_iceberg::SchemaChange>,
+        set_properties: BTreeMap<String, String>,
+    ) -> pg2iceberg_iceberg::Result<pg2iceberg_iceberg::TableMetadata> {
+        self.inner
+            .evolve_schema(ident, changes, set_properties)
+            .await
+    }
+
+    async fn snapshots(
+        &self,
+        ident: &TableIdent,
+    ) -> pg2iceberg_iceberg::Result<Vec<pg2iceberg_iceberg::Snapshot>> {
+        self.inner.snapshots(ident).await
+    }
+}
+
+/// A commit that never returns stops the main loop for good. Nothing
+/// completes from then on, so `/healthz` reports the process stuck —
+/// the restart that recovers it — even though it's still up.
+#[tokio::test(start_paused = true)]
+async fn liveness_fails_once_a_request_hangs() {
+    use pg2iceberg_core::Registry;
+    use std::time::Duration;
+
+    const LIVENESS_TIMEOUT: Duration = Duration::from_secs(300);
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let hang = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let catalog = Arc::new(HangingCatalog {
+        inner: stores.catalog.clone(),
+        hang: hang.clone(),
+    });
+    let registry = Arc::new(Registry::new(stores.clock.clone()));
+    let mut lifecycle = sim_lifecycle_with(&db, &stores, every_second(), catalog);
+    lifecycle.metrics = registry.clone();
+    let script = db.clone();
+    let shutdown = Box::pin(async move {
+        // Past the snapshot phase; then the next commit hangs.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        hang.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(5, 50));
+        tx.commit(Timestamp(0)).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let lifecycle = pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown);
+    let watch = async {
+        let mut healthy_for = Duration::ZERO;
+        while healthy_for < Duration::from_secs(3600) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if registry.idle_for() > LIVENESS_TIMEOUT {
+                return healthy_for;
+            }
+            healthy_for += Duration::from_secs(1);
+        }
+        panic!("never reported stuck");
+    };
+    tokio::select! {
+        out = lifecycle => panic!("the lifecycle returned: {out:?}"),
+        healthy_for = watch => {
+            // Healthy until the hang, then stuck one timeout later.
+            assert!(
+                healthy_for > Duration::from_secs(5)
+                    && healthy_for <= LIVENESS_TIMEOUT + Duration::from_secs(10),
+                "healthy for {healthy_for:?}"
+            );
+        }
+    }
 }
 
 fn note_column() -> ColumnSchema {

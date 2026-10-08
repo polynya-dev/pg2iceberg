@@ -4031,7 +4031,7 @@ fn a_default_dropped_before_it_was_read_is_reported() {
     h.run_step(&Step::DriveFlush);
     h.run_step(&Step::MaterializerCycle);
     let mut labels = pg2iceberg_core::Labels::new();
-    labels.insert("table".into(), ident().name);
+    labels.insert("table".into(), ident().to_string());
     labels.insert("column".into(), "note".into());
     labels.insert("reason".into(), "column_gone".into());
     assert_eq!(
@@ -4088,7 +4088,7 @@ fn a_default_postgres_no_longer_stores_is_reported() {
     h.run_step(&Step::DriveFlush);
     h.run_step(&Step::MaterializerCycle);
     let mut labels = pg2iceberg_core::Labels::new();
-    labels.insert("table".into(), ident().name);
+    labels.insert("table".into(), ident().to_string());
     labels.insert("column".into(), "note".into());
     labels.insert("reason".into(), "not_stored".into());
     assert_eq!(

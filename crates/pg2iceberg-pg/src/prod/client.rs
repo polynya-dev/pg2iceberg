@@ -401,7 +401,10 @@ impl PgClient for PgClientImpl {
 
     async fn slot_health(&self, slot: &str) -> Result<Option<SlotHealth>> {
         // One query covering every slot field we use: restart_lsn,
-        // confirmed_flush_lsn, wal_status, safe_wal_size, conflicting.
+        // confirmed_flush_lsn, wal_status, safe_wal_size, conflicting —
+        // and the source's WAL position, to measure the slot against.
+        // On a standby `pg_current_wal_lsn()` errors; there it's how far
+        // the standby has replayed.
         //
         // pg2iceberg requires PG 14+ (validated at startup via
         // `server_version_num`), so `wal_status` and `safe_wal_size`
@@ -414,7 +417,9 @@ impl PgClient for PgClientImpl {
                 confirmed_flush_lsn::text AS confirmed_flush_lsn, \
                 wal_status::text AS wal_status, \
                 safe_wal_size::text AS safe_wal_size, \
-                COALESCE((to_jsonb(pg_replication_slots.*) ->> 'conflicting')::boolean, false) AS conflicting \
+                COALESCE((to_jsonb(pg_replication_slots.*) ->> 'conflicting')::boolean, false) AS conflicting, \
+                (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
+                      ELSE pg_current_wal_lsn() END)::text AS current_wal_lsn \
              FROM pg_replication_slots \
              WHERE slot_name = {}",
             quote_lit(slot)
@@ -442,6 +447,9 @@ impl PgClient for PgClientImpl {
                 let conflicting_text: Option<&str> = row
                     .try_get("conflicting")
                     .map_err(|e| PgError::Protocol(e.to_string()))?;
+                let current_wal_text: Option<&str> = row
+                    .try_get("current_wal_lsn")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
 
                 let restart_lsn = restart_text.map(parse_lsn).transpose()?.unwrap_or(Lsn(0));
                 let confirmed_flush_lsn =
@@ -459,6 +467,7 @@ impl PgClient for PgClientImpl {
                     wal_status,
                     conflicting,
                     safe_wal_size,
+                    current_wal_lsn: current_wal_text.map(parse_lsn).transpose()?,
                 }));
             }
         }

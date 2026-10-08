@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use pg2iceberg_coord::{
     CommitBatch, CoordCommitReceipt, CoordError, Coordinator, MarkerInfo, OffsetClaim,
 };
-use pg2iceberg_core::metrics::{names, Labels};
+use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::{
     ChangeEvent, ColumnName, Lsn, Metrics, NoopMetrics, Op, PgValue, TableIdent, Timestamp,
 };
@@ -118,6 +118,9 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     /// the next published change.
     keepalive_lsn: Lsn,
     metrics: Arc<dyn Metrics>,
+    /// Changes and transactions received since the last flush, counted
+    /// into the metrics when it lands (see [`Received`]).
+    received: Received,
     /// True after `shutdown` runs; further `process` calls become no-ops.
     /// Tested for in flush so a forgotten shutdown sequence stays correct.
     shut_down: bool,
@@ -164,6 +167,57 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     column_defaults: Option<Arc<dyn ColumnDefaultSource>>,
 }
 
+/// What the pipeline received from the replication stream since its last
+/// flush. Counted per message, but recorded into the metrics once per
+/// flush: a metric records with an allocated label map.
+#[derive(Default)]
+struct Received {
+    /// Per table: inserts, updates, deletes, truncates.
+    changes: BTreeMap<TableIdent, [u64; 4]>,
+    transactions: u64,
+}
+
+impl Received {
+    const OPS: [&'static str; 4] = ["insert", "update", "delete", "truncate"];
+
+    fn change(&mut self, table: &TableIdent, op: Op) {
+        let i = match op {
+            Op::Insert => 0,
+            Op::Update => 1,
+            Op::Delete => 2,
+            Op::Truncate => 3,
+            Op::Relation => return,
+        };
+        match self.changes.get_mut(table) {
+            Some(counts) => counts[i] += 1,
+            None => {
+                let mut counts = [0; 4];
+                counts[i] = 1;
+                self.changes.insert(table.clone(), counts);
+            }
+        }
+    }
+
+    fn record(self, metrics: &dyn Metrics) {
+        for (table, counts) in self.changes {
+            let table = table.to_string();
+            for (op, n) in Self::OPS.iter().zip(counts) {
+                if n > 0 {
+                    let l = labels([("table", &table), ("op", op)]);
+                    metrics.counter(names::PIPELINE_CHANGES_TOTAL, &l, n);
+                }
+            }
+        }
+        if self.transactions > 0 {
+            metrics.counter(
+                names::PIPELINE_TRANSACTIONS_TOTAL,
+                &Labels::new(),
+                self.transactions,
+            );
+        }
+    }
+}
+
 impl<C: Coordinator + ?Sized> Pipeline<C> {
     pub fn new(
         coord: Arc<C>,
@@ -198,6 +252,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             flushed_lsn: AtomicU64::new(0),
             keepalive_lsn: Lsn::ZERO,
             metrics,
+            received: Received::default(),
             shut_down: false,
             markers_table: None,
             pending_markers_by_xid: BTreeMap::new(),
@@ -292,6 +347,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             }
             DecodedMessage::Commit { xid, commit_lsn } => {
                 self.open_tx = None;
+                self.received.transactions += 1;
                 // Drain any markers observed in this tx before
                 // committing. Flushed atomically with the rest of
                 // the tx via the next claim_offsets call.
@@ -344,6 +400,7 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                         return Ok(());
                     }
                 }
+                self.received.change(&evt.table, evt.op);
                 // UPDATE with PK change → split into Delete(old PK) +
                 // Update(new full row). Without this, the materializer
                 // folds-by-new-PK and the old row stays orphaned in
@@ -578,16 +635,15 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         self.advance_flushed_lsn(receipt);
 
         // Emit per-flush counters + the flushed_lsn gauge.
-        let mut empty_labels = Labels::new();
+        let no_labels = Labels::new();
         self.metrics
-            .counter(names::PIPELINE_FLUSH_TOTAL, &empty_labels, 1);
-        // Empty-labels gauge doesn't need a fresh map; reuse the buffer.
-        empty_labels.clear();
+            .counter(names::PIPELINE_FLUSH_TOTAL, &no_labels, 1);
         self.metrics.gauge(
             names::PIPELINE_FLUSHED_LSN,
-            &empty_labels,
+            &no_labels,
             flushable_lsn.0 as f64,
         );
+        std::mem::take(&mut self.received).record(self.metrics.as_ref());
         Ok(Some(flushable_lsn))
     }
 
@@ -623,10 +679,14 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         let path = self.namer.next_blob_path(&table).await;
         let byte_size = chunk.bytes.len() as u64;
         self.blob_store.put(&path, chunk.bytes).await?;
-        let mut labels = Labels::new();
-        labels.insert("table".into(), table.name.clone());
+        let table_labels = labels([("table", &table.to_string())]);
+        self.metrics.counter(
+            names::PIPELINE_ROWS_STAGED_TOTAL,
+            &table_labels,
+            chunk.row_count,
+        );
         self.metrics
-            .counter(names::PIPELINE_ROWS_STAGED_TOTAL, &labels, chunk.row_count);
+            .counter(names::PIPELINE_STAGED_BYTES_TOTAL, &table_labels, byte_size);
         Ok(OffsetClaim {
             table,
             record_count: chunk.record_count,
@@ -682,6 +742,8 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             namer: _,
             flushed_lsn: _,
             metrics: _,
+            // Counted as received; a reopened stream sends them again.
+            received: _,
             shut_down: _,
             markers_table: _,
             primary_keys: _,

@@ -28,7 +28,7 @@ use crate::relation_event;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pg2iceberg_coord::{Coordinator, LogEntry};
-use pg2iceberg_core::metrics::{names, Labels};
+use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
     is_snapshot_xid, ColumnName, ColumnSchema, IdGen, Lsn, Metrics, Namespace, NoopMetrics, Op,
@@ -1084,12 +1084,13 @@ impl<C: Catalog> Materializer<C> {
                      already in Iceberg keep NULL for it"
                 );
             }
-            let mut labels = Labels::new();
-            labels.insert("table".into(), ident.name.clone());
-            labels.insert("column".into(), col.name.clone());
-            labels.insert("reason".into(), reason.into());
+            let unfilled = labels([
+                ("table", &ident.to_string()),
+                ("column", &col.name),
+                ("reason", reason),
+            ]);
             self.metrics
-                .counter(names::UNFILLED_COLUMN_DEFAULTS, &labels, 1);
+                .counter(names::UNFILLED_COLUMN_DEFAULTS, &unfilled, 1);
         }
         Ok(marks)
     }
@@ -1390,7 +1391,23 @@ impl<C: Catalog> Materializer<C> {
         self.catalog.set_ttl(clock, ttl);
     }
 
+    /// Materialize each assigned table's staged rows ([`Self::cycle_table`]).
+    /// Returns rows folded.
     pub async fn cycle(&mut self) -> Result<usize> {
+        let started_micros = now_micros();
+        let out = self.cycle_assigned().await;
+        let no_labels = Labels::new();
+        let seconds = (now_micros() - started_micros).max(0) as f64 / 1e6;
+        self.metrics
+            .histogram(names::MATERIALIZER_CYCLE_DURATION, &no_labels, seconds);
+        if out.is_err() {
+            self.metrics
+                .counter(names::MATERIALIZER_CYCLE_FAILURES_TOTAL, &no_labels, 1);
+        }
+        out
+    }
+
+    async fn cycle_assigned(&mut self) -> Result<usize> {
         // Forget what other processes changed since the last cycle.
         self.catalog.sync().await;
         // 1. Default path: process every registered table whose
@@ -1471,6 +1488,14 @@ impl<C: Catalog> Materializer<C> {
                 _ => {}
             }
             dm_state.last_assigned = Some(assigned.clone());
+            let no_labels = Labels::new();
+            self.metrics
+                .gauge(names::DISTRIBUTED_WORKERS, &no_labels, n as f64);
+            self.metrics.gauge(
+                names::DISTRIBUTED_ASSIGNED_TABLES,
+                &no_labels,
+                assigned.len() as f64,
+            );
             idents.retain(|t| assigned.contains(t));
         }
 
@@ -1663,9 +1688,18 @@ impl<C: Catalog> Materializer<C> {
             config,
         )
         .await;
+        let table = ident.to_string();
+        let ran = |outcome: &str| labels([("table", &table), ("outcome", outcome)]);
+        if !matches!(outcome, Ok(None)) {
+            let seconds = (now_micros() - started_micros).max(0) as f64 / 1e6;
+            self.metrics
+                .histogram(names::COMPACTION_DURATION, &Labels::new(), seconds);
+        }
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(e) => {
+                self.metrics
+                    .counter(names::COMPACTION_RUNS_TOTAL, &ran("failed"), 1);
                 // The commit may have applied all the same (its response
                 // lost). If the index can't learn that now, the next sync
                 // will.
@@ -1677,6 +1711,13 @@ impl<C: Catalog> Materializer<C> {
         };
 
         if let Some(o) = &outcome {
+            self.metrics
+                .counter(names::COMPACTION_RUNS_TOTAL, &ran("rewritten"), 1);
+            self.metrics.counter(
+                names::COMPACTION_FILES_REWRITTEN_TOTAL,
+                &labels([("table", &table)]),
+                (o.input_data_files + o.input_delete_files) as u64,
+            );
             let entry_mut = self.tables.get_mut(ident).expect("checked above");
             if o.snapshot_id == Some(entry_mut.index_at.unwrap_or(0) + 1) {
                 // Remap what the pass rewrote rather than replaying its
@@ -1750,10 +1791,11 @@ impl<C: Catalog> Materializer<C> {
     /// committing until the log is drained or `cycle_rows` events were
     /// read. Returns rows folded.
     pub async fn cycle_table(&mut self, ident: &TableIdent) -> Result<usize> {
-        let mut labels = Labels::new();
-        labels.insert("table".into(), ident.name.clone());
-        self.metrics
-            .counter(names::MATERIALIZER_CYCLE_TOTAL, &labels, 1);
+        self.metrics.counter(
+            names::MATERIALIZER_CYCLE_TOTAL,
+            &labels([("table", &ident.to_string())]),
+            1,
+        );
         if !self.tables.contains_key(ident) {
             return Err(MaterializerError::UnknownTable(ident.clone()));
         }
@@ -2036,6 +2078,7 @@ impl<C: Catalog> Materializer<C> {
 
         // Commit catalog snapshots — durability gate.
         let started_micros = now_micros();
+        let has_steps = !unit.steps.is_empty();
         let committed = if unit.steps.is_empty() {
             None
         } else {
@@ -2082,7 +2125,8 @@ impl<C: Catalog> Materializer<C> {
                 }
             }
         };
-        let commit_duration_ms = (now_micros() - started_micros) / 1000;
+        let commit_duration_micros = now_micros() - started_micros;
+        let commit_duration_ms = commit_duration_micros / 1000;
 
         // Advance cursor only after commit success.
         self.coord
@@ -2133,10 +2177,41 @@ impl<C: Catalog> Materializer<C> {
             }
         }
 
-        let mut labels = Labels::new();
-        labels.insert("table".into(), ident.name.clone());
-        self.metrics
-            .counter(names::MATERIALIZER_ROWS_TOTAL, &labels, unit.folded as u64);
+        let table = ident.to_string();
+        let table_labels = labels([("table", &table)]);
+        self.metrics.counter(
+            names::MATERIALIZER_ROWS_TOTAL,
+            &table_labels,
+            unit.folded as u64,
+        );
+        if has_steps {
+            // Committed, or landed despite the error.
+            self.metrics.histogram(
+                names::MATERIALIZER_COMMIT_DURATION,
+                &Labels::new(),
+                commit_duration_micros.max(0) as f64 / 1e6,
+            );
+            self.metrics
+                .counter(names::MATERIALIZER_COMMITS_TOTAL, &table_labels, 1);
+            for (kind, n) in [("data", data_files_count), ("delete", delete_files_count)] {
+                let l = labels([("table", &table), ("kind", kind)]);
+                self.metrics
+                    .counter(names::MATERIALIZER_FILES_TOTAL, &l, n as u64);
+            }
+            self.metrics.counter(
+                names::MATERIALIZER_BYTES_TOTAL,
+                &table_labels,
+                bytes_written as u64,
+            );
+        }
+        // Snapshot rows carry no commit time.
+        if unit.max_source_ts_micros > 0 {
+            self.metrics.gauge(
+                names::MATERIALIZER_SOURCE_TIMESTAMP,
+                &table_labels,
+                unit.max_source_ts_micros as f64 / 1e6,
+            );
+        }
         Ok(unit.folded)
     }
 

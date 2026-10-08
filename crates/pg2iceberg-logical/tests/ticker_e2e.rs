@@ -316,7 +316,7 @@ fn flush_fires_more_often_than_materialize_when_intervals_differ() {
 
     let no_labels = Labels::new();
     let mut table_labels = Labels::new();
-    table_labels.insert("table".into(), "orders".into());
+    table_labels.insert("table".into(), ident().to_string());
 
     // Ticker fires Handler::Flush at t=5, t=10, t=15 — but the metrics
     // counter only ticks when there's actual work (Sink.flush returns

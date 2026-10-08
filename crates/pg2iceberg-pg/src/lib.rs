@@ -75,6 +75,10 @@ pub struct SlotHealth {
     /// already past. `None` when SQL NULL. Useful for metrics /
     /// dashboards; not directly consumed by validation today.
     pub safe_wal_size: Option<i64>,
+    /// How far the source has written WAL (on a standby, replayed it),
+    /// read with the slot. `None` when unknown. The replication lag is
+    /// this minus `confirmed_flush_lsn`.
+    pub current_wal_lsn: Option<Lsn>,
 }
 
 #[derive(Clone, Debug, Error)]
@@ -152,6 +156,12 @@ pub trait ReplicationStream: Send {
     /// Send standby status. `flushed` is the LSN we've durably committed via
     /// the coordinator; PG can recycle WAL up to this point.
     async fn send_standby(&mut self, flushed: Lsn, applied: Lsn) -> Result<()>;
+
+    /// Messages received from the server and decoded, but not yet taken
+    /// by [`Self::recv`]. A stream that doesn't read ahead has none.
+    fn buffered(&self) -> usize {
+        0
+    }
 }
 
 /// Read-only slot inspection. Smaller than [`PgClient`] so non-PG
@@ -175,6 +185,7 @@ pub trait SlotMonitor: Send + Sync {
             wal_status: None,
             conflicting: false,
             safe_wal_size: None,
+            current_wal_lsn: None,
         }))
     }
 }

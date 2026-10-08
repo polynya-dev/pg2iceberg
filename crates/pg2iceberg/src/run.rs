@@ -22,7 +22,8 @@ use pg2iceberg_coord::{
     schema::CoordSchema,
     Coordinator,
 };
-use pg2iceberg_core::{IdGen, TableIdent, TableSchema};
+use pg2iceberg_core::metrics::{labels, names};
+use pg2iceberg_core::{Clock, IdGen, Metrics, NoopMetrics, Phase, TableIdent, TableSchema};
 use pg2iceberg_iceberg::prod::{IcebergRustCatalog, VendedBlobStoreRouter};
 use pg2iceberg_logical::{
     materializer::{MaterializerNamer, UuidMaterializerNamer},
@@ -31,6 +32,7 @@ use pg2iceberg_logical::{
 };
 use pg2iceberg_pg::prod::{PgClientImpl, TlsMode as PgTls};
 use pg2iceberg_stream::{prod::ObjectStoreBlobStore, BlobStore};
+use pg2iceberg_validate::Instrumented;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
@@ -176,14 +178,14 @@ fn data_path(location: &str, kind: &str, partition_segment: &str, id: &str) -> S
     }
 }
 
-pub async fn run(cfg: Config) -> Result<()> {
+pub async fn run(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     cfg.require_catalog()?;
     let catalog = build_rest_catalog(&cfg).await?;
     let catalog = IcebergRustCatalog::new(Arc::new(catalog));
     let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
-    run_inner(cfg, catalog, storage).await
+    run_inner(cfg, catalog, storage, metrics).await
 }
 
 /// Build a REST `iceberg::Catalog` from sink config. We default to the
@@ -362,7 +364,7 @@ fn bucket_from_warehouse(warehouse: &str) -> Result<String> {
 /// never fires. Flush + Standby + Watcher still run on their normal
 /// cadences so the slot stays advanced and invariants stay
 /// monitored.
-pub async fn run_stream_only(cfg: Config) -> Result<()> {
+pub async fn run_stream_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     cfg.require_catalog()?;
     let catalog = build_rest_catalog(&cfg).await?;
     let catalog = IcebergRustCatalog::new(Arc::new(catalog));
@@ -378,6 +380,7 @@ pub async fn run_stream_only(cfg: Config) -> Result<()> {
         // because some duration math saturates to MAX and would
         // never sleep.
         Some(std::time::Duration::from_secs(100 * 365 * 24 * 60 * 60)),
+        metrics,
     )
     .await
 }
@@ -393,18 +396,20 @@ pub async fn run_stream_only(cfg: Config) -> Result<()> {
 /// `_pg2iceberg.consumers` and round-robin tables across themselves
 /// deterministically (sorted tables → sorted workers → `[i % N]`).
 /// Joins and leaves rebalance on the next cycle automatically.
-pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()> {
+pub async fn run_materializer_only(
+    cfg: Config,
+    worker_id: String,
+    metrics: Arc<dyn Metrics>,
+) -> Result<()> {
     use pg2iceberg_core::WorkerId;
 
     if worker_id.is_empty() {
         anyhow::bail!("--worker-id is required for materializer-only mode");
     }
-    let mut materializer = build_one_shot_materializer(cfg.clone()).await?;
+    let mut materializer = build_one_shot_materializer(cfg.clone(), metrics.clone()).await?;
     materializer.set_catalog_cache_ttl(
         Arc::new(crate::realio::RealClock),
-        pg2iceberg_logical::CachingCatalog::<
-            IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>,
-        >::DEFAULT_TTL,
+        pg2iceberg_logical::CachingCatalog::<OneShotCatalog>::DEFAULT_TTL,
     );
 
     // Heartbeat TTL mirrors Go's `lockTTL = 30 * time.Second` in
@@ -431,6 +436,7 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
     // each cycle (bounded by its row budget) is followed straight away by
     // the next.
     let mut pause = cycle_interval;
+    Phase::Running.set(metrics.as_ref());
     loop {
         tokio::select! {
             biased;
@@ -443,7 +449,15 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
                 break;
             }
             _ = tokio::time::sleep(pause) => {
-                pause = match materializer.cycle().await {
+                let cycled = materializer.cycle().await;
+                if cycled.is_ok() {
+                    metrics.gauge(
+                        names::LAST_SUCCESS,
+                        &labels([("stage", "materialize")]),
+                        crate::realio::RealClock.now().0 as f64 / 1e6,
+                    );
+                }
+                pause = match cycled {
                     Ok(0) => cycle_interval,
                     Ok(_) => std::time::Duration::ZERO,
                     Err(e) => {
@@ -459,15 +473,21 @@ pub async fn run_materializer_only(cfg: Config, worker_id: String) -> Result<()>
         }
     }
 
+    Phase::Stopping.set(metrics.as_ref());
     materializer.shutdown_distributed().await;
     Ok(())
 }
 
-async fn run_inner<C>(cfg: Config, catalog: IcebergRustCatalog<C>, storage: Storage) -> Result<()>
+async fn run_inner<C>(
+    cfg: Config,
+    catalog: IcebergRustCatalog<C>,
+    storage: Storage,
+    metrics: Arc<dyn Metrics>,
+) -> Result<()>
 where
     C: iceberg::Catalog + Send + Sync + 'static,
 {
-    run_inner_with_schedule(cfg, catalog, storage, None).await
+    run_inner_with_schedule(cfg, catalog, storage, None, metrics).await
 }
 
 async fn run_inner_with_schedule<C>(
@@ -475,6 +495,7 @@ async fn run_inner_with_schedule<C>(
     catalog: IcebergRustCatalog<C>,
     storage: Storage,
     materialize_override: Option<std::time::Duration>,
+    metrics: Arc<dyn Metrics>,
 ) -> Result<()>
 where
     C: iceberg::Catalog + Send + Sync + 'static,
@@ -487,7 +508,7 @@ where
     // main loop, drain. The fault-DST exercises the same lifecycle
     // helper with sim plumbing, so any change to lifecycle behavior
     // gets fault-tested.
-    let mut lifecycle = crate::setup::build_logical_lifecycle(&cfg, catalog, storage)
+    let mut lifecycle = crate::setup::build_logical_lifecycle(&cfg, catalog, storage, metrics)
         .await
         .context("build logical lifecycle")?;
     if let Some(d) = materialize_override {
@@ -525,7 +546,7 @@ pub async fn run_compact(cfg: Config) -> Result<()> {
              Set a non-zero value (e.g. 134217728 for 128 MiB) to enable."
         );
     }
-    let mut materializer = build_one_shot_materializer(cfg.clone()).await?;
+    let mut materializer = build_one_shot_materializer(cfg.clone(), Arc::new(NoopMetrics)).await?;
     let cfg_compact = cfg.sink.compaction_config();
     let outcomes = materializer
         .compact_cycle(&cfg_compact)
@@ -574,7 +595,7 @@ pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Re
         );
     }
 
-    let mut materializer = build_one_shot_materializer(cfg.clone()).await?;
+    let mut materializer = build_one_shot_materializer(cfg.clone(), Arc::new(NoopMetrics)).await?;
 
     // Step 1: snapshot expiry.
     if !retention_str.is_empty() {
@@ -628,16 +649,44 @@ pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Re
     Ok(())
 }
 
+/// The catalog of a materializer outside the lifecycle, its requests
+/// recorded as the lifecycle records its own.
+type OneShotCatalog = Instrumented<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>>;
+
+/// `catalog`, `blob` and `coord`, recording their requests into `metrics`
+/// (see [`Instrumented`]).
+fn instrument(
+    catalog: IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>,
+    blob: Arc<dyn BlobStore>,
+    coord: Arc<dyn Coordinator>,
+    metrics: &Arc<dyn Metrics>,
+) -> (
+    Arc<OneShotCatalog>,
+    Arc<dyn BlobStore>,
+    Arc<dyn Coordinator>,
+) {
+    let clock: Arc<dyn Clock> = Arc::new(crate::realio::RealClock);
+    let catalog = Arc::new(Instrumented::new(
+        Arc::new(catalog),
+        metrics.clone(),
+        clock.clone(),
+    ));
+    let blob: Arc<dyn BlobStore> =
+        Arc::new(Instrumented::new(blob, metrics.clone(), clock.clone()));
+    let coord: Arc<dyn Coordinator> = Arc::new(Instrumented::new(coord, metrics.clone(), clock));
+    (catalog, blob, coord)
+}
+
 /// Set up the same Materializer the main run loop builds, but without
 /// opening the replication slot or installing signal handlers — for
-/// one-shot subcommands (`compact`, `maintain`).
+/// one-shot subcommands (`compact`, `maintain`) and `materializer-only`,
+/// recording into `metrics`.
 async fn build_one_shot_materializer(
     cfg: Config,
-) -> Result<Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>>> {
+    metrics: Arc<dyn Metrics>,
+) -> Result<Materializer<OneShotCatalog>> {
     cfg.require_catalog()?;
-    let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(
-        build_rest_catalog(&cfg).await?,
-    )));
+    let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?));
     let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
@@ -652,6 +701,7 @@ async fn build_one_shot_materializer(
         .context("coord connect")?;
     let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
     let coord: Arc<dyn Coordinator> = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
+    let (catalog, blob, coord) = instrument(catalog, storage.blob, coord, &metrics);
 
     // Resolve schemas. Discovery requires PG; tables with explicit
     // columns can skip it.
@@ -710,15 +760,15 @@ async fn build_one_shot_materializer(
         resolved_schemas.push(schema);
     }
 
-    let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
-        Materializer::new(
-            coord,
-            storage.blob,
-            catalog,
-            storage.materializer_namer,
-            &cfg.state.group,
-            cfg.sink.materializer_batch_rows,
-        );
+    let mut materializer: Materializer<OneShotCatalog> = Materializer::with_metrics(
+        coord,
+        blob,
+        catalog,
+        storage.materializer_namer,
+        &cfg.state.group,
+        cfg.sink.materializer_batch_rows,
+        metrics,
+    );
     for s in &resolved_schemas {
         materializer
             .register_table(s.clone())
@@ -927,7 +977,7 @@ pub async fn run_cleanup(cfg: Config) -> Result<()> {
 ///
 /// On a checkpoint that already says `snapshot_complete = true`,
 /// returns `Ok(())` immediately without touching PG or the catalog.
-pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
+pub async fn run_snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     use pg2iceberg_logical::pipeline::Pipeline;
     use pg2iceberg_logical::Materializer;
     use pg2iceberg_pg::PgClient;
@@ -935,9 +985,7 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     use pg2iceberg_validate::LifecycleError;
 
     cfg.require_catalog()?;
-    let catalog = Arc::new(IcebergRustCatalog::new(Arc::new(
-        build_rest_catalog(&cfg).await?,
-    )));
+    let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?));
     let Storage {
         blob,
         blob_namer,
@@ -958,7 +1006,7 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
     let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
     coord_concrete.migrate().await.context("coord migrate")?;
-    let coord: Arc<dyn Coordinator> = coord_concrete;
+    let (catalog, blob, coord) = instrument(catalog, blob, coord_concrete, &metrics);
 
     // ── pg + slot ──────────────────────────────────────────────────
     let pg_tls = match cfg.source.postgres.tls_label() {
@@ -1037,11 +1085,12 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
     }
 
     // ── pipeline + materializer ────────────────────────────────────
-    let mut pipeline: Pipeline<dyn Coordinator> = Pipeline::new(
+    let mut pipeline: Pipeline<dyn Coordinator> = Pipeline::with_metrics(
         Arc::clone(&coord),
         Arc::clone(&blob),
         blob_namer,
         cfg.sink.flush_rows,
+        metrics.clone(),
     );
     for s in &schemas {
         let pk_cols: Vec<pg2iceberg_core::ColumnName> = s
@@ -1060,15 +1109,15 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
         }
     }
 
-    let mut materializer: Materializer<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
-        Materializer::new(
-            Arc::clone(&coord),
-            Arc::clone(&blob),
-            Arc::clone(&catalog),
-            materializer_namer,
-            &cfg.state.group,
-            cfg.sink.materializer_batch_rows,
-        );
+    let mut materializer: Materializer<OneShotCatalog> = Materializer::with_metrics(
+        Arc::clone(&coord),
+        Arc::clone(&blob),
+        Arc::clone(&catalog),
+        materializer_namer,
+        &cfg.state.group,
+        cfg.sink.materializer_batch_rows,
+        metrics.clone(),
+    );
     for schema in &schemas {
         materializer
             .register_table(schema.clone())
@@ -1100,6 +1149,7 @@ pub async fn run_snapshot_only(cfg: Config) -> Result<()> {
         }
     }
 
+    Phase::Snapshotting.set(metrics.as_ref());
     let outcome = run_snapshot_phase(
         &source,
         Arc::clone(&coord),

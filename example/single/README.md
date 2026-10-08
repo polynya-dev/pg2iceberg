@@ -15,6 +15,15 @@ docker compose --profile workload up -d workload   # DURATION=300 seconds of wri
 Then query `http://localhost:8123/play`, e.g.
 ``SELECT * FROM rideshare.`rideshare.rides` ``.
 
+To watch pg2iceberg too, add the `monitoring` profile: Prometheus, with the
+alert rules in [`monitoring/alerts.yml`](monitoring/alerts.yml), and Grafana
+with a pg2iceberg dashboard at http://localhost:3000 (no login).
+pg2iceberg's own `/metrics` is at http://localhost:9091/metrics.
+
+```sh
+docker compose --profile monitoring up -d --wait
+```
+
 Or run it as a smoke test, which ends with a row-by-row comparison of
 Postgres and ClickHouse and exits non-zero if they differ (logs in `out/`):
 

@@ -19,8 +19,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use pg2iceberg::config::{self, Config, DEFAULT_CONFIG_PATH};
+use pg2iceberg::telemetry::Telemetry;
 use pg2iceberg::{init, run, tables};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -151,7 +154,11 @@ async fn main() -> Result<()> {
         Command::ConnectPg => connect_pg(&source(config)?).await,
         Command::ConnectIceberg => connect_iceberg(&Config::load(config.as_deref())?).await,
         Command::MigrateCoord => migrate_coord(&source(config)?).await,
-        Command::Run => run::run(replicated(config).await?).await,
+        Command::Run => {
+            let cfg = replicated(config).await?;
+            let telemetry = serve(&cfg, Duration::ZERO).await?;
+            run::run(cfg, telemetry.metrics()).await
+        }
         Command::Compact => run::run_compact(replicated(config).await?).await,
         Command::Maintain { retention } => {
             run::run_maintain(replicated(config).await?, retention).await
@@ -159,13 +166,31 @@ async fn main() -> Result<()> {
         Command::Verify { chunk_size } => {
             run::run_verify(replicated(config).await?, chunk_size).await
         }
-        Command::Snapshot => run::run_snapshot_only(replicated(config).await?).await,
+        Command::Snapshot => {
+            let cfg = replicated(config).await?;
+            let telemetry = serve(&cfg, Duration::ZERO).await?;
+            run::run_snapshot_only(cfg, telemetry.metrics()).await
+        }
         Command::Cleanup => run::run_cleanup(source(config)?).await,
-        Command::StreamOnly => run::run_stream_only(replicated(config).await?).await,
+        Command::StreamOnly => {
+            let cfg = replicated(config).await?;
+            let telemetry = serve(&cfg, Duration::ZERO).await?;
+            run::run_stream_only(cfg, telemetry.metrics()).await
+        }
         Command::MaterializerOnly { worker_id } => {
-            run::run_materializer_only(replicated(config).await?, worker_id).await
+            let cfg = replicated(config).await?;
+            // An idle worker completes nothing between cycles.
+            let between_cycles = cfg.sink.schedule()?.materialize * 3;
+            let telemetry = serve(&cfg, between_cycles).await?;
+            run::run_materializer_only(cfg, worker_id, telemetry.metrics()).await
         }
     }
+}
+
+/// Serve a long-running subcommand's `/metrics`, `/healthz` and
+/// `/readyz`, its liveness timeout at least `at_least`.
+async fn serve(cfg: &Config, at_least: Duration) -> Result<Arc<Telemetry>> {
+    Telemetry::start(cfg, cfg.liveness_timeout()?.max(at_least)).await
 }
 
 /// The config, for a subcommand that needs the source database.

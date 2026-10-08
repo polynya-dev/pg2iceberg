@@ -268,6 +268,8 @@ Settings come from environment variables and an optional YAML file: `--config`, 
 | `ICEBERG_WAREHOUSE` | `sink.warehouse` | `s3://bucket/prefix/` |
 | `ICEBERG_NAMESPACE` | `sink.namespace` | One namespace for every table. Default: each table's Postgres schema |
 | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` | `static` / `iam` / `vended`. Default: inferred |
+| `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` | Where to serve `/metrics`, `/healthz`, `/readyz`. Default `:9090`; `off` serves nothing |
+| `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` | `/healthz` fails once nothing completes for this long. Default `5m` |
 | `AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, ... | `sink.s3_*` | Read as AWS tools read them; the file's `sink.s3_*` take precedence |
 
 ### Inferred settings
@@ -323,9 +325,9 @@ The integration suite covers the prod Coordinator (PG-replication path), the pro
 
 ## Observability
 
-### Prometheus metrics
+### Prometheus metrics and health checks
 
-A future maintenance pass will expose Prometheus metrics on a configurable address. The `Metrics` trait is wired through every hot path; the operational HTTP endpoint that exports them is **not yet wired**.
+`run`, `stream-only`, `materializer-only` and `snapshot` serve `/metrics` (Prometheus), `/healthz` and `/readyz` on `metrics_addr` (default `:9090`): replication lag and slot WAL, per-table backlog and freshness, throughput, the latency and errors of every catalog, object store and coordinator request, and more. `/healthz` fails once nothing has completed for `liveness_timeout` (default `5m`) — stuck, not slow. See [Observability](docs/usage/observability.md) for every metric and what to alert on, and `example/single` (`--profile monitoring`) for Prometheus, alert rules and a Grafana dashboard.
 
 ### Structured logs
 
@@ -333,7 +335,7 @@ The binary uses [`tracing`](https://docs.rs/tracing) with `tracing-subscriber` f
 
 ### Distributed tracing
 
-Distributed-tracing export via OTLP is **not yet wired**. The `tracing` instrumentation that exists is stdout-only today.
+Distributed-tracing export via OTLP is **not yet wired**. Logs are stdout-only today.
 
 ### Control-plane meta tables
 

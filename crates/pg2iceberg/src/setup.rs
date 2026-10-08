@@ -16,7 +16,7 @@ use pg2iceberg_coord::{
     schema::CoordSchema,
     Coordinator,
 };
-use pg2iceberg_core::{InMemoryMetrics, TableIdent, TableSchema};
+use pg2iceberg_core::{Metrics, TableIdent, TableSchema};
 use pg2iceberg_iceberg::prod::IcebergRustCatalog;
 use pg2iceberg_pg::{
     prod::{PgClientImpl, TlsMode as PgTls},
@@ -26,14 +26,15 @@ use pg2iceberg_validate::{LifecycleError, LogicalLifecycle, SnapshotSourceFactor
 use std::sync::Arc;
 
 /// Build the [`LogicalLifecycle`] inputs from a YAML config and
-/// already-opened catalog/blob handles. After this returns, the
-/// caller hands the struct to
+/// already-opened catalog/blob handles, recording into `metrics`. After
+/// this returns, the caller hands the struct to
 /// `pg2iceberg_validate::run_logical_lifecycle` and the rest of the
 /// loop runs in library code.
 pub async fn build_logical_lifecycle<C>(
     cfg: &Config,
     catalog: IcebergRustCatalog<C>,
     storage: crate::run::Storage,
+    metrics: Arc<dyn Metrics>,
 ) -> Result<LogicalLifecycle<IcebergRustCatalog<C>>>
 where
     C: iceberg::Catalog + Send + Sync + 'static,
@@ -137,7 +138,7 @@ where
         snapshot_source_factory,
         materializer_namer,
         blob_namer,
-        metrics: Arc::new(InMemoryMetrics::new()),
+        metrics,
         // Blue-green marker mode. Operators set
         // `sink.meta_namespace: "_pg2iceberg_<env>"` in YAML to
         // opt in.
