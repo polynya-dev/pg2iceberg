@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use pg2iceberg_core::{Clock, IdGen, Spawner, Timestamp, WorkerId};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Wall-clock-backed [`Clock`]. Microsecond precision matches our
@@ -22,6 +22,42 @@ impl Clock for RealClock {
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
         Timestamp(micros)
+    }
+
+    async fn sleep(&self, d: Duration) {
+        tokio::time::sleep(d).await;
+    }
+}
+
+/// [`Clock`] that never steps: the wall-clock time at creation, plus the
+/// time since by the monotonic clock. For measuring how long something
+/// took — an NTP step of the wall clock would skew that — not for
+/// timestamps compared across processes.
+pub struct MonotonicClock {
+    start_micros: i64,
+    start: Instant,
+}
+
+impl MonotonicClock {
+    pub fn new() -> Self {
+        Self {
+            start_micros: RealClock.now().0,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Clock for MonotonicClock {
+    fn now(&self) -> Timestamp {
+        let elapsed = self.start.elapsed().as_micros() as i64;
+        Timestamp(self.start_micros.saturating_add(elapsed))
     }
 
     async fn sleep(&self, d: Duration) {

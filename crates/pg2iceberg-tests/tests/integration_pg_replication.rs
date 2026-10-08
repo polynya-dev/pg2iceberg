@@ -312,6 +312,21 @@ async fn slot_health_query_works_against_real_pg() {
     // PG 16+ has the `conflicting` column and reports false on a
     // healthy non-physical slot.
     assert!(!h.conflicting);
+    // The server's WAL position, read with the slot: the replication lag
+    // is measured from it.
+    let current = h.current_wal_lsn.expect("the source's WAL position");
+    assert!(current >= h.confirmed_flush_lsn, "{current:?} vs {h:?}");
+    regular
+        .batch_execute(&format!("INSERT INTO {table} VALUES (1)"))
+        .await
+        .expect("write some WAL");
+    let later = client
+        .slot_health(&slot)
+        .await
+        .expect("slot_health after a write")
+        .expect("slot exists");
+    assert!(later.current_wal_lsn > Some(current), "{later:?}");
+    assert_eq!(later.confirmed_flush_lsn, cp, "nothing acked it");
 
     // Cleanup.
     regular

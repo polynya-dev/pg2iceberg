@@ -48,6 +48,8 @@ sink:
 | `ICEBERG_WAREHOUSE` | `sink.warehouse` |
 | `ICEBERG_NAMESPACE` | `sink.namespace` |
 | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` |
+| `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` |
+| `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` |
 
 AWS's own variables are read as AWS tools read them, and give way to the config file: `AWS_REGION` / `AWS_DEFAULT_REGION` for `sink.s3_region`, `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` for `sink.s3_endpoint`. Credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are read by the AWS default credential chain, with `credential_mode: iam`.
 
@@ -178,7 +180,8 @@ state:
   coordinator_schema: _pg2iceberg
   group: default                 # consumer group name (distributed mode)
 
-metrics_addr: ":9090"            # parsed but not yet wired (Prometheus endpoint TODO)
+metrics_addr: ":9090"            # /metrics, /healthz, /readyz; `off` serves nothing
+liveness_timeout: 5m             # /healthz fails once nothing completes for this long
 snapshot_only: false             # legacy field; prefer the `snapshot` subcommand
 ```
 
@@ -192,7 +195,7 @@ snapshot_only: false             # legacy field; prefer the `snapshot` subcomman
 - **`sink.materializer_target_file_size` / `materializer_concurrency`** — not yet exposed; uses `target_file_size` + a fixed concurrency.
 - **`sink.materializer_worker_id`** — replaced by the `--worker-id` flag on `pg2iceberg materializer-only`.
 - **`sink.meta_enabled`** — inferred from `meta_namespace`: setting it enables meta-table writes.
-- **`metrics_addr`** — parsed but not yet wired (Prometheus endpoint TODO).
+- **`metrics_addr`** / **`liveness_timeout`** — where `run`, `stream-only`, `materializer-only` and `snapshot` serve `/metrics`, `/healthz` and `/readyz`, and how long nothing may complete before `/healthz` fails. See [Observability](observability.md).
 - **`state.path`** — file-based checkpoint store. Not implemented; coord is always Postgres-backed.
 - **`snapshot_only`** — use the `pg2iceberg snapshot` subcommand instead. The field still parses for backward compat.
 

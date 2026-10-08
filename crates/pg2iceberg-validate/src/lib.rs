@@ -10,10 +10,12 @@
 //!   Iceberg at the snapshot id committed at that LSN, and reports per-PK
 //!   diffs. This is the headline "is my mirror correct?" command.
 
+pub mod instrument;
 pub mod runtime;
 pub mod verify;
 pub mod watcher;
 
+pub use instrument::Instrumented;
 pub use runtime::{
     drain_and_shutdown, run_logical_lifecycle, run_logical_main_loop, run_materialize_tick,
     run_watcher_tick, LifecycleError, LogicalLifecycle, LogicalLoop, MainLoopError,

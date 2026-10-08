@@ -161,6 +161,10 @@ impl ReplicationStream for ReplicationStreamImpl {
         }
     }
 
+    fn buffered(&self) -> usize {
+        self.events_rx.len()
+    }
+
     async fn send_standby(&mut self, flushed: Lsn, applied: Lsn) -> Result<()> {
         let (done_tx, done_rx) = oneshot::channel();
         self.cmd_tx

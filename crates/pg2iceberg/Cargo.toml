@@ -46,6 +46,8 @@ tokio = { version = "1", features = [
     "signal",
     "time",
     "sync",
+    "net",
+    "io-util",
 ] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -55,6 +57,10 @@ anyhow = "1"
 # Parses `pg2iceberg maintain --retention 168h` style durations.
 humantime = "2"
 tracing = "0.1"
+# The /metrics, /healthz and /readyz endpoint (see `telemetry.rs`).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["v4"] }

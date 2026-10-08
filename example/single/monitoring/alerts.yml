@@ -1,0 +1,76 @@
+# Alerts on pg2iceberg's metrics; see docs/usage/observability.md. The
+# thresholds suit this example: tune them to your workload and SLOs.
+groups:
+  - name: pg2iceberg
+    rules:
+      - alert: Pg2icebergDown
+        expr: up{job="pg2iceberg"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "pg2iceberg's endpoint on {{ $labels.instance }} doesn't answer"
+
+      # Nothing completed for 10 minutes: stuck, not slow. /healthz fails
+      # after liveness_timeout (5m) too; this catches a process nothing
+      # restarts.
+      - alert: Pg2icebergStuck
+        expr: time() - max by (instance) (pg2iceberg_last_success_timestamp_seconds) > 600
+        labels: {severity: critical}
+        annotations:
+          summary: "pg2iceberg on {{ $labels.instance }} has completed nothing for {{ $value | humanizeDuration }}"
+
+      - alert: Pg2icebergReplicationLag
+        expr: pg2iceberg_replication_lag_bytes > 1e9
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "pg2iceberg is {{ $value | humanize1024 }}B of WAL behind"
+
+      # Postgres removes the slot's WAL at the next checkpoint (unreserved),
+      # or already has (lost: the tables need snapshotting again).
+      - alert: Pg2icebergSlotLosingWal
+        expr: pg2iceberg_slot_wal_status{status=~"unreserved|lost"} == 1
+        labels: {severity: critical}
+        annotations:
+          summary: "replication slot wal_status is {{ $labels.status }}"
+
+      # How stale a table is matters only while it has rows to catch up on:
+      # a table nobody writes to is current however old its last commit.
+      - alert: Pg2icebergTableStale
+        expr: >
+          time() - pg2iceberg_materializer_source_commit_timestamp_seconds > 900
+          and on (table) pg2iceberg_materializer_backlog_rows > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.table }} in Iceberg is {{ $value | humanizeDuration }} behind Postgres"
+
+      - alert: Pg2icebergInvariantViolation
+        expr: increase(pg2iceberg_invariant_violations_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "pg2iceberg invariant {{ $labels.invariant }} broke"
+
+      - alert: Pg2icebergReconnecting
+        expr: increase(pg2iceberg_replication_reconnects_total{outcome="error"}[10m]) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: "pg2iceberg keeps failing to reopen replication"
+
+      - alert: Pg2icebergMaterializerFailing
+        expr: increase(pg2iceberg_materializer_cycle_failures_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "materializer cycles are failing on {{ $labels.instance }}"
+
+      - alert: Pg2icebergRequestErrors
+        expr: >
+          sum by (instance) (
+            rate(pg2iceberg_catalog_request_errors_total[5m])
+            or rate(pg2iceberg_blob_request_errors_total[5m])
+            or rate(pg2iceberg_coord_request_errors_total[5m])
+          ) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "requests to the catalog, object store or coordinator keep failing"

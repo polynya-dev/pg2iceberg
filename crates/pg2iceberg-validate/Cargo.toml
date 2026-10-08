@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes = "1"
 pg2iceberg-core.workspace = true
 pg2iceberg-pg.workspace = true
 pg2iceberg-coord.workspace = true

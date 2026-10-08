@@ -147,7 +147,7 @@ fn pipeline_flush_emits_counter_and_gauge() {
 
     let no_labels = Labels::new();
     let mut table_labels = Labels::new();
-    table_labels.insert("table".into(), "orders".into());
+    table_labels.insert("table".into(), ident().to_string());
 
     assert_eq!(
         h.metrics
@@ -180,7 +180,7 @@ fn materializer_cycle_emits_counters_per_table() {
     block_on(h.materializer.cycle()).unwrap();
 
     let mut table_labels = Labels::new();
-    table_labels.insert("table".into(), "orders".into());
+    table_labels.insert("table".into(), ident().to_string());
 
     assert_eq!(
         h.metrics

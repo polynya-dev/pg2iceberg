@@ -2085,6 +2085,7 @@ impl PgClient for SimPgClient {
             wal_status,
             conflicting: s.conflicting,
             safe_wal_size: Some(s.safe_wal_size),
+            current_wal_lsn: Some(self.db.current_lsn()),
         }))
     }
 

@@ -3561,7 +3561,10 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "http-body-util",
  "humantime",
+ "hyper",
+ "hyper-util",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
@@ -3774,6 +3777,7 @@ name = "pg2iceberg-validate"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "pg2iceberg-coord",
  "pg2iceberg-core",
  "pg2iceberg-iceberg",

@@ -12,7 +12,7 @@ pub mod schema;
 pub mod typemap;
 pub mod value;
 
-pub use metrics::{InMemoryMetrics, Labels, Metrics, NoopMetrics};
+pub use metrics::{InMemoryMetrics, Labels, Metrics, NoopMetrics, Phase, Registry};
 
 pub use event::{is_snapshot_xid, ChangeEvent, ColumnName, Op, Row, SNAPSHOT_XID_BASE};
 pub use io::{Clock, IdGen, Spawner, Timestamp, WorkerId};

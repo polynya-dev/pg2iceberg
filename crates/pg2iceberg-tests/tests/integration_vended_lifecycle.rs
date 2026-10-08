@@ -302,6 +302,7 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
         },
         state: StateConfig::default(),
         metrics_addr: String::new(),
+        liveness_timeout: String::new(),
         snapshot_only: false,
     }
 }

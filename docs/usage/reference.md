@@ -19,14 +19,16 @@ Logging follows `RUST_LOG` (default `info,pg2iceberg=debug`), e.g. `RUST_LOG=war
 
 ## Metrics
 
-pg2iceberg exposes Prometheus metrics on `:9090/metrics`.
+`run`, `stream-only`, `materializer-only` and `snapshot` serve Prometheus metrics on `:9090/metrics` (`metrics_addr`), with `/healthz` and `/readyz` beside it. A few to start with:
 
 | Metric | Description |
 |--------|-------------|
-| `pg2iceberg_lsn_lag_bytes` | WAL bytes between current LSN and confirmed flush LSN |
-| `pg2iceberg_rows_written_total` | Total rows written to Iceberg, by table |
-| `pg2iceberg_flush_duration_seconds` | Histogram of Iceberg flush durations |
-| `pg2iceberg_snapshot_rows_total` | Rows written during initial snapshot, by table |
+| `pg2iceberg_replication_lag_bytes` | WAL the source has written past the slot's confirmed position |
+| `pg2iceberg_materializer_backlog_rows` | Rows staged but not yet in Iceberg, by table |
+| `pg2iceberg_materializer_source_commit_timestamp_seconds` | Source commit time of the newest change in Iceberg, by table |
+| `pg2iceberg_last_success_timestamp_seconds` | When each stage (flush, ack, materialize, watch) last completed |
+
+[Observability](observability.md) lists every metric and what to alert on.
 
 ## Troubleshooting
 
@@ -40,7 +42,7 @@ pg2iceberg exposes Prometheus metrics on `:9090/metrics`.
     WHERE slot_name = 'pg2iceberg';
     ```
 
-    A large lag typically means pg2iceberg is not running or is failing to flush. Check `pg2iceberg_flush_duration_seconds` and application logs.
+    A large lag typically means pg2iceberg is not running or is failing to flush. Check `pg2iceberg_last_success_timestamp_seconds`, the request errors and latencies on [`/metrics`](observability.md), and the logs.
 
 ??? question "Tables are missing from the Iceberg catalog"
 

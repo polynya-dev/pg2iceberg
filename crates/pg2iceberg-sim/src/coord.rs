@@ -202,6 +202,13 @@ impl Coordinator for MemoryCoordinator {
         after_offset: u64,
         limit: usize,
     ) -> Result<Vec<LogEntry>> {
+        // As Postgres's bigint parameters bound them in prod.
+        if i64::try_from(after_offset).is_err() {
+            return Err(CoordError::Other("after_offset > i64".into()));
+        }
+        if i64::try_from(limit).is_err() {
+            return Err(CoordError::Other("limit > i64".into()));
+        }
         let state = self.state.lock().unwrap();
         let mut out: Vec<LogEntry> = state
             .log

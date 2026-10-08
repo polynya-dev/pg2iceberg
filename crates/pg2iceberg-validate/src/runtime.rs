@@ -20,10 +20,12 @@
 //! Coordinator and Materializer's Catalog. Crash-and-restart, signal
 //! handling, and the `select!` itself stay in the binary.
 
-use crate::watcher::{InvariantViolation, InvariantWatcher, WatcherInputs};
+use crate::instrument::Instrumented;
+use crate::watcher::{record_slot_health, InvariantViolation, InvariantWatcher, WatcherInputs};
 use crate::{validate_startup, SlotState, StartupValidation, TableExistence};
 use pg2iceberg_coord::Coordinator;
-use pg2iceberg_core::{Clock, IdGen, Lsn, TableIdent, TableSchema, Timestamp};
+use pg2iceberg_core::metrics::{labels, names, Labels};
+use pg2iceberg_core::{Clock, IdGen, Lsn, Metrics, Phase, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
 use pg2iceberg_logical::{
     materializer::MaterializerNamer,
@@ -221,9 +223,10 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     pub materializer_namer: Arc<dyn MaterializerNamer>,
     /// Pipeline blob namer.
     pub blob_namer: Arc<dyn BlobNamer>,
-    /// Metrics surface. `InMemoryMetrics` for tests + the binary;
-    /// follow-on Prometheus exporter wraps the same trait.
-    pub metrics: Arc<dyn pg2iceberg_core::Metrics>,
+    /// Metrics surface: the binary's [`Registry`](pg2iceberg_core::Registry),
+    /// tests' `InMemoryMetrics`. The lifecycle records the requests it
+    /// makes of `coord`, `catalog` and `blob` into it too ([`Instrumented`]).
+    pub metrics: Arc<dyn Metrics>,
     /// Blue-green marker mode. When `Some(meta_namespace)`,
     /// pg2iceberg watches `_pg2iceberg.markers` in the source PG
     /// (auto-included in the publication) and emits
@@ -276,6 +279,71 @@ pub type SnapshotSourceFactory = Box<dyn FnOnce(&[TableSchema]) -> SnapshotSourc
 /// publication, advancing the slot before the snapshot is durable)
 /// surface in fault tests automatically.
 pub async fn run_logical_lifecycle<Cat, F>(
+    lc: LogicalLifecycle<Cat>,
+    shutdown: F,
+) -> Result<(), LifecycleError>
+where
+    Cat: Catalog + 'static,
+    F: Future<Output = ()> + Unpin + Send,
+{
+    Phase::Starting.set(lc.metrics.as_ref());
+    run_instrumented_lifecycle(instrument(lc), shutdown).await
+}
+
+/// `lc`, recording the requests it makes of its catalog, object store
+/// and coordinator into its metrics (see [`Instrumented`]).
+fn instrument<Cat: Catalog + 'static>(
+    lc: LogicalLifecycle<Cat>,
+) -> LogicalLifecycle<Instrumented<Cat>> {
+    let LogicalLifecycle {
+        pg,
+        slot_monitor,
+        coord,
+        catalog,
+        blob,
+        clock,
+        id_gen,
+        schemas,
+        skip_snapshot_idents,
+        slot_name,
+        publication_name,
+        group,
+        schedule,
+        compaction,
+        flush_rows,
+        mat_batch_rows,
+        snapshot_source_factory,
+        materializer_namer,
+        blob_namer,
+        metrics,
+        meta_namespace,
+    } = lc;
+    LogicalLifecycle {
+        pg,
+        slot_monitor,
+        coord: Arc::new(Instrumented::new(coord, metrics.clone(), clock.clone())),
+        catalog: Arc::new(Instrumented::new(catalog, metrics.clone(), clock.clone())),
+        blob: Arc::new(Instrumented::new(blob, metrics.clone(), clock.clone())),
+        clock,
+        id_gen,
+        schemas,
+        skip_snapshot_idents,
+        slot_name,
+        publication_name,
+        group,
+        schedule,
+        compaction,
+        flush_rows,
+        mat_batch_rows,
+        snapshot_source_factory,
+        materializer_namer,
+        blob_namer,
+        metrics,
+        meta_namespace,
+    }
+}
+
+async fn run_instrumented_lifecycle<Cat, F>(
     lc: LogicalLifecycle<Cat>,
     shutdown: F,
 ) -> Result<(), LifecycleError>
@@ -413,11 +481,12 @@ where
     }
 
     // 3. Build pipeline + materializer + register tables.
-    let mut pipeline = Pipeline::new(
+    let mut pipeline = Pipeline::with_metrics(
         Arc::clone(&lc.coord),
         Arc::clone(&lc.blob),
         Arc::clone(&lc.blob_namer),
         lc.flush_rows,
+        Arc::clone(&lc.metrics),
     );
     // It consumes the replication stream; a restart resumes past what
     // it staged.
@@ -449,13 +518,14 @@ where
     if lc.meta_namespace.is_some() {
         pipeline.enable_markers(markers_table_ident.clone());
     }
-    let mut materializer: Materializer<Cat> = Materializer::new(
+    let mut materializer: Materializer<Cat> = Materializer::with_metrics(
         Arc::clone(&lc.coord),
         Arc::clone(&lc.blob),
         Arc::clone(&lc.catalog),
         Arc::clone(&lc.materializer_namer),
         &lc.group,
         lc.mat_batch_rows,
+        Arc::clone(&lc.metrics),
     );
     materializer.set_catalog_cache_ttl(
         Arc::clone(&lc.clock),
@@ -555,6 +625,7 @@ where
                 snap_lsn = ?source.snapshot_lsn().await?,
                 "snapshot phase starting"
             );
+            Phase::Snapshotting.set(lc.metrics.as_ref());
             // Look up `pg_class.oid` for each schema so the snapshotter
             // can stamp `cp.snapshoted_table_oids` on completion. This
             // is what powers startup invariant 11 (TableIdentityChanged)
@@ -707,6 +778,7 @@ where
     let watched_tables = table_idents.clone();
     let watcher = InvariantWatcher::new(Arc::clone(&lc.coord), Arc::clone(&lc.metrics));
     let slot_monitor = lc.slot_monitor.clone();
+    Phase::Running.set(lc.metrics.as_ref());
     let loop_state = LogicalLoop {
         pipeline,
         materializer,
@@ -726,6 +798,7 @@ where
         compaction: lc.compaction,
         pending_snapshot_rx,
         pending_snapshot_handle,
+        metrics: lc.metrics,
     };
     run_logical_main_loop(loop_state, shutdown).await
 }
@@ -856,6 +929,9 @@ pub struct LogicalLoop<C: Coordinator + ?Sized + 'static, Cat: Catalog + 'static
     /// shutdown so the task gets a chance to flush its final
     /// chunks; aborted on hard shutdown if we can't wait.
     pub pending_snapshot_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Where the loop records how its handlers and the stream fare. The
+    /// pipeline, materializer and watcher record into their own.
+    pub metrics: Arc<dyn Metrics>,
 }
 
 /// Per-table completion message from a background snapshot task to
@@ -1058,7 +1134,12 @@ where
             _ = shutdown.as_mut() => return Ok(false),
             _ = tokio::time::sleep(reconnect_delay(outage.attempts)) => {}
         }
-        match open_stream(loop_state).await {
+        let opened = open_stream(loop_state).await;
+        let outcome = labels([("outcome", if opened.is_ok() { "ok" } else { "error" })]);
+        loop_state
+            .metrics
+            .counter(names::REPLICATION_RECONNECTS_TOTAL, &outcome, 1);
+        match opened {
             Ok(stream) => {
                 loop_state.stream = stream;
                 outage.reopened_at = Some(loop_state.clock.now());
@@ -1124,11 +1205,19 @@ where
     match h {
         Handler::Flush => {
             loop_state.pipeline.flush().await?;
+            loop_state.metrics.gauge(
+                names::REPLICATION_BUFFERED_MESSAGES,
+                &Labels::new(),
+                loop_state.stream.buffered() as f64,
+            );
+            succeeded(loop_state, "flush");
         }
         Handler::Standby => {
             // A failed ack is retried next tick; a dropped stream, the
             // next recv reopens.
-            let _ = record_and_ack(loop_state).await;
+            if record_and_ack(loop_state).await.1.is_ok() {
+                succeeded(loop_state, "ack");
+            }
         }
         Handler::Materialize => {
             // `cycle` failure is fatal (propagates); compaction
@@ -1139,6 +1228,7 @@ where
             if let Some(err) = outcome.compaction_error {
                 tracing::warn!(error = %err, "materializer.compact_cycle failed");
             }
+            succeeded(loop_state, "materialize");
         }
         Handler::Watcher => {
             // One combined slot probe per tick covers every health
@@ -1157,6 +1247,7 @@ where
                 .await
                 .ok()
                 .flatten();
+            record_slot_health(loop_state.metrics.as_ref(), health.as_ref());
             let confirmed = health
                 .as_ref()
                 .map(|h| h.confirmed_flush_lsn)
@@ -1189,9 +1280,23 @@ where
             if let Some(fatal) = violations.iter().find(|v| v.is_fatal()) {
                 return Err(MainLoopError::SlotHealth(fatal.to_string()));
             }
+            succeeded(loop_state, "watch");
         }
     }
     Ok(())
+}
+
+/// Record that `stage` just completed ([`names::LAST_SUCCESS`]).
+fn succeeded<C, Cat>(loop_state: &LogicalLoop<C, Cat>, stage: &str)
+where
+    C: Coordinator + ?Sized + 'static,
+    Cat: Catalog + 'static,
+{
+    loop_state.metrics.gauge(
+        names::LAST_SUCCESS,
+        &labels([("stage", stage)]),
+        loop_state.clock.now().0 as f64 / 1e6,
+    );
 }
 
 /// Record how far the pipeline has staged, then ack the slot up to the
@@ -1242,6 +1347,7 @@ where
     C: Coordinator + ?Sized + 'static,
     Cat: Catalog + 'static,
 {
+    Phase::Stopping.set(loop_state.metrics.as_ref());
     if let Err(e) = loop_state.pipeline.flush().await {
         tracing::warn!(error = %e, "final flush failed");
     }

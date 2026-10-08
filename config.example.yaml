@@ -130,3 +130,9 @@ state:
   # postgres_url: postgres://coord_user:secret@coord-db.example.com/coord?sslmode=require
   coordinator_schema: _pg2iceberg
   # group: default
+
+# /metrics (Prometheus), /healthz and /readyz, served by run, stream-only,
+# materializer-only and snapshot. `off` serves nothing.
+# metrics_addr: ":9090"
+# /healthz fails once nothing has completed for this long: stuck, not slow.
+# liveness_timeout: 5m

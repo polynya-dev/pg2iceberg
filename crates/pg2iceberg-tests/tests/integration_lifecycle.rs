@@ -31,7 +31,8 @@ use pg2iceberg::config::{
     Config, LogicalConfig, PostgresConfig, SinkConfig, SourceConfig, StateConfig, TableConfig,
 };
 use pg2iceberg::run::build_rest_catalog;
-use pg2iceberg_core::{ColumnName, Namespace, PgValue, TableIdent};
+use pg2iceberg_core::metrics::{labels, names, Labels};
+use pg2iceberg_core::{ColumnName, Namespace, PgValue, Phase, TableIdent};
 use pg2iceberg_iceberg::{prod::IcebergRustCatalog, read_materialized_state};
 use testcontainers::core::IntoContainerPort;
 use testcontainers::core::WaitFor;
@@ -261,6 +262,7 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             group: "default".into(),
         },
         metrics_addr: String::new(),
+        liveness_timeout: String::new(),
         snapshot_only: false,
     }
 }
@@ -383,15 +385,24 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         .expect("build storage");
     let blob = storage.blob.clone();
 
-    let lifecycle = pg2iceberg::setup::build_logical_lifecycle(&cfg, lifecycle_catalog, storage)
-        .await
-        .expect("build lifecycle");
+    // The metrics `pg2iceberg run` serves.
+    let telemetry = pg2iceberg::telemetry::Telemetry::new(Duration::from_secs(300));
+    let mut lifecycle = pg2iceberg::setup::build_logical_lifecycle(
+        &cfg,
+        lifecycle_catalog,
+        storage,
+        telemetry.metrics(),
+    )
+    .await
+    .expect("build lifecycle");
     let second = std::time::Duration::from_secs(1);
     assert_eq!(
         (lifecycle.schedule.flush, lifecycle.schedule.materialize),
         (second, second),
         "the configured intervals"
     );
+    // The watcher reads the slot every 30s: sooner, so this run sees it.
+    lifecycle.schedule.watcher = second;
 
     // Drive the lifecycle inline (rather than via tokio::spawn —
     // tracing's `Arguments<'_>` / `dyn Value` aren't Send so the
@@ -551,6 +562,50 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
             result.expect("lifecycle ran to clean shutdown");
         }
     }
+
+    // What the run recorded against real Postgres, catalog and MinIO.
+    let metrics = telemetry.registry();
+    let table_label = ident.to_string();
+    let inserts = labels([("table", &table_label), ("op", "insert")]);
+    assert!(
+        metrics.counter_value(names::PIPELINE_CHANGES_TOTAL, &inserts) >= 6,
+        "{}",
+        metrics.render()
+    );
+    let reopened = labels([("outcome", "ok")]);
+    assert!(metrics.counter_value(names::REPLICATION_RECONNECTS_TOTAL, &reopened) >= 1);
+    // The slot query reads the server's WAL position.
+    assert!(metrics
+        .gauge_value(names::REPLICATION_LAG, &Labels::new())
+        .is_some());
+    let status = labels([("status", "reserved")]);
+    assert!(metrics
+        .gauge_value(names::SLOT_WAL_STATUS, &status)
+        .is_some());
+    let commits = labels([("op", "commit_snapshots")]);
+    assert!(metrics.histogram_count(names::CATALOG_REQUEST_DURATION, &commits) > 0);
+    assert!(metrics.counter_value(names::BLOB_BYTES_TOTAL, &labels([("op", "put")])) > 0);
+    let claims = labels([("op", "claim_offsets")]);
+    assert!(metrics.histogram_count(names::COORD_REQUEST_DURATION, &claims) > 0);
+    let table = labels([("table", &table_label)]);
+    assert!(metrics.counter_value(names::MATERIALIZER_COMMITS_TOTAL, &table) > 0);
+    // The watcher reads the log past the cursor of the real coordinator,
+    // which bounds a read's limit.
+    assert!(metrics
+        .gauge_value(names::MATERIALIZER_BACKLOG_ROWS, &table)
+        .is_some());
+    let read_log = labels([("op", "read_log")]);
+    assert_eq!(
+        metrics.counter_value(names::COORD_REQUEST_ERRORS_TOTAL, &read_log),
+        0
+    );
+    assert!(
+        metrics
+            .gauge_value(names::MATERIALIZER_SOURCE_TIMESTAMP, &table)
+            .is_some_and(|ts| ts > 1_600_000_000.0),
+        "a commit time in Unix seconds"
+    );
+    assert_eq!(metrics.phase(), Some(Phase::Stopping));
 }
 
 /// Poll Iceberg until the table reads `expected` (id → balance), or

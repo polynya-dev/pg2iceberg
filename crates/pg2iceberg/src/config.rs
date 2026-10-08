@@ -50,10 +50,36 @@ pub struct Config {
     pub sink: SinkConfig,
     #[serde(default)]
     pub state: StateConfig,
+    /// Where long-running subcommands serve `/metrics`, `/healthz` and
+    /// `/readyz`: `host:port`, or `:port` for every interface. Empty:
+    /// [`DEFAULT_METRICS_ADDR`]. `off` serves nothing. See
+    /// [`Self::metrics_addr`].
     #[serde(default)]
     pub metrics_addr: String,
+    /// How long nothing may complete before `/healthz` calls the process
+    /// stuck, e.g. `5m`. Empty: [`DEFAULT_LIVENESS_TIMEOUT`].
+    #[serde(default)]
+    pub liveness_timeout: String,
     #[serde(default)]
     pub snapshot_only: bool,
+}
+
+/// Where `/metrics` is served unless `metrics_addr` says otherwise.
+pub const DEFAULT_METRICS_ADDR: &str = ":9090";
+
+/// `liveness_timeout` unless set.
+pub const DEFAULT_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Where to serve `/metrics` (see [`Config::metrics_addr`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetricsAddr {
+    /// `metrics_addr: off`.
+    Off,
+    /// [`DEFAULT_METRICS_ADDR`], `metrics_addr` being unset: an address
+    /// already in use is worth a warning, not a failed start.
+    Default(String),
+    /// The address `metrics_addr` names.
+    Configured(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -606,7 +632,54 @@ impl Config {
         self.validate_mode()?;
         self.validate_tables()?;
         self.sink.schedule()?;
+        self.metrics_addr()?;
+        self.liveness_timeout()?;
         Ok(self)
+    }
+
+    /// Where to serve `/metrics`, `/healthz` and `/readyz`, as an address
+    /// to bind: `:port` reads as every IPv4 interface.
+    pub fn metrics_addr(&self) -> Result<MetricsAddr> {
+        let addr = self.metrics_addr.trim();
+        if addr.eq_ignore_ascii_case("off") {
+            return Ok(MetricsAddr::Off);
+        }
+        let (configured, addr) = match addr {
+            "" => (false, DEFAULT_METRICS_ADDR),
+            addr => (true, addr),
+        };
+        let invalid = || {
+            anyhow::anyhow!(
+                "metrics_addr {addr:?}: expected host:port, :port, or off \
+                 (PG2ICEBERG_METRICS_ADDR)"
+            )
+        };
+        let (host, port) = addr.rsplit_once(':').ok_or_else(invalid)?;
+        port.parse::<u16>().map_err(|_| invalid())?;
+        let addr = if host.is_empty() {
+            format!("0.0.0.0:{port}")
+        } else {
+            addr.to_string()
+        };
+        Ok(if configured {
+            MetricsAddr::Configured(addr)
+        } else {
+            MetricsAddr::Default(addr)
+        })
+    }
+
+    /// How long nothing may complete before `/healthz` calls the process
+    /// stuck.
+    pub fn liveness_timeout(&self) -> Result<std::time::Duration> {
+        if self.liveness_timeout.is_empty() {
+            return Ok(DEFAULT_LIVENESS_TIMEOUT);
+        }
+        let d = humantime::parse_duration(&self.liveness_timeout)
+            .with_context(|| format!("parse liveness_timeout `{}`", self.liveness_timeout))?;
+        if d.is_zero() {
+            anyhow::bail!("liveness_timeout must be longer than zero");
+        }
+        Ok(d)
     }
 
     /// Parse YAML, with `${NAME}` in its string values replaced by the
@@ -635,6 +708,8 @@ impl Config {
     /// | `ICEBERG_WAREHOUSE` | `sink.warehouse` |
     /// | `ICEBERG_NAMESPACE` | `sink.namespace` |
     /// | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` |
+    /// | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` |
+    /// | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` |
     ///
     /// AWS's own variables fill in only what the file leaves out:
     /// `AWS_REGION` / `AWS_DEFAULT_REGION` for `sink.s3_region`, and
@@ -668,6 +743,8 @@ impl Config {
         set(&mut self.sink.warehouse, "ICEBERG_WAREHOUSE");
         set(&mut self.sink.namespace, "ICEBERG_NAMESPACE");
         set(&mut self.sink.credential_mode, "ICEBERG_CREDENTIAL_MODE");
+        set(&mut self.metrics_addr, "PG2ICEBERG_METRICS_ADDR");
+        set(&mut self.liveness_timeout, "PG2ICEBERG_LIVENESS_TIMEOUT");
         if let Some(tables) = env("PG2ICEBERG_TABLES") {
             self.tables = tables
                 .split(|c: char| c == ',' || c.is_whitespace())
@@ -1663,5 +1740,65 @@ sink:
         assert!(err.contains("public.*"), "{err}");
         cfg.tables = vec![TableConfig::named("public.*")];
         cfg.validate_tables().unwrap();
+    }
+
+    #[test]
+    fn metrics_are_served_on_9090_unless_configured() {
+        let addr = |value: &str| {
+            Config {
+                metrics_addr: value.into(),
+                ..Config::default()
+            }
+            .metrics_addr()
+        };
+        assert_eq!(
+            addr("").unwrap(),
+            MetricsAddr::Default("0.0.0.0:9090".into())
+        );
+        assert_eq!(
+            addr(":9187").unwrap(),
+            MetricsAddr::Configured("0.0.0.0:9187".into())
+        );
+        assert_eq!(
+            addr("127.0.0.1:9090").unwrap(),
+            MetricsAddr::Configured("127.0.0.1:9090".into())
+        );
+        assert_eq!(
+            addr("[::]:9090").unwrap(),
+            MetricsAddr::Configured("[::]:9090".into())
+        );
+        assert_eq!(addr("off").unwrap(), MetricsAddr::Off);
+        for bad in ["9090", "host", ":port", ":99999"] {
+            assert!(addr(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn metrics_settings_come_from_the_environment_too() {
+        let cfg = Config::from_env(&vars(&[
+            ("PG2ICEBERG_METRICS_ADDR", "off"),
+            ("PG2ICEBERG_LIVENESS_TIMEOUT", "90s"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.metrics_addr().unwrap(), MetricsAddr::Off);
+        assert_eq!(
+            cfg.liveness_timeout().unwrap(),
+            std::time::Duration::from_secs(90)
+        );
+        let defaults = Config::from_env(&vars(&[])).unwrap();
+        assert_eq!(
+            defaults.liveness_timeout().unwrap(),
+            DEFAULT_LIVENESS_TIMEOUT
+        );
+        for (name, value) in [
+            ("PG2ICEBERG_METRICS_ADDR", "9090"),
+            ("PG2ICEBERG_LIVENESS_TIMEOUT", "0s"),
+            ("PG2ICEBERG_LIVENESS_TIMEOUT", "soon"),
+        ] {
+            assert!(
+                Config::from_env(&vars(&[(name, value)])).is_err(),
+                "{name}={value}"
+            );
+        }
     }
 }

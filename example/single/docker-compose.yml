@@ -1,5 +1,6 @@
 # Postgres -> pg2iceberg -> Iceberg REST catalog + MinIO, with ClickHouse to
-# query the tables and a mixed workload to drive Postgres. See README.md.
+# query the tables, a mixed workload to drive Postgres, and Prometheus +
+# Grafana to watch pg2iceberg. See README.md.
 name: pg2iceberg-single
 services:
   postgres:
@@ -87,6 +88,8 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: info
+    # /metrics, /healthz and /readyz.
+    ports: ["9091:9090"]
     volumes:
       - ./config.yaml:/etc/pg2iceberg/config.yaml:ro
     depends_on:
@@ -117,3 +120,26 @@ services:
       - ./workload.py:/app/workload.py
     working_dir: /app
     command: sh -c "pip install -q psycopg2-binary && python -u workload.py"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["monitoring"]
+    ports: ["9090:9090"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["monitoring"]
+    ports: ["3000:3000"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/pg2iceberg.json
+    volumes:
+      - ./monitoring/grafana/datasources.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/pg2iceberg.yml:ro
+      - ./monitoring/grafana/pg2iceberg.json:/etc/grafana/dashboards/pg2iceberg.json:ro
+    depends_on: [prometheus]
