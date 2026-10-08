@@ -471,6 +471,25 @@ fn is_tx_boundary(last: Option<&MatEvent>, next: Option<&MatEvent>) -> bool {
     }
 }
 
+/// Who maintains the materialized tables: compacts them, expires their
+/// snapshots, removes their orphan files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Maintenance {
+    /// pg2iceberg: it compacts as it materializes, and `maintain` expires
+    /// and cleans up. It's then the tables' only writer.
+    #[default]
+    Pg2iceberg,
+    /// Their catalog, as managed catalogs do (S3 Tables, R2 Data Catalog,
+    /// Glue's table optimizers): it commits to the tables itself, as
+    /// another engine. pg2iceberg leaves their data files, snapshots and
+    /// unreferenced files to it — two compactions race each other, and
+    /// only the catalog knows which unreferenced files are its writes in
+    /// flight — but retires the delete files its compaction leaves
+    /// behind. And it rereads what it knows of the tables every cycle:
+    /// the catalog's commits tell no pg2iceberg process.
+    Managed,
+}
+
 pub struct Materializer<C: Catalog> {
     coord: Arc<dyn Coordinator>,
     blob_store: Arc<dyn BlobStore>,
@@ -516,6 +535,7 @@ pub struct Materializer<C: Catalog> {
     /// controls how long a missed heartbeat survives before the
     /// worker drops out of the active list.
     distributed: Option<DistributedMode>,
+    maintenance: Maintenance,
 }
 
 /// Distributed-mode parameters. Built by
@@ -635,6 +655,7 @@ impl<C: Catalog> Materializer<C> {
             meta_marker: None,
             meta_recorder: None,
             distributed: None,
+            maintenance: Maintenance::default(),
         }
     }
 
@@ -1330,6 +1351,14 @@ impl<C: Catalog> Materializer<C> {
         Ok(())
     }
 
+    /// Who maintains the tables (default: pg2iceberg). See
+    /// [`Maintenance`].
+    pub fn set_maintenance(&mut self, maintenance: Maintenance) {
+        self.maintenance = maintenance;
+        self.catalog
+            .set_other_writers(maintenance == Maintenance::Managed);
+    }
+
     /// Enable distributed-materializer mode. Subsequent [`Self::cycle`]
     /// calls will heartbeat this worker, read the active-worker
     /// list, and round-robin tables across workers. Pass a stable,
@@ -1548,6 +1577,10 @@ impl<C: Catalog> Materializer<C> {
         now_ms: i64,
         grace_period_ms: i64,
     ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CleanupOutcome)>> {
+        if self.maintenance == Maintenance::Managed {
+            tracing::info!("the catalog maintains the tables: leaving orphan cleanup to it");
+            return Ok(Vec::new());
+        }
         self.catalog.sync().await;
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
@@ -1599,6 +1632,10 @@ impl<C: Catalog> Materializer<C> {
     /// when meta recording is enabled, with `operation =
     /// "expire_snapshots"`.
     pub async fn expire_cycle(&mut self, retention_ms: i64) -> Result<Vec<(TableIdent, usize)>> {
+        if self.maintenance == Maintenance::Managed {
+            tracing::info!("the catalog maintains the tables: leaving snapshot expiry to it");
+            return Ok(Vec::new());
+        }
         self.catalog.sync().await;
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
@@ -1666,28 +1703,44 @@ impl<C: Catalog> Materializer<C> {
 
         let namer = self.namer.clone();
         let started_micros = now_micros();
-        let outcome = pg2iceberg_iceberg::compact_table(
-            self.catalog.as_ref(),
-            self.blob_store.as_ref(),
-            move |t, _idx| {
-                let n = namer.clone();
-                let t = t.clone();
-                // Compaction always rewrites whole partitions, so
-                // we don't yet thread per-partition compaction
-                // outputs into separate dirs. The empty segment
-                // groups all compaction outputs under
-                // `<table>/compact/`.
-                async move { n.next_path(&t, "compact", "").await }
-            },
-            ident,
-            &schema,
-            &pk_cols,
-            // Lets the pass find files with deleted rows without reading
-            // the table; the index tracks exactly this catalog's state.
-            Some(&entry.file_index),
-            config,
-        )
-        .await;
+        let outcome = match self.maintenance {
+            Maintenance::Pg2iceberg => {
+                pg2iceberg_iceberg::compact_table(
+                    self.catalog.as_ref(),
+                    self.blob_store.as_ref(),
+                    move |t, _idx| {
+                        let n = namer.clone();
+                        let t = t.clone();
+                        // Compaction always rewrites whole partitions, so
+                        // we don't yet thread per-partition compaction
+                        // outputs into separate dirs. The empty segment
+                        // groups all compaction outputs under
+                        // `<table>/compact/`.
+                        async move { n.next_path(&t, "compact", "").await }
+                    },
+                    ident,
+                    &schema,
+                    &pk_cols,
+                    // Lets the pass find files with deleted rows without
+                    // reading the table; the index tracks exactly this
+                    // catalog's state.
+                    Some(&entry.file_index),
+                    config,
+                )
+                .await
+            }
+            // The catalog rewrites the data files; the deletes its
+            // rewrites leave behind are pg2iceberg's to retire.
+            Maintenance::Managed => {
+                pg2iceberg_iceberg::retire_deletes(
+                    self.catalog.as_ref(),
+                    ident,
+                    Some(&entry.file_index),
+                    config,
+                )
+                .await
+            }
+        };
         let table = ident.to_string();
         let ran = |outcome: &str| labels([("table", &table), ("outcome", outcome)]);
         if !matches!(outcome, Ok(None)) {

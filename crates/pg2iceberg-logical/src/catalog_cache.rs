@@ -6,6 +6,10 @@
 //! read of a table stays true until one of them writes it. Each catalog
 //! call is a round trip, often to a catalog and object store across the
 //! internet; a materializer makes several per table per cycle.
+//!
+//! Unless the catalog maintains the tables too (`Maintenance::Managed`):
+//! its commits tell no pg2iceberg process, so nothing read is kept past
+//! the cycle that read it ([`CachingCatalog::set_other_writers`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,6 +47,8 @@ struct State {
     /// Each table's epoch as this process last knew it; 0 = never bumped.
     epochs: HashMap<TableIdent, i64>,
     ttl: Option<(Arc<dyn Clock>, Duration)>,
+    /// Whether something other than pg2iceberg writes the tables.
+    other_writers: bool,
 }
 
 #[derive(Default)]
@@ -104,13 +110,29 @@ impl<C: Catalog> CachingCatalog<C> {
         self.lock().ttl = Some((clock, ttl));
     }
 
+    /// Whether something other than pg2iceberg writes the tables — a
+    /// managed catalog compacting and expiring them. Its writes bump no
+    /// epoch, so then [`Self::sync`] drops everything read: each cycle
+    /// starts from the tables as they are, rereading only those it
+    /// works on.
+    pub fn set_other_writers(&self, other_writers: bool) {
+        self.lock().other_writers = other_writers;
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("catalog cache poisoned")
     }
 
     /// Drop the tables another process wrote since this one last knew,
-    /// and those kept past the TTL.
+    /// and those kept past the TTL — or, with other writers, every one.
     pub async fn sync(&self) {
+        {
+            let mut s = self.lock();
+            if s.other_writers {
+                s.tables.clear();
+                return;
+            }
+        }
         let tables: Vec<TableIdent> = {
             let s = self.lock();
             let known: std::collections::BTreeSet<&TableIdent> =

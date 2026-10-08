@@ -358,6 +358,15 @@ pub struct SinkConfig {
     #[serde(default = "default_maintenance_grace")]
     pub maintenance_grace: String,
 
+    /// Who maintains the tables. `"pg2iceberg"` (or empty): pg2iceberg
+    /// compacts them as it materializes, and `pg2iceberg maintain`
+    /// expires their snapshots and removes orphan files. `"managed"`:
+    /// the catalog does — S3 Tables, R2 Data Catalog, Glue's table
+    /// optimizers — and pg2iceberg only retires the delete files its
+    /// compaction leaves behind. See [`Self::resolved_maintenance`].
+    #[serde(default)]
+    pub maintenance: String,
+
     /// Free-form REST-catalog props passthrough. Useful for
     /// vendor-specific settings (Polaris OAuth2
     /// server URI, etc.) without us having to enumerate every quirk.
@@ -406,6 +415,7 @@ impl Default for SinkConfig {
             target_file_size: default_target_file_size(),
             maintenance_retention: String::new(),
             maintenance_grace: default_maintenance_grace(),
+            maintenance: String::new(),
             catalog_props: BTreeMap::new(),
             meta_namespace: String::new(),
         }
@@ -454,6 +464,17 @@ impl SinkConfig {
         aws_endpoint(&self.catalog_uri)
             .map(|(_, region)| region)
             .unwrap_or_else(|| "us-east-1".into())
+    }
+
+    /// `maintenance`, parsed.
+    pub fn resolved_maintenance(&self) -> Result<pg2iceberg_logical::Maintenance> {
+        match self.maintenance.as_str() {
+            "" | "pg2iceberg" => Ok(pg2iceberg_logical::Maintenance::Pg2iceberg),
+            "managed" => Ok(pg2iceberg_logical::Maintenance::Managed),
+            other => anyhow::bail!(
+                "unknown sink.maintenance {other:?}; expected \"pg2iceberg\" or \"managed\""
+            ),
+        }
     }
 
     /// Translate the Go-shaped sink fields into the iceberg crate's
@@ -634,6 +655,7 @@ impl Config {
         self.sink.schedule()?;
         self.metrics_addr()?;
         self.liveness_timeout()?;
+        self.sink.resolved_maintenance()?;
         Ok(self)
     }
 
@@ -710,6 +732,7 @@ impl Config {
     /// | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` |
     /// | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` |
     /// | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` |
+    /// | `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` |
     ///
     /// AWS's own variables fill in only what the file leaves out:
     /// `AWS_REGION` / `AWS_DEFAULT_REGION` for `sink.s3_region`, and
@@ -745,6 +768,7 @@ impl Config {
         set(&mut self.sink.credential_mode, "ICEBERG_CREDENTIAL_MODE");
         set(&mut self.metrics_addr, "PG2ICEBERG_METRICS_ADDR");
         set(&mut self.liveness_timeout, "PG2ICEBERG_LIVENESS_TIMEOUT");
+        set(&mut self.sink.maintenance, "PG2ICEBERG_MAINTENANCE");
         if let Some(tables) = env("PG2ICEBERG_TABLES") {
             self.tables = tables
                 .split(|c: char| c == ',' || c.is_whitespace())

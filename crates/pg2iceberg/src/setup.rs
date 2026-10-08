@@ -133,6 +133,7 @@ where
         } else {
             None
         },
+        maintenance: cfg.sink.resolved_maintenance()?,
         flush_rows: cfg.sink.flush_rows,
         mat_batch_rows: cfg.sink.materializer_batch_rows,
         snapshot_source_factory,
