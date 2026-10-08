@@ -63,3 +63,14 @@ With `credential_mode: iam`, pg2iceberg uses the AWS SDK default credential chai
 
 !!! note
     S3 Tables manages data storage internally — you do not supply an S3 endpoint or access keys.
+
+## Maintenance
+
+S3 Tables compacts tables, expires their snapshots and removes unreferenced files by default. Leave that to it, and tell pg2iceberg:
+
+```yaml
+sink:
+  maintenance: managed
+```
+
+Or turn S3 Tables' maintenance off for the table (`PutTableMaintenanceConfiguration`) and keep pg2iceberg's. See [Table Maintenance](../architecture/maintenance.md#when-the-catalog-maintains-the-tables).

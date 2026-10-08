@@ -1535,6 +1535,27 @@ sink:
         move |name: &str| map.get(name).cloned()
     }
 
+    /// pg2iceberg maintains the tables unless told the catalog does; a
+    /// value it doesn't know fails the config, not a later `maintain`.
+    #[test]
+    fn maintenance_is_pg2iceberg_unless_the_catalog_manages_it() {
+        use pg2iceberg_logical::Maintenance;
+        let cfg = Config::from_env(&vars(&[])).unwrap();
+        assert_eq!(
+            cfg.sink.resolved_maintenance().unwrap(),
+            Maintenance::Pg2iceberg
+        );
+        let cfg = Config::from_env(&vars(&[("PG2ICEBERG_MAINTENANCE", "managed")])).unwrap();
+        assert_eq!(
+            cfg.sink.resolved_maintenance().unwrap(),
+            Maintenance::Managed
+        );
+        let err = Config::from_env(&vars(&[("PG2ICEBERG_MAINTENANCE", "catalog")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sink.maintenance"), "{err}");
+    }
+
     #[test]
     fn the_environment_alone_is_a_config() {
         let env = vars(&[

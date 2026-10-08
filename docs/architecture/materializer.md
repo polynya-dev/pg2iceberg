@@ -44,6 +44,8 @@ Every pg2iceberg process that writes a table's Iceberg metadata — `run`, the w
 
 A writer that dies between its commit and the bump leaves the epoch behind: long-running processes keep nothing longer than a minute, well inside `maintenance_grace`. Orphan cleanup, which deletes what the table doesn't reference, always reads the catalog.
 
+A catalog that maintains the tables itself (`sink.maintenance: managed`) commits to them without bumping any epoch. Then the materializer forgets what it read at the start of every cycle, and rereads the tables it works on.
+
 ## Merge-on-read
 
 pg2iceberg uses Iceberg's **merge-on-read** write mode. Rather than rewriting existing data files on every update or delete, it appends:

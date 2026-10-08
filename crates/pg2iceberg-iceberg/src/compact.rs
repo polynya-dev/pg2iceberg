@@ -719,6 +719,39 @@ mod tests {
         assert!(deletes.is_empty(), "delete file should be removed");
     }
 
+    /// A delete retires once no dirty data file older than it is left —
+    /// the rule a pass that rewrites nothing still applies.
+    #[test]
+    fn deletes_retire_once_no_older_dirty_file_is_left() {
+        let file = |seq: i64| LiveFile {
+            byte_size: 1,
+            record_count: 2,
+            partition_values: Vec::new(),
+            seq,
+        };
+        let files = |entries: &[(&str, i64)]| -> BTreeMap<String, LiveFile> {
+            entries
+                .iter()
+                .map(|(path, seq)| (path.to_string(), file(*seq)))
+                .collect()
+        };
+        let deletes = files(&[("eq-2", 2), ("eq-4", 4)]);
+        // No index: every data file older than the newest delete is dirty.
+        let is_dirty = dirty_check(&deletes, None);
+        let none = BTreeSet::new();
+
+        // A file from before both: either may apply to it.
+        let retired = retirable_deletes(&files(&[("a", 1), ("b", 3)]), &deletes, &is_dirty, &none);
+        assert!(retired.is_empty(), "{retired:?}");
+        // Rewritten at 3 (a managed catalog's compaction keeps the number
+        // its pass read): `eq-2` has nothing left to apply to.
+        let retired = retirable_deletes(&files(&[("c", 3), ("b", 3)]), &deletes, &is_dirty, &none);
+        assert_eq!(retired, ["eq-2"]);
+        // Nothing older than either.
+        let retired = retirable_deletes(&files(&[("d", 4)]), &deletes, &is_dirty, &none);
+        assert_eq!(retired, ["eq-2", "eq-4"]);
+    }
+
     #[test]
     fn config_default_thresholds_are_reasonable() {
         let c = CompactionConfig::default();

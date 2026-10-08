@@ -4,7 +4,7 @@ pg2iceberg mirrors data from Postgres directly to Iceberg, no Kafka needed. Opin
 - Only supports Postgres as source and Iceberg as destination, nothing else.
 - Mirrors data, i.e. source and target contain the same data. So no such thing as skipping snapshot.
 - Stateless, all state lives in Postgres and S3. This makes operation simple.
-- Assumes pg2iceberg is the sole writer of the Iceberg tables it manages, including compaction.
+- Assumes pg2iceberg is the sole writer of the rows in the Iceberg tables it manages. It compacts and maintains them too, unless their catalog does (`sink.maintenance: managed`).
 
 ```mermaid
 graph LR
@@ -133,8 +133,8 @@ Every subcommand takes its settings from environment variables and an optional c
 | `run` | Long-running pipeline: initial snapshot, then CDC via logical replication. |
 | `snapshot` | One-shot: run the initial snapshot phase per configured table, then exit. Auto-creates the slot first so a later `run` doesn't lose WAL. |
 | `cleanup` | Drop the replication slot, drop the publication, and `DROP SCHEMA … CASCADE` on the coordinator. Resets PG-side state ahead of a re-bootstrap. **Doesn't drop Iceberg tables** — do that out-of-band. |
-| `compact` | One-shot: run a single compaction pass over every configured table, then exit. For cron / k8s `CronJob`. |
-| `maintain` | One-shot: snapshot expiry + orphan-file cleanup over every configured table. Reads `sink.maintenance_retention` / `sink.maintenance_grace`. |
+| `compact` | One-shot: run a single compaction pass over every configured table, then exit. For cron / k8s `CronJob`. With `sink.maintenance: managed`, only retires delete files. |
+| `maintain` | One-shot: snapshot expiry + orphan-file cleanup over every configured table. Reads `sink.maintenance_retention` / `sink.maintenance_grace`. Refuses with `sink.maintenance: managed`. |
 | `verify` | Diff PG ground truth against Iceberg materialized state for every configured table. Exits non-zero on any diff. Day-2 confidence check. |
 | `stream-only` | Distributed mode: WAL writer only; pair with one or more `materializer-only` workers. |
 | `materializer-only --worker-id <id>` | Distributed mode: materializer worker only. Joins the heartbeat group keyed by `state.group`; tables auto-rebalance on join/leave. |
@@ -270,6 +270,7 @@ Settings come from environment variables and an optional YAML file: `--config`, 
 | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` | `static` / `iam` / `vended`. Default: inferred |
 | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` | Where to serve `/metrics`, `/healthz`, `/readyz`. Default `:9090`; `off` serves nothing |
 | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` | `/healthz` fails once nothing completes for this long. Default `5m` |
+| `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` | `pg2iceberg` / `managed` (the catalog compacts, expires and cleans the tables). Default: `pg2iceberg` |
 | `AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, ... | `sink.s3_*` | Read as AWS tools read them; the file's `sink.s3_*` take precedence |
 
 ### Inferred settings

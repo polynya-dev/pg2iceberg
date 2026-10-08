@@ -389,6 +389,46 @@ mod tests {
         }
     }
 
+    /// Another engine — a managed catalog compacting the table — writes
+    /// it without a word to the coordinator. With other writers, a sync
+    /// forgets what was read, so the next cycle sees the table as it is.
+    #[test]
+    fn with_other_writers_a_sync_forgets_what_was_read() {
+        let (coord, _clock) = MemoryCoordinator::with_test_clock(TestClock::at(0));
+        let coord: Arc<dyn Coordinator> = Arc::new(coord);
+        let shared = Arc::new(MemoryCatalog::new());
+        let ours = CachingCatalog::new(shared.clone(), coord);
+        block_on(ours.ensure_namespace(&ident().namespace)).unwrap();
+        block_on(ours.create_table(&schema())).unwrap();
+        let current = |c: &CachingCatalog<MemoryCatalog>| {
+            block_on(c.load_table(&ident()))
+                .unwrap()
+                .unwrap()
+                .current_snapshot_id
+        };
+        let theirs = |n: usize| {
+            block_on(shared.commit_snapshot(append(&format!("s3://t/theirs-{n}.parquet"))))
+                .unwrap();
+        };
+
+        assert_eq!(current(&ours), None);
+        theirs(0);
+        block_on(ours.sync());
+        assert_eq!(
+            current(&ours),
+            None,
+            "no other writers: kept until a pg2iceberg write"
+        );
+
+        ours.set_other_writers(true);
+        block_on(ours.sync());
+        assert_eq!(current(&ours), Some(1));
+        theirs(1);
+        block_on(ours.sync());
+        assert_eq!(current(&ours), Some(2));
+        assert_eq!(block_on(ours.snapshots(&ident())).unwrap().len(), 2);
+    }
+
     /// Another process writes the table after this one's commit lands but
     /// before this one records it: the commit's response is already
     /// stale, and the epoch — moved twice — is what tells.
