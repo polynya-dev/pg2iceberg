@@ -2036,7 +2036,9 @@ impl DstHarness {
         // Compaction errors are non-fatal in the lifecycle; a pass whose
         // commit response was lost applied anyway, and one that lost to
         // another process's pass over the same files plans again next time.
-        match block_on(self.materializer.compact_table(&ident(), &cfg)) {
+        // As `run` and `compact` do: first learning of other processes'
+        // commits.
+        match block_on(self.materializer.compact_cycle(&cfg)) {
             Ok(_) => {
                 // 18. Delete files don't pile up: past a pass, none is
                 //     older than every data file — nothing is left for it
