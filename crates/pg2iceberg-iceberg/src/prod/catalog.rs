@@ -229,6 +229,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             .flat_map(LogRange::to_properties)
             .chain(log_ends_property(&ends))
             .collect();
+        let appends = !files.is_empty();
         let tx = Transaction::new(&table);
         let tx = match files.len() {
             // No work — match the sim-catalog noop semantics so the
@@ -254,6 +255,12 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             .apply(tx),
         }
         .map_err(map_iceberg_err)?;
+        // The table records the ends too: once expiry leaves only another
+        // engine's snapshots, the snapshots know nothing of them.
+        let tx = match log_range {
+            Some(range) if appends => RecordLogEnds { range }.apply(tx).map_err(map_iceberg_err)?,
+            _ => tx,
+        };
         let tx = if remove_properties.is_empty() {
             tx
         } else {
@@ -737,6 +744,29 @@ impl TransactionAction for ChainedAppendAction {
     }
 }
 
+/// Sets the table's `pg2iceberg.log-ends` property to each group's end:
+/// what the table already records, with `range`'s. Taken from the table
+/// the commit lands on — after the appends before it in the transaction,
+/// and on a retry, the newer table it retries against.
+struct RecordLogEnds {
+    range: LogRange,
+}
+
+#[async_trait]
+impl TransactionAction for RecordLogEnds {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        let mut ends = table_log_ends(table);
+        merge_log_ends(&mut ends, [(self.range.group.clone(), self.range.end)]);
+        let updates = log_ends_property(&ends)
+            .map(|(key, value)| TableUpdate::SetProperties {
+                updates: HashMap::from([(key, value)]),
+            })
+            .into_iter()
+            .collect();
+        Ok(ActionCommit::new(updates, vec![]))
+    }
+}
+
 /// Inline `TransactionAction` that emits `TableUpdate::RemoveSnapshots`.
 /// We don't add this to the iceberg-rust fork because it's pure metadata
 /// — `ActionCommit::new` and `TableUpdate` are public, no fork-side
@@ -1115,9 +1145,11 @@ fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Res
     })
 }
 
-/// [`TableMetadata::log_ends`]: what the table's snapshots record.
+/// [`TableMetadata::log_ends`]: what the table's properties and its
+/// snapshots record.
 fn table_log_ends(table: &iceberg::table::Table) -> BTreeMap<String, u64> {
-    let mut ends = BTreeMap::new();
+    let properties = table.metadata().properties();
+    let mut ends = recorded_log_ends(|key| properties.get(key).map(String::as_str));
     for snap in table.metadata().snapshots() {
         let properties = &snap.summary().additional_properties;
         merge_log_ends(
@@ -2066,6 +2098,77 @@ mod tests {
             .await
             .unwrap();
         IcebergRustCatalog::new(Arc::new(inner))
+    }
+
+    /// A commit's log range outlives its snapshot: another engine commits
+    /// on top — a managed catalog's compaction, say, which carries nothing
+    /// of pg2iceberg's — and every snapshot but its own expires. The
+    /// table's property still holds the ends.
+    #[tokio::test]
+    async fn log_ends_outlive_their_snapshots_under_another_engines() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let range = LogRange {
+            group: "default".into(),
+            start: 0,
+            end: 7,
+        };
+        c.commit_snapshots(
+            vec![PreparedCommit {
+                ident: ident(),
+                data_files: vec![DataFile {
+                    path: "memory:///warehouse/public/orders/ours.parquet".into(),
+                    record_count: 1,
+                    byte_size: 100,
+                    equality_field_ids: vec![],
+                    partition_values: Vec::new(),
+                    sequence_number: None,
+                }],
+                equality_deletes: vec![],
+            }],
+            Some(range),
+            BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+
+        let it = to_iceberg_table_ident(&ident()).unwrap();
+        let table = c.inner.load_table(&it).await.unwrap();
+        let theirs = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("memory:///warehouse/public/orders/theirs.parquet".into())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition(Struct::empty())
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .build()
+            .unwrap();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .fast_append()
+            .add_data_files(vec![theirs])
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(c.inner.as_ref()).await.unwrap();
+        let current = table.metadata().current_snapshot_id();
+        let expired: Vec<i64> = table
+            .metadata()
+            .snapshots()
+            .map(|s| s.snapshot_id())
+            .filter(|id| Some(*id) != current)
+            .collect();
+        let tx = Transaction::new(&table);
+        let tx = ExpireSnapshotsAction {
+            snapshot_ids: expired,
+        }
+        .apply(tx)
+        .unwrap();
+        tx.commit(c.inner.as_ref()).await.unwrap();
+
+        let meta = c.load_table(&ident()).await.unwrap().unwrap();
+        assert_eq!(meta.log_ends, BTreeMap::from([("default".to_string(), 7)]));
     }
 
     async fn append(c: &IcebergRustCatalog<iceberg::memory::MemoryCatalog>, i: usize) {

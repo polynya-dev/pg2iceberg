@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
 use pg2iceberg_iceberg::PreparedCommit;
 use pg2iceberg_iceberg::{
-    apply_schema_changes, merge_log_ends, Catalog, DataFile, IcebergError, LogRange, Result,
-    SchemaChange, Snapshot, TableMetadata,
+    apply_schema_changes, log_ends_property, merge_log_ends, recorded_log_ends, Catalog, DataFile,
+    IcebergError, LogRange, Result, SchemaChange, Snapshot, TableMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -89,9 +89,11 @@ impl MemTable {
         Ok(())
     }
 
-    /// Bring `metadata.log_ends` in line with the unexpired snapshots.
+    /// Bring `metadata.log_ends` in line with the table's properties and
+    /// its unexpired snapshots.
     fn refresh_log_ends(&mut self) {
-        let mut ends = BTreeMap::new();
+        let properties = &self.metadata.properties;
+        let mut ends = recorded_log_ends(|key| properties.get(key).map(String::as_str));
         for (id, recorded) in &self.log_ends {
             if !self.expired.contains(id) {
                 merge_log_ends(&mut ends, recorded.clone());
@@ -365,6 +367,13 @@ impl Catalog for MemoryCatalog {
         }
         if let Some(id) = last {
             table.record_log_ends(id, log_range.as_ref());
+            // The table records the ends too, as the prod catalog does.
+            if log_range.is_some() {
+                table
+                    .metadata
+                    .properties
+                    .extend(log_ends_property(&table.metadata.log_ends));
+            }
             let snap = table.snapshots.last_mut().expect("just pushed");
             debug_assert_eq!(snap.id, id);
             snap.log_range = log_range;
