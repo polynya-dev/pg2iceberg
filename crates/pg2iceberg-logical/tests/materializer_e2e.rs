@@ -596,5 +596,12 @@ fn a_default_added_mid_transaction_is_filled_once() {
     );
     // The fill's mark is gone with its commit.
     let meta = block_on(h.catalog.load_table(&ident())).unwrap().unwrap();
-    assert!(meta.properties.is_empty(), "{:?}", meta.properties);
+    assert!(
+        !meta
+            .properties
+            .keys()
+            .any(|k| k.starts_with("pg2iceberg.fill.")),
+        "{:?}",
+        meta.properties
+    );
 }

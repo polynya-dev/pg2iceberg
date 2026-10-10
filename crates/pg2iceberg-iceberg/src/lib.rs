@@ -67,7 +67,8 @@ pub struct TableMetadata {
     /// `metadata`).
     pub location: String,
     /// Per cursor group, how far commits have applied the change log, as
-    /// the table's live snapshots record it (see [`LogRange`]).
+    /// the table's properties and its live snapshots record it (see
+    /// [`LogRange`]).
     #[serde(default)]
     pub log_ends: std::collections::BTreeMap<String, u64>,
     /// The table's properties.
@@ -82,8 +83,11 @@ pub struct TableMetadata {
 /// and isn't applied again.
 ///
 /// Every snapshot pg2iceberg commits — compactions too — also carries
-/// each group's end so far forward, so the current snapshot, which
-/// expiry never removes, has them all.
+/// each group's end so far forward. But another engine's commits carry
+/// nothing of pg2iceberg's — a managed catalog's compaction — and once
+/// expiry leaves only those, the snapshots know nothing: the table's
+/// `pg2iceberg.log-ends` property, set by the same commit as the range,
+/// holds every group's end too.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRange {
     pub group: String,
@@ -128,8 +132,8 @@ pub fn merge_log_ends(
 }
 
 /// How far commits had applied the log, per group, as a snapshot's
-/// summary properties record it: the ends carried forward, and its own
-/// commit's range.
+/// summary properties record it — the ends carried forward, and its own
+/// commit's range — or the table's properties.
 pub fn recorded_log_ends<'a>(
     get: impl Fn(&str) -> Option<&'a str>,
 ) -> std::collections::BTreeMap<String, u64> {
@@ -142,7 +146,8 @@ pub fn recorded_log_ends<'a>(
     ends
 }
 
-/// The summary property carrying `ends` forward, unless there are none.
+/// The property recording `ends` — a snapshot's, carrying them forward,
+/// or the table's — unless there are none.
 pub fn log_ends_property(
     ends: &std::collections::BTreeMap<String, u64>,
 ) -> Option<(String, String)> {
