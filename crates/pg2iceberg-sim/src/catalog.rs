@@ -50,6 +50,45 @@ impl MemTable {
         self.refresh_log_ends();
     }
 
+    /// Record snapshot `id`, just committed by another engine: it records
+    /// no log ends, carried forward or its own.
+    fn record_no_log_ends(&mut self, id: i64) {
+        self.log_ends.insert(id, BTreeMap::new());
+        self.refresh_log_ends();
+    }
+
+    /// The paths of the files the table holds now.
+    fn live_paths(&self) -> BTreeSet<&str> {
+        let removed: BTreeSet<&str> = self
+            .snapshots
+            .iter()
+            .flat_map(|snap| snap.removed_paths.iter().map(String::as_str))
+            .collect();
+        self.snapshots
+            .iter()
+            .flat_map(|snap| snap.data_files.iter().chain(&snap.delete_files))
+            .map(|f| f.path.as_str())
+            .filter(|path| !removed.contains(path))
+            .collect()
+    }
+
+    /// Like iceberg-rust's rewrite: a file another commit already removed
+    /// fails a commit that removes it, or both passes' outputs would hold
+    /// its rows.
+    fn check_removable(&self, paths: &[String]) -> Result<()> {
+        let live = self.live_paths();
+        let missing: Vec<&String> = paths
+            .iter()
+            .filter(|path| !live.contains(path.as_str()))
+            .collect();
+        if !missing.is_empty() {
+            return Err(IcebergError::Conflict(format!(
+                "rewrite removes files no longer in the table: {missing:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Bring `metadata.log_ends` in line with the unexpired snapshots.
     fn refresh_log_ends(&mut self) {
         let mut ends = BTreeMap::new();
@@ -101,6 +140,100 @@ impl MemoryCatalog {
             .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
         table.metadata.config = config;
         Ok(())
+    }
+
+    /// Test hook: a rewrite another engine commits — a managed catalog's
+    /// own compaction. Unlike [`Catalog::commit_compaction`], its snapshot
+    /// records no log ends: only pg2iceberg writes those.
+    ///
+    /// Its outputs keep the sequence number of the snapshot the pass read
+    /// (`prepared.data_sequence_number`), as Iceberg's Java rewrite does by
+    /// default — or, with `own_sequence_number`, take the commit's own, as
+    /// it does when told not to. Then, as it does, the commit fails if a
+    /// delete file landed since the pass read the table: at the newer
+    /// number, it would no longer apply to the rewritten rows.
+    pub fn commit_foreign_rewrite(
+        &self,
+        prepared: pg2iceberg_iceberg::PreparedCompaction,
+        own_sequence_number: bool,
+    ) -> Result<TableMetadata> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(&prepared.ident)
+            .ok_or_else(|| IcebergError::NotFound(format!("table: {}", prepared.ident)))?;
+        table.check_removable(&prepared.removed_paths)?;
+        if own_sequence_number {
+            let read = prepared.data_sequence_number.unwrap_or(0);
+            let since = table
+                .snapshots
+                .iter()
+                .filter(|snap| snap.id > read && !snap.delete_files.is_empty())
+                .map(|snap| snap.id)
+                .collect::<Vec<_>>();
+            if !since.is_empty() {
+                return Err(IcebergError::Conflict(format!(
+                    "delete files landed since the rewrite read snapshot {read}: {since:?}"
+                )));
+            }
+        }
+        let id = table.next_snapshot_id;
+        table.next_snapshot_id += 1;
+        let sequence_number = if own_sequence_number {
+            None
+        } else {
+            prepared.data_sequence_number
+        };
+        let added = prepared
+            .added_data_files
+            .into_iter()
+            .map(|f| DataFile {
+                sequence_number,
+                ..f
+            })
+            .collect();
+        table.snapshots.push(Snapshot {
+            id,
+            data_files: added,
+            delete_files: Vec::new(),
+            removed_paths: prepared.removed_paths,
+            timestamp_ms: id * 1000,
+            expired: false,
+            log_range: None,
+        });
+        table.metadata.current_snapshot_id = Some(id);
+        table.record_no_log_ends(id);
+        Ok(table.metadata.clone())
+    }
+
+    /// Test hook: another engine removes files without rewriting any —
+    /// a `delete` snapshot, as one that drops delete files nothing is left
+    /// for them to apply to commits.
+    pub fn commit_foreign_removal(
+        &self,
+        ident: &TableIdent,
+        paths: Vec<String>,
+    ) -> Result<TableMetadata> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
+        table.check_removable(&paths)?;
+        let id = table.next_snapshot_id;
+        table.next_snapshot_id += 1;
+        table.snapshots.push(Snapshot {
+            id,
+            data_files: Vec::new(),
+            delete_files: Vec::new(),
+            removed_paths: paths,
+            timestamp_ms: id * 1000,
+            expired: false,
+            log_range: None,
+        });
+        table.metadata.current_snapshot_id = Some(id);
+        table.record_no_log_ends(id);
+        Ok(table.metadata.clone())
     }
 }
 
@@ -256,30 +389,7 @@ impl Catalog for MemoryCatalog {
         if prepared.added_data_files.is_empty() && prepared.removed_paths.is_empty() {
             return Ok(table.metadata.clone());
         }
-        // Like iceberg-rust's rewrite: a file another pass already removed
-        // fails the commit, or both passes' outputs would hold its rows.
-        let removed: BTreeSet<&str> = table
-            .snapshots
-            .iter()
-            .flat_map(|snap| snap.removed_paths.iter().map(String::as_str))
-            .collect();
-        let live: BTreeSet<&str> = table
-            .snapshots
-            .iter()
-            .flat_map(|snap| snap.data_files.iter().chain(&snap.delete_files))
-            .map(|f| f.path.as_str())
-            .filter(|path| !removed.contains(path))
-            .collect();
-        let missing: Vec<&String> = prepared
-            .removed_paths
-            .iter()
-            .filter(|path| !live.contains(path.as_str()))
-            .collect();
-        if !missing.is_empty() {
-            return Err(IcebergError::Conflict(format!(
-                "rewrite removes files no longer in the table: {missing:?}"
-            )));
-        }
+        table.check_removable(&prepared.removed_paths)?;
 
         let id = table.next_snapshot_id;
         table.next_snapshot_id += 1;
