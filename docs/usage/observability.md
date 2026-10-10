@@ -4,13 +4,14 @@ icon: lucide/activity
 
 # Observability
 
-pg2iceberg has three observability surfaces:
+pg2iceberg has four observability surfaces:
 
 1. **Prometheus metrics and health checks** on an HTTP endpoint, served by every long-running subcommand.
-2. **Structured logs** on stdout, via `tracing`.
-3. **Iceberg control-plane meta tables**, when `sink.meta_namespace` is set. See [metadata-tables.md](metadata-tables.md).
+2. **Traces**, exported over OTLP when you point it at a collector: where the time in a flush or a materializer cycle goes, down to each request.
+3. **Structured logs** on stdout, as text or JSON.
+4. **Iceberg control-plane meta tables**, when `sink.meta_namespace` is set. See [metadata-tables.md](metadata-tables.md).
 
-Use the metrics for live dashboards and alerts, and the meta tables for history, such as a per-commit audit trail you can query with SQL. Traces aren't exported yet; OTLP export is planned.
+Use the metrics for live dashboards and alerts, traces to see why one cycle was slow or failed, and the meta tables for history, such as a per-commit audit trail you can query with SQL.
 
 ## The endpoint
 
@@ -160,21 +161,61 @@ How stale a table is only means something while it has a backlog. A table nobody
 
 The replication lag counts every write on the source, including writes to tables pg2iceberg doesn't replicate. pg2iceberg acks those writes along with its own.
 
+## Traces
+
+pg2iceberg exports its spans as OpenTelemetry traces over OTLP/HTTP (protobuf) once `OTEL_EXPORTER_OTLP_ENDPOINT` says where: an OpenTelemetry Collector, Grafana Tempo, Jaeger, or a vendor's OTLP endpoint. Unset, nothing is exported.
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 pg2iceberg run
+```
+
+Each unit of work is a trace of its own, and every request it makes to the Iceberg catalog, the object store or the coordinator is a span within it, with its store, operation, duration and, if it failed, the error:
+
+| Trace | What it covers |
+|---|---|
+| `startup` | Validation, slot and table setup, before replicating |
+| `snapshot.table`, `snapshot.chunk` | Resuming one table's snapshot, and each chunk it stages — a snapshot can take hours, so each chunk is its own trace |
+| `pipeline.flush` | Staging committed changes and recording them (`rows`, `lsn`) |
+| `pipeline.spill` | Staging part of a transaction too large to hold in memory |
+| `slot.ack` | Recording the flushed LSN and acking the slot |
+| `materializer.cycle` | A materializer cycle: `materializer.table` per table, `materializer.commit` per Iceberg commit (`rows`, `data_files`, `delete_files`, `bytes`, `snapshot`) |
+| `compaction.cycle` | A compaction pass: `compaction.table` per table |
+| `watcher.check` | The invariant checks, with the slot read |
+| `replication.reconnect` | An attempt to reopen a dropped replication stream |
+| `shutdown` | The final flush, cycle and ack |
+| `compact`, `maintain`, `snapshot` | The one-shot subcommands |
+
+Requests are exported as `<store>.<operation>`, e.g. `catalog.commit_snapshots`, `object_store.put`, `coordinator.claim_offsets`.
+
+The standard OpenTelemetry variables apply:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset: no export | The collector's base URL; traces go to `/v1/traces` under it |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | | The full traces URL, instead |
+| `OTEL_EXPORTER_OTLP_HEADERS` | | `key=value,...`, e.g. an API key |
+| `OTEL_SERVICE_NAME` | `pg2iceberg` | The service the traces belong to; with more than one pg2iceberg, name each |
+| `OTEL_RESOURCE_ATTRIBUTES` | | More attributes, e.g. `deployment.environment=prod` |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | every trace | Keep a share, e.g. `traceidratio` and `0.1` |
+| `OTEL_SDK_DISABLED` | | `true` turns the export off |
+
+pg2iceberg exports over HTTP only — a collector's port 4318. gRPC (`OTEL_EXPORTER_OTLP_PROTOCOL=grpc`, port 4317) is refused at startup. An idle `run` makes a few traces a minute (acks, materializer cycles, watcher checks); under load, one per flush and per cycle. An export that fails is logged.
+
 ## Try it
 
-[`example/single`](https://github.com/pg2iceberg/pg2iceberg/tree/main/example/single) runs Prometheus with these rules, and Grafana with a pg2iceberg dashboard:
+[`example/single`](https://github.com/pg2iceberg/pg2iceberg/tree/main/example/single) runs Prometheus with these rules, Tempo for the traces, and Grafana with a pg2iceberg dashboard:
 
 ```sh
 cd example/single
-docker compose --profile monitoring up -d --wait
+OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318 docker compose --profile monitoring up -d --wait
 docker compose --profile workload up -d workload
 ```
 
-Grafana is at <http://localhost:3000> (no login), Prometheus at <http://localhost:9090>, and pg2iceberg's own endpoint at <http://localhost:9091/metrics>.
+Grafana is at <http://localhost:3000> (no login), Prometheus at <http://localhost:9090>, and pg2iceberg's own endpoint at <http://localhost:9091/metrics>. The dashboard's Traces row lists recent materializer cycles, failed traces and slow catalog requests; open one for its waterfall, or search them in Explore with TraceQL, e.g. `{ name = "materializer.commit" && span.table = "rideshare.rides" }`.
 
 ## Logs
 
-The binary logs through [`tracing`](https://docs.rs/tracing) to stdout, as plain text. Tune verbosity with `RUST_LOG`:
+The binary logs through [`tracing`](https://docs.rs/tracing) to stdout, as plain text, or one JSON object a line with `PG2ICEBERG_LOG_FORMAT=json` — for a log collector to parse. A message logged during a unit of work names it and its fields, e.g. `materializer.cycle:materializer.table{table=public.orders}: ...`. Tune verbosity with `RUST_LOG`:
 
 ```sh
 # Default

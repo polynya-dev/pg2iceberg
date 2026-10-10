@@ -16,12 +16,13 @@ Then query `http://localhost:8123/play`, e.g.
 ``SELECT * FROM rideshare.`rideshare.rides` ``.
 
 To watch pg2iceberg too, add the `monitoring` profile: Prometheus, with the
-alert rules in [`monitoring/alerts.yml`](monitoring/alerts.yml), and Grafana
-with a pg2iceberg dashboard at http://localhost:3000 (no login).
-pg2iceberg's own `/metrics` is at http://localhost:9091/metrics.
+alert rules in [`monitoring/alerts.yml`](monitoring/alerts.yml), Tempo for
+pg2iceberg's traces, and Grafana with a pg2iceberg dashboard at
+http://localhost:3000 (no login). pg2iceberg's own `/metrics` is at
+http://localhost:9091/metrics.
 
 ```sh
-docker compose --profile monitoring up -d --wait
+OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318 docker compose --profile monitoring up -d --wait
 ```
 
 Or run it as a smoke test, which ends with a row-by-row comparison of

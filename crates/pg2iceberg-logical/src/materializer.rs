@@ -49,6 +49,8 @@ use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::field::Empty;
+use tracing::Instrument as _;
 
 /// Build the [`TableSchema`] for the blue-green meta-marker table.
 /// Each pg2iceberg instance writes one row per `(marker_uuid, table)`
@@ -1389,11 +1391,14 @@ impl<C: Catalog> Materializer<C> {
             Some(d) => d,
             None => return,
         };
+        let span = crate::work_span!("materializer.unregister", worker = %dm.worker_id.0);
         if let Err(e) = self
             .coord
             .unregister_consumer(&self.group, &dm.worker_id)
+            .instrument(span.clone())
             .await
         {
+            crate::spans::record_error(&span, &e);
             tracing::warn!(
                 error = %e,
                 worker = %dm.worker_id.0,
@@ -1424,7 +1429,12 @@ impl<C: Catalog> Materializer<C> {
     /// Returns rows folded.
     pub async fn cycle(&mut self) -> Result<usize> {
         let started_micros = now_micros();
-        let out = self.cycle_assigned().await;
+        let span = crate::work_span!("materializer.cycle", rows = Empty);
+        let out = self.cycle_assigned().instrument(span.clone()).await;
+        if let Ok(rows) = &out {
+            span.record("rows", rows);
+        }
+        crate::spans::record_outcome(&span, &out);
         let no_labels = Labels::new();
         let seconds = (now_micros() - started_micros).max(0) as f64 / 1e6;
         self.metrics
@@ -1547,6 +1557,16 @@ impl<C: Catalog> Materializer<C> {
         &mut self,
         config: &pg2iceberg_iceberg::CompactionConfig,
     ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CompactionOutcome)>> {
+        let span = crate::work_span!("compaction.cycle");
+        let out = self.compact_tables(config).instrument(span.clone()).await;
+        crate::spans::record_outcome(&span, &out);
+        out
+    }
+
+    async fn compact_tables(
+        &mut self,
+        config: &pg2iceberg_iceberg::CompactionConfig,
+    ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CompactionOutcome)>> {
         self.catalog.sync().await;
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
@@ -1581,6 +1601,20 @@ impl<C: Catalog> Materializer<C> {
             tracing::info!("the catalog maintains the tables: leaving orphan cleanup to it");
             return Ok(Vec::new());
         }
+        let span = crate::work_span!("maintenance.cleanup_orphans", grace_period_ms);
+        let out = self
+            .cleanup_orphans(now_ms, grace_period_ms)
+            .instrument(span.clone())
+            .await;
+        crate::spans::record_outcome(&span, &out);
+        out
+    }
+
+    async fn cleanup_orphans(
+        &mut self,
+        now_ms: i64,
+        grace_period_ms: i64,
+    ) -> Result<Vec<(TableIdent, pg2iceberg_iceberg::CleanupOutcome)>> {
         self.catalog.sync().await;
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
@@ -1636,6 +1670,13 @@ impl<C: Catalog> Materializer<C> {
             tracing::info!("the catalog maintains the tables: leaving snapshot expiry to it");
             return Ok(Vec::new());
         }
+        let span = crate::work_span!("maintenance.expire_snapshots", retention_ms);
+        let out = self.expire(retention_ms).instrument(span.clone()).await;
+        crate::spans::record_outcome(&span, &out);
+        out
+    }
+
+    async fn expire(&mut self, retention_ms: i64) -> Result<Vec<(TableIdent, usize)>> {
         self.catalog.sync().await;
         let idents: Vec<TableIdent> = self.tables.keys().cloned().collect();
         let mut out = Vec::new();
@@ -1688,6 +1729,23 @@ impl<C: Catalog> Materializer<C> {
     }
 
     pub async fn compact_table(
+        &mut self,
+        ident: &TableIdent,
+        config: &pg2iceberg_iceberg::CompactionConfig,
+    ) -> Result<Option<pg2iceberg_iceberg::CompactionOutcome>> {
+        let span = crate::work_span!("compaction.table", table = %ident, rewritten = Empty);
+        let out = self
+            .compact_one(ident, config)
+            .instrument(span.clone())
+            .await;
+        if let Ok(Some(o)) = &out {
+            span.record("rewritten", o.input_data_files + o.input_delete_files);
+        }
+        crate::spans::record_outcome(&span, &out);
+        out
+    }
+
+    async fn compact_one(
         &mut self,
         ident: &TableIdent,
         config: &pg2iceberg_iceberg::CompactionConfig,
@@ -1844,6 +1902,16 @@ impl<C: Catalog> Materializer<C> {
     /// committing until the log is drained or `cycle_rows` events were
     /// read. Returns rows folded.
     pub async fn cycle_table(&mut self, ident: &TableIdent) -> Result<usize> {
+        let span = crate::work_span!("materializer.table", table = %ident, rows = Empty);
+        let out = self.materialize_table(ident).instrument(span.clone()).await;
+        if let Ok(rows) = &out {
+            span.record("rows", rows);
+        }
+        crate::spans::record_outcome(&span, &out);
+        out
+    }
+
+    async fn materialize_table(&mut self, ident: &TableIdent) -> Result<usize> {
         self.metrics.counter(
             names::MATERIALIZER_CYCLE_TOTAL,
             &labels([("table", &ident.to_string())]),
@@ -2096,6 +2164,25 @@ impl<C: Catalog> Materializer<C> {
     /// Commit every step of `unit` as one atomic table update, then
     /// advance the cursor past it. Returns rows folded.
     async fn commit_unit(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<usize> {
+        // Nothing read: nothing to commit, and no span for it.
+        if unit.end_offset.is_none() {
+            return self.commit(ident, unit).await;
+        }
+        let span = crate::work_span!(
+            "materializer.commit",
+            table = %ident,
+            rows = Empty,
+            data_files = Empty,
+            delete_files = Empty,
+            bytes = Empty,
+            snapshot = Empty,
+        );
+        let out = self.commit(ident, unit).instrument(span.clone()).await;
+        crate::spans::record_outcome(&span, &out);
+        out
+    }
+
+    async fn commit(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<usize> {
         self.prepare_step(ident, unit).await?;
         let unit = std::mem::take(unit);
         let Some(end_offset) = unit.end_offset else {
@@ -2114,6 +2201,12 @@ impl<C: Catalog> Materializer<C> {
             .flat_map(|s| s.data_files.iter().chain(s.equality_deletes.iter()))
             .map(|f| f.byte_size as i64)
             .sum();
+
+        let span = tracing::Span::current();
+        span.record("rows", unit.folded);
+        span.record("data_files", data_files_count);
+        span.record("delete_files", delete_files_count);
+        span.record("bytes", bytes_written);
 
         // The commit adds one snapshot per step with files.
         let snapshots = unit
@@ -2149,6 +2242,9 @@ impl<C: Catalog> Materializer<C> {
                         0 => entry.index_at,
                         n => Some(entry.index_at.unwrap_or(0) + n),
                     };
+                    if let Some(id) = meta.current_snapshot_id {
+                        span.record("snapshot", id);
+                    }
                     if meta.current_snapshot_id == expected {
                         entry.index_at = expected;
                     } else {

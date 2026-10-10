@@ -68,6 +68,9 @@ proptest.workspace = true
 # to keep `run_logical_main_loop`'s scheduler-driven ticks
 # deterministic under proptest seeds.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util", "sync"] }
+# Records the spans a lifecycle run makes (`dst_fault.rs`).
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [features]
 # Enables the testcontainers-driven integration tests

@@ -146,7 +146,7 @@ impl Telemetry {
 
 /// The commit the binary was built from, when the build said
 /// (`PG2ICEBERG_COMMIT_SHA`, as the Dockerfile sets it).
-const REVISION: &str = match option_env!("PG2ICEBERG_COMMIT_SHA") {
+pub(crate) const REVISION: &str = match option_env!("PG2ICEBERG_COMMIT_SHA") {
     Some(sha) if !sha.is_empty() => sha,
     _ => "unknown",
 };

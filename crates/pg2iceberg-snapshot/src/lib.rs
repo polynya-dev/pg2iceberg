@@ -34,11 +34,13 @@ use async_trait::async_trait;
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::{ChangeEvent, ColumnName, Lsn, Op, Row, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{pk_key, Catalog};
+use pg2iceberg_logical::work_span;
 use pg2iceberg_logical::{Pipeline, PipelineError};
 use pg2iceberg_pg::DecodedMessage;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::Instrument as _;
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {
@@ -272,8 +274,9 @@ impl Snapshotter {
         // in `snapshot_progress`; on resume the inner loop picks up
         // at the saved PK.
         let mut total_chunks = 0usize;
+        // A table can take hours: each chunk is a trace of its own
+        // (`snapshot.chunk`), not part of one for the table.
         'tables: for (i, schema) in schemas.iter().enumerate() {
-            let xid = SNAPSHOT_XID_BASE.wrapping_add(i as u32);
             let pk_cols: Vec<ColumnName> = schema
                 .primary_key_columns()
                 .map(|c| ColumnName(c.name.clone()))
@@ -284,26 +287,19 @@ impl Snapshotter {
                     schema.ident
                 )));
             }
+            let table = TableRun {
+                schema,
+                xid: SNAPSHOT_XID_BASE.wrapping_add(i as u32),
+                pk_cols,
+                snap_lsn,
+            };
 
-            // Skip tables already complete from a prior pass. Cheap
-            // single-row read; avoids re-reading the source for
-            // already-snapshotted data.
-            if let Some(state) = self
-                .coord
-                .table_state(&schema.ident)
-                .await
-                .map_err(|e| SnapshotError::Source(format!("table_state: {e}")))?
-            {
-                if state.snapshot_complete {
-                    continue;
-                }
-            }
-
-            let mut last_pk_key: Option<String> = self
-                .coord
-                .snapshot_progress(&schema.ident)
-                .await
-                .map_err(|e| SnapshotError::Source(format!("snapshot_progress: {e}")))?;
+            let span = work_span!(parent: None, "snapshot.table", table = %schema.ident);
+            let resume = self.resume(schema).instrument(span.clone()).await;
+            pg2iceberg_logical::spans::record_outcome(&span, &resume);
+            let Resume::From(mut last_pk_key) = resume? else {
+                continue;
+            };
 
             loop {
                 if let Some(cap) = max_chunks {
@@ -311,93 +307,177 @@ impl Snapshotter {
                         break 'tables;
                     }
                 }
-
-                // PG-side ident — `read_chunk` issues a SELECT against
-                // the source PG table, so namespace must be the PG
-                // schema (not the Iceberg `sink.namespace`).
-                let pg_ident = schema.pg_ident();
-                let chunk = source
-                    .read_chunk(&pg_ident, self.chunk_size, last_pk_key.as_deref())
-                    .await?;
-                if chunk.is_empty() {
-                    // Table done — drop the resume cursor and stamp
-                    // the per-table completion row. Order matters: we
-                    // clear progress *first* so a crash between the
-                    // two writes leaves the table marked
-                    // not-yet-complete (snapshotter retries cleanly)
-                    // rather than complete-without-cursor (no-op
-                    // resume; correct).
-                    self.coord
-                        .clear_snapshot_progress(&schema.ident)
-                        .await
-                        .map_err(|e| {
-                            SnapshotError::Source(format!("clear_snapshot_progress: {e}"))
-                        })?;
-                    let oid = self.table_oids.get(&schema.ident).copied().unwrap_or(0);
-                    self.coord
-                        .mark_table_snapshot_complete(&schema.ident, oid, snap_lsn)
-                        .await
-                        .map_err(|e| {
-                            SnapshotError::Source(format!("mark_table_snapshot_complete: {e}"))
-                        })?;
-                    break;
-                }
-
-                let last_in_chunk = chunk.last().unwrap();
-                let new_key = pk_key(last_in_chunk, &pk_cols);
-
-                if let Some(prev) = last_pk_key.as_deref() {
-                    if new_key.as_str() == prev {
-                        return Err(SnapshotError::Source(format!(
-                            "snapshot source did not advance past PK {prev} for table {}; got {new_key}",
-                            schema.ident
-                        )));
+                let span = work_span!(
+                    parent: None,
+                    "snapshot.chunk",
+                    table = %schema.ident,
+                    rows = tracing::field::Empty,
+                );
+                let chunk = self
+                    .chunk(source, &table, pipeline, last_pk_key.as_deref())
+                    .instrument(span.clone())
+                    .await;
+                pg2iceberg_logical::spans::record_outcome(&span, &chunk);
+                match chunk? {
+                    Chunk::TableDone => break,
+                    Chunk::Staged { last_pk_key: key } => {
+                        last_pk_key = Some(key);
+                        total_chunks += 1;
                     }
                 }
-
-                pipeline
-                    .process(DecodedMessage::Begin {
-                        final_lsn: snap_lsn,
-                        xid,
-                    })
-                    .await?;
-                for row in chunk {
-                    pipeline
-                        .process(DecodedMessage::Change(ChangeEvent {
-                            table: schema.ident.clone(),
-                            op: Op::Insert,
-                            lsn: snap_lsn,
-                            commit_ts: Timestamp(0),
-                            xid: Some(xid),
-                            before: None,
-                            after: Some(row),
-                            unchanged_cols: vec![],
-                        }))
-                        .await?;
-                }
-                pipeline
-                    .process(DecodedMessage::Commit {
-                        commit_lsn: snap_lsn,
-                        xid,
-                    })
-                    .await?;
-                pipeline.flush().await?;
-
-                // Chunk fully durable in coord. Stamp the resume
-                // cursor *after* the flush — if we crash before this
-                // write, resume re-reads the chunk (idempotent: the
-                // materializer's fold-by-PK absorbs the duplicate
-                // staged events).
-                last_pk_key = Some(new_key.clone());
-                self.coord
-                    .set_snapshot_progress(&schema.ident, &new_key)
-                    .await
-                    .map_err(|e| SnapshotError::Source(format!("set_snapshot_progress: {e}")))?;
-                total_chunks += 1;
             }
         }
         Ok(snap_lsn)
     }
+
+    /// Where `schema`'s snapshot resumes: after the last chunk a prior
+    /// pass staged, if any — or nowhere, the table being complete.
+    async fn resume(&self, schema: &TableSchema) -> Result<Resume> {
+        // Cheap single-row read; avoids re-reading the source for
+        // already-snapshotted data.
+        if let Some(state) = self
+            .coord
+            .table_state(&schema.ident)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("table_state: {e}")))?
+        {
+            if state.snapshot_complete {
+                return Ok(Resume::Complete);
+            }
+        }
+        let last_pk_key = self
+            .coord
+            .snapshot_progress(&schema.ident)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("snapshot_progress: {e}")))?;
+        Ok(Resume::From(last_pk_key))
+    }
+
+    /// Stage the chunk of `table` after `last_pk_key`, then stamp the
+    /// resume cursor past it — or, with nothing left to read, mark the
+    /// table complete.
+    async fn chunk<S, C>(
+        &self,
+        source: &S,
+        table: &TableRun<'_>,
+        pipeline: &mut Pipeline<C>,
+        last_pk_key: Option<&str>,
+    ) -> Result<Chunk>
+    where
+        S: SnapshotSource + ?Sized,
+        C: Coordinator + ?Sized,
+    {
+        let TableRun {
+            schema,
+            xid,
+            ref pk_cols,
+            snap_lsn,
+        } = *table;
+        // PG-side ident — `read_chunk` issues a SELECT against
+        // the source PG table, so namespace must be the PG
+        // schema (not the Iceberg `sink.namespace`).
+        let pg_ident = schema.pg_ident();
+        let chunk = source
+            .read_chunk(&pg_ident, self.chunk_size, last_pk_key)
+            .await?;
+        tracing::Span::current().record("rows", chunk.len());
+        if chunk.is_empty() {
+            // Table done — drop the resume cursor and stamp
+            // the per-table completion row. Order matters: we
+            // clear progress *first* so a crash between the
+            // two writes leaves the table marked
+            // not-yet-complete (snapshotter retries cleanly)
+            // rather than complete-without-cursor (no-op
+            // resume; correct).
+            self.coord
+                .clear_snapshot_progress(&schema.ident)
+                .await
+                .map_err(|e| SnapshotError::Source(format!("clear_snapshot_progress: {e}")))?;
+            let oid = self.table_oids.get(&schema.ident).copied().unwrap_or(0);
+            self.coord
+                .mark_table_snapshot_complete(&schema.ident, oid, snap_lsn)
+                .await
+                .map_err(|e| SnapshotError::Source(format!("mark_table_snapshot_complete: {e}")))?;
+            return Ok(Chunk::TableDone);
+        }
+
+        let last_in_chunk = chunk.last().unwrap();
+        let new_key = pk_key(last_in_chunk, pk_cols);
+
+        if let Some(prev) = last_pk_key {
+            if new_key.as_str() == prev {
+                return Err(SnapshotError::Source(format!(
+                    "snapshot source did not advance past PK {prev} for table {}; got {new_key}",
+                    schema.ident
+                )));
+            }
+        }
+
+        pipeline
+            .process(DecodedMessage::Begin {
+                final_lsn: snap_lsn,
+                xid,
+            })
+            .await?;
+        for row in chunk {
+            pipeline
+                .process(DecodedMessage::Change(ChangeEvent {
+                    table: schema.ident.clone(),
+                    op: Op::Insert,
+                    lsn: snap_lsn,
+                    commit_ts: Timestamp(0),
+                    xid: Some(xid),
+                    before: None,
+                    after: Some(row),
+                    unchanged_cols: vec![],
+                }))
+                .await?;
+        }
+        pipeline
+            .process(DecodedMessage::Commit {
+                commit_lsn: snap_lsn,
+                xid,
+            })
+            .await?;
+        pipeline.flush().await?;
+
+        // Chunk fully durable in coord. Stamp the resume
+        // cursor *after* the flush — if we crash before this
+        // write, resume re-reads the chunk (idempotent: the
+        // materializer's fold-by-PK absorbs the duplicate
+        // staged events).
+        self.coord
+            .set_snapshot_progress(&schema.ident, &new_key)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("set_snapshot_progress: {e}")))?;
+        Ok(Chunk::Staged {
+            last_pk_key: new_key,
+        })
+    }
+}
+
+/// One table of a [`Snapshotter`] run.
+struct TableRun<'a> {
+    schema: &'a TableSchema,
+    /// The synthetic transaction id its chunks are staged under.
+    xid: u32,
+    pk_cols: Vec<ColumnName>,
+    snap_lsn: Lsn,
+}
+
+/// Where a table's snapshot resumes.
+enum Resume {
+    Complete,
+    /// After this primary key, or from the start.
+    From(Option<String>),
+}
+
+/// What [`Snapshotter::chunk`] did.
+enum Chunk {
+    /// Nothing left: the table is marked complete.
+    TableDone,
+    /// Staged, through the row with this primary key.
+    Staged { last_pk_key: String },
 }
 
 /// Outcome of [`run_snapshot_phase`].
