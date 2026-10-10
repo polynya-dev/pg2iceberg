@@ -21,7 +21,7 @@ pub mod sink;
 
 pub use catalog_cache::CachingCatalog;
 pub use materializer::{
-    CounterMaterializerNamer, Materializer, MaterializerError, MaterializerNamer,
+    CounterMaterializerNamer, Maintenance, Materializer, MaterializerError, MaterializerNamer,
 };
 pub use pipeline::{replication_start_lsn, Pipeline, PipelineError};
 pub use runner::{Handler, Schedule, Ticker};

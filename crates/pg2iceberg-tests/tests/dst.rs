@@ -67,7 +67,9 @@ use pg2iceberg_iceberg::{
 };
 use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
-use pg2iceberg_logical::{replication_start_lsn, CachingCatalog, Materializer, Pipeline};
+use pg2iceberg_logical::{
+    replication_start_lsn, CachingCatalog, Maintenance, Materializer, Pipeline,
+};
 use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
@@ -1394,13 +1396,17 @@ fn worker(name: &str) -> pg2iceberg_core::WorkerId {
     pg2iceberg_core::WorkerId(format!("worker-{name}"))
 }
 
-/// Keep `m`'s reads of the catalog as long as production does: until a
-/// pg2iceberg process writes the table, or a minute by `clock`.
-fn cache_like_production(m: &Materializer<AuditedCatalog>, clock: &TestClock) {
+/// Set `m` up as production does: it keeps its reads of the catalog
+/// until a pg2iceberg process writes the table, or a minute by `clock`;
+/// and where the catalog maintains the table, it's told so.
+fn like_production(m: &mut Materializer<AuditedCatalog>, clock: &TestClock) {
     m.set_catalog_cache_ttl(
         Arc::new(clock.clone()),
         CachingCatalog::<AuditedCatalog>::DEFAULT_TTL,
     );
+    if MANAGED.get() {
+        m.set_maintenance(Maintenance::Managed);
+    }
 }
 
 /// One materializer cycle; `None` if it failed because a commit's
@@ -1580,7 +1586,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
-        cache_like_production(&materializer, &clock);
+        like_production(&mut materializer, &clock);
         block_on(materializer.register_table(schema())).unwrap();
         register_other(&mut materializer);
         let other = DISTRIBUTED.get().then(|| {
@@ -1594,7 +1600,7 @@ impl DstHarness {
                 MAT_BATCH,
                 metrics(),
             );
-            cache_like_production(&b, &clock);
+            like_production(&mut b, &clock);
             block_on(b.register_table(schema())).unwrap();
             register_other(&mut b);
             b.enable_distributed_mode(worker("b"), WORKER_TTL);
@@ -1717,7 +1723,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
-        cache_like_production(&materializer, &clock);
+        like_production(&mut materializer, &clock);
         block_on(materializer.register_table(schema())).unwrap();
         register_other(&mut materializer);
         let other = DISTRIBUTED.get().then(|| {
@@ -1731,7 +1737,7 @@ impl DstHarness {
                 MAT_BATCH,
                 metrics(),
             );
-            cache_like_production(&b, &clock);
+            like_production(&mut b, &clock);
             block_on(b.register_table(schema())).unwrap();
             register_other(&mut b);
             b.enable_distributed_mode(worker("b"), WORKER_TTL);
@@ -1907,21 +1913,32 @@ impl DstHarness {
             held: Mutex::new(None),
         };
         let namer = mat_namer(&self.id_gen);
-        block_on(pg2iceberg_iceberg::compact_table(
-            &held,
-            self.blob_store.as_ref(),
-            |t, _| {
-                let namer = namer.clone();
-                let t = t.clone();
-                async move { namer.next_path(&t, "compact", "").await }
-            },
-            &ident(),
-            &schema(),
-            &pk_cols,
-            Some(&index),
-            &cfg,
-        ))
-        .unwrap();
+        if MANAGED.get() {
+            // As the materializer's own pass: the catalog rewrites.
+            block_on(pg2iceberg_iceberg::retire_deletes(
+                &held,
+                &ident(),
+                Some(&index),
+                &cfg,
+            ))
+            .unwrap();
+        } else {
+            block_on(pg2iceberg_iceberg::compact_table(
+                &held,
+                self.blob_store.as_ref(),
+                |t, _| {
+                    let namer = namer.clone();
+                    let t = t.clone();
+                    async move { namer.next_path(&t, "compact", "").await }
+                },
+                &ident(),
+                &schema(),
+                &pk_cols,
+                Some(&index),
+                &cfg,
+            ))
+            .unwrap();
+        }
         self.pending_external = held.held.into_inner().unwrap();
     }
 
@@ -2104,7 +2121,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
-        cache_like_production(&materializer, &self.clock);
+        like_production(&mut materializer, &self.clock);
         // As the lifecycle restarts: a table still backfilling is gated.
         if self.backfilling {
             block_on(materializer.register_table_pending(discovered_schema(&self.db))).unwrap();

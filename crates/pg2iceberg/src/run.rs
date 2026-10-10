@@ -583,6 +583,14 @@ pub async fn run_compact(cfg: Config) -> Result<()> {
 /// `sink.maintenance_grace`; each table's cleanup scope is the
 /// directory the materializer writes its files to.
 pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Result<()> {
+    if cfg.sink.resolved_maintenance()? == pg2iceberg_logical::Maintenance::Managed {
+        // Its orphan cleanup would delete the catalog's own writes in
+        // flight: only the catalog knows which unreferenced files those are.
+        anyhow::bail!(
+            "sink.maintenance is \"managed\": the catalog expires the tables' snapshots \
+             and removes their orphan files, so `pg2iceberg maintain` leaves them alone"
+        );
+    }
     let retention_str = retention_override
         .clone()
         .unwrap_or_else(|| cfg.sink.maintenance_retention.clone());
@@ -769,6 +777,7 @@ async fn build_one_shot_materializer(
         cfg.sink.materializer_batch_rows,
         metrics,
     );
+    materializer.set_maintenance(cfg.sink.resolved_maintenance()?);
     for s in &resolved_schemas {
         materializer
             .register_table(s.clone())
@@ -1118,6 +1127,7 @@ pub async fn run_snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result
         cfg.sink.materializer_batch_rows,
         metrics.clone(),
     );
+    materializer.set_maintenance(cfg.sink.resolved_maintenance()?);
     for schema in &schemas {
         materializer
             .register_table(schema.clone())

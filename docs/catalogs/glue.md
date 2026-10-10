@@ -67,3 +67,7 @@ For production, attach an IAM role to the compute instance rather than using env
 
 !!! warning "No vended credentials"
     Glue does not support vended credentials. The IAM role must have direct S3 access to the data bucket.
+
+## Maintenance
+
+With Glue's table optimizers on (compaction, snapshot retention, orphan file deletion), set `sink.maintenance: managed` so pg2iceberg leaves maintenance to them. See [Table Maintenance](../architecture/maintenance.md#when-the-catalog-maintains-the-tables).

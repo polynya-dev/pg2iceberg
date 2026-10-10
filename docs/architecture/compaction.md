@@ -18,3 +18,7 @@ The result is a smaller set of data files with no equality delete files, reducin
 
 !!! warning "Known limitation"
     Compaction currently writes unpartitioned output for partitioned tables. This will be fixed in a future release.
+
+## When the catalog compacts
+
+With `sink.maintenance: managed`, the catalog compacts the table and pg2iceberg rewrites no data files. Its pass keeps one job: retiring the delete files no data file is left for — the catalog's rewrites leave them behind. See [Table Maintenance](maintenance.md#when-the-catalog-maintains-the-tables).

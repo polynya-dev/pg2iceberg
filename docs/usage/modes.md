@@ -103,6 +103,8 @@ pg2iceberg maintain --config config.yaml --retention 168h   # CLI override
 | Snapshot expiry | `sink.maintenance_retention` | Drops snapshots older than retention. Never drops the current snapshot. |
 | Orphan-file cleanup | `sink.maintenance_grace` | Deletes S3 files older than grace that no live snapshot references. |
 
+With `sink.maintenance: managed` the catalog does both, and `maintain` refuses: its orphan cleanup would delete the catalog's own files in flight. See [Table Maintenance](../architecture/maintenance.md#when-the-catalog-maintains-the-tables).
+
 ## `verify` — one-shot diff against PG
 
 Reads PG ground truth (REPEATABLE READ snapshot) and Iceberg materialized state for every configured table, compares row-by-row by primary key, prints per-table diff counts. Exits non-zero if any diff is non-empty.

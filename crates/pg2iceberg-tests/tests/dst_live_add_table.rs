@@ -233,6 +233,7 @@ async fn live_add_table_backfills_via_background_snapshot() {
         group: "default".into(),
         schedule: Schedule::default(),
         compaction: None,
+        maintenance: Default::default(),
         flush_rows: 64,
         mat_batch_rows: 128,
         snapshot_source_factory: snapshot_factory,

@@ -208,6 +208,9 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     pub group: String,
     pub schedule: Schedule,
     pub compaction: Option<CompactionConfig>,
+    /// Who maintains the tables: pg2iceberg, or their catalog (see
+    /// [`pg2iceberg_logical::Maintenance`]).
+    pub maintenance: pg2iceberg_logical::Maintenance,
     pub flush_rows: usize,
     /// Materializer step size in change events — the bound on its memory
     /// (see [`Materializer::new`]).
@@ -310,6 +313,7 @@ fn instrument<Cat: Catalog + 'static>(
         group,
         schedule,
         compaction,
+        maintenance,
         flush_rows,
         mat_batch_rows,
         snapshot_source_factory,
@@ -333,6 +337,7 @@ fn instrument<Cat: Catalog + 'static>(
         group,
         schedule,
         compaction,
+        maintenance,
         flush_rows,
         mat_batch_rows,
         snapshot_source_factory,
@@ -531,6 +536,7 @@ where
         Arc::clone(&lc.clock),
         pg2iceberg_logical::CachingCatalog::<Cat>::DEFAULT_TTL,
     );
+    materializer.set_maintenance(lc.maintenance);
     // Tables that need a backfill snapshot before any of their CDC
     // events are applied to Iceberg. Computed here so we can register
     // each schema with the right gate (`register_table_pending` vs

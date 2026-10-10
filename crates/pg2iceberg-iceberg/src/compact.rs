@@ -368,6 +368,51 @@ where
     }))
 }
 
+/// Retire the delete files no data file they could apply to is left for,
+/// and rewrite nothing: the part of a pass a table needs when another
+/// engine compacts it — a managed catalog. Iceberg's Java rewrite leaves
+/// the deletes it applied behind, and pg2iceberg commits one with every
+/// change, so they would pile up.
+///
+/// Runs when the table holds at least `config.delete_file_threshold`
+/// delete files; `live_pks` as for [`compact_table`]. Its commit adds no
+/// files: a `Replace` that only removes deletes.
+pub async fn retire_deletes<C>(
+    catalog: &C,
+    ident: &TableIdent,
+    live_pks: Option<&FileIndex>,
+    config: &CompactionConfig,
+) -> Result<Option<CompactionOutcome>>
+where
+    C: Catalog + ?Sized,
+{
+    let snapshots = catalog.snapshots(ident).await?;
+    let (live_data, live_deletes) = compute_live_files(&snapshots);
+    if live_deletes.is_empty() || live_deletes.len() < config.delete_file_threshold {
+        return Ok(None);
+    }
+    let is_dirty = dirty_check(&live_deletes, live_pks);
+    let retired = retirable_deletes(&live_data, &live_deletes, &is_dirty, &BTreeSet::new());
+    if retired.is_empty() {
+        return Ok(None);
+    }
+    let bytes_before = retired.iter().map(|p| live_deletes[p].byte_size).sum();
+    let committed = catalog
+        .commit_compaction(PreparedCompaction {
+            ident: ident.clone(),
+            added_data_files: Vec::new(),
+            removed_paths: retired.clone(),
+            data_sequence_number: snapshots.last().map(|s| s.id),
+        })
+        .await?;
+    Ok(Some(CompactionOutcome {
+        input_delete_files: retired.len(),
+        bytes_before,
+        snapshot_id: committed.current_snapshot_id,
+        ..Default::default()
+    }))
+}
+
 /// The output side of a pass: at most one open file, plus the files
 /// already uploaded.
 #[derive(Default)]
@@ -442,6 +487,44 @@ impl OutputFiles {
     }
 }
 
+/// Whether some live delete may have killed one of a data file's rows.
+/// Only a delete newer than the file can; past that, trust the index's
+/// count of live rows when there is one.
+fn dirty_check<'a>(
+    live_deletes: &BTreeMap<String, LiveFile>,
+    live_pks: Option<&'a FileIndex>,
+) -> impl Fn(&str, &LiveFile) -> bool + 'a {
+    let newest_delete = live_deletes.values().map(|d| d.seq).max();
+    let live_rows = live_pks.map(FileIndex::live_rows_per_file);
+    move |path: &str, f: &LiveFile| {
+        newest_delete.is_some_and(|d| d > f.seq)
+            && live_rows
+                .as_ref()
+                .is_none_or(|counts| counts.get(path).copied().unwrap_or(0) < f.record_count)
+    }
+}
+
+/// The deletes no dirty data file they could apply to (seq below their
+/// own) is left for, once the files in `taken` are rewritten — a pass
+/// applies every delete to their rows before they move.
+fn retirable_deletes(
+    live_data: &BTreeMap<String, LiveFile>,
+    live_deletes: &BTreeMap<String, LiveFile>,
+    is_dirty: &impl Fn(&str, &LiveFile) -> bool,
+    taken: &BTreeSet<&str>,
+) -> Vec<String> {
+    let oldest_remaining_dirty = live_data
+        .iter()
+        .filter(|(path, f)| !taken.contains(path.as_str()) && is_dirty(path, f))
+        .map(|(_, f)| f.seq)
+        .min();
+    live_deletes
+        .iter()
+        .filter(|(_, d)| oldest_remaining_dirty.is_none_or(|s| d.seq <= s))
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
 /// Decide what one pass rewrites and which deletes it retires.
 fn plan_pass(
     live_data: &BTreeMap<String, LiveFile>,
@@ -449,17 +532,7 @@ fn plan_pass(
     live_pks: Option<&FileIndex>,
     config: &CompactionConfig,
 ) -> PassPlan {
-    let newest_delete = live_deletes.values().map(|d| d.seq).max();
-    let live_rows = live_pks.map(FileIndex::live_rows_per_file);
-    // Dirty: some live delete may have killed one of the file's rows. Only
-    // a delete newer than the file can; past that, trust the index's
-    // count of live rows when there is one.
-    let is_dirty = |path: &str, f: &LiveFile| {
-        newest_delete.is_some_and(|d| d > f.seq)
-            && live_rows
-                .as_ref()
-                .is_none_or(|counts| counts.get(path).copied().unwrap_or(0) < f.record_count)
-    };
+    let is_dirty = dirty_check(live_deletes, live_pks);
 
     // Candidates grouped by partition, each group oldest first.
     let small = config.target_size_bytes / 2;
@@ -511,20 +584,8 @@ fn plan_pass(
         }
     }
 
-    // Retire a delete once no dirty file it could apply to (seq below
-    // its own) survives this pass. Inputs are excluded: their rows have
-    // every delete applied before they move.
     let taken: BTreeSet<&str> = inputs.iter().map(|(p, _)| p.as_str()).collect();
-    let oldest_remaining_dirty = live_data
-        .iter()
-        .filter(|(path, f)| !taken.contains(path.as_str()) && is_dirty(path, f))
-        .map(|(_, f)| f.seq)
-        .min();
-    let retired_deletes = live_deletes
-        .iter()
-        .filter(|(_, d)| oldest_remaining_dirty.is_none_or(|s| d.seq <= s))
-        .map(|(p, _)| p.clone())
-        .collect();
+    let retired_deletes = retirable_deletes(live_data, live_deletes, &is_dirty, &taken);
 
     PassPlan {
         inputs,
@@ -656,6 +717,39 @@ mod tests {
         assert!(data.contains_key("b.parquet"));
         assert!(!data.contains_key("a.parquet"));
         assert!(deletes.is_empty(), "delete file should be removed");
+    }
+
+    /// A delete retires once no dirty data file older than it is left —
+    /// the rule a pass that rewrites nothing still applies.
+    #[test]
+    fn deletes_retire_once_no_older_dirty_file_is_left() {
+        let file = |seq: i64| LiveFile {
+            byte_size: 1,
+            record_count: 2,
+            partition_values: Vec::new(),
+            seq,
+        };
+        let files = |entries: &[(&str, i64)]| -> BTreeMap<String, LiveFile> {
+            entries
+                .iter()
+                .map(|(path, seq)| (path.to_string(), file(*seq)))
+                .collect()
+        };
+        let deletes = files(&[("eq-2", 2), ("eq-4", 4)]);
+        // No index: every data file older than the newest delete is dirty.
+        let is_dirty = dirty_check(&deletes, None);
+        let none = BTreeSet::new();
+
+        // A file from before both: either may apply to it.
+        let retired = retirable_deletes(&files(&[("a", 1), ("b", 3)]), &deletes, &is_dirty, &none);
+        assert!(retired.is_empty(), "{retired:?}");
+        // Rewritten at 3 (a managed catalog's compaction keeps the number
+        // its pass read): `eq-2` has nothing left to apply to.
+        let retired = retirable_deletes(&files(&[("c", 3), ("b", 3)]), &deletes, &is_dirty, &none);
+        assert_eq!(retired, ["eq-2"]);
+        // Nothing older than either.
+        let retired = retirable_deletes(&files(&[("d", 4)]), &deletes, &is_dirty, &none);
+        assert_eq!(retired, ["eq-2", "eq-4"]);
     }
 
     #[test]

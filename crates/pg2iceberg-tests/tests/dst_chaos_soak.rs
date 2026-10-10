@@ -430,6 +430,7 @@ impl ChaosHarness {
                 target_size_bytes: 4 * 1024 * 1024,
                 ..Default::default()
             }),
+            maintenance: Default::default(),
             flush_rows: 64,
             mat_batch_rows: 128,
             snapshot_source_factory: snapshot_factory,
