@@ -16,6 +16,11 @@
 //! - **`load_table` not-found.** Maps `ErrorKind::TableNotFound` and
 //!   `NamespaceNotFound` → `Ok(None)` (the materializer treats not-found
 //!   distinctly from transient errors).
+//! - **History, whoever wrote it.** `snapshots` takes what a snapshot
+//!   holds from its live manifest entries — Java writes the files a
+//!   commit removes as `DELETED` entries — and what it removed as what its
+//!   parent held that it doesn't, whatever its operation: a managed
+//!   catalog maintaining the table commits rewrites and deletes of its own.
 //!
 //! See [`super::gap_audit`] for the full method-by-method status and the
 //! list of fork patches we depend on.
@@ -441,7 +446,6 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     }
 
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>> {
-        use iceberg::spec::Operation;
         let it = to_iceberg_table_ident(ident)?;
         let table = match self.inner.load_table(&it).await {
             Ok(t) => t,
@@ -457,13 +461,12 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let mut snaps: Vec<_> = table.metadata().snapshots().cloned().collect();
         // Sort by sequence_number ASC so we visit each snapshot AFTER its
         // parent. The path-cache lookup below relies on the parent already
-        // being populated when we compute `removed_paths` for a Replace.
+        // being populated when we compute `removed_paths`.
         snaps.sort_by_key(|s| s.sequence_number());
         // Cache of snapshot_id → all live file paths in that snapshot's
         // manifest list. We need the previous snapshot's full path set to
-        // compute `removed_paths` for compaction snapshots — diffing
-        // parent_paths - current_paths gives the set of files dropped by
-        // this Replace.
+        // compute `removed_paths` — diffing parent_paths - current_paths
+        // gives the set of files the snapshot dropped.
         let mut paths_per_snap: BTreeMap<i64, std::collections::BTreeSet<String>> = BTreeMap::new();
         // Live files added by expired snapshots, by path. Expiry drops a
         // snapshot from the metadata but not the files it added: they stay
@@ -484,7 +487,6 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             let snap_id = snap.snapshot_id();
             let seq_num = snap.sequence_number();
             let parent_id = snap.parent_snapshot_id();
-            let is_replace = matches!(snap.summary().operation, Operation::Replace);
             let list_path = snap.manifest_list();
             let manifest_list = match cached.lists.get(list_path) {
                 Some(list) => Arc::clone(list),
@@ -500,10 +502,10 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 .insert(list_path.to_string(), Arc::clone(&manifest_list));
             let mut data_files: Vec<DataFile> = Vec::new();
             let mut delete_files: Vec<DataFile> = Vec::new();
-            // All file paths reachable in this snapshot's manifest list,
+            // All live file paths in this snapshot's manifest list,
             // regardless of which snapshot first added them. Used both as
             // the cache for the next snapshot's diff and as the "current"
-            // side of the diff for Replace snapshots.
+            // side of this snapshot's.
             let mut all_paths_this_snap: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
             for entry in manifest_list.entries() {
@@ -519,7 +521,10 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     ),
                 };
                 read.manifests.insert(path.clone(), Arc::clone(&manifest));
-                for me in manifest.entries() {
+                // A `DELETED` entry records a file its snapshot removed (other
+                // engines write them; our rewrite omits removed files): no
+                // file the snapshot holds.
+                for me in manifest.entries().iter().filter(|me| me.is_alive()) {
                     let df = me.data_file();
                     all_paths_this_snap.insert(df.file_path().to_string());
 
@@ -547,10 +552,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                     if me.snapshot_id() != Some(snap_id) {
                         let added_by_expired =
                             me.snapshot_id().is_none_or(|id| !retained.contains(&id));
-                        // A `Deleted` entry names the snapshot that removed
-                        // the file. Our rewrite omits removed files instead,
-                        // but other engines maintaining the table write them.
-                        if added_by_expired && me.is_alive() {
+                        if added_by_expired {
                             let seq = me.sequence_number().unwrap_or(seq_num);
                             expired_adds.entry(our.path.clone()).or_insert((
                                 seq,
@@ -572,28 +574,19 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 }
             }
 
-            // Compute removed_paths: only meaningful for Replace
-            // snapshots; for Append it'd just always be empty (Append
-            // never drops paths).
-            let removed_paths: Vec<String> = if is_replace {
-                if let Some(pid) = parent_id {
-                    if let Some(parent_paths) = paths_per_snap.get(&pid) {
-                        parent_paths
-                            .difference(&all_paths_this_snap)
-                            .cloned()
-                            .collect()
-                    } else {
-                        // Parent not in cache (shouldn't happen since we
-                        // walk in order), surface empty rather than
-                        // erroring.
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
+            // What the snapshot removed: what its parent held that it
+            // doesn't. A rewrite's inputs, but not only: another engine
+            // may drop files in a `delete` or `overwrite` (dangling delete
+            // files, say). An expired parent's files are gone with it.
+            let removed_paths: Vec<String> = parent_id
+                .and_then(|pid| paths_per_snap.get(&pid))
+                .map(|parent_paths| {
+                    parent_paths
+                        .difference(&all_paths_this_snap)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
 
             paths_per_snap.insert(snap_id, all_paths_this_snap);
 
