@@ -291,7 +291,7 @@ async fn every_request_is_traced_within_its_unit_of_work() {
         .expect("a commit");
     assert_eq!(parent(commit).map(|p| p.name), Some("materializer.table"));
     assert_eq!(
-        parent(commit).and_then(&parent).map(|c| c.name),
+        parent(commit).and_then(|t| t.parent).map(|c| spans[c].name),
         Some("materializer.cycle")
     );
     for f in ["rows", "data_files", "delete_files", "bytes", "snapshot"] {
