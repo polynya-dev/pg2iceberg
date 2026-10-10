@@ -18,6 +18,7 @@ pub mod pipeline;
 pub mod relation_event;
 pub mod runner;
 pub mod sink;
+pub mod spans;
 
 pub use catalog_cache::CachingCatalog;
 pub use materializer::{

@@ -270,6 +270,8 @@ Settings come from environment variables and an optional YAML file: `--config`, 
 | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` | `static` / `iam` / `vended`. Default: inferred |
 | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` | Where to serve `/metrics`, `/healthz`, `/readyz`. Default `:9090`; `off` serves nothing |
 | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` | `/healthz` fails once nothing completes for this long. Default `5m` |
+| `PG2ICEBERG_LOG_FORMAT` | — | `text` (default) or `json` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Export traces over OTLP/HTTP to this collector. Default: none |
 | `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` | `pg2iceberg` / `managed` (the catalog compacts, expires and cleans the tables). Default: `pg2iceberg` |
 | `AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, ... | `sink.s3_*` | Read as AWS tools read them; the file's `sink.s3_*` take precedence |
 
@@ -330,13 +332,13 @@ The integration suite covers the prod Coordinator (PG-replication path), the pro
 
 `run`, `stream-only`, `materializer-only` and `snapshot` serve `/metrics` (Prometheus), `/healthz` and `/readyz` on `metrics_addr` (default `:9090`): replication lag and slot WAL, per-table backlog and freshness, throughput, the latency and errors of every catalog, object store and coordinator request, and more. `/healthz` fails once nothing has completed for `liveness_timeout` (default `5m`) — stuck, not slow. See [Observability](docs/usage/observability.md) for every metric and what to alert on, and `example/single` (`--profile monitoring`) for Prometheus, alert rules and a Grafana dashboard.
 
+### Traces
+
+With `OTEL_EXPORTER_OTLP_ENDPOINT` set, pg2iceberg exports OpenTelemetry traces over OTLP/HTTP: each flush, materializer cycle, commit and snapshot chunk a trace, with every catalog, object store and coordinator request inside it. View them in Grafana (Tempo), Jaeger, or any OTLP backend. See [Observability](docs/usage/observability.md#traces).
+
 ### Structured logs
 
-The binary uses [`tracing`](https://docs.rs/tracing) with `tracing-subscriber` for stdout output. Set `RUST_LOG=info,pg2iceberg=debug` (or finer) to control verbosity.
-
-### Distributed tracing
-
-Distributed-tracing export via OTLP is **not yet wired**. Logs are stdout-only today.
+The binary logs to stdout through [`tracing`](https://docs.rs/tracing): plain text, or JSON lines with `PG2ICEBERG_LOG_FORMAT=json`. Set `RUST_LOG=info,pg2iceberg=debug` (or finer) to control verbosity.
 
 ### Control-plane meta tables
 

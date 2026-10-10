@@ -6,3 +6,8 @@ datasources:
     access: proxy
     url: http://prometheus:9090
     isDefault: true
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200

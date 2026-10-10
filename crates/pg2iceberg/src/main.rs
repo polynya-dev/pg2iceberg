@@ -130,18 +130,18 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,pg2iceberg=debug".into()),
-        )
-        // Plain text: log collectors (Cloudflare's, CloudWatch, `docker
-        // logs` piped to a file) show color codes as raw escapes.
-        .with_ansi(false)
-        .init();
+fn main() -> Result<()> {
+    // Dropped after the runtime: the spans not yet exported are, outside
+    // async code.
+    let _subscriber = pg2iceberg::subscriber::init(&config::process_env)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("start the async runtime")?
+        .block_on(run_command())
+}
 
+async fn run_command() -> Result<()> {
     let cli = Cli::parse();
     let config = cli.config;
     match cli.command {

@@ -61,7 +61,22 @@ tracing = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Spans exported as OpenTelemetry traces over OTLP/HTTP, when
+# OTEL_EXPORTER_OTLP_ENDPOINT says where (see `subscriber.rs`).
+# `internal-logs`: an export that fails is logged, not silently dropped.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+    "trace",
+    "internal-logs",
+] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "internal-logs",
+] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 async-trait = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 # Snapshot/verify SnapshotSource impl needs to format dates/timestamps
@@ -76,3 +91,11 @@ tokio-postgres = { version = "0.7", default-features = false, features = [
     "with-uuid-1",
     "with-serde_json-1",
 ] }
+
+[dev-dependencies]
+# Decodes what the OTLP exporter sends, in `subscriber.rs`'s tests.
+opentelemetry-proto = { version = "0.33", default-features = false, features = [
+    "gen-tonic-messages",
+    "trace",
+] }
+prost = "0.14"

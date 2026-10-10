@@ -34,8 +34,19 @@ use pg2iceberg_pg::prod::{PgClientImpl, TlsMode as PgTls};
 use pg2iceberg_stream::{prod::ObjectStoreBlobStore, BlobStore};
 use pg2iceberg_validate::Instrumented;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
+use tracing::Instrument as _;
+
+/// `work` in `span`, marked failed if it fails.
+async fn traced<T>(span: tracing::Span, work: impl Future<Output = Result<T>>) -> Result<T> {
+    let out = work.instrument(span.clone()).await;
+    if let Err(e) = &out {
+        pg2iceberg_logical::spans::record_error(&span, &format_args!("{e:#}"));
+    }
+    out
+}
 
 /// Production blob namer. Uses an [`IdGen`]-supplied UUID per blob so
 /// uploaded paths never collide across processes.
@@ -406,7 +417,11 @@ pub async fn run_materializer_only(
     if worker_id.is_empty() {
         anyhow::bail!("--worker-id is required for materializer-only mode");
     }
-    let mut materializer = build_one_shot_materializer(cfg.clone(), metrics.clone()).await?;
+    let mut materializer = traced(
+        pg2iceberg_logical::work_span!("startup"),
+        build_one_shot_materializer(cfg.clone(), metrics.clone()),
+    )
+    .await?;
     materializer.set_catalog_cache_ttl(
         Arc::new(crate::realio::RealClock),
         pg2iceberg_logical::CachingCatalog::<OneShotCatalog>::DEFAULT_TTL,
@@ -540,6 +555,10 @@ where
 /// One-shot: run a compaction pass over every configured table, log
 /// outcomes, exit.
 pub async fn run_compact(cfg: Config) -> Result<()> {
+    traced(pg2iceberg_logical::work_span!("compact"), compact(cfg)).await
+}
+
+async fn compact(cfg: Config) -> Result<()> {
     if cfg.sink.target_file_size == 0 {
         anyhow::bail!(
             "sink.target_file_size is 0 — compaction is disabled. \
@@ -591,6 +610,11 @@ pub async fn run_maintain(cfg: Config, retention_override: Option<String>) -> Re
              and removes their orphan files, so `pg2iceberg maintain` leaves them alone"
         );
     }
+    let span = pg2iceberg_logical::work_span!("maintain");
+    traced(span, maintain(cfg, retention_override)).await
+}
+
+async fn maintain(cfg: Config, retention_override: Option<String>) -> Result<()> {
     let retention_str = retention_override
         .clone()
         .unwrap_or_else(|| cfg.sink.maintenance_retention.clone());
@@ -987,6 +1011,12 @@ pub async fn run_cleanup(cfg: Config) -> Result<()> {
 /// On a checkpoint that already says `snapshot_complete = true`,
 /// returns `Ok(())` immediately without touching PG or the catalog.
 pub async fn run_snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
+    // The snapshot's chunks are traces of their own.
+    let span = pg2iceberg_logical::work_span!("snapshot");
+    traced(span, snapshot_only(cfg, metrics)).await
+}
+
+async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     use pg2iceberg_logical::pipeline::Pipeline;
     use pg2iceberg_logical::Materializer;
     use pg2iceberg_pg::PgClient;

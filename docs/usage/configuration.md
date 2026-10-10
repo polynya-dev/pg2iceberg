@@ -51,6 +51,8 @@ sink:
 <<<<<<< HEAD
 | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` |
 | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` |
+| `PG2ICEBERG_LOG_FORMAT` | `text` (default) or `json` logs; no config field |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, ... | trace export, as OpenTelemetry defines it: see [Observability](observability.md#traces) |
 =======
 | `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` |
 >>>>>>> 4c75811 (docs, tests: sink.maintenance: managed)

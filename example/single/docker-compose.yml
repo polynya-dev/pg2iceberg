@@ -1,6 +1,6 @@
 # Postgres -> pg2iceberg -> Iceberg REST catalog + MinIO, with ClickHouse to
-# query the tables, a mixed workload to drive Postgres, and Prometheus +
-# Grafana to watch pg2iceberg. See README.md.
+# query the tables, a mixed workload to drive Postgres, and Prometheus,
+# Tempo and Grafana to watch pg2iceberg. See README.md.
 name: pg2iceberg-single
 services:
   postgres:
@@ -88,6 +88,8 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: info
+      # Where to send spans: http://tempo:4318 with the monitoring profile.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     # /metrics, /healthz and /readyz.
     ports: ["9091:9090"]
     volumes:
@@ -129,6 +131,15 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
 
+  tempo:
+    image: grafana/tempo:2.9.0
+    profiles: ["monitoring"]
+    command: ["-config.file=/etc/tempo.yml"]
+    volumes:
+      - ./monitoring/tempo.yml:/etc/tempo.yml:ro
+    # Writable by the user Tempo runs as.
+    tmpfs: ["/var/tempo:mode=1777"]
+
   grafana:
     image: grafana/grafana:12.1.0
     profiles: ["monitoring"]
@@ -142,4 +153,4 @@ services:
       - ./monitoring/grafana/datasources.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
       - ./monitoring/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/pg2iceberg.yml:ro
       - ./monitoring/grafana/pg2iceberg.json:/etc/grafana/dashboards/pg2iceberg.json:ro
-    depends_on: [prometheus]
+    depends_on: [prometheus, tempo]

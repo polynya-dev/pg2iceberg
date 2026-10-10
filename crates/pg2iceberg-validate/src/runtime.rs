@@ -27,6 +27,8 @@ use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::{Clock, IdGen, Lsn, Metrics, Phase, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
+use pg2iceberg_logical::spans::record_outcome;
+use pg2iceberg_logical::work_span;
 use pg2iceberg_logical::{
     materializer::MaterializerNamer,
     pipeline::BlobNamer,
@@ -43,6 +45,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::field::Empty;
+use tracing::Instrument as _;
 
 /// Outcome of one [`run_materialize_tick`] call. The binary logs
 /// these counts; the fault-DST asserts on them under faults.
@@ -356,6 +360,19 @@ where
     Cat: Catalog + 'static,
     F: Future<Output = ()> + Unpin + Send,
 {
+    // The snapshot phase within makes traces of its own: a snapshot can
+    // take hours.
+    let span = work_span!("startup");
+    let started = start(lc).instrument(span.clone()).await;
+    record_outcome(&span, &started);
+    run_logical_main_loop(started?, shutdown).await
+}
+
+/// Everything before the main loop: steps 1-7 of
+/// [`run_logical_lifecycle`].
+async fn start<Cat: Catalog + 'static>(
+    lc: LogicalLifecycle<Cat>,
+) -> Result<LogicalLoop<dyn Coordinator, Cat>, LifecycleError> {
     // 1. Fingerprint the source cluster. `IDENTIFY_SYSTEM`'s systemid
     //    is unique per `initdb` and survives clone/replication, so a
     //    stale resume against the wrong cluster (accidental DSN swap,
@@ -806,7 +823,7 @@ where
         pending_snapshot_handle,
         metrics: lc.metrics,
     };
-    run_logical_main_loop(loop_state, shutdown).await
+    Ok(loop_state)
 }
 
 /// Bridge between [`crate::validate_startup`] (sync) and the lifecycle
@@ -1140,7 +1157,9 @@ where
             _ = shutdown.as_mut() => return Ok(false),
             _ = tokio::time::sleep(reconnect_delay(outage.attempts)) => {}
         }
-        let opened = open_stream(loop_state).await;
+        let span = work_span!("replication.reconnect", attempt = outage.attempts);
+        let opened = open_stream(loop_state).instrument(span.clone()).await;
+        record_outcome(&span, &opened);
         let outcome = labels([("outcome", if opened.is_ok() { "ok" } else { "error" })]);
         loop_state
             .metrics
@@ -1237,57 +1256,72 @@ where
             succeeded(loop_state, "materialize");
         }
         Handler::Watcher => {
-            // One combined slot probe per tick covers every health
-            // field the watcher needs:
-            //   - confirmed_flush_lsn → invariant 1 (SlotAheadOfRecord)
-            //   - wal_status=Unreserved → invariant 4 (warn-only)
-            //   - wal_status=Lost → invariant 5 (fatal)
-            //   - conflicting=true → invariant 6 (fatal)
-            // Fatal violations break the loop with
-            // `LifecycleError::SlotHealth` so the operator gets the
-            // actionable message instead of a confusing
-            // `recv()` error a few ticks later.
-            let health = loop_state
-                .slot_monitor
-                .slot_health_for_watcher(&loop_state.slot_name)
-                .await
-                .ok()
-                .flatten();
-            record_slot_health(loop_state.metrics.as_ref(), health.as_ref());
-            let confirmed = health
-                .as_ref()
-                .map(|h| h.confirmed_flush_lsn)
-                .unwrap_or(Lsn::ZERO);
-            let wal_status = health.as_ref().and_then(|h| h.wal_status);
-            let safe_wal_size = health.as_ref().and_then(|h| h.safe_wal_size);
-            let restart_lsn = health.as_ref().map(|h| h.restart_lsn).unwrap_or(Lsn::ZERO);
-            let conflicting = health.as_ref().map(|h| h.conflicting).unwrap_or(false);
-            // The durable record, unread if the coordinator is down: the
-            // invariant then skips.
-            let recorded = loop_state.coord.flushed_lsn().await.unwrap_or(Lsn::ZERO);
-            let violations = run_watcher_tick(
-                &loop_state.watcher,
-                loop_state.pipeline.flushed_lsn(),
-                confirmed,
-                recorded,
-                wal_status,
-                safe_wal_size,
-                restart_lsn,
-                conflicting,
-                &loop_state.slot_name,
-                &loop_state.group,
-                &loop_state.watched_tables,
-            )
-            .await;
-            // Log all, then fail fast on the first fatal one.
-            for v in &violations {
-                tracing::warn!(violation = %v, "invariant violation");
-            }
-            if let Some(fatal) = violations.iter().find(|v| v.is_fatal()) {
-                return Err(MainLoopError::SlotHealth(fatal.to_string()));
-            }
+            let span = work_span!("watcher.check", violations = Empty);
+            let out = watch(loop_state).instrument(span.clone()).await;
+            record_outcome(&span, &out);
+            out?;
             succeeded(loop_state, "watch");
         }
+    }
+    Ok(())
+}
+
+/// Check the invariants against the slot, the coordinator and the
+/// pipeline (see [`InvariantWatcher`]), gauging the slot as it goes.
+async fn watch<C, Cat>(loop_state: &mut LogicalLoop<C, Cat>) -> Result<(), MainLoopError>
+where
+    C: Coordinator + ?Sized + 'static,
+    Cat: Catalog + 'static,
+{
+    // One combined slot probe per tick covers every health
+    // field the watcher needs:
+    //   - confirmed_flush_lsn → invariant 1 (SlotAheadOfRecord)
+    //   - wal_status=Unreserved → invariant 4 (warn-only)
+    //   - wal_status=Lost → invariant 5 (fatal)
+    //   - conflicting=true → invariant 6 (fatal)
+    // Fatal violations break the loop with
+    // `LifecycleError::SlotHealth` so the operator gets the
+    // actionable message instead of a confusing
+    // `recv()` error a few ticks later.
+    let health = loop_state
+        .slot_monitor
+        .slot_health_for_watcher(&loop_state.slot_name)
+        .await
+        .ok()
+        .flatten();
+    record_slot_health(loop_state.metrics.as_ref(), health.as_ref());
+    let confirmed = health
+        .as_ref()
+        .map(|h| h.confirmed_flush_lsn)
+        .unwrap_or(Lsn::ZERO);
+    let wal_status = health.as_ref().and_then(|h| h.wal_status);
+    let safe_wal_size = health.as_ref().and_then(|h| h.safe_wal_size);
+    let restart_lsn = health.as_ref().map(|h| h.restart_lsn).unwrap_or(Lsn::ZERO);
+    let conflicting = health.as_ref().map(|h| h.conflicting).unwrap_or(false);
+    // The durable record, unread if the coordinator is down: the
+    // invariant then skips.
+    let recorded = loop_state.coord.flushed_lsn().await.unwrap_or(Lsn::ZERO);
+    let violations = run_watcher_tick(
+        &loop_state.watcher,
+        loop_state.pipeline.flushed_lsn(),
+        confirmed,
+        recorded,
+        wal_status,
+        safe_wal_size,
+        restart_lsn,
+        conflicting,
+        &loop_state.slot_name,
+        &loop_state.group,
+        &loop_state.watched_tables,
+    )
+    .await;
+    tracing::Span::current().record("violations", violations.len());
+    // Log all, then fail fast on the first fatal one.
+    for v in &violations {
+        tracing::warn!(violation = %v, "invariant violation");
+    }
+    if let Some(fatal) = violations.iter().find(|v| v.is_fatal()) {
+        return Err(MainLoopError::SlotHealth(fatal.to_string()));
     }
     Ok(())
 }
@@ -1324,6 +1358,20 @@ where
     C: Coordinator + ?Sized + 'static,
     Cat: Catalog + 'static,
 {
+    let span = work_span!("slot.ack", lsn = Empty);
+    let (lsn, acked) = record_then_ack(loop_state).instrument(span.clone()).await;
+    span.record("lsn", tracing::field::display(lsn));
+    record_outcome(&span, &acked);
+    (lsn, acked)
+}
+
+async fn record_then_ack<C, Cat>(
+    loop_state: &mut LogicalLoop<C, Cat>,
+) -> (Lsn, pg2iceberg_pg::Result<()>)
+where
+    C: Coordinator + ?Sized + 'static,
+    Cat: Catalog + 'static,
+{
     let lsn = loop_state.pipeline.flushed_lsn();
     if lsn > loop_state.recorded_lsn {
         match loop_state.coord.set_flushed_lsn(lsn).await {
@@ -1347,8 +1395,19 @@ where
 /// [`run_logical_main_loop`] on shutdown; also exposed so callers can
 /// drive shutdown directly.
 pub async fn drain_and_shutdown<C, Cat>(
-    mut loop_state: LogicalLoop<C, Cat>,
+    loop_state: LogicalLoop<C, Cat>,
 ) -> Result<(), MainLoopError>
+where
+    C: Coordinator + ?Sized + 'static,
+    Cat: Catalog + 'static,
+{
+    let span = work_span!("shutdown");
+    let out = drain(loop_state).instrument(span.clone()).await;
+    record_outcome(&span, &out);
+    out
+}
+
+async fn drain<C, Cat>(mut loop_state: LogicalLoop<C, Cat>) -> Result<(), MainLoopError>
 where
     C: Coordinator + ?Sized + 'static,
     Cat: Catalog + 'static,

@@ -1,10 +1,11 @@
-//! Request metrics for the three stores pg2iceberg talks to: the Iceberg
-//! catalog, the object store, and the coordinator.
+//! Request metrics and spans for the three stores pg2iceberg talks to: the
+//! Iceberg catalog, the object store, and the coordinator.
 //!
 //! [`Instrumented`] wraps one and forwards every call unchanged, recording
-//! how long it took and whether it failed. Every method is forwarded,
-//! including the traits' provided ones, so the wrapped store's own
-//! overrides still run.
+//! how long it took and whether it failed, and running it in a `request`
+//! span (exported as `<store>.<op>`, e.g. `catalog.commit_snapshots`) under
+//! whatever unit of work made it. Every method is forwarded, including the
+//! traits' provided ones, so the wrapped store's own overrides still run.
 //!
 //! Recording on every completed request is also what keeps a
 //! [`Registry`](pg2iceberg_core::Registry)'s liveness signal fresh while a
@@ -24,9 +25,37 @@ use pg2iceberg_iceberg::{
 };
 use pg2iceberg_stream::{BlobInfo, BlobStore};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument as _;
+
+/// How one kind of store's requests are recorded.
+struct Store {
+    /// The `store` span field, and the exported span name's prefix.
+    name: &'static str,
+    duration: &'static str,
+    errors: &'static str,
+}
+
+const CATALOG: Store = Store {
+    name: "catalog",
+    duration: names::CATALOG_REQUEST_DURATION,
+    errors: names::CATALOG_REQUEST_ERRORS_TOTAL,
+};
+
+const OBJECT_STORE: Store = Store {
+    name: "object_store",
+    duration: names::BLOB_REQUEST_DURATION,
+    errors: names::BLOB_REQUEST_ERRORS_TOTAL,
+};
+
+const COORDINATOR: Store = Store {
+    name: "coordinator",
+    duration: names::COORD_REQUEST_DURATION,
+    errors: names::COORD_REQUEST_ERRORS_TOTAL,
+};
 
 /// A store whose requests are timed and counted (see the module docs).
 pub struct Instrumented<T: ?Sized> {
@@ -49,28 +78,36 @@ impl<T: ?Sized> Instrumented<T> {
         &self.inner
     }
 
-    /// Run `request`, recording its duration under `duration` and, if it
-    /// fails, an error under `errors` — labelled with `error_kind`'s
-    /// answer when it has one.
-    async fn observe<R, E>(
+    /// Run `request` in its span, recording its duration and, if it
+    /// fails, an error — labelled with `error_kind`'s answer when it has
+    /// one.
+    async fn observe<R, E: Display>(
         &self,
-        duration: &str,
-        errors: &str,
+        store: &Store,
         op: &'static str,
         error_kind: fn(&E) -> Option<&'static str>,
         request: impl Future<Output = Result<R, E>>,
     ) -> Result<R, E> {
+        let span = tracing::info_span!(
+            "request",
+            otel.name = %format_args!("{}.{op}", store.name),
+            otel.kind = "client",
+            store = store.name,
+            op,
+            otel.status_description = tracing::field::Empty,
+        );
         let start = self.clock.now();
-        let out = request.await;
+        let out = request.instrument(span.clone()).await;
         let op_labels = labels([("op", op)]);
         let elapsed = seconds_between(start, self.clock.now());
-        self.metrics.histogram(duration, &op_labels, elapsed);
+        self.metrics.histogram(store.duration, &op_labels, elapsed);
         if let Err(e) = &out {
+            pg2iceberg_logical::spans::record_error(&span, e);
             let mut error_labels = op_labels;
             if let Some(kind) = error_kind(e) {
                 error_labels.insert("kind".into(), kind.into());
             }
-            self.metrics.counter(errors, &error_labels, 1);
+            self.metrics.counter(store.errors, &error_labels, 1);
         }
         out
     }
@@ -92,14 +129,8 @@ impl<C: Catalog + ?Sized> Instrumented<C> {
         op: &'static str,
         request: impl Future<Output = pg2iceberg_iceberg::Result<R>>,
     ) -> pg2iceberg_iceberg::Result<R> {
-        self.observe(
-            names::CATALOG_REQUEST_DURATION,
-            names::CATALOG_REQUEST_ERRORS_TOTAL,
-            op,
-            catalog_error_kind,
-            request,
-        )
-        .await
+        self.observe(&CATALOG, op, catalog_error_kind, request)
+            .await
     }
 }
 
@@ -194,14 +225,7 @@ impl<B: BlobStore + ?Sized> Instrumented<B> {
         op: &'static str,
         request: impl Future<Output = pg2iceberg_stream::Result<R>>,
     ) -> pg2iceberg_stream::Result<R> {
-        self.observe(
-            names::BLOB_REQUEST_DURATION,
-            names::BLOB_REQUEST_ERRORS_TOTAL,
-            op,
-            |_| None,
-            request,
-        )
-        .await
+        self.observe(&OBJECT_STORE, op, |_| None, request).await
     }
 
     fn bytes(&self, op: &str, n: usize) {
@@ -251,14 +275,7 @@ impl<C: Coordinator + ?Sized> Instrumented<C> {
         op: &'static str,
         request: impl Future<Output = pg2iceberg_coord::Result<R>>,
     ) -> pg2iceberg_coord::Result<R> {
-        self.observe(
-            names::COORD_REQUEST_DURATION,
-            names::COORD_REQUEST_ERRORS_TOTAL,
-            op,
-            |_| None,
-            request,
-        )
-        .await
+        self.observe(&COORDINATOR, op, |_| None, request).await
     }
 }
 

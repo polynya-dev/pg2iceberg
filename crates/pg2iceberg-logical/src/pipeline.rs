@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::Instrument as _;
 
 #[derive(Clone, Debug, Error)]
 pub enum PipelineError {
@@ -569,8 +570,27 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     /// Drain all committed-but-unflushed transactions: encode → upload →
     /// `claim_offsets` → advance `flushedLSN` via the receipt. No-op if
     /// nothing is ready (no staged events, no markers awaiting emission,
-    /// and no keepalive past `flushedLSN`).
+    /// and no keepalive past `flushedLSN`). Runs in a `pipeline.flush`
+    /// span, unless there's nothing to do.
     pub async fn flush(&mut self) -> Result<Option<Lsn>> {
+        if !self.sink.has_committed()
+            && self.committed_spills.is_empty()
+            && self.ready_markers.is_empty()
+            && self.keepalive_lsn <= self.flushed_lsn()
+        {
+            return Ok(None);
+        }
+        let span = crate::work_span!(
+            "pipeline.flush",
+            rows = tracing::field::Empty,
+            lsn = tracing::field::Empty,
+        );
+        let out = self.flush_committed().instrument(span.clone()).await;
+        crate::spans::record_outcome(&span, &out);
+        out
+    }
+
+    async fn flush_committed(&mut self) -> Result<Option<Lsn>> {
         let sink_output = self.sink.flush()?;
         // Markers can ride alone in an otherwise-empty flush — a tx
         // that contains only a marker INSERT (no user-data events)
@@ -623,6 +643,9 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         // call. Re-flushing markers is idempotent (uuid is the PK
         // in coord's pending_markers).
         let markers_for_batch = self.ready_markers.clone();
+        let span = tracing::Span::current();
+        span.record("rows", claims.iter().map(|c| c.record_count).sum::<u64>());
+        span.record("lsn", tracing::field::display(flushable_lsn));
         let batch = CommitBatch {
             claims,
             flushable_lsn,
@@ -661,9 +684,17 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         let Some(xid) = xid else {
             return Ok(());
         };
-        if self.sink.open_tx_rows(xid) < self.flush_threshold {
+        let rows = self.sink.open_tx_rows(xid);
+        if rows < self.flush_threshold {
             return Ok(());
         }
+        let span = crate::work_span!("pipeline.spill", xid, rows);
+        let out = self.spill(xid).instrument(span.clone()).await;
+        crate::spans::record_outcome(&span, &out);
+        out
+    }
+
+    async fn spill(&mut self, xid: u32) -> Result<()> {
         if self.sink.has_committed() {
             self.flush().await?;
         }

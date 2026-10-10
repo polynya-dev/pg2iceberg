@@ -17,6 +17,7 @@ pg2iceberg-coord.workspace = true
 pg2iceberg-iceberg.workspace = true
 pg2iceberg-logical.workspace = true
 thiserror.workspace = true
+tracing = "0.1"
 
 [dev-dependencies]
 pg2iceberg-sim.workspace = true
