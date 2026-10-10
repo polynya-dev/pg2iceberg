@@ -362,9 +362,13 @@ where
 {
     // The snapshot phase within makes traces of its own: a snapshot can
     // take hours.
-    let span = work_span!("startup");
-    let started = start(lc).instrument(span.clone()).await;
-    record_outcome(&span, &started);
+    let started = {
+        // Closed here, when startup ends: a span is exported once closed.
+        let span = work_span!("startup");
+        let started = start(lc).instrument(span.clone()).await;
+        record_outcome(&span, &started);
+        started
+    };
     run_logical_main_loop(started?, shutdown).await
 }
 

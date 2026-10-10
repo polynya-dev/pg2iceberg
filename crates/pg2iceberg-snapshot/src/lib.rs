@@ -294,9 +294,13 @@ impl Snapshotter {
                 snap_lsn,
             };
 
-            let span = work_span!(parent: None, "snapshot.table", table = %schema.ident);
-            let resume = self.resume(schema).instrument(span.clone()).await;
-            pg2iceberg_logical::spans::record_outcome(&span, &resume);
+            let resume = {
+                // Closed here, before the chunks: a span is exported once closed.
+                let span = work_span!(parent: None, "snapshot.table", table = %schema.ident);
+                let resume = self.resume(schema).instrument(span.clone()).await;
+                pg2iceberg_logical::spans::record_outcome(&span, &resume);
+                resume
+            };
             let Resume::From(mut last_pk_key) = resume? else {
                 continue;
             };

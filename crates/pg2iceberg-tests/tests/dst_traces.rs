@@ -143,6 +143,17 @@ struct RecordedSpan {
     fields: BTreeMap<String, String>,
     /// Index of the span it's a child of.
     parent: Option<usize>,
+    /// When it began and ended, as positions in one sequence of every
+    /// span's beginning and end.
+    opened: usize,
+    closed: Option<usize>,
+}
+
+/// The position of the next span beginning or ending.
+static EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn next_event() -> usize {
+    EVENTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
 struct FieldsVisitor<'a>(&'a mut BTreeMap<String, String>);
@@ -178,6 +189,8 @@ where
             name: attrs.metadata().name(),
             fields,
             parent,
+            opened: next_event(),
+            closed: None,
         });
         span.extensions_mut().insert(spans.len() - 1);
     }
@@ -193,6 +206,14 @@ where
             return;
         };
         values.record(&mut FieldsVisitor(&mut self.0.lock().unwrap()[i].fields));
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let span = ctx.span(&id).expect("a closing span");
+        let Some(&i) = span.extensions().get::<usize>() else {
+            return;
+        };
+        self.0.lock().unwrap()[i].closed = Some(next_event());
     }
 }
 
@@ -284,6 +305,32 @@ async fn every_request_is_traced_within_its_unit_of_work() {
     .into_iter()
     .collect();
     assert_eq!(roots, expected);
+    // A trace ends with its work, so it's exported then: startup's before
+    // the main loop's first unit of work begins.
+    let startup = named("startup").next().expect("startup");
+    let first_ack = named("slot.ack").map(|a| a.opened).min().expect("an ack");
+    assert!(
+        startup.closed.is_some_and(|c| c < first_ack),
+        "startup ends at {:?}, after the main loop began at {first_ack}",
+        startup.closed
+    );
+    // And a table's resume, before its first chunk.
+    let table = named("snapshot.table").next().expect("a snapshot table");
+    let first_chunk = named("snapshot.chunk")
+        .map(|c| c.opened)
+        .min()
+        .expect("a chunk");
+    assert!(
+        table.closed.is_some_and(|c| c < first_chunk),
+        "snapshot.table ends at {:?}, after its first chunk began at {first_chunk}",
+        table.closed
+    );
+    let open: Vec<&str> = spans
+        .iter()
+        .filter(|s| s.closed.is_none())
+        .map(|s| s.name)
+        .collect();
+    assert!(open.is_empty(), "spans never closed: {open:?}");
 
     // A commit: within its table's materialization, within the cycle.
     let commit = named("materializer.commit")
