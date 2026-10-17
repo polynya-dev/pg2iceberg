@@ -13,18 +13,21 @@
 //! promotion (`int` → `long`, `float` → `double`) reads as the promoted
 //! type.
 
-use crate::writer::WriterError;
-use arrow_array::RecordBatch;
+use crate::writer::{arrow_schema_for, WriterError};
+use arrow_array::{new_null_array, ArrayRef, RecordBatch};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
+use arrow_cast::cast;
+use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ProjectionMask;
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimestampMicros};
 use pg2iceberg_core::{ColumnName, ColumnSchema, IcebergType, PgValue, Row};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub type Result<T> = std::result::Result<T, WriterError>;
 
@@ -97,29 +100,101 @@ pub struct RowBatches {
 
 impl RowBatches {
     pub fn new(bytes: Bytes, cols: &[ColumnSchema], batch_rows: usize) -> Result<Self> {
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?;
-        let parquet_schema = builder.parquet_schema();
-        let wanted = (0..parquet_schema.num_columns()).filter(|&i| {
-            let column = parquet_schema.column(i);
-            let info = column.self_type().get_basic_info();
-            if info.has_id() {
-                cols.iter().any(|c| c.field_id == info.id())
-            } else {
-                let name = column.path().string();
-                cols.iter().any(|c| c.name == name)
-            }
-        });
-        let projection = ProjectionMask::leaves(parquet_schema, wanted);
-        let reader = builder
-            .with_projection(projection)
-            .with_batch_size(batch_rows.max(1))
-            .build()
-            .map_err(|e| WriterError::Encode(format!("parquet reader build: {e}")))?;
         Ok(Self {
-            reader,
+            reader: projected_reader(bytes, cols, batch_rows)?,
             cols: cols.to_vec(),
         })
+    }
+}
+
+/// A reader of `bytes`'s columns among `cols`, `batch_rows` rows at a time.
+fn projected_reader(
+    bytes: Bytes,
+    cols: &[ColumnSchema],
+    batch_rows: usize,
+) -> Result<ParquetRecordBatchReader> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?;
+    let parquet_schema = builder.parquet_schema();
+    let wanted = (0..parquet_schema.num_columns()).filter(|&i| {
+        let column = parquet_schema.column(i);
+        let info = column.self_type().get_basic_info();
+        if info.has_id() {
+            cols.iter().any(|c| c.field_id == info.id())
+        } else {
+            let name = column.path().string();
+            cols.iter().any(|c| c.name == name)
+        }
+    });
+    let projection = ProjectionMask::leaves(parquet_schema, wanted);
+    builder
+        .with_projection(projection)
+        .with_batch_size(batch_rows.max(1))
+        .build()
+        .map_err(|e| WriterError::Encode(format!("parquet reader build: {e}")))
+}
+
+/// Reads a data file one record batch at a time like [`RowBatches`], but
+/// keeps each batch columnar, in `cols`' schema as the writer encodes it
+/// ([`crate::writer::arrow_schema_for`]): a column the file doesn't have
+/// is NULL, as in [`RowBatches`], and one a type promotion widened is
+/// cast. For a caller that moves rows without looking at most of their
+/// values — decoding each value into a [`Row`] costs far more than
+/// reading it.
+pub struct ArrowBatches {
+    reader: ParquetRecordBatchReader,
+    cols: Vec<ColumnSchema>,
+    schema: SchemaRef,
+}
+
+impl ArrowBatches {
+    pub fn new(bytes: Bytes, cols: &[ColumnSchema], batch_rows: usize) -> Result<Self> {
+        Ok(Self {
+            reader: projected_reader(bytes, cols, batch_rows)?,
+            cols: cols.to_vec(),
+            schema: Arc::new(arrow_schema_for(cols)),
+        })
+    }
+}
+
+impl Iterator for ArrowBatches {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = match self.reader.next()? {
+            Ok(b) => b,
+            Err(e) => return Some(Err(WriterError::Encode(format!("read batch: {e}")))),
+        };
+        let n = batch.num_rows();
+        let columns = column_indices(&batch, &self.cols)
+            .into_iter()
+            .zip(self.schema.fields())
+            .map(|(i, field)| match i.map(|i| batch.column(i)) {
+                Some(a) if a.data_type() == field.data_type() => Ok(a.clone()),
+                Some(a) => cast(a, field.data_type()).map_err(|e| {
+                    WriterError::Encode(format!(
+                        "cast {} to {}: {e}",
+                        field.name(),
+                        field.data_type()
+                    ))
+                }),
+                None => Ok(new_null_array(field.data_type(), n)),
+            })
+            .collect::<Result<Vec<ArrayRef>>>();
+        Some(columns.and_then(|columns| {
+            RecordBatch::try_new(self.schema.clone(), columns)
+                .map_err(|e| WriterError::Encode(format!("build record batch: {e}")))
+        }))
+    }
+}
+
+/// Row `i`'s value in `arr`, the column of `col`: what [`RowBatches`]
+/// decodes it to.
+pub(crate) fn value_at(col: &ColumnSchema, arr: &dyn Array, i: usize) -> Result<PgValue> {
+    if arr.is_null(i) {
+        Ok(PgValue::Null)
+    } else {
+        decode_value(col.ty, arr, i)
     }
 }
 
@@ -135,12 +210,10 @@ impl Iterator for RowBatches {
     }
 }
 
-/// The batch's column for each of `cols`: by field id (by name for a
-/// column the file wrote without one), `None` where the file has none.
-fn resolve_columns<'a>(
-    batch: &'a RecordBatch,
-    cols: &[ColumnSchema],
-) -> Vec<Option<&'a dyn Array>> {
+/// The index of the batch's column for each of `cols`: by field id (by
+/// name for a column the file wrote without one), `None` where the file
+/// has none.
+fn column_indices(batch: &RecordBatch, cols: &[ColumnSchema]) -> Vec<Option<usize>> {
     let schema = batch.schema();
     let mut by_id: BTreeMap<i32, usize> = BTreeMap::new();
     let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
@@ -163,8 +236,19 @@ fn resolve_columns<'a>(
             by_id
                 .get(&c.field_id)
                 .or_else(|| by_name.get(c.name.as_str()))
-                .map(|&i| batch.column(i).as_ref())
+                .copied()
         })
+        .collect()
+}
+
+/// The batch's column for each of `cols` (see [`column_indices`]).
+fn resolve_columns<'a>(
+    batch: &'a RecordBatch,
+    cols: &[ColumnSchema],
+) -> Vec<Option<&'a dyn Array>> {
+    column_indices(batch, cols)
+        .into_iter()
+        .map(|i| i.map(|i| batch.column(i).as_ref()))
         .collect()
 }
 
@@ -182,11 +266,7 @@ fn decode_batch(batch: &RecordBatch, cols: &[ColumnSchema]) -> Result<Vec<Row>> 
                 row.insert(key, PgValue::Null);
                 continue;
             };
-            if arr.is_null(i) {
-                row.insert(key, PgValue::Null);
-            } else {
-                row.insert(key, decode_value(col.ty, arr, i)?);
-            }
+            row.insert(key, value_at(col, arr, i)?);
         }
         out.push(row);
     }

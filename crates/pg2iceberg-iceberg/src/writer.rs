@@ -433,6 +433,19 @@ impl StreamingDataFile {
         Ok(())
     }
 
+    /// Append a batch in the table's schema — as [`crate::ArrowBatches`]
+    /// reads one.
+    pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        self.writer
+            .write(batch)
+            .map_err(|e| WriterError::Encode(format!("parquet write: {e}")))?;
+        self.record_count += batch.num_rows() as u64;
+        Ok(())
+    }
+
     /// Encoded bytes so far: flushed row groups plus the buffered one.
     pub fn estimated_size(&self) -> u64 {
         (self.writer.bytes_written() + self.writer.in_progress_size()) as u64
@@ -455,7 +468,7 @@ impl StreamingDataFile {
     }
 }
 
-fn arrow_schema_for(cols: &[ColumnSchema]) -> Schema {
+pub(crate) fn arrow_schema_for(cols: &[ColumnSchema]) -> Schema {
     let fields: Vec<Field> = cols
         .iter()
         .map(|c| {

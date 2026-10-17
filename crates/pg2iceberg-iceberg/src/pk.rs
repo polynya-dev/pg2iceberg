@@ -65,11 +65,15 @@ impl PkKey {
     /// The key of `row`'s primary key. Like [`crate::pk_key`], PK columns
     /// missing from the row are skipped.
     pub fn from_row(row: &Row, pk_cols: &[ColumnName]) -> Self {
+        Self::from_values(pk_cols.iter().filter_map(|c| row.get(c)))
+    }
+
+    /// The key of a primary key's values, in its columns' order: what
+    /// [`Self::from_row`] makes of a row holding them.
+    pub fn from_values<'a>(values: impl IntoIterator<Item = &'a PgValue>) -> Self {
         let mut buf = Vec::with_capacity(INLINE);
-        for col in pk_cols {
-            if let Some(v) = row.get(col) {
-                encode(v, &mut buf);
-            }
+        for v in values {
+            encode(v, &mut buf);
         }
         Self::from_bytes(&buf)
     }

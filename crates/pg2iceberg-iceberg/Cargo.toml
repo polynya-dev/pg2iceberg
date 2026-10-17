@@ -13,7 +13,9 @@ workspace = true
 async-trait.workspace = true
 arrow-array = "54"
 arrow-buffer = "54"
+arrow-cast = "54"
 arrow-schema = "54"
+arrow-select = "54"
 bytes = "1"
 parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
 pg2iceberg-core.workspace = true

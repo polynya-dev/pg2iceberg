@@ -962,3 +962,94 @@ fn compaction_reads_only_the_files_it_rewrites() {
     );
     assert_eq!(visible_id_qty(&h, &s), before);
 }
+
+/// Files written before a schema change are rewritten in the current
+/// schema, holding what a reader sees in them: NULL for a column added
+/// since, and a promoted column's values, widened.
+#[test]
+fn older_files_are_rewritten_in_the_current_schema() {
+    let h = Harness::new();
+    let v1 = schema_id_qty();
+    ensure_table(&h, &v1);
+    insert(&h, &v1, row_id_qty(1, 10));
+    insert(&h, &v1, row_id_qty(2, 20));
+
+    // `qty` int → long, and a new column.
+    let mut v2 = v1.clone();
+    v2.columns[1].ty = IcebergType::Long;
+    v2.columns.push(ColumnSchema {
+        name: "note".into(),
+        field_id: 3,
+        ty: IcebergType::String,
+        nullable: true,
+        is_primary_key: false,
+    });
+    let mut three = BTreeMap::new();
+    three.insert(ColumnName("id".into()), PgValue::Int4(3));
+    three.insert(ColumnName("qty".into()), PgValue::Int8(30));
+    three.insert(ColumnName("note".into()), PgValue::Text("three".into()));
+    insert(&h, &v2, three);
+    delete(&h, &v2, pk_only(2));
+
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let out = h.run_compaction(&v2, &cfg).expect("compaction should run");
+    assert_eq!(out.input_data_files, 3);
+    assert_eq!(out.rows_removed_by_deletes, 1);
+
+    let [output] = out.added_files.as_slice() else {
+        panic!("one output file: {:?}", out.added_files);
+    };
+    let bytes = block_on(h.blob.get(&output.path)).unwrap();
+    let written = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .schema()
+        .clone();
+    let types: Vec<(&str, &arrow_schema::DataType)> = written
+        .fields()
+        .iter()
+        .map(|f| (f.name().as_str(), f.data_type()))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("id", &arrow_schema::DataType::Int32),
+            ("qty", &arrow_schema::DataType::Int64),
+            ("note", &arrow_schema::DataType::Utf8),
+        ]
+    );
+
+    let mut visible = block_on(read_materialized_state(
+        &h.cat,
+        h.blob.as_ref(),
+        &v2.ident,
+        &v2,
+        &pk_cols(),
+    ))
+    .unwrap();
+    visible.sort_by_key(|r| format!("{:?}", r.get(&ColumnName("id".into()))));
+    let values: Vec<Vec<PgValue>> = visible
+        .iter()
+        .map(|r| {
+            ["id", "qty", "note"]
+                .iter()
+                .map(|c| r.get(&ColumnName(c.to_string())).cloned().unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        values,
+        [
+            vec![PgValue::Int4(1), PgValue::Int8(10), PgValue::Null],
+            vec![
+                PgValue::Int4(3),
+                PgValue::Int8(30),
+                PgValue::Text("three".into())
+            ],
+        ]
+    );
+}
