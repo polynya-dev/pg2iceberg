@@ -87,7 +87,7 @@ Runs a single compaction pass across every configured table, then exits. Designe
 pg2iceberg compact --config config.yaml
 ```
 
-Skipped for tables below the configured `compaction_data_files` / `compaction_delete_files` thresholds. Set `target_file_size: 0` in YAML to disable compaction entirely.
+Skipped for tables below the configured `compaction_data_files` / `compaction_delete_files` / `compaction_delete_ratio` thresholds. Set `target_file_size: 0` in YAML to disable compaction entirely.
 
 ## `maintain` — one-shot maintenance pass
 

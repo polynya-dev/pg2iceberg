@@ -105,7 +105,11 @@ sink:
   # partition tuple). Equality deletes are applied inline at compaction
   # time; surviving rows are deduped and folded into the new files.
   compaction_data_files: 8
-  compaction_delete_files: 4
+  # Rows a delete hides stay in their data files until compaction
+  # rewrites them: once there are this many delete files, or the hidden
+  # rows are this share of the rows in the files holding them.
+  compaction_delete_files: 32
+  compaction_delete_ratio: 0.1
   target_file_size: 134217728   # 128 MiB
 
   # `pg2iceberg maintain` knobs. The subcommand runs in two phases:

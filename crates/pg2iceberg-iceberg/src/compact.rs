@@ -11,12 +11,14 @@
 //! 1. Load snapshot history; compute live data + delete files
 //!    (cumulative across snapshots, skipping anything in
 //!    `Snapshot.removed_paths`).
-//! 2. Threshold check: bail with `None` if both file counts are below
-//!    their thresholds.
-//! 3. Plan the pass ([`plan_pass`]): candidates are small files
-//!    (< `target_size_bytes / 2`) and *dirty* files — ones holding rows a
-//!    live delete has killed. Oldest first, take candidates until
-//!    `max_input_bytes_per_pass`; the rest wait for a later pass.
+//! 2. Decide what's worth doing, if anything: merging small files
+//!    (< `target_size_bytes / 2`), once there are `data_file_threshold`
+//!    data files; rewriting *dirty* files — ones holding rows a live delete
+//!    has killed — once those rows are `delete_ratio` of the rows the
+//!    dirty files hold, or there are `delete_file_threshold` delete files
+//!    ([`purge_due`]). Neither due: bail with `None`.
+//! 3. Plan the pass ([`plan_pass`]): oldest first, take the candidates
+//!    until `max_input_bytes_per_pass`; the rest wait for a later pass.
 //! 4. Retire every delete file no remaining dirty file could still need.
 //! 5. Load deleted PKs (`PK → max delete seq`) from the delete files that
 //!    can apply to an input.
@@ -78,12 +80,19 @@ pub const DECODE_BATCH_ROWS: usize = 1024;
 /// size the output.
 #[derive(Clone, Debug)]
 pub struct CompactionConfig {
-    /// Trigger compaction when live data files >= this count.
+    /// Merge small files once live data files >= this count.
     pub data_file_threshold: usize,
-    /// Trigger compaction when live delete files >= this count. A delete
-    /// file is dropped once no data file it could apply to remains, so
-    /// even a single sufficiently-old delete is a reason to compact.
+    /// Rewrite the files deletes killed rows in once live delete files >=
+    /// this count, however few rows they killed: each delete file costs a
+    /// reader. A delete file is dropped once no data file it could apply
+    /// to remains, and that takes rewriting every older dirty file.
     pub delete_file_threshold: usize,
+    /// ... or once the rows deletes killed are this share of the rows the
+    /// files holding them hold. Rewriting them then reads at most `1 /
+    /// delete_ratio` rows per row deleted; sooner, under updates spread
+    /// across a large table, a pass rewrites the table for a few of its
+    /// rows.
+    pub delete_ratio: f64,
     /// Files smaller than `target_size_bytes / 2` are eligible for
     /// rewrite, and output files roll over at this size. Default
     /// 128 MiB target → 64 MiB minimum.
@@ -105,7 +114,8 @@ impl Default for CompactionConfig {
         let target_size_bytes = 128 * 1024 * 1024;
         Self {
             data_file_threshold: 8,
-            delete_file_threshold: 4,
+            delete_file_threshold: 32,
+            delete_ratio: 0.1,
             target_size_bytes,
             max_input_bytes_per_pass: target_size_bytes * Self::DEFAULT_PASS_TARGET_FILES,
         }
@@ -233,13 +243,15 @@ where
 
     let (live_data, live_deletes) = compute_live_files(&snapshots);
 
-    if live_data.len() < config.data_file_threshold
-        && live_deletes.len() < config.delete_file_threshold
-    {
+    let is_dirty = dirty_check(&live_deletes, live_pks);
+    let rewrite = Rewrite {
+        merge: live_data.len() >= config.data_file_threshold,
+        purge: purge_due(&live_data, &live_deletes, live_pks, &is_dirty, config),
+    };
+    if !rewrite.merge && !rewrite.purge {
         return Ok(None);
     }
-
-    let plan = plan_pass(&live_data, &live_deletes, live_pks, config);
+    let plan = plan_pass(&live_data, &live_deletes, &is_dirty, rewrite, config);
     if plan.inputs.is_empty() && plan.retired_deletes.is_empty() {
         return Ok(None);
     }
@@ -535,21 +547,64 @@ fn retirable_deletes(
         .collect()
 }
 
+/// What a pass rewrites: small files, to merge them; dirty ones, to drop
+/// their dead rows and the deletes that killed them.
+#[derive(Clone, Copy, Debug)]
+struct Rewrite {
+    merge: bool,
+    purge: bool,
+}
+
+/// Whether the deletes have killed enough rows — or are enough files — to
+/// rewrite the dirty files for (see [`CompactionConfig::delete_ratio`]).
+/// Without an index the rows deletes killed aren't known; the delete
+/// files' rows stand in for them.
+fn purge_due(
+    live_data: &BTreeMap<String, LiveFile>,
+    live_deletes: &BTreeMap<String, LiveFile>,
+    live_pks: Option<&FileIndex>,
+    is_dirty: &impl Fn(&str, &LiveFile) -> bool,
+    config: &CompactionConfig,
+) -> bool {
+    if live_deletes.is_empty() {
+        return false;
+    }
+    if live_deletes.len() >= config.delete_file_threshold {
+        return true;
+    }
+    let live_rows = live_pks.map(FileIndex::live_rows_per_file);
+    let mut held: u64 = 0;
+    let mut dead: u64 = 0;
+    for (path, f) in live_data.iter().filter(|(p, f)| is_dirty(p, f)) {
+        held += f.record_count;
+        if let Some(live) = &live_rows {
+            let live = live.get(path.as_str()).copied().unwrap_or(0);
+            dead += f.record_count.saturating_sub(live);
+        }
+    }
+    if live_rows.is_none() {
+        dead = live_deletes.values().map(|d| d.record_count).sum();
+    }
+    held > 0 && dead as f64 >= config.delete_ratio * held as f64
+}
+
 /// Decide what one pass rewrites and which deletes it retires.
 fn plan_pass(
     live_data: &BTreeMap<String, LiveFile>,
     live_deletes: &BTreeMap<String, LiveFile>,
-    live_pks: Option<&FileIndex>,
+    is_dirty: &impl Fn(&str, &LiveFile) -> bool,
+    rewrite: Rewrite,
     config: &CompactionConfig,
 ) -> PassPlan {
-    let is_dirty = dirty_check(live_deletes, live_pks);
-
-    // Candidates grouped by partition, each group oldest first.
+    // Candidates grouped by partition, each group oldest first. A pass
+    // that rewrites anything merges the small files it can.
     let small = config.target_size_bytes / 2;
     let mut groups: Vec<Vec<(&String, &LiveFile, bool)>> = Vec::new();
     for (path, f) in live_data {
         let dirty = is_dirty(path, f);
-        if !dirty && f.byte_size >= small {
+        let candidate =
+            (rewrite.purge && dirty) || ((rewrite.merge || rewrite.purge) && f.byte_size < small);
+        if !candidate {
             continue;
         }
         match groups
@@ -595,7 +650,7 @@ fn plan_pass(
     }
 
     let taken: BTreeSet<&str> = inputs.iter().map(|(p, _)| p.as_str()).collect();
-    let retired_deletes = retirable_deletes(live_data, live_deletes, &is_dirty, &taken);
+    let retired_deletes = retirable_deletes(live_data, live_deletes, is_dirty, &taken);
 
     PassPlan {
         inputs,

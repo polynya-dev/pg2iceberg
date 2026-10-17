@@ -956,6 +956,7 @@ fn unrecorded_compaction(h: &FaultHarness) {
     let eager = CompactionConfig {
         data_file_threshold: 2,
         delete_file_threshold: 1,
+        delete_ratio: 0.0,
         target_size_bytes: 1 << 20,
         max_input_bytes_per_pass: u64::MAX,
     };

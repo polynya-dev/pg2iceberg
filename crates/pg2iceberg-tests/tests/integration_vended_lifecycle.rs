@@ -291,6 +291,7 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
             materializer_interval: String::new(),
             compaction_data_files: 8,
             compaction_delete_files: 4,
+            compaction_delete_ratio: 0.1,
             target_file_size: 0,
             maintenance_retention: String::new(),
             maintenance_grace: "30m".into(),

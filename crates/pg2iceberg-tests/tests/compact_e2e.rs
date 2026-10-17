@@ -1053,3 +1053,64 @@ fn older_files_are_rewritten_in_the_current_schema() {
         ]
     );
 }
+
+/// A pass doesn't rewrite a file for a few of its rows: deletes wait until
+/// they've killed `delete_ratio` of the rows rewriting would read. Then
+/// the pass rewrites, and retires them all.
+#[test]
+fn deletes_wait_until_they_kill_enough_rows_to_rewrite_for() {
+    let h = Harness::new();
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    let insert_all = (0..1000)
+        .map(|i| MaterializedRow {
+            op: Op::Insert,
+            row: row_id_qty(i, i),
+            unchanged_cols: vec![],
+            unchanged_from: None,
+        })
+        .collect();
+    h.commit(&s, insert_all);
+    let cfg = CompactionConfig {
+        delete_ratio: 0.1,
+        ..Default::default()
+    };
+
+    // 1% of the rows, in five commits — five delete files.
+    for i in 0..5 {
+        h.commit(
+            &s,
+            (0..2)
+                .map(|j| MaterializedRow {
+                    op: Op::Delete,
+                    row: pk_only(i * 2 + j),
+                    unchanged_cols: vec![],
+                    unchanged_from: None,
+                })
+                .collect(),
+        );
+        assert!(
+            h.run_compaction(&s, &cfg).is_none(),
+            "rewrote 1000 rows for {} deleted",
+            (i + 1) * 2
+        );
+    }
+
+    // 11%.
+    h.commit(
+        &s,
+        (10..110)
+            .map(|id| MaterializedRow {
+                op: Op::Delete,
+                row: pk_only(id),
+                unchanged_cols: vec![],
+                unchanged_from: None,
+            })
+            .collect(),
+    );
+    let out = h.run_compaction(&s, &cfg).expect("worth a rewrite now");
+    assert_eq!(out.rows_rewritten, 1000);
+    assert_eq!(out.rows_removed_by_deletes, 110);
+    assert_eq!(out.input_delete_files, 6);
+    assert_eq!(visible_id_qty(&h, &s).len(), 890);
+}

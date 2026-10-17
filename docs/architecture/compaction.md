@@ -4,20 +4,29 @@ icon: lucide/archive
 
 # Compaction
 
-Compaction merges accumulated data files and equality delete files into fewer, larger data files. It runs automatically after each materializer cycle when file count thresholds are exceeded (default: 10 data files or 100 delete files), and can also be triggered manually with `--compact`.
+Compaction merges small data files into larger ones, and drops the rows updates and deletes left behind. It runs after each materializer cycle, for each table where it's due, and on demand with [`pg2iceberg compact`](../usage/modes.md#compact-one-shot-compaction-pass).
 
-## How compaction works
+## Why rows need dropping
 
-1. **Evaluate** — load the current table snapshot and count data and delete files; skip if below thresholds
-2. **Plan** — separate files into carry-forward (large, no deletions) and rewrite (small or affected by deletes)
-3. **Apply deletes** — for rewrite candidates: download files, deduplicate rows by primary key, apply equality deletes respecting Iceberg sequence number ordering (a delete only removes a row if the delete's sequence number is strictly greater than the row's)
-4. **Re-serialize** — write merged rows into new Parquet files targeting the configured target file size (default: 128 MB)
-5. **Commit** — replace the old file set with the new one in a single snapshot commit
+pg2iceberg writes [merge-on-read](materializer.md#merge-on-read): an update or delete doesn't touch the data file holding the old row, it adds an equality delete — the row's key — that readers apply. The old row stays in its file, and every reader skips it.
 
-The result is a smaller set of data files with no equality delete files, reducing read amplification for downstream query engines.
+An equality delete applies to every older data file, so a delete file can only go once no older file holds a row it hides: those files must be rewritten without their deleted rows first. Under updates spread across a large table, that's most of the table.
 
-!!! warning "Known limitation"
-    Compaction currently writes unpartitioned output for partitioned tables. This will be fixed in a future release.
+## When it runs
+
+A table is compacted when:
+
+- it has `compaction_data_files` data files (default 8): its small files — under half of `target_file_size` — are merged; or
+- the rows deletes hide are `compaction_delete_ratio` (default 0.1) of the rows in the files holding them, or there are `compaction_delete_files` delete files (default 32): those files are rewritten without the hidden rows, and the delete files no remaining file needs are dropped.
+
+The ratio bounds the work: rewriting reads at most 1 / `compaction_delete_ratio` rows per row deleted (10, by default). pg2iceberg knows which file holds each row (its [file index](materializer.md)), so it counts hidden rows without reading any file, and rewrites only files that have some.
+
+## A pass
+
+1. **Plan** — oldest files first, up to four `target_file_size`s of input; the rest wait for the next pass
+2. **Apply deletes** — read the keys the deletes hide; a delete hides a row only if its sequence number is greater than the row's
+3. **Rewrite** — stream each input file through, in batches of 1024 rows, dropping hidden rows, into new files of up to `target_file_size`, one partition each. Files from before a schema change come out in the current schema
+4. **Commit** — one snapshot replaces the inputs and the dropped delete files with the outputs
 
 ## When the catalog compacts
 
