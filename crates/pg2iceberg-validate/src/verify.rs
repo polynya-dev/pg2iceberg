@@ -108,7 +108,7 @@ where
             break;
         }
         let last = chunk.last().unwrap();
-        last_pk = Some(pk_key(last, &pk_cols));
+        last_pk = Some(source.cursor(&pg_ident, last_pk.as_deref(), last, &pk_cols));
         for row in chunk {
             let row = as_stored(schema, row);
             let key = pk_key(&row, &pk_cols);
