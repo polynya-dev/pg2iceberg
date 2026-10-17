@@ -14,7 +14,7 @@
 use crate::io::{Clock, Timestamp};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -36,6 +36,16 @@ pub trait Metrics: Send + Sync {
     /// duration in seconds ([`DURATION_BUCKETS`]). Sim stores raw
     /// observations so tests can read percentiles.
     fn histogram(&self, name: &str, labels: &Labels, value: f64);
+
+    /// A request — to the catalog, object store or coordinator — started:
+    /// [`Self::request_ended`] gets what this returns once it's over. One
+    /// that never ends is a stuck process, however busy the rest of it is
+    /// ([`Registry::idle_for`]).
+    fn request_started(&self) -> u64 {
+        0
+    }
+
+    fn request_ended(&self, _request: u64) {}
 }
 
 /// `Labels` from `(key, value)` pairs.
@@ -276,12 +286,17 @@ pub const DURATION_BUCKETS: &[f64] = &[
 /// object store or coordinator, a handler tick, a commit. Nothing records
 /// on a timer of its own. So a registry nothing has been recorded to for
 /// a while is a process that's stuck, not idle: the watcher alone records
-/// every 30 seconds while the main loop turns.
+/// every 30 seconds while the main loop turns. Its work goes on side by
+/// side, though — replication beside a materializer tick — so a request
+/// that never returns is stuck too, whatever records meanwhile.
 pub struct Registry {
     clock: Arc<dyn Clock>,
     families: Mutex<BTreeMap<String, Family>>,
     /// [`Clock::now`] micros at the last record, or at creation.
     last_record: AtomicI64,
+    /// When each request in flight started ([`Metrics::request_started`]).
+    in_flight: Mutex<BTreeMap<u64, i64>>,
+    next_request: AtomicU64,
 }
 
 struct Family {
@@ -310,17 +325,24 @@ impl Registry {
             clock,
             families: Mutex::new(BTreeMap::new()),
             last_record: AtomicI64::new(now),
+            in_flight: Mutex::new(BTreeMap::new()),
+            next_request: AtomicU64::new(0),
         }
     }
 
-    /// How long since anything was recorded (or since creation).
+    /// How long since anything was recorded (or since creation) — or, if
+    /// longer, since the oldest request still in flight started.
     pub fn idle_for(&self) -> Duration {
-        let micros = self
-            .clock
-            .now()
-            .0
-            .saturating_sub(self.last_record.load(Ordering::SeqCst))
-            .max(0);
+        let last = self.last_record.load(Ordering::SeqCst);
+        let oldest = self
+            .in_flight
+            .lock()
+            .expect("in-flight requests lock")
+            .values()
+            .min()
+            .copied();
+        let since = oldest.map_or(last, |started| started.min(last));
+        let micros = self.clock.now().0.saturating_sub(since).max(0);
         Duration::from_micros(micros as u64)
     }
 
@@ -455,6 +477,22 @@ impl Registry {
 }
 
 impl Metrics for Registry {
+    fn request_started(&self) -> u64 {
+        let request = self.next_request.fetch_add(1, Ordering::SeqCst);
+        self.in_flight
+            .lock()
+            .expect("in-flight requests lock")
+            .insert(request, self.clock.now().0);
+        request
+    }
+
+    fn request_ended(&self, request: u64) {
+        self.in_flight
+            .lock()
+            .expect("in-flight requests lock")
+            .remove(&request);
+    }
+
     fn counter(&self, name: &str, labels: &Labels, delta: u64) {
         self.record(name, labels, MetricKind::Counter, |s| {
             if let Series::Counter(v) = s {
@@ -847,6 +885,22 @@ mod tests {
         assert_eq!(r.idle_for(), Duration::ZERO);
         clock.advance(Duration::from_secs(5));
         assert_eq!(r.idle_for(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_request_in_flight_ages_however_much_else_records() {
+        let (r, clock) = registry();
+        let hung = r.request_started();
+        let quick = r.request_started();
+        clock.advance(Duration::from_secs(5));
+        r.request_ended(quick);
+        r.counter(names::PIPELINE_FLUSH_TOTAL, &no_labels(), 1);
+        assert_eq!(r.idle_for(), Duration::from_secs(5));
+        clock.advance(Duration::from_secs(5));
+        r.counter(names::PIPELINE_FLUSH_TOTAL, &no_labels(), 1);
+        assert_eq!(r.idle_for(), Duration::from_secs(10));
+        r.request_ended(hung);
+        assert_eq!(r.idle_for(), Duration::ZERO);
     }
 
     #[test]
