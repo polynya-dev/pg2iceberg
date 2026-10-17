@@ -747,6 +747,82 @@ fn naive_continue_after_flush_failure_loses_events() {
 // arms ever diverge from these helpers, the tests below stop
 // matching production behavior — that's a regression signal.
 
+/// A tick that leaves a backlog doesn't compact: the next tick, right
+/// behind it, dirties again what a pass would rewrite. The tick that
+/// catches up does.
+#[test]
+fn compaction_waits_out_a_backlog() {
+    let mut h = FaultHarness::boot();
+    // Two budgets' worth (the harness materializes 1024 changes a tick).
+    for id in 0..2000 {
+        h.insert(id, id);
+    }
+    h.try_flush().unwrap();
+    // Every rewrite due but the delete-file backstop's.
+    let compaction = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: usize::MAX,
+        delete_ratio: 0.0,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let mut ticks = 0;
+    loop {
+        let outcome =
+            block_on(run_materialize_tick(&mut h.materializer, Some(&compaction))).unwrap();
+        ticks += 1;
+        if !h.materializer.backlogged() {
+            assert!(
+                !outcome.compaction.is_empty(),
+                "caught up, and didn't compact"
+            );
+            break;
+        }
+        let rewritten: u64 = outcome
+            .compaction
+            .iter()
+            .map(|(_, o)| o.rows_rewritten)
+            .sum();
+        assert!(
+            outcome.compaction.is_empty(),
+            "compacted with a backlog: {rewritten} rows rewritten"
+        );
+    }
+    assert!(ticks > 1, "no backlog to wait out");
+}
+
+/// Deferring for a backlog stops at the delete-file backstop: past it,
+/// readers pay for every delete file, so a tick compacts all the same.
+#[test]
+fn a_backlog_doesnt_hold_back_the_delete_file_backstop() {
+    let mut h = FaultHarness::boot();
+    for id in 0..200 {
+        h.insert(id, id);
+    }
+    h.try_flush().unwrap();
+    block_on(run_materialize_tick(&mut h.materializer, None)).unwrap();
+    // A backlog of updates: each tick commits a delete file.
+    for round in 1..=12 {
+        for id in 0..200 {
+            h.update(id, id + round);
+        }
+    }
+    h.try_flush().unwrap();
+    let compaction = CompactionConfig {
+        data_file_threshold: usize::MAX,
+        delete_file_threshold: 1,
+        delete_ratio: f64::INFINITY,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let outcome = block_on(run_materialize_tick(&mut h.materializer, Some(&compaction))).unwrap();
+    assert!(h.materializer.backlogged(), "no backlog");
+    assert!(
+        !outcome.compaction.is_empty(),
+        "held back past the delete-file backstop"
+    );
+}
+
 #[test]
 fn binary_materialize_tick_with_compaction_under_blob_put_fault_keeps_replication_progressing() {
     // Wire a workload, fault the *compaction* PUT, and call the

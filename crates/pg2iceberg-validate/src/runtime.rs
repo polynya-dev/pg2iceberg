@@ -10,7 +10,8 @@
 //! ## Provided ticks
 //!
 //! - [`run_materialize_tick`] — `Materializer::cycle` plus inline
-//!   compaction (when `CompactionConfig` is supplied), with the same
+//!   compaction (when `CompactionConfig` is supplied; only its
+//!   delete-file backstop while the cycle left a backlog), with the same
 //!   "warn-and-continue on compact_cycle Err" behavior the binary
 //!   uses. Returns counts so callers can log.
 //! - [`run_watcher_tick`] — builds [`WatcherInputs`] and calls
@@ -88,6 +89,16 @@ where
         compaction_error: None,
     };
     if let Some(cfg) = compaction {
+        // With a backlog the next tick follows straight away, and dirties
+        // again what a pass rewrites: until it's applied, only the
+        // delete-file backstop, which readers can't wait for.
+        let deferring;
+        let cfg = if materializer.backlogged() {
+            deferring = cfg.backstop_only();
+            &deferring
+        } else {
+            cfg
+        };
         match materializer.compact_cycle(cfg).await {
             Ok(c) => outcome.compaction = c,
             Err(e) => outcome.compaction_error = Some(e.to_string()),
