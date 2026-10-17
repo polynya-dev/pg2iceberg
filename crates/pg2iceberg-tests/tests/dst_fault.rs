@@ -2126,6 +2126,77 @@ async fn replication_goes_on_while_a_materializer_tick_runs() {
     assert_eq!(rows.len(), 304);
 }
 
+/// A backlog is materialized tick after tick, not one tick per
+/// `materializer_interval`: a tick that stops at its row budget leaves
+/// the rest for the next, which runs as soon as it ends. Only a caught-up
+/// materializer waits the interval out — or a backlog of N budgets takes
+/// N intervals to apply, the materializer idle most of the time.
+#[tokio::test(start_paused = true)]
+async fn a_backlog_is_materialized_without_waiting_between_ticks() {
+    use std::time::Duration;
+
+    const INTERVAL: Duration = Duration::from_secs(60);
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let second = Duration::from_secs(1);
+    let schedule = pg2iceberg_logical::Schedule {
+        flush: second,
+        materialize: INTERVAL,
+        standby: second,
+        watcher: second,
+    };
+    let mut lifecycle = sim_lifecycle_on(&db, &stores, schedule);
+    // A budget of 80 rows a tick (8 steps of 10).
+    lifecycle.mat_batch_rows = 10;
+    let script = db.clone();
+    let catalog = stores.catalog.clone();
+    let blob = stores.blob.clone();
+    // Its own task, so it times the materializer while the loop runs.
+    let observer = tokio::spawn(async move {
+        // Past startup and the first tick.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        // A thousand rows: a dozen budgets.
+        for t in 0..100 {
+            let mut tx = script.begin_tx();
+            for i in 0..10 {
+                let id = 5 + t * 10 + i;
+                tx.insert(&ident(), row(id, id * 10));
+            }
+            tx.commit(Timestamp(0)).unwrap();
+        }
+        let start = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(second).await;
+            let rows = read_materialized_state(
+                catalog.as_ref(),
+                blob.as_ref(),
+                &ident(),
+                &schema(),
+                &[ColumnName("id".into())],
+            )
+            .await
+            .unwrap();
+            if rows.len() == 1004 {
+                return start.elapsed();
+            }
+        }
+    });
+    let took = Arc::new(std::sync::Mutex::new(None));
+    let record = took.clone();
+    let shutdown = Box::pin(async move {
+        *record.lock().unwrap() = Some(observer.await.unwrap());
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let took = took.lock().unwrap().expect("the observer ran");
+    assert!(
+        took <= 2 * INTERVAL,
+        "took {took:?} to apply a dozen budgets, at a {INTERVAL:?} interval"
+    );
+}
+
 // ── Observability ────────────────────────────────────────────────
 
 /// What a run records, as `/metrics` serves it: what it received, staged

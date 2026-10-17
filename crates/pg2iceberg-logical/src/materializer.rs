@@ -508,6 +508,9 @@ pub struct Materializer<C: Catalog> {
     /// always finishes the transaction it's in). Lets one cycle catch up
     /// through many steps instead of one batch per tick.
     cycle_rows: usize,
+    /// Whether the last cycle stopped at `cycle_rows` with log left to
+    /// read ([`Self::backlogged`]).
+    backlogged: bool,
     metrics: Arc<dyn Metrics>,
     /// Optional meta-marker table state. When `Some`, every
     /// successful `cycle_table` queries pending markers from the
@@ -653,6 +656,7 @@ impl<C: Catalog> Materializer<C> {
             group: group.into(),
             batch_rows,
             cycle_rows: batch_rows.saturating_mul(DEFAULT_STEPS_PER_CYCLE),
+            backlogged: false,
             metrics,
             meta_marker: None,
             meta_recorder: None,
@@ -1447,6 +1451,7 @@ impl<C: Catalog> Materializer<C> {
     }
 
     async fn cycle_assigned(&mut self) -> Result<usize> {
+        self.backlogged = false;
         // Forget what other processes changed since the last cycle.
         self.catalog.sync().await;
         // 1. Default path: process every registered table whose
@@ -1894,6 +1899,13 @@ impl<C: Catalog> Materializer<C> {
         self
     }
 
+    /// Whether the last [`Self::cycle`] stopped at its row budget
+    /// (`cycle_rows`) with log entries left to read: the next can start
+    /// straight away, rather than a materializer interval later.
+    pub fn backlogged(&self) -> bool {
+        self.backlogged
+    }
+
     /// Materialize pending log entries for one table. Entries are folded
     /// in steps of at most `batch_rows` events; steps are committed
     /// together, as one atomic `commit_snapshots`, up to a transaction
@@ -1990,6 +2002,7 @@ impl<C: Catalog> Materializer<C> {
                         folded += self.commit_unit(ident, &mut unit).await?;
                         if events_read >= self.cycle_rows {
                             // Leave this entry for the next cycle.
+                            self.backlogged = true;
                             break 'read;
                         }
                     } else {

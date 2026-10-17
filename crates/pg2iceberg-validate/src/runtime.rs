@@ -989,7 +989,8 @@ pub struct PendingSnapshotMsg {
 ///    (see [`reopen_stream`]).
 /// 4. On tick → fire due handlers. A materializer tick
 ///    ([`run_materialize_tick`]) runs on a task of its own (see
-///    [`Ticks`]): replication goes on while it does.
+///    [`Ticks`]): replication goes on while it does. One that stops at
+///    its row budget is followed by the next as soon as it ends.
 /// 5. On shutdown → wait for a tick in flight, then final flush +
 ///    send_standby.
 ///
@@ -1136,7 +1137,9 @@ type TickTask<Cat> = tokio::task::JoinHandle<(
 /// the task interleaves with the loop deterministically.
 struct Ticks<Cat: Catalog + 'static> {
     running: Option<TickTask<Cat>>,
-    /// Another tick as soon as the running one ends (see [`Self::want`]).
+    /// Another tick as soon as the running one ends: a blue-green marker
+    /// arrived meanwhile ([`Self::want`]), or it stopped at its row budget
+    /// with log left to read — a backlog doesn't wait an interval a tick.
     again: bool,
     /// Tables whose background snapshot completed while a tick had the
     /// materializer: ungated when it's back.
@@ -1225,6 +1228,7 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
         for ident in self.ungated.drain(..) {
             materializer.mark_snapshot_complete(&ident);
         }
+        self.again |= materializer.backlogged();
         loop_state.materializer = Some(materializer);
         // `cycle` failure is fatal (propagates); compaction failure is
         // captured in the outcome and only logged.

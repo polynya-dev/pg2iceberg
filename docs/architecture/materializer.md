@@ -20,7 +20,7 @@ For each table:
     - Inserts and updates → Parquet data files (partitioned by the table's partition spec)
     - Deletes, and the previous version of updated rows → Parquet equality delete files (PK columns only)
 5. **Commit** — at a transaction boundary, commit every step prepared so far as **one atomic catalog update**: each step becomes its own snapshot, but the table's `main` branch moves once. The last snapshot's summary records the log range the commit applied (`pg2iceberg.log-group`, `pg2iceberg.log-start`, `pg2iceberg.log-end`), and how far each cursor group has applied the log (`pg2iceberg.log-ends`)
-6. **Advance cursor** — only after the commit succeeds; then continue with the next entries until the log is drained or the cycle has read its row budget
+6. **Advance cursor** — only after the commit succeeds; then continue with the next entries until the log is drained or the cycle has read its row budget. A cycle that stops at its budget is followed by the next as soon as it ends; one that drained the log waits `materializer_interval`
 
 ### Applying each change once
 
