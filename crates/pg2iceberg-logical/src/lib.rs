@@ -19,6 +19,7 @@ pub mod relation_event;
 pub mod runner;
 pub mod sink;
 pub mod spans;
+pub mod staged_log;
 
 pub use catalog_cache::CachingCatalog;
 pub use materializer::{

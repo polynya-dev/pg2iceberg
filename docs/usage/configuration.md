@@ -48,14 +48,11 @@ sink:
 | `ICEBERG_WAREHOUSE` | `sink.warehouse` |
 | `ICEBERG_NAMESPACE` | `sink.namespace` |
 | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` |
-<<<<<<< HEAD
+| `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` |
 | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` |
 | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` |
 | `PG2ICEBERG_LOG_FORMAT` | `text` (default) or `json` logs; no config field |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, ... | trace export, as OpenTelemetry defines it: see [Observability](observability.md#traces) |
-=======
-| `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` |
->>>>>>> 4c75811 (docs, tests: sink.maintenance: managed)
 
 AWS's own variables are read as AWS tools read them, and give way to the config file: `AWS_REGION` / `AWS_DEFAULT_REGION` for `sink.s3_region`, `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` for `sink.s3_endpoint`. Credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are read by the AWS default credential chain, with `credential_mode: iam`.
 
@@ -201,7 +198,7 @@ snapshot_only: false             # legacy field; prefer the `snapshot` subcomman
 
 - **`source.logical.snapshot_concurrency` / `snapshot_chunk_pages` / `snapshot_target_file_size`** — not yet exposed; snapshot uses fixed defaults.
 - **`sink.flush_rows`** — the most change events pg2iceberg holds in memory before staging them. A transaction bigger than this is staged in chunks of this size as it streams in, and claimed in one step when it commits, so readers never see part of it. Larger values mean fewer, larger staged files.
-- **`sink.materializer_batch_rows`** — the most change events the materializer folds into one Iceberg snapshot, which bounds its memory. A transaction larger than this is written as several snapshots committed in one atomic catalog update, so readers of the table never see part of it.
+- **`sink.materializer_batch_rows`** — the most change events the materializer folds into one Iceberg snapshot, which bounds its memory, along with the up to eight staged files it reads ahead (each at most `flush_rows` events). A transaction larger than this is written as several snapshots committed in one atomic catalog update, so readers of the table never see part of it.
 - **`sink.flush_interval` / `sink.materializer_interval`** — the micro-batch cadence: changes are staged every `flush_interval` (or sooner, once `flush_rows` are buffered) and committed to Iceberg every `materializer_interval` (or back to back, while catching up on a backlog). A change typically reaches Iceberg within about the two added together. Shorter intervals mean fresher tables, and more, smaller Iceberg snapshots and files for compaction to merge.
 - **`sink.compaction_delete_files` / `sink.compaction_delete_ratio`** — when compaction drops deleted rows. An update or delete leaves the old row in its data file, hidden by an equality delete that every reader applies; dropping it means rewriting the files holding such rows, and every older one, before the delete file can go. Under updates spread across a large table that's most of the table, so pg2iceberg waits until the deleted rows are `compaction_delete_ratio` of the rows those files hold (rewriting then reads at most 10 rows per row deleted, at 0.1), or until there are `compaction_delete_files` delete files for readers to open. Lower values keep reads cheaper; higher ones rewrite less.
 - **`sink.flush_bytes`** — not yet exposed; flush threshold is `flush_rows` + `flush_interval` only.

@@ -139,6 +139,8 @@ Every request to the Iceberg catalog, the object store and the coordinator.
 | `pg2iceberg_coord_request_duration_seconds` | histogram | `op` | Coordinator requests (`claim_offsets`, `set_cursor`, ...). |
 | `pg2iceberg_coord_request_errors_total` | counter | `op` | Failed coordinator requests. |
 
+The materializer reads staged files ahead of the one it's applying, up to eight at once, while it uploads and commits what it has read: its `get`s overlap its other requests. A response that arrives while it's folding or encoding waits until it next awaits a request, so a `get`'s duration and span can include that time.
+
 ### Invariants
 
 | Metric | Type | Labels | Meaning |
