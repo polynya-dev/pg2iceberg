@@ -19,7 +19,7 @@
 //! cursors, `verify` paging).
 
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimeMicros, TimestampMicros};
-use pg2iceberg_core::{ColumnName, ColumnSchema, IcebergType, PgValue, Row};
+use pg2iceberg_core::{ColumnName, ColumnSchema, Columns, IcebergType, PgValue, Row};
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -110,6 +110,39 @@ impl PkKey {
             row.insert(ColumnName(col.name.clone()), as_column_type(v, col.ty)?);
         }
         values.0.is_empty().then_some(row)
+    }
+}
+
+/// Reads rows' keys as [`PkKey::from_row`] does, finding the key's
+/// columns once per column list the rows share, not once per row.
+pub struct KeyReader<'a> {
+    pk_cols: &'a [ColumnName],
+    last: Option<(Columns, Vec<Option<usize>>)>,
+}
+
+impl<'a> KeyReader<'a> {
+    pub fn new(pk_cols: &'a [ColumnName]) -> Self {
+        Self {
+            pk_cols,
+            last: None,
+        }
+    }
+
+    pub fn key(&mut self, row: &Row) -> PkKey {
+        if !self
+            .last
+            .as_ref()
+            .is_some_and(|(columns, _)| columns.same(row.columns()))
+        {
+            let places = self
+                .pk_cols
+                .iter()
+                .map(|c| row.columns().position(c))
+                .collect();
+            self.last = Some((row.columns().clone(), places));
+        }
+        let (_, places) = self.last.as_ref().expect("set above");
+        PkKey::from_values(places.iter().flatten().map(|&i| row.value_at(i)))
     }
 }
 
