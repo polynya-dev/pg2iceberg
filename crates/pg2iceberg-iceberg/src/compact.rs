@@ -11,12 +11,14 @@
 //! 1. Load snapshot history; compute live data + delete files
 //!    (cumulative across snapshots, skipping anything in
 //!    `Snapshot.removed_paths`).
-//! 2. Threshold check: bail with `None` if both file counts are below
-//!    their thresholds.
-//! 3. Plan the pass ([`plan_pass`]): candidates are small files
-//!    (< `target_size_bytes / 2`) and *dirty* files — ones holding rows a
-//!    live delete has killed. Oldest first, take candidates until
-//!    `max_input_bytes_per_pass`; the rest wait for a later pass.
+//! 2. Decide what's worth doing, if anything: merging small files
+//!    (< `target_size_bytes / 2`), once there are `data_file_threshold`
+//!    data files; rewriting *dirty* files — ones holding rows a live delete
+//!    has killed — once those rows are `delete_ratio` of the rows the
+//!    dirty files hold, or there are `delete_file_threshold` delete files
+//!    ([`purge_due`]). Neither due: bail with `None`.
+//! 3. Plan the pass ([`plan_pass`]): oldest first, take the candidates
+//!    until `max_input_bytes_per_pass`; the rest wait for a later pass.
 //! 4. Retire every delete file no remaining dirty file could still need.
 //! 5. Load deleted PKs (`PK → max delete seq`) from the delete files that
 //!    can apply to an input.
@@ -60,9 +62,11 @@
 //! - **Atomicity.** Either the entire `Replace` snapshot lands, or none
 //!   of it. The catalog's commit path is the gate.
 
-use crate::reader::RowBatches;
+use crate::reader::{value_at, ArrowBatches};
 use crate::writer::{StreamingDataFile, TableWriter, WriterError};
 use crate::{Catalog, DataFile, FileIndex, IcebergError, PkKey, PreparedCompaction, Snapshot};
+use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_select::filter::filter_record_batch;
 use pg2iceberg_core::{ColumnName, ColumnSchema, PartitionLiteral, Row, TableIdent, TableSchema};
 use pg2iceberg_stream::{BlobStore, StreamError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -76,12 +80,19 @@ pub const DECODE_BATCH_ROWS: usize = 1024;
 /// size the output.
 #[derive(Clone, Debug)]
 pub struct CompactionConfig {
-    /// Trigger compaction when live data files >= this count.
+    /// Merge small files once live data files >= this count.
     pub data_file_threshold: usize,
-    /// Trigger compaction when live delete files >= this count. A delete
-    /// file is dropped once no data file it could apply to remains, so
-    /// even a single sufficiently-old delete is a reason to compact.
+    /// Rewrite the files deletes killed rows in once live delete files >=
+    /// this count, however few rows they killed: each delete file costs a
+    /// reader. A delete file is dropped once no data file it could apply
+    /// to remains, and that takes rewriting every older dirty file.
     pub delete_file_threshold: usize,
+    /// ... or once the rows deletes killed are this share of the rows the
+    /// files holding them hold. Rewriting them then reads at most `1 /
+    /// delete_ratio` rows per row deleted; sooner, under updates spread
+    /// across a large table, a pass rewrites the table for a few of its
+    /// rows.
+    pub delete_ratio: f64,
     /// Files smaller than `target_size_bytes / 2` are eligible for
     /// rewrite, and output files roll over at this size. Default
     /// 128 MiB target → 64 MiB minimum.
@@ -103,7 +114,8 @@ impl Default for CompactionConfig {
         let target_size_bytes = 128 * 1024 * 1024;
         Self {
             data_file_threshold: 8,
-            delete_file_threshold: 4,
+            delete_file_threshold: 32,
+            delete_ratio: 0.1,
             target_size_bytes,
             max_input_bytes_per_pass: target_size_bytes * Self::DEFAULT_PASS_TARGET_FILES,
         }
@@ -231,13 +243,15 @@ where
 
     let (live_data, live_deletes) = compute_live_files(&snapshots);
 
-    if live_data.len() < config.data_file_threshold
-        && live_deletes.len() < config.delete_file_threshold
-    {
+    let is_dirty = dirty_check(&live_deletes, live_pks);
+    let rewrite = Rewrite {
+        merge: live_data.len() >= config.data_file_threshold,
+        purge: purge_due(&live_data, &live_deletes, live_pks, &is_dirty, config),
+    };
+    if !rewrite.merge && !rewrite.purge {
         return Ok(None);
     }
-
-    let plan = plan_pass(&live_data, &live_deletes, live_pks, config);
+    let plan = plan_pass(&live_data, &live_deletes, &is_dirty, rewrite, config);
     if plan.inputs.is_empty() && plan.retired_deletes.is_empty() {
         return Ok(None);
     }
@@ -246,27 +260,26 @@ where
 
     // Deleted PKs → highest delete seq. Only deletes newer than some
     // input can drop one of its rows.
-    let pk_schema: Vec<ColumnSchema> = schema
-        .columns
+    // The key's columns, in its order.
+    let pk_schema: Vec<ColumnSchema> = pk_cols
         .iter()
-        .filter(|c| c.is_primary_key)
+        .filter_map(|pk| schema.columns.iter().find(|c| c.name == pk.0))
         .cloned()
         .collect();
     let oldest_input = plan.inputs.iter().map(|(_, f)| f.seq).min();
     let mut delete_pks: HashMap<PkKey, i64> = HashMap::new();
     for (path, meta) in &live_deletes {
-        if !oldest_input.is_some_and(|s| meta.seq > s) {
+        if oldest_input.is_none_or(|s| meta.seq <= s) {
             continue;
         }
         let bytes = blob_store.get(path).await?;
-        for batch in RowBatches::new(bytes, &pk_schema, DECODE_BATCH_ROWS)? {
-            let rows = batch?;
-            peak_rows = peak_rows.max(rows.len() as u64);
-            for row in rows {
+        for batch in ArrowBatches::new(bytes, &pk_schema, DECODE_BATCH_ROWS)? {
+            let batch = batch?;
+            peak_rows = peak_rows.max(batch.num_rows() as u64);
+            let keys = RowKeys::new(&batch, &pk_schema, &pk_schema);
+            for i in 0..batch.num_rows() {
                 // Highest seq wins — covers re-deletes of the same PK.
-                let seq = delete_pks
-                    .entry(PkKey::from_row(&row, pk_cols))
-                    .or_insert(meta.seq);
+                let seq = delete_pks.entry(keys.at(i)?).or_insert(meta.seq);
                 *seq = (*seq).max(meta.seq);
             }
         }
@@ -277,46 +290,56 @@ where
     let mut rows_rewritten: u64 = 0;
     let mut rows_removed_by_deletes: u64 = 0;
     let mut bytes_before: u64 = 0;
+    let partition_cols: Vec<ColumnSchema> = schema
+        .partition_spec
+        .iter()
+        .filter_map(|f| schema.columns.iter().find(|c| c.name == f.source_column))
+        .cloned()
+        .collect();
     for (path, meta) in &plan.inputs {
         bytes_before += meta.byte_size;
         let bytes = blob_store.get(path).await?;
-        for batch in RowBatches::new(bytes, &schema.columns, DECODE_BATCH_ROWS)? {
-            let rows = batch?;
-            peak_rows = peak_rows.max(rows.len() as u64);
-            rows_rewritten += rows.len() as u64;
+        for batch in ArrowBatches::new(bytes, &schema.columns, DECODE_BATCH_ROWS)? {
+            let batch = batch?;
+            let n = batch.num_rows();
+            peak_rows = peak_rows.max(n as u64);
+            rows_rewritten += n as u64;
             // A delete applies iff it is strictly newer than the row.
             // Rewritten rows land above every live delete, so a delete
             // not applied now would never apply again.
-            let survivors: Vec<&Row> = rows
-                .iter()
-                .filter(|r| {
-                    delete_pks
-                        .get(&PkKey::from_row(r, pk_cols))
-                        .is_none_or(|del_seq| *del_seq <= meta.seq)
-                })
-                .collect();
-            rows_removed_by_deletes += (rows.len() - survivors.len()) as u64;
+            let keys = RowKeys::new(&batch, &schema.columns, &pk_schema);
+            let mut live = Vec::with_capacity(n);
+            let mut survivor_keys = Vec::with_capacity(n);
+            for i in 0..n {
+                let key = keys.at(i)?;
+                let kept = delete_pks
+                    .get(&key)
+                    .is_none_or(|del_seq| *del_seq <= meta.seq);
+                live.push(kept);
+                if kept {
+                    survivor_keys.push(key);
+                }
+            }
+            let survivors = filter_record_batch(&batch, &BooleanArray::from(live))
+                .map_err(|e| WriterError::Encode(format!("filter deleted rows: {e}")))?;
+            rows_removed_by_deletes += (n - survivors.num_rows()) as u64;
             // Write runs of rows sharing a partition tuple; a new tuple
             // closes the open file. Inputs come grouped by partition, so
             // a run is normally the whole batch.
-            let tuples = survivors
-                .iter()
-                .map(|r| writer.partition_tuple(r))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let mut run_start = 0;
-            while run_start < survivors.len() {
-                let tuple = &tuples[run_start];
-                let run_end = (run_start..survivors.len())
-                    .find(|&i| tuples[i] != *tuple)
-                    .unwrap_or(survivors.len());
-                if out.open_tuple().is_some_and(|t| t != tuple) {
+            let mut survivor_keys = survivor_keys.into_iter();
+            for (tuple, start, len) in partition_runs(&writer, &survivors, &partition_cols)? {
+                if out.open_tuple().is_some_and(|t| t != tuple.as_slice()) {
                     out.close(blob_store, &path_for_chunk, ident).await?;
                 }
-                out.write(&writer, tuple, &survivors[run_start..run_end], pk_cols)?;
+                out.write(
+                    &writer,
+                    &tuple,
+                    &survivors.slice(start, len),
+                    survivor_keys.by_ref().take(len),
+                )?;
                 if out.open_size() >= config.target_size_bytes {
                     out.close(blob_store, &path_for_chunk, ident).await?;
                 }
-                run_start = run_end;
             }
         }
     }
@@ -426,22 +449,21 @@ struct OutputFiles {
 }
 
 impl OutputFiles {
-    /// Append rows of partition `tuple`; the caller closes any open file
-    /// of another tuple first.
+    /// Append rows of partition `tuple`, whose keys are `keys`; the caller
+    /// closes any open file of another tuple first.
     fn write(
         &mut self,
         writer: &TableWriter,
         tuple: &[PartitionLiteral],
-        rows: &[&Row],
-        pk_cols: &[ColumnName],
+        rows: &RecordBatch,
+        keys: impl Iterator<Item = PkKey>,
     ) -> Result<()> {
         if self.open.is_none() {
             self.open = Some((tuple.to_vec(), writer.start_data_file()?));
         }
         let (_, file) = self.open.as_mut().expect("opened above");
-        file.write(rows)?;
-        self.open_pks
-            .extend(rows.iter().map(|r| PkKey::from_row(r, pk_cols)));
+        file.write_batch(rows)?;
+        self.open_pks.extend(keys);
         Ok(())
     }
 
@@ -525,21 +547,64 @@ fn retirable_deletes(
         .collect()
 }
 
+/// What a pass rewrites: small files, to merge them; dirty ones, to drop
+/// their dead rows and the deletes that killed them.
+#[derive(Clone, Copy, Debug)]
+struct Rewrite {
+    merge: bool,
+    purge: bool,
+}
+
+/// Whether the deletes have killed enough rows — or are enough files — to
+/// rewrite the dirty files for (see [`CompactionConfig::delete_ratio`]).
+/// Without an index the rows deletes killed aren't known; the delete
+/// files' rows stand in for them.
+fn purge_due(
+    live_data: &BTreeMap<String, LiveFile>,
+    live_deletes: &BTreeMap<String, LiveFile>,
+    live_pks: Option<&FileIndex>,
+    is_dirty: &impl Fn(&str, &LiveFile) -> bool,
+    config: &CompactionConfig,
+) -> bool {
+    if live_deletes.is_empty() {
+        return false;
+    }
+    if live_deletes.len() >= config.delete_file_threshold {
+        return true;
+    }
+    let live_rows = live_pks.map(FileIndex::live_rows_per_file);
+    let mut held: u64 = 0;
+    let mut dead: u64 = 0;
+    for (path, f) in live_data.iter().filter(|(p, f)| is_dirty(p, f)) {
+        held += f.record_count;
+        if let Some(live) = &live_rows {
+            let live = live.get(path.as_str()).copied().unwrap_or(0);
+            dead += f.record_count.saturating_sub(live);
+        }
+    }
+    if live_rows.is_none() {
+        dead = live_deletes.values().map(|d| d.record_count).sum();
+    }
+    held > 0 && dead as f64 >= config.delete_ratio * held as f64
+}
+
 /// Decide what one pass rewrites and which deletes it retires.
 fn plan_pass(
     live_data: &BTreeMap<String, LiveFile>,
     live_deletes: &BTreeMap<String, LiveFile>,
-    live_pks: Option<&FileIndex>,
+    is_dirty: &impl Fn(&str, &LiveFile) -> bool,
+    rewrite: Rewrite,
     config: &CompactionConfig,
 ) -> PassPlan {
-    let is_dirty = dirty_check(live_deletes, live_pks);
-
-    // Candidates grouped by partition, each group oldest first.
+    // Candidates grouped by partition, each group oldest first. A pass
+    // that rewrites anything merges the small files it can.
     let small = config.target_size_bytes / 2;
     let mut groups: Vec<Vec<(&String, &LiveFile, bool)>> = Vec::new();
     for (path, f) in live_data {
         let dirty = is_dirty(path, f);
-        if !dirty && f.byte_size >= small {
+        let candidate =
+            (rewrite.purge && dirty) || ((rewrite.merge || rewrite.purge) && f.byte_size < small);
+        if !candidate {
             continue;
         }
         match groups
@@ -585,13 +650,87 @@ fn plan_pass(
     }
 
     let taken: BTreeSet<&str> = inputs.iter().map(|(p, _)| p.as_str()).collect();
-    let retired_deletes = retirable_deletes(live_data, live_deletes, &is_dirty, &taken);
+    let retired_deletes = retirable_deletes(live_data, live_deletes, is_dirty, &taken);
 
     PassPlan {
         inputs,
         retired_deletes,
         pending_files,
     }
+}
+
+/// The primary keys of a batch's rows, read straight from its key
+/// columns — what [`PkKey::from_row`] makes of each decoded row.
+struct RowKeys<'a> {
+    columns: Vec<(&'a ColumnSchema, &'a dyn Array)>,
+}
+
+impl<'a> RowKeys<'a> {
+    /// `batch` is in `cols`' schema, as [`ArrowBatches`] reads it.
+    fn new(batch: &'a RecordBatch, cols: &[ColumnSchema], pk_schema: &'a [ColumnSchema]) -> Self {
+        let columns = pk_schema
+            .iter()
+            .map(|pk| {
+                let i = cols
+                    .iter()
+                    .position(|c| c.field_id == pk.field_id)
+                    .expect("primary key columns are the table's");
+                (pk, batch.column(i).as_ref())
+            })
+            .collect();
+        Self { columns }
+    }
+
+    fn at(&self, i: usize) -> Result<PkKey> {
+        let values = self
+            .columns
+            .iter()
+            .map(|(col, arr)| value_at(col, *arr, i))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(PkKey::from_values(&values))
+    }
+}
+
+/// The batch's runs of rows sharing a partition tuple, as `(tuple, start,
+/// len)`. `partition_cols` are the spec's source columns; the batch is in
+/// the table's schema.
+fn partition_runs(
+    writer: &TableWriter,
+    batch: &RecordBatch,
+    partition_cols: &[ColumnSchema],
+) -> Result<Vec<(Vec<PartitionLiteral>, usize, usize)>> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if partition_cols.is_empty() {
+        return Ok(vec![(Vec::new(), 0, n)]);
+    }
+    let schema = writer.schema();
+    let arrays: Vec<(&ColumnSchema, &dyn Array)> = partition_cols
+        .iter()
+        .map(|c| {
+            let i = schema
+                .columns
+                .iter()
+                .position(|s| s.field_id == c.field_id)
+                .expect("partition source columns are the table's");
+            (c, batch.column(i).as_ref())
+        })
+        .collect();
+    let mut runs: Vec<(Vec<PartitionLiteral>, usize, usize)> = Vec::new();
+    for i in 0..n {
+        let mut row = Row::new();
+        for (col, arr) in &arrays {
+            row.insert(ColumnName(col.name.clone()), value_at(col, *arr, i)?);
+        }
+        let tuple = writer.partition_tuple(&row)?;
+        match runs.last_mut() {
+            Some((t, _, len)) if *t == tuple => *len += 1,
+            _ => runs.push((tuple, i, 1)),
+        }
+    }
+    Ok(runs)
 }
 
 /// Walk the snapshot history and compute (data, deletes) live now: each

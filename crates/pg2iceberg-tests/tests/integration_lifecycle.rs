@@ -249,6 +249,7 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             materializer_interval: "1s".into(),
             compaction_data_files: 8,
             compaction_delete_files: 4,
+            compaction_delete_ratio: 0.1,
             target_file_size: 0, // disable compaction for this test
             maintenance_retention: String::new(),
             maintenance_grace: "30m".into(),

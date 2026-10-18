@@ -962,3 +962,155 @@ fn compaction_reads_only_the_files_it_rewrites() {
     );
     assert_eq!(visible_id_qty(&h, &s), before);
 }
+
+/// Files written before a schema change are rewritten in the current
+/// schema, holding what a reader sees in them: NULL for a column added
+/// since, and a promoted column's values, widened.
+#[test]
+fn older_files_are_rewritten_in_the_current_schema() {
+    let h = Harness::new();
+    let v1 = schema_id_qty();
+    ensure_table(&h, &v1);
+    insert(&h, &v1, row_id_qty(1, 10));
+    insert(&h, &v1, row_id_qty(2, 20));
+
+    // `qty` int → long, and a new column.
+    let mut v2 = v1.clone();
+    v2.columns[1].ty = IcebergType::Long;
+    v2.columns.push(ColumnSchema {
+        name: "note".into(),
+        field_id: 3,
+        ty: IcebergType::String,
+        nullable: true,
+        is_primary_key: false,
+    });
+    let mut three = BTreeMap::new();
+    three.insert(ColumnName("id".into()), PgValue::Int4(3));
+    three.insert(ColumnName("qty".into()), PgValue::Int8(30));
+    three.insert(ColumnName("note".into()), PgValue::Text("three".into()));
+    insert(&h, &v2, three);
+    delete(&h, &v2, pk_only(2));
+
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let out = h.run_compaction(&v2, &cfg).expect("compaction should run");
+    assert_eq!(out.input_data_files, 3);
+    assert_eq!(out.rows_removed_by_deletes, 1);
+
+    let [output] = out.added_files.as_slice() else {
+        panic!("one output file: {:?}", out.added_files);
+    };
+    let bytes = block_on(h.blob.get(&output.path)).unwrap();
+    let written = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .schema()
+        .clone();
+    let types: Vec<(&str, &arrow_schema::DataType)> = written
+        .fields()
+        .iter()
+        .map(|f| (f.name().as_str(), f.data_type()))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("id", &arrow_schema::DataType::Int32),
+            ("qty", &arrow_schema::DataType::Int64),
+            ("note", &arrow_schema::DataType::Utf8),
+        ]
+    );
+
+    let mut visible = block_on(read_materialized_state(
+        &h.cat,
+        h.blob.as_ref(),
+        &v2.ident,
+        &v2,
+        &pk_cols(),
+    ))
+    .unwrap();
+    visible.sort_by_key(|r| format!("{:?}", r.get(&ColumnName("id".into()))));
+    let values: Vec<Vec<PgValue>> = visible
+        .iter()
+        .map(|r| {
+            ["id", "qty", "note"]
+                .iter()
+                .map(|c| r.get(&ColumnName(c.to_string())).cloned().unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        values,
+        [
+            vec![PgValue::Int4(1), PgValue::Int8(10), PgValue::Null],
+            vec![
+                PgValue::Int4(3),
+                PgValue::Int8(30),
+                PgValue::Text("three".into())
+            ],
+        ]
+    );
+}
+
+/// A pass doesn't rewrite a file for a few of its rows: deletes wait until
+/// they've killed `delete_ratio` of the rows rewriting would read. Then
+/// the pass rewrites, and retires them all.
+#[test]
+fn deletes_wait_until_they_kill_enough_rows_to_rewrite_for() {
+    let h = Harness::new();
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    let insert_all = (0..1000)
+        .map(|i| MaterializedRow {
+            op: Op::Insert,
+            row: row_id_qty(i, i),
+            unchanged_cols: vec![],
+            unchanged_from: None,
+        })
+        .collect();
+    h.commit(&s, insert_all);
+    let cfg = CompactionConfig {
+        delete_ratio: 0.1,
+        ..Default::default()
+    };
+
+    // 1% of the rows, in five commits — five delete files.
+    for i in 0..5 {
+        h.commit(
+            &s,
+            (0..2)
+                .map(|j| MaterializedRow {
+                    op: Op::Delete,
+                    row: pk_only(i * 2 + j),
+                    unchanged_cols: vec![],
+                    unchanged_from: None,
+                })
+                .collect(),
+        );
+        assert!(
+            h.run_compaction(&s, &cfg).is_none(),
+            "rewrote 1000 rows for {} deleted",
+            (i + 1) * 2
+        );
+    }
+
+    // 11%.
+    h.commit(
+        &s,
+        (10..110)
+            .map(|id| MaterializedRow {
+                op: Op::Delete,
+                row: pk_only(id),
+                unchanged_cols: vec![],
+                unchanged_from: None,
+            })
+            .collect(),
+    );
+    let out = h.run_compaction(&s, &cfg).expect("worth a rewrite now");
+    assert_eq!(out.rows_rewritten, 1000);
+    assert_eq!(out.rows_removed_by_deletes, 110);
+    assert_eq!(out.input_delete_files, 6);
+    assert_eq!(visible_id_qty(&h, &s).len(), 890);
+}

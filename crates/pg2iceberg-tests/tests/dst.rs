@@ -1896,6 +1896,7 @@ impl DstHarness {
         let cfg = CompactionConfig {
             data_file_threshold: 1,
             delete_file_threshold: 1,
+            delete_ratio: 0.0,
             target_size_bytes: 1024,
             max_input_bytes_per_pass: 1,
         };
@@ -1960,6 +1961,7 @@ impl DstHarness {
         let cfg = CompactionConfig {
             data_file_threshold: 1,
             delete_file_threshold: 1,
+            delete_ratio: 0.0,
             target_size_bytes: 1024,
             max_input_bytes_per_pass: 1,
         };
@@ -2038,6 +2040,7 @@ impl DstHarness {
         let cfg = CompactionConfig {
             data_file_threshold: 1,
             delete_file_threshold: 1,
+            delete_ratio: 0.0,
             // Around the size of a few-row file, so the table mixes
             // small files with large ones only deletes make worth
             // rewriting.
@@ -5258,6 +5261,7 @@ fn compaction_does_not_replay_the_table() {
     let cfg = CompactionConfig {
         data_file_threshold: 1,
         delete_file_threshold: 1,
+        delete_ratio: 0.0,
         target_size_bytes: 1024,
         max_input_bytes_per_pass: 1,
     };

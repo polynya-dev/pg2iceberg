@@ -330,14 +330,20 @@ pub struct SinkConfig {
     #[serde(default)]
     pub materializer_interval: String,
 
-    /// Compaction file-count thresholds. Names match Go
-    /// (`compaction_data_files`, `compaction_delete_files`). Compaction
-    /// runs as part of every materializer cycle, gated by these
-    /// thresholds — so most cycles do no compaction work.
+    /// Compaction thresholds. Compaction runs as part of every
+    /// materializer cycle, gated by these — so most cycles do no
+    /// compaction work. `compaction_data_files` (as Go names it): merge
+    /// small files once there are this many data files.
     #[serde(default = "default_compaction_data_files")]
     pub compaction_data_files: usize,
+    /// Rewrite the files deletes killed rows in once there are this many
+    /// delete files…
     #[serde(default = "default_compaction_delete_files")]
     pub compaction_delete_files: usize,
+    /// …or once the rows deletes killed are this share of the rows those
+    /// files hold. See [`pg2iceberg_iceberg::CompactionConfig::delete_ratio`].
+    #[serde(default = "default_compaction_delete_ratio")]
+    pub compaction_delete_ratio: f64,
     /// Target output file size in bytes for compaction. Files smaller
     /// than `target_file_size / 2` are eligible for rewrite. Matches
     /// Go's `target_file_size`. 0 = disable compaction (no files are
@@ -412,6 +418,7 @@ impl Default for SinkConfig {
             materializer_interval: String::new(),
             compaction_data_files: default_compaction_data_files(),
             compaction_delete_files: default_compaction_delete_files(),
+            compaction_delete_ratio: default_compaction_delete_ratio(),
             target_file_size: default_target_file_size(),
             maintenance_retention: String::new(),
             maintenance_grace: default_maintenance_grace(),
@@ -477,12 +484,23 @@ impl SinkConfig {
         }
     }
 
+    /// `compaction_delete_ratio` is a share: 0 rewrites a file for any row
+    /// deleted from it; past 1, only `compaction_delete_files` does.
+    pub fn validate_compaction(&self) -> Result<()> {
+        let ratio = self.compaction_delete_ratio;
+        if !(ratio.is_finite() && ratio >= 0.0) {
+            anyhow::bail!("sink.compaction_delete_ratio must be 0 or more, not {ratio}");
+        }
+        Ok(())
+    }
+
     /// Translate the Go-shaped sink fields into the iceberg crate's
     /// `CompactionConfig` shape. Used on every materializer cycle.
     pub fn compaction_config(&self) -> pg2iceberg_iceberg::CompactionConfig {
         pg2iceberg_iceberg::CompactionConfig {
             data_file_threshold: self.compaction_data_files,
             delete_file_threshold: self.compaction_delete_files,
+            delete_ratio: self.compaction_delete_ratio,
             target_size_bytes: self.target_file_size,
             max_input_bytes_per_pass: self
                 .target_file_size
@@ -561,7 +579,11 @@ fn default_compaction_data_files() -> usize {
 }
 
 fn default_compaction_delete_files() -> usize {
-    4
+    32
+}
+
+fn default_compaction_delete_ratio() -> f64 {
+    0.1
 }
 
 fn default_target_file_size() -> u64 {
@@ -653,6 +675,7 @@ impl Config {
         self.validate_mode()?;
         self.validate_tables()?;
         self.sink.schedule()?;
+        self.sink.validate_compaction()?;
         self.metrics_addr()?;
         self.liveness_timeout()?;
         self.sink.resolved_maintenance()?;
@@ -1224,6 +1247,21 @@ state:
             err.contains("no longer supported") && err.contains("wal_level=logical"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn compaction_delete_ratio_is_a_share() {
+        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        assert_eq!(cfg.sink.compaction_config().delete_ratio, 0.1);
+        for ok in [0.0, 0.3, 2.0] {
+            cfg.sink.compaction_delete_ratio = ok;
+            cfg.sink.validate_compaction().unwrap();
+        }
+        for bad in [-0.1, f64::NAN, f64::INFINITY] {
+            cfg.sink.compaction_delete_ratio = bad;
+            let err = cfg.sink.validate_compaction().unwrap_err().to_string();
+            assert!(err.contains("compaction_delete_ratio"), "{err}");
+        }
     }
 
     #[test]

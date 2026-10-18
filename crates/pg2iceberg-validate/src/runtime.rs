@@ -169,6 +169,10 @@ pub enum LifecycleError {
     /// backfill blew up."
     #[error("background snapshot failed for {ident}: {error}")]
     BackgroundSnapshot { ident: String, error: String },
+    /// A materializer tick's task ended without finishing: the runtime
+    /// shut down under it.
+    #[error("materializer tick: {0}")]
+    Tick(String),
 }
 
 /// Type alias for backwards-compat — the previous loop-only error
@@ -808,7 +812,7 @@ async fn start<Cat: Catalog + 'static>(
     Phase::Running.set(lc.metrics.as_ref());
     let loop_state = LogicalLoop {
         pipeline,
-        materializer,
+        materializer: Some(materializer),
         stream,
         pg: Arc::clone(&lc.pg),
         publication_name: lc.publication_name,
@@ -924,7 +928,9 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
 /// drain logic.
 pub struct LogicalLoop<C: Coordinator + ?Sized + 'static, Cat: Catalog + 'static> {
     pub pipeline: Pipeline<C>,
-    pub materializer: Materializer<Cat>,
+    /// `None` while a materializer tick, on a task of its own, has it
+    /// (see [`run_logical_main_loop`]).
+    pub materializer: Option<Materializer<Cat>>,
     pub stream: Box<dyn ReplicationStream>,
     /// Source PG, to reopen `stream` when it drops (see
     /// [`run_logical_main_loop`]).
@@ -981,9 +987,11 @@ pub struct PendingSnapshotMsg {
 /// 3. On a replication error — Postgres restarted, the network dropped
 ///    the connection, the walsender was terminated — reopen the stream
 ///    (see [`reopen_stream`]).
-/// 4. On tick → fire due handlers via [`run_materialize_tick`] /
-///    [`run_watcher_tick`] (the helpers the binary used to inline).
-/// 5. On shutdown → final flush + send_standby.
+/// 4. On tick → fire due handlers. A materializer tick
+///    ([`run_materialize_tick`]) runs on a task of its own (see
+///    [`Ticks`]): replication goes on while it does.
+/// 5. On shutdown → wait for a tick in flight, then final flush +
+///    send_standby.
 ///
 /// **Why this is a library function:** the production binary's
 /// `run_inner` used to inline this whole loop (~80 lines), which
@@ -992,6 +1000,27 @@ pub struct PendingSnapshotMsg {
 /// path*. Bugs in the loop surface in fault-injection automatically.
 pub async fn run_logical_main_loop<C, Cat, F>(
     mut loop_state: LogicalLoop<C, Cat>,
+    shutdown: F,
+) -> Result<(), MainLoopError>
+where
+    C: Coordinator + ?Sized + 'static,
+    Cat: Catalog + 'static,
+    F: Future<Output = ()> + Unpin + Send,
+{
+    let mut ticks = Ticks::default();
+    let out = main_loop(&mut loop_state, &mut ticks, shutdown).await;
+    // However the loop ended, a tick in flight ends first: nothing may
+    // run beside it — the drain's final cycle, or, after an error, the
+    // next process's materializer.
+    let ended = ticks.wait(&mut loop_state).await;
+    out?;
+    ended?;
+    drain_and_shutdown(loop_state).await
+}
+
+async fn main_loop<C, Cat, F>(
+    loop_state: &mut LogicalLoop<C, Cat>,
+    ticks: &mut Ticks<Cat>,
     shutdown: F,
 ) -> Result<(), MainLoopError>
 where
@@ -1024,7 +1053,7 @@ where
             } => {
                 match msg.result {
                     Ok(()) => {
-                        loop_state.materializer.mark_snapshot_complete(&msg.ident);
+                        ticks.ungate(loop_state, msg.ident.clone());
                         tracing::info!(
                             table = %msg.ident,
                             "background snapshot complete; materializer ungated"
@@ -1038,10 +1067,16 @@ where
                     }
                 }
             }
+            joined = ticks.join(), if ticks.running() => {
+                ticks.finish(loop_state, joined)?;
+                // The next tick is due an interval after this one ended.
+                ticker.finished(Handler::Materialize, loop_state.clock.now());
+                ticks.start_if_wanted(loop_state);
+            }
             res = loop_state.stream.recv() => match res {
                 Ok(msg) => process_message(&mut loop_state.pipeline, msg).await?,
                 Err(e) => {
-                    if !reopen_stream(&mut loop_state, &mut outage, e, shutdown.as_mut()).await? {
+                    if !reopen_stream(loop_state, &mut outage, e, shutdown.as_mut()).await? {
                         break;
                     }
                 }
@@ -1058,20 +1093,173 @@ where
         // intervals differ wildly: each one acts on the marker as
         // soon as its WAL stream delivers it, and the meta-marker
         // emission ends up pointing at the same logical
-        // (uuid, table, snapshot) tuple on both sides.
+        // (uuid, table, snapshot) tuple on both sides. A tick already
+        // running may have read the log before the marker's flush:
+        // then another runs as soon as it ends.
         if loop_state.pipeline.has_pending_marker() {
-            dispatch_handler(&mut loop_state, Handler::Flush).await?;
-            dispatch_handler(&mut loop_state, Handler::Materialize).await?;
+            dispatch_handler(loop_state, Handler::Flush).await?;
+            ticks.want(loop_state);
         }
 
         let now = loop_state.clock.now();
         for h in ticker.fire_due(now) {
-            dispatch_handler(&mut loop_state, h).await?;
-            ticker.finished(h, loop_state.clock.now());
+            match h {
+                // Finished when its task ends; skipped while one runs.
+                Handler::Materialize => ticks.start(loop_state),
+                h => {
+                    dispatch_handler(loop_state, h).await?;
+                    ticker.finished(h, loop_state.clock.now());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+type TickTask<Cat> = tokio::task::JoinHandle<(
+    Materializer<Cat>,
+    std::result::Result<MaterializeTickOutcome, MaterializerError>,
+)>;
+
+/// The main loop's materializer ticks. Each runs on a task of its own,
+/// holding the materializer until it ends: a tick against a distant
+/// catalog, or one that compacts a large table, takes minutes, and
+/// replication must go on meanwhile — or the slot falls behind and the
+/// source's WAL piles up. The pipeline and the materializer share only
+/// what the coordinator, the blob store and the catalog hold, as a
+/// `stream-only` and a `materializer-only` process do.
+///
+/// Why a task (a `tokio::spawn`, besides the background snapshot's): a
+/// tick's compaction is CPU-bound, so on the loop's own task it would
+/// stall replication between its awaits all the same. The DSTs drive
+/// the loop under tokio runtimes — `current_thread`, paused time — where
+/// the task interleaves with the loop deterministically.
+struct Ticks<Cat: Catalog + 'static> {
+    running: Option<TickTask<Cat>>,
+    /// Another tick as soon as the running one ends (see [`Self::want`]).
+    again: bool,
+    /// Tables whose background snapshot completed while a tick had the
+    /// materializer: ungated when it's back.
+    ungated: Vec<TableIdent>,
+}
+
+impl<Cat: Catalog + 'static> Default for Ticks<Cat> {
+    fn default() -> Self {
+        Self {
+            running: None,
+            again: false,
+            ungated: Vec::new(),
+        }
+    }
+}
+
+impl<Cat: Catalog + 'static> Ticks<Cat> {
+    fn running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// Start a tick, unless one is running.
+    fn start<C: Coordinator + ?Sized>(&mut self, loop_state: &mut LogicalLoop<C, Cat>) {
+        let Some(mut materializer) = loop_state.materializer.take() else {
+            return;
+        };
+        let compaction = loop_state.compaction.clone();
+        let tick = async move {
+            let out = run_materialize_tick(&mut materializer, compaction.as_ref()).await;
+            (materializer, out)
+        };
+        self.running = Some(tokio::spawn(tick.in_current_span()));
+    }
+
+    /// Start a tick now, or as soon as the running one ends.
+    fn want<C: Coordinator + ?Sized>(&mut self, loop_state: &mut LogicalLoop<C, Cat>) {
+        if self.running() {
+            self.again = true;
+        } else {
+            self.start(loop_state);
         }
     }
 
-    drain_and_shutdown(loop_state).await
+    fn start_if_wanted<C: Coordinator + ?Sized>(&mut self, loop_state: &mut LogicalLoop<C, Cat>) {
+        if std::mem::take(&mut self.again) {
+            self.start(loop_state);
+        }
+    }
+
+    /// The running tick's end. Pending forever with none running, as a
+    /// `select!` arm guarded by [`Self::running`] never polls it.
+    async fn join(
+        &mut self,
+    ) -> std::result::Result<
+        (
+            Materializer<Cat>,
+            std::result::Result<MaterializeTickOutcome, MaterializerError>,
+        ),
+        tokio::task::JoinError,
+    > {
+        match self.running.as_mut() {
+            Some(task) => task.await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Take the materializer back from the tick that ended with `joined`.
+    fn finish<C: Coordinator + ?Sized>(
+        &mut self,
+        loop_state: &mut LogicalLoop<C, Cat>,
+        joined: std::result::Result<
+            (
+                Materializer<Cat>,
+                std::result::Result<MaterializeTickOutcome, MaterializerError>,
+            ),
+            tokio::task::JoinError,
+        >,
+    ) -> Result<(), MainLoopError> {
+        self.running = None;
+        let (mut materializer, out) = match joined {
+            Ok(ended) => ended,
+            // As if it had panicked on the loop's own task.
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => return Err(MainLoopError::Tick(e.to_string())),
+        };
+        for ident in self.ungated.drain(..) {
+            materializer.mark_snapshot_complete(&ident);
+        }
+        loop_state.materializer = Some(materializer);
+        // `cycle` failure is fatal (propagates); compaction failure is
+        // captured in the outcome and only logged.
+        let outcome = out?;
+        if let Some(err) = outcome.compaction_error {
+            tracing::warn!(error = %err, "materializer.compact_cycle failed");
+        }
+        succeeded(loop_state, "materialize");
+        Ok(())
+    }
+
+    /// Lift `ident`'s snapshot gate, now or when the running tick ends.
+    fn ungate<C: Coordinator + ?Sized>(
+        &mut self,
+        loop_state: &mut LogicalLoop<C, Cat>,
+        ident: TableIdent,
+    ) {
+        match loop_state.materializer.as_mut() {
+            Some(materializer) => materializer.mark_snapshot_complete(&ident),
+            None => self.ungated.push(ident),
+        }
+    }
+
+    /// Wait for the running tick, if any, to end.
+    async fn wait<C: Coordinator + ?Sized>(
+        &mut self,
+        loop_state: &mut LogicalLoop<C, Cat>,
+    ) -> Result<(), MainLoopError> {
+        self.again = false;
+        if !self.running() {
+            return Ok(());
+        }
+        let joined = self.join().await;
+        self.finish(loop_state, joined)
+    }
 }
 
 async fn process_message<C: Coordinator + ?Sized>(
@@ -1248,17 +1436,8 @@ where
                 succeeded(loop_state, "ack");
             }
         }
-        Handler::Materialize => {
-            // `cycle` failure is fatal (propagates); compaction
-            // failure is captured in the outcome and only logged.
-            let outcome =
-                run_materialize_tick(&mut loop_state.materializer, loop_state.compaction.as_ref())
-                    .await?;
-            if let Some(err) = outcome.compaction_error {
-                tracing::warn!(error = %err, "materializer.compact_cycle failed");
-            }
-            succeeded(loop_state, "materialize");
-        }
+        // On a task of its own: see `Ticks`.
+        Handler::Materialize => {}
         Handler::Watcher => {
             let span = work_span!("watcher.check", violations = Empty);
             let out = watch(loop_state).instrument(span.clone()).await;
@@ -1427,8 +1606,10 @@ where
     // re-process the same staged events. Errors here are logged but
     // not fatal: the staged parquet is durable, so a subsequent
     // start picks up where we left off.
-    if let Err(e) = loop_state.materializer.cycle().await {
-        tracing::warn!(error = %e, "final materializer cycle failed");
+    if let Some(materializer) = loop_state.materializer.as_mut() {
+        if let Err(e) = materializer.cycle().await {
+            tracing::warn!(error = %e, "final materializer cycle failed");
+        }
     }
     let (final_lsn, acked) = record_and_ack(&mut loop_state).await;
     if let Err(e) = acked {

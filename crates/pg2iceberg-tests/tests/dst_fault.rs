@@ -956,6 +956,7 @@ fn unrecorded_compaction(h: &FaultHarness) {
     let eager = CompactionConfig {
         data_file_threshold: 2,
         delete_file_threshold: 1,
+        delete_ratio: 0.0,
         target_size_bytes: 1 << 20,
         max_input_bytes_per_pass: u64::MAX,
     };
@@ -1585,7 +1586,7 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
             &mut h.pipeline,
             pg2iceberg_logical::Pipeline::new(h.coord.clone(), h.blob.clone(), h.namer.clone(), 64),
         ),
-        materializer: std::mem::replace(
+        materializer: Some(std::mem::replace(
             &mut h.materializer,
             pg2iceberg_logical::Materializer::new(
                 h.coord.clone() as Arc<dyn Coordinator>,
@@ -1597,7 +1598,7 @@ fn full_main_loop_with_blob_put_fault_recovers_via_external_restart() {
                 "drop",
                 128,
             ),
-        ),
+        )),
         stream: async_stream,
         pg: Arc::new(pg2iceberg_sim::postgres::SimPgClient::new(h.db.clone())),
         publication_name: PUB.into(),
@@ -2055,6 +2056,74 @@ async fn replication_keeps_up_while_materializer_ticks_outlast_their_interval() 
         acked >= end,
         "a minute after the workload, the slot is acked to {acked:?} of {end:?}"
     );
+}
+
+/// A materializer tick that takes minutes — a slow catalog, a large
+/// compaction — doesn't stop replication: changes are staged and the slot
+/// acked while it runs, as `stream-only` beside `materializer-only` would.
+/// Otherwise the source's WAL piles up for as long as the tick lasts.
+#[tokio::test(start_paused = true)]
+async fn replication_goes_on_while_a_materializer_tick_runs() {
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    // Every catalog call a minute: a tick that commits takes several.
+    let catalog = Arc::new(SlowCatalog {
+        inner: stores.catalog.clone(),
+        latency: Duration::from_secs(60),
+    });
+    let mut lifecycle = sim_lifecycle_with(&db, &stores, every_second(), catalog);
+    lifecycle.compaction = Some(CompactionConfig::default());
+    let script = db.clone();
+    let workload = tokio::spawn(async move {
+        // Well past startup.
+        tokio::time::sleep(Duration::from_secs(900)).await;
+        for i in 5..305 {
+            let mut tx = script.begin_tx();
+            tx.insert(&ident(), row(i, i * 10));
+            tx.commit(Timestamp(0)).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        script.current_lsn()
+    });
+    // Its own task too, so it looks while the main loop is busy.
+    let script = db.clone();
+    let observer = tokio::spawn(async move {
+        let end = workload.await.unwrap();
+        // A fraction of one catalog call.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let acked = script
+            .slot_state(LIFECYCLE_SLOT)
+            .unwrap()
+            .confirmed_flush_lsn;
+        (end, acked)
+    });
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let record = seen.clone();
+    let shutdown = Box::pin(async move {
+        *record.lock().unwrap() = Some(observer.await.unwrap());
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let (end, acked) = seen.lock().unwrap().expect("the script ran");
+    assert!(
+        acked >= end,
+        "10s after the workload, mid-tick, the slot is acked to {acked:?} of {end:?}"
+    );
+    // And the drain's final cycle, after the tick in flight, applies it all.
+    let rows = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 304);
 }
 
 // ── Observability ────────────────────────────────────────────────

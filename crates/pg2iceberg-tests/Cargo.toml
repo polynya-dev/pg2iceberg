@@ -58,6 +58,9 @@ pg2iceberg-snapshot.workspace = true
 pg2iceberg-stream.workspace = true
 pg2iceberg-validate.workspace = true
 bytes = "1"
+# Reads the schema a compaction output was written in (`compact_e2e.rs`).
+arrow-schema = "54"
+parquet = { version = "54", default-features = false, features = ["arrow"] }
 # Counting global allocator for `tests/file_index_memory.rs` (the
 # workspace forbids the `unsafe` a hand-rolled one would need).
 peak_alloc = "0.3"

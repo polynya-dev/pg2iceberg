@@ -97,7 +97,9 @@ impl<T: ?Sized> Instrumented<T> {
             otel.status_description = tracing::field::Empty,
         );
         let start = self.clock.now();
+        let in_flight = InFlight::new(self.metrics.as_ref());
         let out = request.instrument(span.clone()).await;
+        drop(in_flight);
         let op_labels = labels([("op", op)]);
         let elapsed = seconds_between(start, self.clock.now());
         self.metrics.histogram(store.duration, &op_labels, elapsed);
@@ -110,6 +112,28 @@ impl<T: ?Sized> Instrumented<T> {
             self.metrics.counter(store.errors, &error_labels, 1);
         }
         out
+    }
+}
+
+/// A request in flight, as liveness counts it ([`Metrics::request_started`]),
+/// until dropped — as its future may be, mid-request.
+struct InFlight<'a> {
+    metrics: &'a dyn Metrics,
+    request: u64,
+}
+
+impl<'a> InFlight<'a> {
+    fn new(metrics: &'a dyn Metrics) -> Self {
+        Self {
+            metrics,
+            request: metrics.request_started(),
+        }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.metrics.request_ended(self.request);
     }
 }
 

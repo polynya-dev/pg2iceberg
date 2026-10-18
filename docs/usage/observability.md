@@ -40,7 +40,7 @@ curl -s localhost:9090/metrics | grep '^pg2iceberg_replication_lag_bytes'
 
 pg2iceberg records a metric only when it finishes something: a request to the catalog, object store or coordinator, a flush, an ack, a materializer cycle, or a watcher tick. Nothing records on a timer of its own.
 
-So if nothing has been recorded for `liveness_timeout`, the process is stuck, not idle. Typical causes are a request that never returns or a deadlock. `/healthz` then answers `503`, and restarting the process is the fix.
+So if nothing has been recorded for `liveness_timeout`, the process is stuck, not idle. Typical causes are a request that never returns or a deadlock. `/healthz` then answers `503`, and restarting the process is the fix. Replication and the materializer work side by side in `run`, so a request that never returns counts even while the other keeps recording: `/healthz` fails once one has been in flight for `liveness_timeout`.
 
 A process that is merely slow keeps passing. For example, a materializer cycle can take many minutes against a distant catalog, but its requests keep completing in the meantime. An idle `run` or `stream-only` still records every 30 seconds through its watcher.
 
