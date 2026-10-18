@@ -48,14 +48,11 @@ sink:
 | `ICEBERG_WAREHOUSE` | `sink.warehouse` |
 | `ICEBERG_NAMESPACE` | `sink.namespace` |
 | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` |
-<<<<<<< HEAD
+| `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` |
 | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` |
 | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` |
 | `PG2ICEBERG_LOG_FORMAT` | `text` (default) or `json` logs; no config field |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, ... | trace export, as OpenTelemetry defines it: see [Observability](observability.md#traces) |
-=======
-| `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` |
->>>>>>> 4c75811 (docs, tests: sink.maintenance: managed)
 
 AWS's own variables are read as AWS tools read them, and give way to the config file: `AWS_REGION` / `AWS_DEFAULT_REGION` for `sink.s3_region`, `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` for `sink.s3_endpoint`. Credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are read by the AWS default credential chain, with `credential_mode: iam`.
 
