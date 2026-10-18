@@ -11,11 +11,11 @@ The materializer runs on a configurable interval (default: 30 seconds) and appli
 For each table:
 
 1. **Read cursor** — fetch the last committed offset from `mat_cursor`
-2. **Read log entries** — page through the `log_index` rows after the cursor and download their staged events
+2. **Read log entries** — page through the `log_index` rows after the cursor and download their staged events, up to eight files ahead of the one being folded, while the cycle folds, uploads and commits what it has read: a file is a round trip to the object store, and reading them one at a time leaves the cycle mostly waiting
 3. **Fold, in steps** — at most `materializer_batch_rows` events at a time, deduplicated by primary key:
     - `INSERT` / `UPDATE`: keep the latest row state
     - `DELETE`: mark the primary key for deletion
-    - `UPDATE` with unresolved TOAST columns: read the row's previous version and backfill the missing columns
+    - `UPDATE` with unresolved TOAST columns: read the row's previous version and backfill the missing columns (the data files holding them, up to eight at once)
 4. **Prepare** — serialize each step's folded rows into Iceberg data and delete files and upload them:
     - Inserts and updates → Parquet data files (partitioned by the table's partition spec)
     - Deletes, and the previous version of updated rows → Parquet equality delete files (PK columns only)

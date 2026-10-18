@@ -61,7 +61,7 @@ While streaming, a flush — encoding its changes, both steps — runs on a task
 
 **Read** (materializer ← log):
 
-The materializer reads `log_index` entries with offsets greater than its cursor, downloads the referenced files, decodes them via the staging codec, and processes events in offset order. There is no in-memory cache optimization for the single-process case; profiling showed the S3-fetch overhead is amortized well below the materializer cycle interval.
+The materializer reads `log_index` entries with offsets greater than its cursor, downloads the referenced files — up to eight ahead of the one it's applying — decodes them via the staging codec, and processes events in offset order. There is no in-memory cache optimization for the single-process case; profiling showed the S3-fetch overhead is amortized well below the materializer cycle interval.
 
 ## Restart record
 

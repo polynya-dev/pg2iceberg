@@ -25,8 +25,10 @@
 
 use crate::catalog_cache::CachingCatalog;
 use crate::relation_event;
+use crate::staged_log::{StagedLog, LOG_PAGE_ENTRIES, READ_AHEAD};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use pg2iceberg_coord::{Coordinator, LogEntry};
 use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::typemap::IcebergType;
@@ -422,8 +424,6 @@ enum Backfill {
 /// The snapshot cursor's value once a backfill's rows are all applied.
 const SNAPSHOT_APPLIED: i64 = i64::MAX;
 
-/// Log entries fetched per `read_log` call while a cycle drains a table.
-const LOG_PAGE_ENTRIES: usize = 64;
 /// Default `cycle_rows`, in multiples of `batch_rows`.
 const DEFAULT_STEPS_PER_CYCLE: usize = 8;
 
@@ -1289,33 +1289,27 @@ impl<C: Catalog> Materializer<C> {
     }
 
     async fn fold_snapshot_rows(&mut self, ident: &TableIdent, from: i64) -> Result<usize> {
-        let mut after = from.max(0) as u64;
         let mut unit = Unit {
             snapshot: true,
             ..Unit::default()
         };
-        loop {
-            let entries = self.coord.read_log(ident, after, LOG_PAGE_ENTRIES).await?;
-            if entries.is_empty() {
-                break;
+        let mut log = self.staged_log(ident, from.max(0) as u64);
+        while let Some((e, bytes)) = log.next().await? {
+            let rows: Vec<MatEvent> = decode_chunk(&bytes)?
+                .into_iter()
+                .filter(|evt| is_snapshot_xid(evt.xid))
+                .collect();
+            if unit.start_offset.is_none() {
+                log.alongside(self.begin_unit(ident, &mut unit, e.start_offset))
+                    .await?;
             }
-            for e in entries {
-                let bytes = self.blob_store.get(&e.s3_path).await?;
-                let rows: Vec<MatEvent> = decode_chunk(&bytes)?
-                    .into_iter()
-                    .filter(|evt| is_snapshot_xid(evt.xid))
-                    .collect();
-                if unit.start_offset.is_none() {
-                    self.begin_unit(ident, &mut unit, e.start_offset).await?;
-                }
-                if !unit.buf.is_empty() && unit.buf.len() + rows.len() > self.batch_rows {
-                    self.prepare_step(ident, &mut unit).await?;
-                }
-                unit.buf.extend(rows);
-                unit.end_offset = Some(e.end_offset);
-                after = e.end_offset;
+            if !unit.buf.is_empty() && unit.buf.len() + rows.len() > self.batch_rows {
+                log.alongside(self.prepare_step(ident, &mut unit)).await?;
             }
+            unit.buf.extend(rows);
+            unit.end_offset = Some(e.end_offset);
         }
+        drop(log);
         self.commit_unit(ident, &mut unit).await
     }
 
@@ -1970,56 +1964,52 @@ impl<C: Catalog> Materializer<C> {
             .get_cursor(&self.group, ident)
             .await?
             .unwrap_or(-1);
-        let mut after = if cursor < 0 { 0 } else { cursor as u64 };
         let mut unit = Unit::default();
         let mut events_read = 0usize;
         let mut folded = 0usize;
         let mut read_any = false;
-        'read: loop {
-            let entries = self.coord.read_log(ident, after, LOG_PAGE_ENTRIES).await?;
-            if entries.is_empty() {
-                break;
-            }
+        let mut log = self.staged_log(ident, cursor.max(0) as u64);
+        while let Some((e, bytes)) = log.next().await? {
             read_any = true;
-            for e in entries {
-                let bytes = self.blob_store.get(&e.s3_path).await?;
-                let events = decode_chunk(&bytes)?;
-                // A schema change starts its entry (the pipeline stages it
-                // so). Commit the rows before it — written under the old
-                // schema — before applying it: a crash in between then
-                // re-reads this entry, and applying the change again is a
-                // no-op. Within a transaction (DDL mid-transaction) the
-                // rows so far can only be staged as a step.
-                if events.first().is_some_and(|e| e.op == Op::Relation) {
-                    if is_tx_boundary(unit.buf.last(), events.first()) {
-                        folded += self.commit_unit(ident, &mut unit).await?;
-                    } else {
-                        self.prepare_step(ident, &mut unit).await?;
-                    }
+            let events = decode_chunk(&bytes)?;
+            // A schema change starts its entry (the pipeline stages it
+            // so). Commit the rows before it — written under the old
+            // schema — before applying it: a crash in between then
+            // re-reads this entry, and applying the change again is a
+            // no-op. Within a transaction (DDL mid-transaction) the rows
+            // so far can only be staged as a step.
+            if events.first().is_some_and(|e| e.op == Op::Relation) {
+                if is_tx_boundary(unit.buf.last(), events.first()) {
+                    folded += log.alongside(self.commit_unit(ident, &mut unit)).await?;
+                } else {
+                    log.alongside(self.prepare_step(ident, &mut unit)).await?;
                 }
-                if !unit.buf.is_empty() && unit.buf.len() + events.len() > self.batch_rows {
-                    if is_tx_boundary(unit.buf.last(), events.first()) {
-                        folded += self.commit_unit(ident, &mut unit).await?;
-                        if events_read >= self.cycle_rows {
-                            // Leave this entry for the next cycle.
-                            self.backlogged = true;
-                            break 'read;
-                        }
-                    } else {
-                        // A transaction spans this boundary: stage what's
-                        // buffered as an intermediate step and keep going.
-                        self.prepare_step(ident, &mut unit).await?;
-                    }
-                }
-                events_read += events.len();
-                if unit.start_offset.is_none() {
-                    self.begin_unit(ident, &mut unit, e.start_offset).await?;
-                }
-                self.buffer_entry(ident, &mut unit, events).await?;
-                unit.end_offset = Some(e.end_offset);
-                after = e.end_offset;
             }
+            if !unit.buf.is_empty() && unit.buf.len() + events.len() > self.batch_rows {
+                if is_tx_boundary(unit.buf.last(), events.first()) {
+                    folded += log.alongside(self.commit_unit(ident, &mut unit)).await?;
+                    if events_read >= self.cycle_rows {
+                        // Leave this entry for the next cycle.
+                        self.backlogged = true;
+                        break;
+                    }
+                } else {
+                    // A transaction spans this boundary: stage what's
+                    // buffered as an intermediate step and keep going.
+                    log.alongside(self.prepare_step(ident, &mut unit)).await?;
+                }
+            }
+            events_read += events.len();
+            if unit.start_offset.is_none() {
+                log.alongside(self.begin_unit(ident, &mut unit, e.start_offset))
+                    .await?;
+            }
+            log.alongside(self.buffer_entry(ident, &mut unit, events))
+                .await?;
+            unit.end_offset = Some(e.end_offset);
         }
+        // Nothing may wait on the reads ahead from here: drop them.
+        drop(log);
 
         if !read_any {
             // No new events for this table — but a marker may have
@@ -2530,18 +2520,37 @@ impl<C: Catalog> Materializer<C> {
         Ok(pending.len())
     }
 
+    /// The table's staged log past offset `after`, read ahead.
+    fn staged_log(&self, ident: &TableIdent, after: u64) -> StagedLog {
+        StagedLog::new(
+            self.coord.clone(),
+            self.blob_store.clone(),
+            ident.clone(),
+            after,
+        )
+    }
+
     async fn fetch_prior_rows(
         &self,
         paths: &BTreeSet<String>,
         schema: &TableSchema,
     ) -> Result<BTreeMap<String, Vec<Row>>> {
-        let mut out = BTreeMap::new();
-        for path in paths {
-            let bytes = self.blob_store.get(path).await?;
-            let rows = read_data_file(&bytes, &schema.columns)?;
-            out.insert(path.clone(), rows);
-        }
-        Ok(out)
+        let blob_store = &self.blob_store;
+        let files: Vec<(String, Bytes)> = stream::iter(paths.iter().cloned())
+            .map(|path| {
+                let blob_store = blob_store.clone();
+                async move {
+                    let bytes = blob_store.get(&path).await?;
+                    Ok::<_, StreamError>((path, bytes))
+                }
+            })
+            .buffer_unordered(READ_AHEAD)
+            .try_collect()
+            .await?;
+        files
+            .into_iter()
+            .map(|(path, bytes)| Ok((path, read_data_file(&bytes, &schema.columns)?)))
+            .collect()
     }
 }
 
