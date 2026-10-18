@@ -10,7 +10,8 @@
 //! ## Provided ticks
 //!
 //! - [`run_materialize_tick`] — `Materializer::cycle` plus inline
-//!   compaction (when `CompactionConfig` is supplied), with the same
+//!   compaction (when `CompactionConfig` is supplied; only its
+//!   delete-file backstop while the cycle left a backlog), with the same
 //!   "warn-and-continue on compact_cycle Err" behavior the binary
 //!   uses. Returns counts so callers can log.
 //! - [`run_watcher_tick`] — builds [`WatcherInputs`] and calls
@@ -88,6 +89,16 @@ where
         compaction_error: None,
     };
     if let Some(cfg) = compaction {
+        // With a backlog the next tick follows straight away, and dirties
+        // again what a pass rewrites: until it's applied, only the
+        // delete-file backstop, which readers can't wait for.
+        let deferring;
+        let cfg = if materializer.backlogged() {
+            deferring = cfg.backstop_only();
+            &deferring
+        } else {
+            cfg
+        };
         match materializer.compact_cycle(cfg).await {
             Ok(c) => outcome.compaction = c,
             Err(e) => outcome.compaction_error = Some(e.to_string()),
@@ -989,7 +1000,8 @@ pub struct PendingSnapshotMsg {
 ///    (see [`reopen_stream`]).
 /// 4. On tick → fire due handlers. A materializer tick
 ///    ([`run_materialize_tick`]) runs on a task of its own (see
-///    [`Ticks`]): replication goes on while it does.
+///    [`Ticks`]): replication goes on while it does. One that stops at
+///    its row budget is followed by the next as soon as it ends.
 /// 5. On shutdown → wait for a tick in flight, then final flush +
 ///    send_standby.
 ///
@@ -1136,7 +1148,9 @@ type TickTask<Cat> = tokio::task::JoinHandle<(
 /// the task interleaves with the loop deterministically.
 struct Ticks<Cat: Catalog + 'static> {
     running: Option<TickTask<Cat>>,
-    /// Another tick as soon as the running one ends (see [`Self::want`]).
+    /// Another tick as soon as the running one ends: a blue-green marker
+    /// arrived meanwhile ([`Self::want`]), or it stopped at its row budget
+    /// with log left to read — a backlog doesn't wait an interval a tick.
     again: bool,
     /// Tables whose background snapshot completed while a tick had the
     /// materializer: ungated when it's back.
@@ -1225,6 +1239,7 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
         for ident in self.ungated.drain(..) {
             materializer.mark_snapshot_complete(&ident);
         }
+        self.again |= materializer.backlogged();
         loop_state.materializer = Some(materializer);
         // `cycle` failure is fatal (propagates); compaction failure is
         // captured in the outcome and only logged.

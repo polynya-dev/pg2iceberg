@@ -747,6 +747,82 @@ fn naive_continue_after_flush_failure_loses_events() {
 // arms ever diverge from these helpers, the tests below stop
 // matching production behavior — that's a regression signal.
 
+/// A tick that leaves a backlog doesn't compact: the next tick, right
+/// behind it, dirties again what a pass would rewrite. The tick that
+/// catches up does.
+#[test]
+fn compaction_waits_out_a_backlog() {
+    let mut h = FaultHarness::boot();
+    // Two budgets' worth (the harness materializes 1024 changes a tick).
+    for id in 0..2000 {
+        h.insert(id, id);
+    }
+    h.try_flush().unwrap();
+    // Every rewrite due but the delete-file backstop's.
+    let compaction = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: usize::MAX,
+        delete_ratio: 0.0,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let mut ticks = 0;
+    loop {
+        let outcome =
+            block_on(run_materialize_tick(&mut h.materializer, Some(&compaction))).unwrap();
+        ticks += 1;
+        if !h.materializer.backlogged() {
+            assert!(
+                !outcome.compaction.is_empty(),
+                "caught up, and didn't compact"
+            );
+            break;
+        }
+        let rewritten: u64 = outcome
+            .compaction
+            .iter()
+            .map(|(_, o)| o.rows_rewritten)
+            .sum();
+        assert!(
+            outcome.compaction.is_empty(),
+            "compacted with a backlog: {rewritten} rows rewritten"
+        );
+    }
+    assert!(ticks > 1, "no backlog to wait out");
+}
+
+/// Deferring for a backlog stops at the delete-file backstop: past it,
+/// readers pay for every delete file, so a tick compacts all the same.
+#[test]
+fn a_backlog_doesnt_hold_back_the_delete_file_backstop() {
+    let mut h = FaultHarness::boot();
+    for id in 0..200 {
+        h.insert(id, id);
+    }
+    h.try_flush().unwrap();
+    block_on(run_materialize_tick(&mut h.materializer, None)).unwrap();
+    // A backlog of updates: each tick commits a delete file.
+    for round in 1..=12 {
+        for id in 0..200 {
+            h.update(id, id + round);
+        }
+    }
+    h.try_flush().unwrap();
+    let compaction = CompactionConfig {
+        data_file_threshold: usize::MAX,
+        delete_file_threshold: 1,
+        delete_ratio: f64::INFINITY,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let outcome = block_on(run_materialize_tick(&mut h.materializer, Some(&compaction))).unwrap();
+    assert!(h.materializer.backlogged(), "no backlog");
+    assert!(
+        !outcome.compaction.is_empty(),
+        "held back past the delete-file backstop"
+    );
+}
+
 #[test]
 fn binary_materialize_tick_with_compaction_under_blob_put_fault_keeps_replication_progressing() {
     // Wire a workload, fault the *compaction* PUT, and call the
@@ -2124,6 +2200,77 @@ async fn replication_goes_on_while_a_materializer_tick_runs() {
     .await
     .unwrap();
     assert_eq!(rows.len(), 304);
+}
+
+/// A backlog is materialized tick after tick, not one tick per
+/// `materializer_interval`: a tick that stops at its row budget leaves
+/// the rest for the next, which runs as soon as it ends. Only a caught-up
+/// materializer waits the interval out — or a backlog of N budgets takes
+/// N intervals to apply, the materializer idle most of the time.
+#[tokio::test(start_paused = true)]
+async fn a_backlog_is_materialized_without_waiting_between_ticks() {
+    use std::time::Duration;
+
+    const INTERVAL: Duration = Duration::from_secs(60);
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let second = Duration::from_secs(1);
+    let schedule = pg2iceberg_logical::Schedule {
+        flush: second,
+        materialize: INTERVAL,
+        standby: second,
+        watcher: second,
+    };
+    let mut lifecycle = sim_lifecycle_on(&db, &stores, schedule);
+    // A budget of 80 rows a tick (8 steps of 10).
+    lifecycle.mat_batch_rows = 10;
+    let script = db.clone();
+    let catalog = stores.catalog.clone();
+    let blob = stores.blob.clone();
+    // Its own task, so it times the materializer while the loop runs.
+    let observer = tokio::spawn(async move {
+        // Past startup and the first tick.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        // A thousand rows: a dozen budgets.
+        for t in 0..100 {
+            let mut tx = script.begin_tx();
+            for i in 0..10 {
+                let id = 5 + t * 10 + i;
+                tx.insert(&ident(), row(id, id * 10));
+            }
+            tx.commit(Timestamp(0)).unwrap();
+        }
+        let start = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(second).await;
+            let rows = read_materialized_state(
+                catalog.as_ref(),
+                blob.as_ref(),
+                &ident(),
+                &schema(),
+                &[ColumnName("id".into())],
+            )
+            .await
+            .unwrap();
+            if rows.len() == 1004 {
+                return start.elapsed();
+            }
+        }
+    });
+    let took = Arc::new(std::sync::Mutex::new(None));
+    let record = took.clone();
+    let shutdown = Box::pin(async move {
+        *record.lock().unwrap() = Some(observer.await.unwrap());
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let took = took.lock().unwrap().expect("the observer ran");
+    assert!(
+        took <= 2 * INTERVAL,
+        "took {took:?} to apply a dozen budgets, at a {INTERVAL:?} interval"
+    );
 }
 
 // ── Observability ────────────────────────────────────────────────

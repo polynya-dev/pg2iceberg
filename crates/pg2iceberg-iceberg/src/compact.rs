@@ -107,6 +107,17 @@ pub struct CompactionConfig {
 impl CompactionConfig {
     /// Default pass budget, in target-size files.
     pub const DEFAULT_PASS_TARGET_FILES: u64 = 4;
+
+    /// This config with only its delete-file backstop: no small-file
+    /// merge, no rewrite for the share of rows deletes killed. What a
+    /// materializer catching up on a backlog does, until it has.
+    pub fn backstop_only(&self) -> Self {
+        Self {
+            data_file_threshold: usize::MAX,
+            delete_ratio: f64::INFINITY,
+            ..self.clone()
+        }
+    }
 }
 
 impl Default for CompactionConfig {
