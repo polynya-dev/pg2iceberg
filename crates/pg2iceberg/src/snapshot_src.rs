@@ -61,7 +61,7 @@ use pg2iceberg_coord::prod::{connect_with as coord_connect_with, TlsMode as Coor
 use pg2iceberg_core::value::{
     DaysSinceEpoch, Decimal as CoreDecimal, PgValue, TimeMicros, TimestampMicros,
 };
-use pg2iceberg_core::{ColumnName, ColumnSchema, Lsn, Row, TableIdent, TableSchema};
+use pg2iceberg_core::{ColumnName, ColumnSchema, Columns, Lsn, Row, TableIdent, TableSchema};
 use pg2iceberg_iceberg::pk_key;
 use pg2iceberg_pg::prod::value_decode::decode_text;
 use pg2iceberg_snapshot::{Result as SnapshotResult, SnapshotError, SnapshotSource};
@@ -84,6 +84,10 @@ struct CachedSchema {
     /// Chunks are read in this order, which the index serves; in any other
     /// order each chunk scans and sorts the whole table.
     index_order: Option<Vec<ColumnName>>,
+    /// The column names its rows share, and where each of the schema's
+    /// columns goes.
+    row_columns: Columns,
+    places: Vec<usize>,
 }
 
 /// The cursor of a table read in its index order: the last row's key, in
@@ -178,6 +182,13 @@ impl PgSnapshotSource {
                     && order.len() == pk_cols.len()
                     && order.iter().all(|c| pk_cols.contains(c))
             });
+            let (row_columns, places) = Columns::sorted(
+                s.columns
+                    .iter()
+                    .map(|c| ColumnName(c.name.clone()))
+                    .collect(),
+            )
+            .with_context(|| format!("table {} names a column twice", s.ident))?;
             // Key by PG-side ident — `read_chunk` is called with the
             // PG identifier (the snapshotter passes `s.pg_ident()`),
             // and our SELECT issues against PG. The Iceberg-side
@@ -188,6 +199,8 @@ impl PgSnapshotSource {
                     schema: s.clone(),
                     pk_cols,
                     index_order,
+                    row_columns,
+                    places,
                 },
             );
         }
@@ -299,18 +312,18 @@ impl SnapshotSource for PgSnapshotSource {
         let mut out = Vec::with_capacity(chunk_size.min(64));
         for msg in messages {
             if let SimpleQueryMessage::Row(row) = msg {
-                let mut decoded: Row = Row::new();
-                for (idx, col) in cached.schema.columns.iter().enumerate() {
+                let mut values = vec![PgValue::Null; cached.places.len()];
+                for ((idx, col), &place) in
+                    cached.schema.columns.iter().enumerate().zip(&cached.places)
+                {
                     let raw: Option<&str> = row.try_get(idx).map_err(|e| {
                         SnapshotError::Source(format!("row.try_get({}, {idx}): {e}", col.name))
                     })?;
-                    let value = match raw {
-                        None => PgValue::Null,
-                        Some(s) => decode_column(col, s)?,
-                    };
-                    decoded.insert(ColumnName(col.name.clone()), value);
+                    if let Some(s) = raw {
+                        values[place] = decode_column(col, s)?;
+                    }
                 }
-                out.push(decoded);
+                out.push(Row::with_columns(cached.row_columns.clone(), values));
             }
         }
         Ok(out)

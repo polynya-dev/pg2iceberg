@@ -48,7 +48,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use pg2iceberg_core::typemap::PgType;
 use pg2iceberg_core::Namespace;
-use pg2iceberg_core::{ColumnName, Lsn, Op, PgValue, Row, TableIdent, Timestamp};
+use pg2iceberg_core::{ColumnName, Columns, Lsn, Op, PgValue, Row, TableIdent, Timestamp};
 use postgres_replication::protocol::{
     LogicalReplicationMessage as PgMsg, ReplicationMessage as PgEnv, Tuple, TupleData,
 };
@@ -89,6 +89,10 @@ const BLOCKED_STATUS_INTERVAL: std::time::Duration = std::time::Duration::from_s
 struct RelationCache {
     ident: TableIdent,
     columns: Vec<ColumnInfo>,
+    /// The column names every row decoded for the relation shares, and
+    /// where in them each of `columns` goes.
+    row_columns: Columns,
+    places: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,11 +314,20 @@ impl ReaderState {
                         nullable: !is_pk,
                     });
                 }
+                let names = internal_columns
+                    .iter()
+                    .map(|c| ColumnName(c.name.clone()))
+                    .collect();
+                let (row_columns, places) = Columns::sorted(names).ok_or_else(|| {
+                    PgError::Protocol(format!("relation {ident} names a column twice"))
+                })?;
                 self.relations.insert(
                     r.rel_id(),
                     RelationCache {
                         ident: ident.clone(),
                         columns: internal_columns,
+                        row_columns,
+                        places,
                     },
                 );
                 Ok(Some(DecodedMessage::Relation {
@@ -325,7 +338,7 @@ impl ReaderState {
             }
             PgMsg::Insert(ins) => {
                 let rel = self.lookup_relation(ins.rel_id())?;
-                let (after, _) = decode_tuple(ins.tuple(), &rel.columns)?;
+                let (after, _) = decode_tuple(ins.tuple(), rel)?;
                 Ok(Some(DecodedMessage::Change(self.change_event(
                     rel.ident.clone(),
                     Op::Insert,
@@ -337,10 +350,10 @@ impl ReaderState {
             PgMsg::Update(upd) => {
                 let rel = self.lookup_relation(upd.rel_id())?;
                 let before = match upd.old_tuple().or_else(|| upd.key_tuple()) {
-                    Some(t) => Some(decode_tuple(t, &rel.columns)?.0),
+                    Some(t) => Some(decode_tuple(t, rel)?.0),
                     None => None,
                 };
-                let (after, unchanged) = decode_tuple(upd.new_tuple(), &rel.columns)?;
+                let (after, unchanged) = decode_tuple(upd.new_tuple(), rel)?;
                 Ok(Some(DecodedMessage::Change(self.change_event(
                     rel.ident.clone(),
                     Op::Update,
@@ -354,7 +367,7 @@ impl ReaderState {
                 // Either old_tuple (REPLICA IDENTITY FULL) or key_tuple
                 // (REPLICA IDENTITY DEFAULT/INDEX) carries the deleted PK.
                 let before = match del.old_tuple().or_else(|| del.key_tuple()) {
-                    Some(t) => Some(decode_tuple(t, &rel.columns)?.0),
+                    Some(t) => Some(decode_tuple(t, rel)?.0),
                     None => None,
                 };
                 Ok(Some(DecodedMessage::Change(self.change_event(
@@ -403,10 +416,9 @@ impl ReaderState {
         }
     }
 
-    fn lookup_relation(&self, rel_id: u32) -> Result<RelationCache> {
+    fn lookup_relation(&self, rel_id: u32) -> Result<&RelationCache> {
         self.relations
             .get(&rel_id)
-            .cloned()
             .ok_or_else(|| PgError::Protocol(format!("DML for unknown relation oid {rel_id}")))
     }
 
@@ -1135,35 +1147,27 @@ fn build_table_ident(namespace: &str, name: &str) -> TableIdent {
 /// Decode a wire `Tuple` into our `Row`, returning the row plus the list
 /// of column names whose tuple data was `UnchangedToast` (for downstream
 /// FileIndex resolution).
-fn decode_tuple(tuple: &Tuple, columns: &[ColumnInfo]) -> Result<(Row, Vec<ColumnName>)> {
+fn decode_tuple(tuple: &Tuple, rel: &RelationCache) -> Result<(Row, Vec<ColumnName>)> {
     let data = tuple.tuple_data();
-    if data.len() != columns.len() {
+    if data.len() != rel.columns.len() {
         return Err(PgError::Protocol(format!(
             "tuple has {} columns, relation has {}",
             data.len(),
-            columns.len()
+            rel.columns.len()
         )));
     }
-    let mut row: Row = Row::new();
+    let mut values = vec![PgValue::Null; data.len()];
     let mut unchanged: Vec<ColumnName> = Vec::new();
-    for (col, td) in columns.iter().zip(data.iter()) {
-        let key = ColumnName(col.name.clone());
+    for ((col, td), &place) in rel.columns.iter().zip(data.iter()).zip(&rel.places) {
         match td {
-            TupleData::Null => {
-                row.insert(key, PgValue::Null);
-            }
-            TupleData::UnchangedToast => {
-                // Keep the row entry as Null so downstream code that
-                // iterates the row doesn't trip; the unchanged_cols
-                // vector tells the materializer which entries to
-                // resolve from the FileIndex.
-                row.insert(key.clone(), PgValue::Null);
-                unchanged.push(key);
-            }
+            TupleData::Null => {}
+            // Null in the row, so downstream code that iterates it doesn't
+            // trip; the unchanged_cols vector tells the materializer which
+            // entries to resolve from the FileIndex.
+            TupleData::UnchangedToast => unchanged.push(ColumnName(col.name.clone())),
             TupleData::Text(bytes) => {
-                let val = decode_text(col.pg_type, bytes)
+                values[place] = decode_text(col.pg_type, bytes)
                     .map_err(|e| PgError::Protocol(format!("column {}: {e}", col.name)))?;
-                row.insert(key, val);
             }
             TupleData::Binary(_) => {
                 return Err(PgError::Protocol(format!(
@@ -1174,7 +1178,10 @@ fn decode_tuple(tuple: &Tuple, columns: &[ColumnInfo]) -> Result<(Row, Vec<Colum
             }
         }
     }
-    Ok((row, unchanged))
+    Ok((
+        Row::with_columns(rel.row_columns.clone(), values),
+        unchanged,
+    ))
 }
 
 fn pg_micros_to_timestamp(pg_micros_since_2k: i64) -> Timestamp {

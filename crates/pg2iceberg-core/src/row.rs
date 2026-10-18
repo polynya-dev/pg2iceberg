@@ -56,10 +56,21 @@ impl Columns {
         self.0.binary_search(name).ok()
     }
 
+    /// Where the column named `name` is.
+    pub fn position_of(&self, name: &str) -> Option<usize> {
+        self.0.binary_search_by(|c| c.0.as_str().cmp(name)).ok()
+    }
+
     /// Whether `other` is this very list, not just an equal one: what a
     /// reader caching positions per list checks.
     pub fn same(&self, other: &Columns) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// This very list's identity, while it's alive: equal for two
+    /// [`Self::same`] lists only.
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
     }
 
     fn with(&self, place: usize, name: ColumnName) -> Self {
@@ -263,7 +274,8 @@ impl IntoIterator for Row {
     type IntoIter = std::iter::Zip<std::vec::IntoIter<ColumnName>, std::vec::IntoIter<PgValue>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.columns.0.to_vec().into_iter().zip(self.values)
+        let names: Vec<ColumnName> = self.columns.as_slice().to_vec();
+        names.into_iter().zip(self.values)
     }
 }
 

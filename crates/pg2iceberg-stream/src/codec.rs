@@ -25,7 +25,7 @@
 //! Field IDs are persisted in Parquet column metadata under `PARQUET:field_id`
 //! so Iceberg readers resolve columns by ID, not name.
 
-use crate::binrow::{decode_row, encode_row, ColumnNames};
+use crate::binrow::{encode_row, ColumnNames, RowDecoder};
 use crate::{MatEvent, Result, StreamError};
 use arrow_array::builder::{
     BinaryBuilder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
@@ -308,17 +308,18 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Vec<MatEvent>> {
         .build()
         .map_err(|e| StreamError::Decode(format!("parquet reader build: {e}")))?;
 
+    let mut rows = RowDecoder::new(columns);
     let mut out = Vec::new();
     for batch in reader {
         let batch = batch.map_err(|e| StreamError::Decode(format!("read batch: {e}")))?;
-        decode_batch_into(&batch, &columns, &mut out)?;
+        decode_batch_into(&batch, &mut rows, &mut out)?;
     }
     Ok(out)
 }
 
 fn decode_batch_into(
     batch: &RecordBatch,
-    columns: &[ColumnName],
+    rows: &mut RowDecoder,
     out: &mut Vec<MatEvent>,
 ) -> Result<()> {
     let n = batch.num_rows();
@@ -365,7 +366,8 @@ fn decode_batch_into(
         } else {
             unchanged_cols_from_string(unchanged_col.value(i))
         };
-        let row = decode_row(data_col.value(i), columns)
+        let row = rows
+            .decode(data_col.value(i))
             .map_err(|e| StreamError::Decode(format!("_data at row {i}: {e}")))?;
         let xid = if xid_col.is_null(i) {
             None
@@ -376,7 +378,7 @@ fn decode_batch_into(
             None
         } else {
             Some(
-                decode_row(moved_from_col.value(i), columns)
+                rows.decode(moved_from_col.value(i))
                     .map_err(|e| StreamError::Decode(format!("_moved_from at row {i}: {e}")))?,
             )
         };

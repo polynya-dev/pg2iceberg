@@ -239,10 +239,7 @@ impl TableWriter {
         if !self.schema.is_partitioned() {
             let row_refs: Vec<&Row> = rows.iter().map(|r| &r.row).collect();
             let chunk = write_chunk(arrow_schema, cols, &row_refs)?;
-            let pk_keys = rows
-                .iter()
-                .map(|r| PkKey::from_row(&r.row, &self.pk_col_names))
-                .collect();
+            let pk_keys = self.pk_keys(&row_refs);
             return Ok(vec![PreparedChunk {
                 partition_values: Vec::new(),
                 chunk,
@@ -273,10 +270,7 @@ impl TableWriter {
         for (partition_values, group_rows) in groups {
             let row_refs: Vec<&Row> = group_rows.iter().map(|r| &r.row).collect();
             let chunk = write_chunk(arrow_schema, cols, &row_refs)?;
-            let pk_keys = group_rows
-                .iter()
-                .map(|r| PkKey::from_row(&r.row, &self.pk_col_names))
-                .collect();
+            let pk_keys = self.pk_keys(&row_refs);
             out.push(PreparedChunk {
                 partition_values,
                 chunk,
@@ -284,6 +278,18 @@ impl TableWriter {
             });
         }
         Ok(out)
+    }
+
+    /// Each row's key, as [`PkKey::from_row`] makes it.
+    fn pk_keys(&self, rows: &[&Row]) -> Vec<PkKey> {
+        let positions = Positions::new(&self.pk_columns, rows);
+        (0..rows.len())
+            .map(|row| {
+                PkKey::from_values(
+                    (0..self.pk_columns.len()).filter_map(|col| positions.value(rows, row, col)),
+                )
+            })
+            .collect()
     }
 
     /// Partition tuple of a full data row (every partition source column
@@ -593,22 +599,68 @@ fn write_chunk(
 }
 
 fn build_arrays(cols: &[ColumnSchema], rows: &[&Row]) -> Result<Vec<Arc<dyn Array>>> {
+    let positions = Positions::new(cols, rows);
     let mut out: Vec<Arc<dyn Array>> = Vec::with_capacity(cols.len());
-    for c in cols {
-        out.push(build_one_array(c, rows)?);
+    for (i, c) in cols.iter().enumerate() {
+        out.push(build_one_array(c, i, rows, &positions)?);
     }
     Ok(out)
 }
 
-fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> {
-    let key = ColumnName(col.name.clone());
+/// Where each of some columns is in each of some rows, by name: rows that
+/// share their column list ([`pg2iceberg_core::Columns`]) — a relation's,
+/// a staged chunk's — are searched once for all of them.
+struct Positions {
+    /// For each column list among the rows, each column's place in it.
+    lists: Vec<Vec<Option<usize>>>,
+    /// Each row's list.
+    row_list: Vec<usize>,
+}
+
+impl Positions {
+    fn new(cols: &[ColumnSchema], rows: &[&Row]) -> Self {
+        let mut lists: Vec<Vec<Option<usize>>> = Vec::new();
+        let mut by_id: HashMap<usize, usize> = HashMap::new();
+        let mut last: Option<(usize, usize)> = None;
+        let mut row_list = Vec::with_capacity(rows.len());
+        for r in rows {
+            let id = r.columns().id();
+            let list = match last {
+                Some((last_id, list)) if last_id == id => list,
+                _ => *by_id.entry(id).or_insert_with(|| {
+                    lists.push(
+                        cols.iter()
+                            .map(|c| r.columns().position_of(&c.name))
+                            .collect(),
+                    );
+                    lists.len() - 1
+                }),
+            };
+            last = Some((id, list));
+            row_list.push(list);
+        }
+        Self { lists, row_list }
+    }
+
+    /// Row `row`'s value of the `col`th column, if it has the column.
+    fn value<'r>(&self, rows: &[&'r Row], row: usize, col: usize) -> Option<&'r PgValue> {
+        self.lists[self.row_list[row]][col].map(|place| rows[row].value_at(place))
+    }
+}
+
+fn build_one_array(
+    col: &ColumnSchema,
+    col_index: usize,
+    rows: &[&Row],
+    positions: &Positions,
+) -> Result<Arc<dyn Array>> {
     let n = rows.len();
 
     macro_rules! collect_with {
         ($builder:expr, $extract:expr) => {{
             let mut b = $builder;
-            for r in rows {
-                let v = r.get(&key);
+            for row in 0..n {
+                let v = positions.value(rows, row, col_index);
                 match v {
                     None => {
                         if !col.nullable {
@@ -723,8 +775,8 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
                         "Decimal128Builder precision={precision} scale={scale}: {e}"
                     ))
                 })?;
-            for r in rows {
-                match r.get(&key) {
+            for row in 0..n {
+                match positions.value(rows, row, col_index) {
                     None => {
                         if !col.nullable {
                             return Err(WriterError::MissingColumn {
@@ -764,8 +816,8 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
         }
         IcebergType::Binary => {
             let mut b = BinaryBuilder::with_capacity(n, n * 32);
-            for r in rows {
-                match r.get(&key) {
+            for row in 0..n {
+                match positions.value(rows, row, col_index) {
                     None => {
                         if !col.nullable {
                             return Err(WriterError::MissingColumn {
@@ -795,8 +847,8 @@ fn build_one_array(col: &ColumnSchema, rows: &[&Row]) -> Result<Arc<dyn Array>> 
         }
         IcebergType::Uuid => {
             let mut b = FixedSizeBinaryBuilder::with_capacity(n, 16);
-            for r in rows {
-                match r.get(&key) {
+            for row in 0..n {
+                match positions.value(rows, row, col_index) {
                     None => {
                         if !col.nullable {
                             return Err(WriterError::MissingColumn {
