@@ -1,0 +1,51 @@
+# A store a round trip away, as a cloud service is: every request waits
+# DELAY before it's forwarded, and a response streams at most RATE_KIBPS
+# KiB/s. Then bytes flow at the network's speed — unlike netem's
+# per-packet delay, which makes every TCP round trip slow and so caps a
+# large transfer's throughput by its window. run.sh fills in the
+# placeholders.
+static_resources:
+  listeners:
+  - name: proxy
+    address: { socket_address: { address: 0.0.0.0, port_value: LISTEN_PORT } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: proxy
+          # Large uploads and downloads: no timeouts of the proxy's own.
+          stream_idle_timeout: 0s
+          request_timeout: 0s
+          route_config:
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: upstream, timeout: 0s, idle_timeout: 0s }
+          http_filters:
+          - name: envoy.filters.http.fault
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+              delay:
+                fixed_delay: DELAY
+                percentage: { numerator: 100 }
+              response_rate_limit:
+                fixed_limit: { limit_kbps: RATE_KIBPS }
+                percentage: { numerator: 100 }
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+  - name: upstream
+    type: STRICT_DNS
+    connect_timeout: 5s
+    # As many concurrent requests as pg2iceberg makes.
+    circuit_breakers:
+      thresholds: [{ max_connections: 10000, max_pending_requests: 10000, max_requests: 10000 }]
+    load_assignment:
+      cluster_name: upstream
+      endpoints:
+      - lb_endpoints:
+        - endpoint: { address: { socket_address: { address: UPSTREAM_HOST, port_value: UPSTREAM_PORT } } }

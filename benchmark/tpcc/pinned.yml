@@ -1,0 +1,11 @@
+# CPU pinning, so pg2iceberg's CPU doesn't change what Postgres can do:
+#   COMPOSE_FILE=docker-compose.yml:pinned.yml ./run.sh
+services:
+  postgres: {cpuset: "0-4"}
+  hammerdb: {cpuset: "5"}
+  minio: {cpuset: "5"}
+  iceberg-postgres: {cpuset: "5"}
+  iceberg-rest: {cpuset: "5"}
+  s3-proxy: {cpuset: "5"}
+  catalog-proxy: {cpuset: "5"}
+  pg2iceberg: {cpuset: "6-7"}
