@@ -26,9 +26,11 @@ The ratio bounds the work: rewriting reads at most 1 / `compaction_delete_ratio`
 ## A pass
 
 1. **Plan** — oldest files first, up to four `target_file_size`s of input; the rest wait for the next pass
-2. **Apply deletes** — read the keys the deletes hide; a delete hides a row only if its sequence number is greater than the row's
-3. **Rewrite** — stream each input file through, in batches of 1024 rows, dropping hidden rows, into new files of up to `target_file_size`, one partition each. Files from before a schema change come out in the current schema
-4. **Commit** — one snapshot replaces the inputs and the dropped delete files with the outputs
+2. **Apply deletes** — read the keys the deletes hide, up to eight delete files at once; a delete hides a row only if its sequence number is greater than the row's
+3. **Rewrite** — stream each input file through, in order, in batches of 1024 rows, dropping hidden rows, into new files of up to `target_file_size`, one partition each. Files from before a schema change come out in the current schema
+4. **Commit** — one snapshot replaces the inputs and the dropped delete files with the outputs, once they've all uploaded
+
+Each file is a round trip to the object store, so a pass overlaps them: the inputs are read ahead of the one being rewritten — up to eight files, and `target_file_size` bytes of them — starting while the deletes load, and an output uploads while the next is written, up to `target_file_size` bytes uploading. A pass holds those in memory as well as the file it's reading and the one it's writing: about four `target_file_size`s at most.
 
 ## When the catalog compacts
 

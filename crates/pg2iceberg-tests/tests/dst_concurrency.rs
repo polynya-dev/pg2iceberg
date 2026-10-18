@@ -17,12 +17,14 @@ use pg2iceberg_coord::{
     CommitBatch, CoordCommitReceipt, Coordinator, LogEntry, MarkerInfo, Result as CoordResult,
     TableSnapshotState,
 };
+use pg2iceberg_core::partition::{PartitionField, Transform};
 use pg2iceberg_core::{
     ColumnName, ColumnSchema, IcebergType, Lsn, Namespace, PgValue, Row, TableIdent, TableSchema,
     Timestamp, WorkerId,
 };
-use pg2iceberg_iceberg::read_materialized_state;
-use pg2iceberg_logical::materializer::{CounterMaterializerNamer, Materializer};
+use pg2iceberg_iceberg::compact::READ_AHEAD as PASS_READ_AHEAD;
+use pg2iceberg_iceberg::{read_materialized_state, Catalog, CompactionConfig, CompactionOutcome};
+use pg2iceberg_logical::materializer::{CounterMaterializerNamer, Materializer, MaterializerNamer};
 use pg2iceberg_logical::pipeline::{CounterBlobNamer, Pipeline};
 use pg2iceberg_logical::staged_log::READ_AHEAD;
 use pg2iceberg_sim::blob::MemoryBlobStore;
@@ -58,7 +60,8 @@ fn column(name: &str, field_id: i32, ty: IcebergType, pk: bool) -> ColumnSchema 
     }
 }
 
-fn schema() -> TableSchema {
+/// The table; `partitioned` by `qty`.
+fn schema(partitioned: bool) -> TableSchema {
     TableSchema {
         ident: ident(),
         columns: vec![
@@ -66,7 +69,15 @@ fn schema() -> TableSchema {
             column("qty", 2, IcebergType::Int, false),
             column("note", 3, IcebergType::String, false),
         ],
-        partition_spec: vec![],
+        partition_spec: if partitioned {
+            vec![PartitionField {
+                source_column: "qty".into(),
+                name: "qty".into(),
+                transform: Transform::Identity,
+            }]
+        } else {
+            vec![]
+        },
         pg_schema: None,
     }
 }
@@ -82,7 +93,7 @@ fn row(id: i32, qty: i32) -> Row {
     ])
 }
 
-/// Reads in flight now, and the most there have been at once.
+/// Requests of a kind in flight now, and the most there have been at once.
 #[derive(Default)]
 struct InFlight {
     now: AtomicUsize,
@@ -99,7 +110,7 @@ impl InFlight {
     }
 }
 
-/// Counts a read in flight until dropped: completed or abandoned.
+/// Counts a request in flight until dropped: completed or abandoned.
 struct Reading<'a>(&'a InFlight);
 
 impl<'a> Reading<'a> {
@@ -134,6 +145,11 @@ struct Stores {
     /// Whether the coordinator takes one request at a time, a round trip
     /// each, as `PostgresCoordinator` on its one connection does.
     one_connection: bool,
+    /// How long naming a compaction output takes: stands in for the work
+    /// a pass does between outputs — encoding the next.
+    compact_namer_latency: Duration,
+    /// Whether the table is partitioned (by `qty`).
+    partitioned: bool,
 }
 
 impl Stores {
@@ -145,6 +161,8 @@ impl Stores {
             read_pieces: 1,
             expire_at: None,
             one_connection: false,
+            compact_namer_latency: Duration::ZERO,
+            partitioned: false,
         }
     }
 }
@@ -159,15 +177,24 @@ struct SlowBlobStore {
     inner: Arc<MemoryBlobStore>,
     stores: Stores,
     reads: InFlight,
+    writes: InFlight,
     gets: AtomicUsize,
     requests: AtomicUsize,
+    /// `Stores::expire_at`, or a later one ([`Self::expire_in`]).
+    expire_at: AtomicUsize,
     credentials: RwLock<()>,
 }
 
 impl SlowBlobStore {
+    /// The credentials expire as the `n`th request from now goes out.
+    fn expire_in(&self, n: usize) {
+        let now = self.requests.load(Ordering::SeqCst);
+        self.expire_at.store(now + n, Ordering::SeqCst);
+    }
+
     async fn authorize(&self) {
         let n = self.requests.fetch_add(1, Ordering::SeqCst);
-        if self.stores.expire_at == Some(n) {
+        if self.expire_at.load(Ordering::SeqCst) == n {
             let _refreshing = self.credentials.write().await;
             tokio::time::sleep(10 * LATENCY).await;
         } else {
@@ -179,6 +206,7 @@ impl SlowBlobStore {
 #[async_trait]
 impl BlobStore for SlowBlobStore {
     async fn put(&self, path: &str, bytes: Bytes) -> BlobResult<()> {
+        let _writing = Reading::start(&self.writes);
         self.authorize().await;
         tokio::time::sleep(LATENCY).await;
         self.inner.put(path, bytes).await
@@ -205,6 +233,27 @@ impl BlobStore for SlowBlobStore {
         self.authorize().await;
         tokio::time::sleep(LATENCY).await;
         self.inner.delete(path).await
+    }
+}
+
+/// `CounterMaterializerNamer`, but naming a compaction output takes
+/// `latency`.
+struct SlowNamer {
+    inner: CounterMaterializerNamer,
+    latency: Duration,
+}
+
+#[async_trait]
+impl MaterializerNamer for SlowNamer {
+    async fn next_path(&self, table: &TableIdent, kind: &str, partition_segment: &str) -> String {
+        if kind == "compact" {
+            tokio::time::sleep(self.latency).await;
+        }
+        self.inner.next_path(table, kind, partition_segment).await
+    }
+
+    async fn table_dir(&self, table: &TableIdent) -> String {
+        self.inner.table_dir(table).await
     }
 }
 
@@ -366,12 +415,14 @@ struct Harness {
     materializer: Materializer<MemoryCatalog>,
     blob: Arc<SlowBlobStore>,
     catalog: Arc<MemoryCatalog>,
+    schema: TableSchema,
 }
 
 impl Harness {
     async fn boot(stores: Stores) -> Self {
+        let schema = schema(stores.partitioned);
         let db = SimPostgres::new();
-        db.create_table(schema()).unwrap();
+        db.create_table(schema.clone()).unwrap();
         db.create_publication(PUB, &[ident()]).unwrap();
         db.create_slot(SLOT, PUB).unwrap();
         let stream = db.start_replication(SLOT).unwrap();
@@ -393,8 +444,10 @@ impl Harness {
             inner: memory.clone(),
             stores,
             reads: InFlight::default(),
+            writes: InFlight::default(),
             gets: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
+            expire_at: AtomicUsize::new(stores.expire_at.unwrap_or(usize::MAX)),
             credentials: RwLock::new(()),
         });
         let catalog = Arc::new(MemoryCatalog::new());
@@ -409,12 +462,15 @@ impl Harness {
             coord,
             blob.clone(),
             catalog.clone(),
-            Arc::new(CounterMaterializerNamer::new("s3://table")),
+            Arc::new(SlowNamer {
+                inner: CounterMaterializerNamer::new("s3://table"),
+                latency: stores.compact_namer_latency,
+            }),
             "default",
             stores.batch_rows,
         )
         .with_cycle_rows(stores.cycle_rows);
-        materializer.register_table(schema()).await.unwrap();
+        materializer.register_table(schema.clone()).await.unwrap();
         Self {
             db,
             stream,
@@ -422,6 +478,7 @@ impl Harness {
             materializer,
             blob,
             catalog,
+            schema,
         }
     }
 
@@ -454,6 +511,37 @@ impl Harness {
             .unwrap()
     }
 
+    /// A compaction pass over the table; it fails the test if it stalls,
+    /// or if there was nothing to do.
+    async fn compact(&mut self, config: &CompactionConfig) -> CompactionOutcome {
+        tokio::time::timeout(STALLED, self.materializer.compact_table(&ident(), config))
+            .await
+            .expect("the pass stalled")
+            .unwrap()
+            .expect("nothing to compact")
+    }
+
+    /// A compaction pass, and how long it took.
+    async fn timed_compact(&mut self, config: &CompactionConfig) -> (CompactionOutcome, Duration) {
+        let start = Instant::now();
+        let outcome = self.compact(config).await;
+        (outcome, start.elapsed())
+    }
+
+    /// `files` data files of `rows` rows each, inserted a cycle apiece:
+    /// ids `i * rows ..`.
+    async fn data_files(&mut self, files: usize, rows: usize) {
+        for i in 0..files {
+            self.stage(|tx| {
+                for id in i * rows..(i + 1) * rows {
+                    tx.insert(&ident(), row(id as i32, 0));
+                }
+            })
+            .await;
+            self.cycle().await;
+        }
+    }
+
     /// A materializer cycle, and how long it took.
     async fn timed_cycle(&mut self) -> Duration {
         let start = Instant::now();
@@ -470,7 +558,7 @@ impl Harness {
             self.catalog.as_ref(),
             self.blob.inner.as_ref(),
             &ident(),
-            &schema(),
+            &self.schema,
             &[ColumnName("id".into())],
         )
         .await
@@ -650,5 +738,232 @@ async fn a_step_reads_prior_rows_together() {
     h.cycle().await;
 
     assert_eq!(h.blob.reads.peak(), READ_AHEAD, "reads in flight at once");
+    h.assert_iceberg_matches_pg().await;
+}
+
+/// Compaction that merges the table's small files in one pass, rolling
+/// outputs over at `target` bytes.
+fn merge(target: u64) -> CompactionConfig {
+    CompactionConfig {
+        data_file_threshold: 2,
+        delete_file_threshold: usize::MAX,
+        delete_ratio: f64::INFINITY,
+        target_size_bytes: target,
+        max_input_bytes_per_pass: u64::MAX,
+    }
+}
+
+/// Compaction that rewrites the files deletes killed rows in, in one
+/// pass, rolling outputs over at `target` bytes.
+fn purge(target: u64) -> CompactionConfig {
+    CompactionConfig {
+        data_file_threshold: usize::MAX,
+        delete_file_threshold: 1,
+        delete_ratio: f64::INFINITY,
+        target_size_bytes: target,
+        max_input_bytes_per_pass: u64::MAX,
+    }
+}
+
+/// A compaction pass reads its input files ahead of the one it's
+/// rewriting: a round trip per `PASS_READ_AHEAD` files, not per file.
+#[tokio::test(start_paused = true)]
+async fn a_pass_reads_its_inputs_ahead() {
+    const FILES: usize = 32;
+    let mut h = Harness::boot(Stores::new(1024)).await;
+    h.data_files(FILES, 1).await;
+    h.blob.reads.reset_peak();
+
+    let (outcome, took) = h.timed_compact(&merge(1 << 30)).await;
+
+    assert_eq!(outcome.input_data_files, FILES);
+    assert_eq!(
+        h.blob.reads.peak(),
+        PASS_READ_AHEAD,
+        "reads in flight at once"
+    );
+    // Then one more, to upload the output.
+    let round_trips = FILES.div_ceil(PASS_READ_AHEAD) as u32 + 1;
+    assert!(
+        took <= LATENCY * round_trips,
+        "{FILES} inputs took {took:?}, {} round trips",
+        took.as_millis() / LATENCY.as_millis(),
+    );
+    h.assert_iceberg_matches_pg().await;
+}
+
+/// What a pass reads ahead is bounded in bytes too, by a target file's
+/// size: here three inputs' worth.
+#[tokio::test(start_paused = true)]
+async fn a_pass_reads_ahead_at_most_a_target_files_bytes() {
+    let mut h = Harness::boot(Stores::new(1024)).await;
+    h.data_files(16, 1).await;
+    let largest = h
+        .catalog
+        .snapshots(&ident())
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|s| &s.data_files)
+        .map(|f| f.byte_size)
+        .max()
+        .unwrap();
+    h.blob.reads.reset_peak();
+
+    h.compact(&merge(3 * largest)).await;
+
+    assert_eq!(h.blob.reads.peak(), 3, "reads in flight at once");
+    h.assert_iceberg_matches_pg().await;
+}
+
+/// A pass reads the delete files it applies together, not one after
+/// another.
+#[tokio::test(start_paused = true)]
+async fn a_pass_reads_its_delete_files_together() {
+    const DELETES: usize = 16;
+    let mut h = Harness::boot(Stores::new(1024)).await;
+    h.data_files(1, DELETES).await;
+    // A delete file per row: the data file's every row is dead.
+    for id in 0..DELETES as i32 {
+        h.stage(|tx| {
+            tx.update(&ident(), row(id, 1));
+        })
+        .await;
+        h.cycle().await;
+    }
+
+    let (outcome, took) = h.timed_compact(&purge(1 << 30)).await;
+
+    assert_eq!(outcome.input_delete_files, DELETES);
+    // The inputs, `PASS_READ_AHEAD` at once too — the first while the
+    // delete files load — and the output's upload.
+    let inputs_after = outcome.input_data_files - PASS_READ_AHEAD;
+    let round_trips =
+        (DELETES.div_ceil(PASS_READ_AHEAD) + inputs_after.div_ceil(PASS_READ_AHEAD)) as u32 + 1;
+    assert!(
+        took <= LATENCY * round_trips,
+        "{DELETES} delete files took {took:?}, {} round trips",
+        took.as_millis() / LATENCY.as_millis(),
+    );
+    h.assert_iceberg_matches_pg().await;
+}
+
+/// A table of `files` data files of two rows each, every one of which a
+/// single delete file kills a row of: a purge rewrites them all.
+async fn half_deleted(h: &mut Harness, files: usize) {
+    h.data_files(files, 2).await;
+    h.stage(|tx| {
+        for i in 0..files {
+            tx.delete(&ident(), row(2 * i as i32, 0));
+        }
+    })
+    .await;
+    h.cycle().await;
+}
+
+/// A pass goes on while an output uploads: here each input makes its own
+/// output (outputs roll over at a byte), and the work between outputs
+/// (naming the next) takes a round trip, as long as an upload. Uploading
+/// each before going on would take two round trips an output.
+#[tokio::test(start_paused = true)]
+async fn a_pass_goes_on_while_an_output_uploads() {
+    const FILES: usize = 16;
+    let mut h = Harness::boot(Stores {
+        compact_namer_latency: LATENCY,
+        ..Stores::new(1024)
+    })
+    .await;
+    half_deleted(&mut h, FILES).await;
+
+    let (outcome, took) = h.timed_compact(&purge(1)).await;
+
+    assert_eq!(outcome.output_data_files, FILES);
+    // Reading the delete file and the first input, then an output a
+    // round trip, then the last upload.
+    let round_trips = 1 + FILES as u32 + 2;
+    assert!(
+        took <= LATENCY * round_trips,
+        "{FILES} outputs took {took:?}, {} round trips",
+        took.as_millis() / LATENCY.as_millis(),
+    );
+    h.assert_iceberg_matches_pg().await;
+}
+
+/// What's uploading is bounded too, by a target file's size: outputs that
+/// each reach it upload one at a time, however fast they're made.
+#[tokio::test(start_paused = true)]
+async fn a_pass_uploads_at_most_a_target_files_bytes() {
+    // Reads take no time: nothing but the bound paces the uploads.
+    let mut h = Harness::boot(Stores {
+        read_latency: |_| Duration::ZERO,
+        ..Stores::new(1024)
+    })
+    .await;
+    half_deleted(&mut h, 16).await;
+    h.blob.writes.reset_peak();
+
+    h.compact(&purge(1)).await;
+
+    assert_eq!(h.blob.writes.peak(), 1, "uploads in flight at once");
+    h.assert_iceberg_matches_pg().await;
+}
+
+/// A read ahead that refreshes the object store's credentials holds the
+/// lock every request takes, uploads included: while the pass waits for
+/// an upload stuck behind it to make room for the next, the read has to
+/// go on. Here the first input makes several outputs (a decode batch
+/// each), and reading the second refreshes.
+#[tokio::test(start_paused = true)]
+async fn a_pass_reading_ahead_while_refreshing_credentials_doesnt_stall() {
+    let mut h = Harness::boot(Stores::new(8192)).await;
+    h.data_files(1, 4096).await;
+    h.stage(|tx| {
+        tx.insert(&ident(), row(4096, 0));
+        tx.insert(&ident(), row(4097, 0));
+    })
+    .await;
+    h.cycle().await;
+    h.stage(|tx| {
+        for id in (0..4098).step_by(2) {
+            tx.delete(&ident(), row(id, 0));
+        }
+    })
+    .await;
+    h.cycle().await;
+    // After reading the delete file and the first input.
+    h.blob.expire_in(2);
+
+    let outcome = h.compact(&purge(1)).await;
+
+    assert_eq!(outcome.input_data_files, 2);
+    assert!(outcome.output_data_files > 2, "{outcome:?}");
+    h.assert_iceberg_matches_pg().await;
+}
+
+/// A pass rewrites its inputs in order, however their reads finish: they
+/// come grouped by partition, and an output holds one, so out of order
+/// they'd make more, smaller outputs. Here every other read finishes
+/// sooner, interleaving four partitions' two files each.
+#[tokio::test(start_paused = true)]
+async fn a_pass_rewrites_its_inputs_in_order() {
+    const PARTITIONS: usize = 4;
+    let mut h = Harness::boot(Stores {
+        read_latency: |n| LATENCY * (1 + n as u32 % 2),
+        partitioned: true,
+        ..Stores::new(1024)
+    })
+    .await;
+    for f in 0..2 * PARTITIONS {
+        h.stage(|tx| {
+            tx.insert(&ident(), row(f as i32, (f / 2) as i32));
+        })
+        .await;
+        h.cycle().await;
+    }
+
+    let outcome = h.compact(&merge(1 << 30)).await;
+
+    assert_eq!(outcome.input_data_files, 2 * PARTITIONS);
+    assert_eq!(outcome.output_data_files, PARTITIONS);
     h.assert_iceberg_matches_pg().await;
 }

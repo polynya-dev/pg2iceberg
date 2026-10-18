@@ -25,6 +25,8 @@
 //! 6. Stream the inputs one record batch at a time: drop rows a delete
 //!    applies to (`delete_seq > row_seq`), encode survivors straight into
 //!    the open output file, and upload it once it reaches the target size.
+//!    The inputs are read ahead of the one being rewritten, and an output
+//!    uploads while the next is encoded ([`PassIo`]).
 //! 7. `Catalog::commit_compaction` issues one `Operation::Replace`
 //!    snapshot removing the inputs + retired deletes and adding outputs.
 //!
@@ -32,7 +34,9 @@
 //!
 //! At most one decoded record batch ([`DECODE_BATCH_ROWS`]) of one input
 //! file is alive at a time, next to that file's encoded bytes and the
-//! encoded bytes of one open output file (≈ `target_size_bytes`). What
+//! encoded bytes of one open output file (≈ `target_size_bytes`) — and
+//! the inputs read ahead and the outputs uploading, each at most
+//! `target_size_bytes` (or one file, if larger). What
 //! grows with the table instead: the live-file lists (O(files)), the
 //! deleted-PK set (O(live equality-delete rows) — what every MoR reader
 //! holds anyway, and retiring deletes keeps it down) and the caller's
@@ -67,14 +71,24 @@ use crate::writer::{StreamingDataFile, TableWriter, WriterError};
 use crate::{Catalog, DataFile, FileIndex, IcebergError, PkKey, PreparedCompaction, Snapshot};
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_select::filter::filter_record_batch;
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::stream::{self, FuturesOrdered, FuturesUnordered, StreamExt};
 use pg2iceberg_core::{ColumnName, ColumnSchema, PartitionLiteral, Row, TableIdent, TableSchema};
 use pg2iceberg_stream::{BlobStore, StreamError};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::{poll_fn, Future};
+use std::pin::pin;
+use std::task::{Context, Poll};
 use thiserror::Error;
 
 /// Rows decoded per record batch. Bounds how many rows a pass holds at
 /// once, however large its input files are.
 pub const DECODE_BATCH_ROWS: usize = 1024;
+/// Most files a pass reads at once: the delete files it applies, and the
+/// inputs after the one it's rewriting. Read one at a time, a pass waits
+/// a round trip per file.
+pub const READ_AHEAD: usize = 8;
 
 /// Knobs that decide whether a table is worth compacting and how to
 /// size the output.
@@ -278,23 +292,21 @@ where
         .cloned()
         .collect();
     let oldest_input = plan.inputs.iter().map(|(_, f)| f.seq).min();
-    let mut delete_pks: HashMap<PkKey, i64> = HashMap::new();
-    for (path, meta) in &live_deletes {
-        if oldest_input.is_none_or(|s| meta.seq <= s) {
-            continue;
-        }
-        let bytes = blob_store.get(path).await?;
-        for batch in ArrowBatches::new(bytes, &pk_schema, DECODE_BATCH_ROWS)? {
-            let batch = batch?;
-            peak_rows = peak_rows.max(batch.num_rows() as u64);
-            let keys = RowKeys::new(&batch, &pk_schema, &pk_schema);
-            for i in 0..batch.num_rows() {
-                // Highest seq wins — covers re-deletes of the same PK.
-                let seq = delete_pks.entry(keys.at(i)?).or_insert(meta.seq);
-                *seq = (*seq).max(meta.seq);
-            }
-        }
-    }
+    let applying: Vec<(&String, i64)> = live_deletes
+        .iter()
+        .filter(|(_, meta)| oldest_input.is_some_and(|s| meta.seq > s))
+        .map(|(path, meta)| (path, meta.seq))
+        .collect();
+    // The inputs start reading meanwhile.
+    let mut io = PassIo::new(blob_store, &plan.inputs, config.target_size_bytes);
+    let delete_pks = io
+        .alongside(load_deletes(
+            blob_store,
+            applying,
+            &pk_schema,
+            &mut peak_rows,
+        ))
+        .await?;
 
     let writer = TableWriter::new(schema.clone());
     let mut out = OutputFiles::default();
@@ -307,9 +319,8 @@ where
         .filter_map(|f| schema.columns.iter().find(|c| c.name == f.source_column))
         .cloned()
         .collect();
-    for (path, meta) in &plan.inputs {
+    while let Some(((_, meta), bytes)) = io.next_input().await? {
         bytes_before += meta.byte_size;
-        let bytes = blob_store.get(path).await?;
         for batch in ArrowBatches::new(bytes, &schema.columns, DECODE_BATCH_ROWS)? {
             let batch = batch?;
             let n = batch.num_rows();
@@ -340,7 +351,7 @@ where
             let mut survivor_keys = survivor_keys.into_iter();
             for (tuple, start, len) in partition_runs(&writer, &survivors, &partition_cols)? {
                 if out.open_tuple().is_some_and(|t| t != tuple.as_slice()) {
-                    out.close(blob_store, &path_for_chunk, ident).await?;
+                    out.close(&mut io, &path_for_chunk, ident).await?;
                 }
                 out.write(
                     &writer,
@@ -349,12 +360,15 @@ where
                     survivor_keys.by_ref().take(len),
                 )?;
                 if out.open_size() >= config.target_size_bytes {
-                    out.close(blob_store, &path_for_chunk, ident).await?;
+                    out.close(&mut io, &path_for_chunk, ident).await?;
                 }
             }
         }
     }
-    out.close(blob_store, &path_for_chunk, ident).await?;
+    out.close(&mut io, &path_for_chunk, ident).await?;
+    // Every output landed before the commit names it.
+    io.finish().await?;
+    drop(io);
     for path in &plan.retired_deletes {
         bytes_before += live_deletes[path].byte_size;
     }
@@ -486,9 +500,10 @@ impl OutputFiles {
         self.open.as_ref().map_or(0, |(_, f)| f.estimated_size())
     }
 
+    /// Finish the open file and start its upload.
     async fn close<F, Fut>(
         &mut self,
-        blob_store: &dyn BlobStore,
+        io: &mut PassIo<'_>,
         path_for_chunk: &F,
         ident: &TableIdent,
     ) -> Result<()>
@@ -504,9 +519,9 @@ impl OutputFiles {
             return Ok(());
         }
         let chunk = file.finish()?;
-        let path = path_for_chunk(ident, self.added.len()).await;
+        let path = io.alongside(path_for_chunk(ident, self.added.len())).await;
         let byte_size = chunk.bytes.len() as u64;
-        blob_store.put(&path, chunk.bytes).await?;
+        io.upload(path.clone(), chunk.bytes).await?;
         self.added.push(DataFile {
             path,
             record_count: chunk.record_count,
@@ -517,6 +532,186 @@ impl OutputFiles {
         });
         self.added_pks.push(pks);
         Ok(())
+    }
+}
+
+/// Deleted PKs → the highest seq of the deletes (`(path, seq)`) naming
+/// them, read [`READ_AHEAD`] files at once.
+async fn load_deletes(
+    blob_store: &dyn BlobStore,
+    deletes: Vec<(&String, i64)>,
+    pk_schema: &[ColumnSchema],
+    peak_rows: &mut u64,
+) -> Result<HashMap<PkKey, i64>> {
+    let mut reads: Vec<BoxFuture<'_, (i64, std::result::Result<Bytes, StreamError>)>> =
+        Vec::with_capacity(deletes.len());
+    for (path, seq) in deletes {
+        reads.push(Box::pin(async move { (seq, blob_store.get(path).await) }));
+    }
+    let mut reads = stream::iter(reads).buffer_unordered(READ_AHEAD);
+    let mut delete_pks: HashMap<PkKey, i64> = HashMap::new();
+    while let Some((seq, bytes)) = reads.next().await {
+        for batch in ArrowBatches::new(bytes?, pk_schema, DECODE_BATCH_ROWS)? {
+            let batch = batch?;
+            *peak_rows = (*peak_rows).max(batch.num_rows() as u64);
+            let keys = RowKeys::new(&batch, pk_schema, pk_schema);
+            for i in 0..batch.num_rows() {
+                // Highest seq wins — covers re-deletes of the same PK.
+                let at = delete_pks.entry(keys.at(i)?).or_insert(seq);
+                *at = (*at).max(seq);
+            }
+        }
+    }
+    Ok(delete_pks)
+}
+
+type Input<'a> = &'a (String, LiveFile);
+
+/// A pass's object store traffic, alongside the pass in its own task: its
+/// inputs, read ahead of the one being rewritten — at most [`READ_AHEAD`]
+/// files and `bound` bytes of them — and its outputs, uploading while the
+/// next is encoded — at most `bound` bytes of them. Either way at least
+/// one file, however large.
+///
+/// The requests move along whenever the pass awaits through here, and the
+/// pass awaits nothing else meanwhile: a request left unpolled can hold
+/// what the pass's next one waits for (a vended-credentials refresh holds
+/// a lock every request takes), and the pass would never finish.
+struct PassIo<'a> {
+    blob_store: &'a dyn BlobStore,
+    /// Inputs not yet being read.
+    inputs: std::slice::Iter<'a, (String, LiveFile)>,
+    reading: FuturesOrdered<BoxFuture<'a, (Input<'a>, std::result::Result<Bytes, StreamError>)>>,
+    /// Read, not yet taken.
+    read: VecDeque<(Input<'a>, std::result::Result<Bytes, StreamError>)>,
+    /// Bytes of the inputs `reading` and `read`.
+    reading_bytes: u64,
+    uploading: FuturesUnordered<BoxFuture<'a, (u64, std::result::Result<(), StreamError>)>>,
+    uploading_bytes: u64,
+    /// The first upload that failed.
+    failed: Option<StreamError>,
+    bound: u64,
+}
+
+impl<'a> PassIo<'a> {
+    fn new(blob_store: &'a dyn BlobStore, inputs: &'a [(String, LiveFile)], bound: u64) -> Self {
+        Self {
+            blob_store,
+            inputs: inputs.iter(),
+            reading: FuturesOrdered::new(),
+            read: VecDeque::new(),
+            reading_bytes: 0,
+            uploading: FuturesUnordered::new(),
+            uploading_bytes: 0,
+            failed: None,
+            bound,
+        }
+    }
+
+    /// The next input and its bytes, in order; `None` after the last.
+    async fn next_input(&mut self) -> Result<Option<(Input<'a>, Bytes)>> {
+        poll_fn(|cx| {
+            self.drive(cx);
+            if let Some(e) = self.failed.take() {
+                return Poll::Ready(Err(e.into()));
+            }
+            if let Some((input, bytes)) = self.read.pop_front() {
+                self.reading_bytes -= input.1.byte_size;
+                // Start reading the next, in its place.
+                self.drive(cx);
+                return Poll::Ready(Ok(Some((input, bytes?))));
+            }
+            if self.reading.is_empty() {
+                return Poll::Ready(Ok(None));
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Start uploading `bytes` to `path`, once the uploads under way leave
+    /// room for it.
+    async fn upload(&mut self, path: String, bytes: Bytes) -> Result<()> {
+        let size = bytes.len() as u64;
+        poll_fn(|cx| {
+            self.drive(cx);
+            if let Some(e) = self.failed.take() {
+                return Poll::Ready(Err(e));
+            }
+            if self.uploading.is_empty() || self.uploading_bytes + size <= self.bound {
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        })
+        .await?;
+        let blob_store = self.blob_store;
+        self.uploading_bytes += size;
+        self.uploading.push(Box::pin(async move {
+            (size, blob_store.put(&path, bytes).await)
+        }));
+        // Send it on its way.
+        poll_fn(|cx| {
+            self.drive(cx);
+            Poll::Ready(())
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Wait for the uploads under way.
+    async fn finish(&mut self) -> Result<()> {
+        poll_fn(|cx| {
+            self.drive(cx);
+            if let Some(e) = self.failed.take() {
+                return Poll::Ready(Err(e.into()));
+            }
+            if self.uploading.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// `work`, while the requests go on.
+    async fn alongside<F: Future>(&mut self, work: F) -> F::Output {
+        let mut work = pin!(work);
+        poll_fn(|cx| {
+            if let Poll::Ready(out) = work.as_mut().poll(cx) {
+                return Poll::Ready(out);
+            }
+            self.drive(cx);
+            Poll::Pending
+        })
+        .await
+    }
+
+    /// Move the requests along as far as they go now.
+    fn drive(&mut self, cx: &mut Context<'_>) {
+        while self.reading.len() + self.read.len() < READ_AHEAD {
+            let Some(input) = self.inputs.as_slice().first() else {
+                break;
+            };
+            let ahead = self.reading.len() + self.read.len();
+            if ahead > 0 && self.reading_bytes + input.1.byte_size > self.bound {
+                break;
+            }
+            self.inputs.next();
+            self.reading_bytes += input.1.byte_size;
+            let blob_store = self.blob_store;
+            self.reading.push_back(Box::pin(
+                async move { (input, blob_store.get(&input.0).await) },
+            ));
+        }
+        while let Poll::Ready(Some(read)) = self.reading.poll_next_unpin(cx) {
+            self.read.push_back(read);
+        }
+        while let Poll::Ready(Some((size, uploaded))) = self.uploading.poll_next_unpin(cx) {
+            self.uploading_bytes -= size;
+            if let Err(e) = uploaded {
+                self.failed.get_or_insert(e);
+            }
+        }
     }
 }
 
