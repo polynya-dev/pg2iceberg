@@ -549,6 +549,23 @@ impl Harness {
         start.elapsed()
     }
 
+    /// The materializer's FileIndex is the one the catalog's files make.
+    async fn assert_index_matches_catalog(&self) {
+        let rebuilt = pg2iceberg_iceberg::rebuild_from_catalog(
+            self.catalog.as_ref(),
+            self.blob.inner.as_ref(),
+            &ident(),
+            &self.schema,
+            &[ColumnName("id".into())],
+        )
+        .await
+        .unwrap();
+        assert!(
+            self.materializer.file_index(&ident()) == Some(&rebuilt),
+            "the FileIndex differs from the catalog's"
+        );
+    }
+
     async fn assert_iceberg_matches_pg(&self) {
         let id = |r: &Row| match r.get(&ColumnName("id".into())) {
             Some(PgValue::Int4(v)) => *v,
@@ -966,4 +983,98 @@ async fn a_pass_rewrites_its_inputs_in_order() {
     assert_eq!(outcome.input_data_files, 2 * PARTITIONS);
     assert_eq!(outcome.output_data_files, PARTITIONS);
     h.assert_iceberg_matches_pg().await;
+}
+
+/// A pass prepared beside the materializer — on a task of its own, while
+/// cycles go on — commits after them: rows they updated or deleted since
+/// it planned stay where they put them, in Iceberg and in the FileIndex,
+/// though the pass rewrote their old versions.
+#[tokio::test(start_paused = true)]
+async fn a_pass_prepared_beside_cycles_keeps_their_changes() {
+    let mut h = Harness::boot(Stores::new(1024)).await;
+    half_deleted(&mut h, 8).await;
+    let job = h
+        .materializer
+        .compaction_job(&ident(), &purge(1 << 30))
+        .expect("a job");
+    // Meanwhile: rows it rewrites, updated and deleted.
+    h.stage(|tx| {
+        tx.update(&ident(), row(1, 100));
+        tx.delete(&ident(), row(3, 0));
+    })
+    .await;
+    h.cycle().await;
+
+    let pass = job.run().await;
+    let outcome = h
+        .materializer
+        .commit_compaction_pass(pass)
+        .await
+        .unwrap()
+        .expect("a pass");
+
+    assert_eq!(outcome.input_data_files, 8);
+    h.assert_iceberg_matches_pg().await;
+    h.assert_index_matches_catalog().await;
+    // And what comes next applies on top.
+    h.stage(|tx| {
+        tx.update(&ident(), row(1, 200));
+        tx.insert(&ident(), row(3, 300));
+        tx.update(&ident(), row(5, 500));
+    })
+    .await;
+    h.cycle().await;
+    h.assert_iceberg_matches_pg().await;
+    h.assert_index_matches_catalog().await;
+}
+
+/// A pass reads the table as of the FileIndex it planned from, though it
+/// runs later: a delete committed meanwhile waits for the next pass. The
+/// index's counts don't know the file it hides a row in is dirty — one
+/// too large to merge, so the pass leaves it — and retiring the delete
+/// would bring the row back.
+#[tokio::test(start_paused = true)]
+async fn a_pass_reads_the_table_as_of_its_plan() {
+    let mut h = Harness::boot(Stores::new(1024)).await;
+    // Two files, ids 0–1 and 2–3, and a delete file: the first is dirty.
+    h.data_files(2, 2).await;
+    h.stage(|tx| {
+        tx.delete(&ident(), row(0, 0));
+    })
+    .await;
+    h.cycle().await;
+    // Files of the target size aren't small: only the dirty one is
+    // rewritten.
+    let target = h
+        .catalog
+        .snapshots(&ident())
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|s| &s.data_files)
+        .map(|f| f.byte_size)
+        .max()
+        .unwrap();
+    let job = h
+        .materializer
+        .compaction_job(&ident(), &purge(target))
+        .expect("a job");
+    // Meanwhile, the second file loses a row.
+    h.stage(|tx| {
+        tx.delete(&ident(), row(2, 0));
+    })
+    .await;
+    h.cycle().await;
+
+    let pass = job.run().await;
+    let outcome = h
+        .materializer
+        .commit_compaction_pass(pass)
+        .await
+        .unwrap()
+        .expect("a pass");
+
+    assert_eq!(outcome.input_data_files, 1);
+    h.assert_iceberg_matches_pg().await;
+    h.assert_index_matches_catalog().await;
 }

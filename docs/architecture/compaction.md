@@ -4,7 +4,13 @@ icon: lucide/archive
 
 # Compaction
 
-Compaction merges small data files into larger ones, and drops the rows updates and deletes left behind. It runs after each materializer cycle, for each table where it's due, and on demand with [`pg2iceberg compact`](../usage/modes.md#compact-one-shot-compaction-pass).
+Compaction merges small data files into larger ones, and drops the rows updates and deletes left behind. It runs for each table where it's due: beside the materializer in `pg2iceberg run`, and on demand with [`pg2iceberg compact`](../usage/modes.md#compact-one-shot-compaction-pass).
+
+## Beside the materializer
+
+A pass reads and rewrites files for seconds or minutes; a materializer catching up shouldn't stop for it. In `run`, passes over every table are prepared on a task of their own — planned from the materializer's [file index](materializer.md) as a cycle left it, inputs read and rewritten, outputs uploaded — while cycles go on, and the next cycle after they're done commits them before it starts. The materializer stays the only committer, so its file index takes each commit in turn. The next passes start once those are committed, and not before the next cycle: planned earlier, they could pick the same files again.
+
+A pass reads the table as of the snapshot its file index reflected when it was planned, never later: what's committed meanwhile waits for the next pass. Rows the cycles meanwhile updated or deleted were rewritten in their old versions, which the cycles' own deletes hide; the file index keeps them where the cycles put them.
 
 ## Why rows need dropping
 

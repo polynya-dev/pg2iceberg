@@ -181,7 +181,8 @@ Each unit of work is a trace of its own, and every request it makes to the Icebe
 | `pipeline.spill` | Staging part of a transaction too large to hold in memory |
 | `slot.ack` | Recording the flushed LSN and acking the slot |
 | `materializer.cycle` | A materializer cycle: `materializer.table` per table, `materializer.commit` per Iceberg commit (`rows`, `data_files`, `delete_files`, `bytes`, `snapshot`) |
-| `compaction.cycle` | A compaction pass: `compaction.table` per table |
+| `compaction.cycle` | A compaction pass: `compaction.table` per table. In `run`, prepared beside the materializer |
+| `compaction.commit` | In `run`, committing the passes prepared beside the materializer, as a tick starts |
 | `watcher.check` | The invariant checks, with the slot read |
 | `replication.reconnect` | An attempt to reopen a dropped replication stream |
 | `shutdown` | The final flush, cycle and ack |

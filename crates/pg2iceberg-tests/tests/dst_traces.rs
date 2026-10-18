@@ -299,6 +299,7 @@ async fn every_request_is_traced_within_its_unit_of_work() {
         "slot.ack",
         "materializer.cycle",
         "compaction.cycle",
+        "compaction.commit",
         "watcher.check",
         "shutdown",
     ]

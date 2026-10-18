@@ -182,6 +182,41 @@ pub struct CompactedFile {
     pub partition_values: Vec<PartitionLiteral>,
 }
 
+/// What the caller's PK → file index knows of a table's rows: each data
+/// file's live rows, as of snapshot `as_of` — the latest, with `None`.
+/// The materializer's own index (see [`compact_table`]).
+///
+/// A pass reads the table as of that snapshot too, never later: counts
+/// from before a delete would show the file it hid a row in as clean, and
+/// the pass could retire that delete with the row still in the file.
+#[derive(Clone, Debug, Default)]
+pub struct LiveRows {
+    pub as_of: Option<i64>,
+    pub per_file: BTreeMap<String, u64>,
+}
+
+impl LiveRows {
+    pub fn new(index: &FileIndex, as_of: Option<i64>) -> Self {
+        Self {
+            as_of,
+            per_file: index
+                .live_rows_per_file()
+                .into_iter()
+                .map(|(path, live)| (path.to_string(), live))
+                .collect(),
+        }
+    }
+}
+
+/// A pass with its outputs uploaded and its commit still to make.
+#[derive(Debug)]
+pub struct PreparedPass {
+    /// Its commit, for [`Catalog::commit_compaction`].
+    pub commit: PreparedCompaction,
+    /// What it did; `snapshot_id` is its commit's, once made.
+    pub outcome: CompactionOutcome,
+}
+
 #[derive(Debug, Error)]
 pub enum CompactError {
     #[error("catalog: {0}")]
@@ -226,9 +261,10 @@ struct PassPlan {
     pending_files: usize,
 }
 
-/// Run one compaction pass. Returns `Ok(None)` if the table is below
-/// thresholds or has nothing worth rewriting, `Ok(Some(_))` after a
-/// successful compaction commit.
+/// Run one compaction pass: [`prepare_pass`] on the table's snapshots,
+/// and its commit. Returns `Ok(None)` if the table is below thresholds or
+/// has nothing worth rewriting, `Ok(Some(_))` after a successful
+/// compaction commit.
 ///
 /// `live_pks` is the caller's PK → file index for this table, consistent
 /// with the catalog (the materializer's own). It lets the pass find the
@@ -262,16 +298,67 @@ where
     Fut: std::future::Future<Output = String>,
 {
     let snapshots = catalog.snapshots(ident).await?;
+    let live = live_pks.map(|index| LiveRows::new(index, None));
+    let Some(pass) = prepare_pass(
+        &snapshots,
+        blob_store,
+        path_for_chunk,
+        ident,
+        schema,
+        pk_cols,
+        live.as_ref(),
+        config,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let committed = catalog.commit_compaction(pass.commit).await?;
+    Ok(Some(CompactionOutcome {
+        snapshot_id: committed.current_snapshot_id,
+        ..pass.outcome
+    }))
+}
+
+/// Everything of a compaction pass but its commit: plan it from the
+/// table's `snapshots` (as [`Catalog::snapshots`] lists them) and `live`,
+/// read and rewrite its inputs, and upload its outputs. `Ok(None)` if
+/// nothing is due. The outputs stay unreferenced until the commit: a pass
+/// abandoned before it leaves them to orphan cleanup.
+///
+/// `live` as for [`compact_table`]'s `live_pks`; the pass reads the table
+/// as of its `as_of` ([`LiveRows`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_pass<F, Fut>(
+    snapshots: &[Snapshot],
+    blob_store: &dyn BlobStore,
+    path_for_chunk: F,
+    ident: &TableIdent,
+    schema: &TableSchema,
+    pk_cols: &[ColumnName],
+    live: Option<&LiveRows>,
+    config: &CompactionConfig,
+) -> Result<Option<PreparedPass>>
+where
+    F: Fn(&TableIdent, usize) -> Fut,
+    Fut: std::future::Future<Output = String>,
+{
+    // The table as the counts know it: snapshots come oldest first.
+    let snapshots = match live.and_then(|l| l.as_of) {
+        Some(at) => &snapshots[..snapshots.partition_point(|s| s.id <= at)],
+        None => snapshots,
+    };
     if snapshots.is_empty() {
         return Ok(None);
     }
+    let live_rows = live.map(|l| &l.per_file);
 
-    let (live_data, live_deletes) = compute_live_files(&snapshots);
+    let (live_data, live_deletes) = compute_live_files(snapshots);
 
-    let is_dirty = dirty_check(&live_deletes, live_pks);
+    let is_dirty = dirty_check(&live_deletes, live_rows);
     let rewrite = Rewrite {
         merge: live_data.len() >= config.data_file_threshold,
-        purge: purge_due(&live_data, &live_deletes, live_pks, &is_dirty, config),
+        purge: purge_due(&live_data, &live_deletes, live_rows, &is_dirty, config),
     };
     if !rewrite.merge && !rewrite.purge {
         return Ok(None);
@@ -390,29 +477,28 @@ where
             partition_values: f.partition_values.clone(),
         })
         .collect();
-    let committed = catalog
-        .commit_compaction(PreparedCompaction {
+    Ok(Some(PreparedPass {
+        commit: PreparedCompaction {
             ident: ident.clone(),
             added_data_files: out.added,
             removed_paths,
             // The table as the pass read it: the last snapshot.
             data_sequence_number: snapshots.last().map(|s| s.id),
-        })
-        .await?;
-
-    Ok(Some(CompactionOutcome {
-        input_data_files: plan.inputs.len(),
-        input_delete_files: plan.retired_deletes.len(),
-        output_data_files,
-        rows_rewritten,
-        rows_removed_by_deletes,
-        bytes_before,
-        bytes_after,
-        peak_rows_in_memory: peak_rows,
-        pending_files: plan.pending_files,
-        rewritten_files: plan.inputs.into_iter().map(|(p, _)| p).collect(),
-        added_files,
-        snapshot_id: committed.current_snapshot_id,
+        },
+        outcome: CompactionOutcome {
+            input_data_files: plan.inputs.len(),
+            input_delete_files: plan.retired_deletes.len(),
+            output_data_files,
+            rows_rewritten,
+            rows_removed_by_deletes,
+            bytes_before,
+            bytes_after,
+            peak_rows_in_memory: peak_rows,
+            pending_files: plan.pending_files,
+            rewritten_files: plan.inputs.into_iter().map(|(p, _)| p).collect(),
+            added_files,
+            snapshot_id: None,
+        },
     }))
 }
 
@@ -439,7 +525,8 @@ where
     if live_deletes.is_empty() || live_deletes.len() < config.delete_file_threshold {
         return Ok(None);
     }
-    let is_dirty = dirty_check(&live_deletes, live_pks);
+    let live = live_pks.map(|index| LiveRows::new(index, None));
+    let is_dirty = dirty_check(&live_deletes, live.as_ref().map(|l| &l.per_file));
     let retired = retirable_deletes(&live_data, &live_deletes, &is_dirty, &BTreeSet::new());
     if retired.is_empty() {
         return Ok(None);
@@ -720,14 +807,12 @@ impl<'a> PassIo<'a> {
 /// count of live rows when there is one.
 fn dirty_check<'a>(
     live_deletes: &BTreeMap<String, LiveFile>,
-    live_pks: Option<&'a FileIndex>,
+    live_rows: Option<&'a BTreeMap<String, u64>>,
 ) -> impl Fn(&str, &LiveFile) -> bool + 'a {
     let newest_delete = live_deletes.values().map(|d| d.seq).max();
-    let live_rows = live_pks.map(FileIndex::live_rows_per_file);
     move |path: &str, f: &LiveFile| {
         newest_delete.is_some_and(|d| d > f.seq)
             && live_rows
-                .as_ref()
                 .is_none_or(|counts| counts.get(path).copied().unwrap_or(0) < f.record_count)
     }
 }
@@ -768,7 +853,7 @@ struct Rewrite {
 fn purge_due(
     live_data: &BTreeMap<String, LiveFile>,
     live_deletes: &BTreeMap<String, LiveFile>,
-    live_pks: Option<&FileIndex>,
+    live_rows: Option<&BTreeMap<String, u64>>,
     is_dirty: &impl Fn(&str, &LiveFile) -> bool,
     config: &CompactionConfig,
 ) -> bool {
@@ -778,12 +863,11 @@ fn purge_due(
     if live_deletes.len() >= config.delete_file_threshold {
         return true;
     }
-    let live_rows = live_pks.map(FileIndex::live_rows_per_file);
     let mut held: u64 = 0;
     let mut dead: u64 = 0;
     for (path, f) in live_data.iter().filter(|(p, f)| is_dirty(p, f)) {
         held += f.record_count;
-        if let Some(live) = &live_rows {
+        if let Some(live) = live_rows {
             let live = live.get(path.as_str()).copied().unwrap_or(0);
             dead += f.record_count.saturating_sub(live);
         }

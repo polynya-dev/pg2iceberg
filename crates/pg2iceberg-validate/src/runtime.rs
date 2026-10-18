@@ -31,7 +31,7 @@ use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
 use pg2iceberg_logical::spans::record_outcome;
 use pg2iceberg_logical::work_span;
 use pg2iceberg_logical::{
-    materializer::MaterializerNamer,
+    materializer::{CompactionJob, CompactionPass, MaterializerNamer},
     pipeline::BlobNamer,
     replication_start_lsn,
     runner::{Handler, Schedule, Ticker},
@@ -105,6 +105,55 @@ where
         }
     }
     Ok(outcome)
+}
+
+/// A tick while compaction runs beside the materializer ([`Ticks`]):
+/// commit the passes prepared since the last one, then a cycle. Failures
+/// as for [`run_materialize_tick`]: a pass that fails to commit is
+/// captured in the outcome, and leaves its outputs to orphan cleanup.
+async fn run_tick_committing<Cat>(
+    materializer: &mut Materializer<Cat>,
+    passes: Vec<CompactionPass>,
+) -> std::result::Result<MaterializeTickOutcome, MaterializerError>
+where
+    Cat: Catalog + 'static,
+{
+    let mut compaction = Vec::new();
+    let mut compaction_error = None;
+    if !passes.is_empty() {
+        let span = work_span!(parent: None, "compaction.commit");
+        let committed = async {
+            for pass in passes {
+                let ident = pass.ident().clone();
+                match materializer.commit_compaction_pass(pass).await {
+                    Ok(Some(outcome)) => compaction.push((ident, outcome)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        compaction_error.get_or_insert_with(|| e.to_string());
+                    }
+                }
+            }
+        };
+        committed.instrument(span).await;
+    }
+    let rows_committed = materializer.cycle().await?;
+    Ok(MaterializeTickOutcome {
+        rows_committed,
+        compaction,
+        compaction_error,
+    })
+}
+
+/// Prepare a compaction pass per table, one after another.
+async fn prepare_passes<Cat: Catalog + 'static>(
+    jobs: Vec<CompactionJob<Cat>>,
+) -> Vec<CompactionPass> {
+    let mut passes = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let span = work_span!("compaction.table", table = %job.ident(), rewritten = Empty);
+        passes.push(job.run().instrument(span).await);
+    }
+    passes
 }
 
 /// Run one watcher tick — builds [`WatcherInputs`] and calls
@@ -1089,7 +1138,10 @@ where
                     }
                 }
             }
-            joined = ticks.join(), if ticks.running() => {
+            joined = join_task(&mut ticks.compacting), if ticks.compacting() => {
+                ticks.finish_compacting(loop_state, joined);
+            }
+            joined = join_task(&mut ticks.running), if ticks.running() => {
                 ticks.finish(loop_state, joined)?;
                 // The next tick is due an interval after this one ended.
                 ticker.finished(Handler::Materialize, loop_state.clock.now());
@@ -1139,6 +1191,18 @@ where
     Ok(())
 }
 
+/// `task`'s end. Pending forever without one, as a `select!` arm guarded
+/// by whether there is never polls it. By field, so the loop can wait on
+/// a tick and compaction at once.
+async fn join_task<T>(
+    task: &mut Option<tokio::task::JoinHandle<T>>,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    match task.as_mut() {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
+}
+
 type TickTask<Cat> = tokio::task::JoinHandle<(
     Materializer<Cat>,
     std::result::Result<MaterializeTickOutcome, MaterializerError>,
@@ -1157,8 +1221,21 @@ type TickTask<Cat> = tokio::task::JoinHandle<(
 /// stall replication between its awaits all the same. The DSTs drive
 /// the loop under tokio runtimes — `current_thread`, paused time — where
 /// the task interleaves with the loop deterministically.
+///
+/// Compaction runs beside the ticks, on a task of its own too: passes
+/// over every table, prepared — read, rewritten, uploaded — from the
+/// materializer's FileIndex as a tick left it, then committed by the next
+/// tick after they're done ([`run_tick_committing`]). Catching up, the
+/// materializer doesn't stop for them; and it stays the one committer,
+/// so its index follows each commit in order. The next passes start
+/// once those are committed: planned before, they could rewrite the
+/// same files again.
 struct Ticks<Cat: Catalog + 'static> {
     running: Option<TickTask<Cat>>,
+    /// The passes being prepared.
+    compacting: Option<tokio::task::JoinHandle<Vec<CompactionPass>>>,
+    /// Passes prepared, for the next tick to commit.
+    prepared: Vec<CompactionPass>,
     /// Another tick as soon as the running one ends: a blue-green marker
     /// arrived meanwhile ([`Self::want`]), or it stopped at its row budget
     /// with log left to read — a backlog doesn't wait an interval a tick.
@@ -1172,6 +1249,8 @@ impl<Cat: Catalog + 'static> Default for Ticks<Cat> {
     fn default() -> Self {
         Self {
             running: None,
+            compacting: None,
+            prepared: Vec::new(),
             again: false,
             ungated: Vec::new(),
         }
@@ -1188,12 +1267,69 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
         let Some(mut materializer) = loop_state.materializer.take() else {
             return;
         };
-        let compaction = loop_state.compaction.clone();
+        let background = loop_state.compaction.is_some();
+        let passes = std::mem::take(&mut self.prepared);
         let tick = async move {
-            let out = run_materialize_tick(&mut materializer, compaction.as_ref()).await;
+            let out = if background {
+                run_tick_committing(&mut materializer, passes).await
+            } else {
+                run_materialize_tick(&mut materializer, None).await
+            };
             (materializer, out)
         };
         self.running = Some(tokio::spawn(tick.in_current_span()));
+    }
+
+    fn compacting(&self) -> bool {
+        self.compacting.is_some()
+    }
+
+    /// Start preparing compaction passes from `materializer` as it is, if
+    /// none are under way or waiting to be committed.
+    fn compact(&mut self, materializer: &Materializer<Cat>, config: Option<&CompactionConfig>) {
+        let Some(config) = config else {
+            return;
+        };
+        if self.compacting() || !self.prepared.is_empty() {
+            return;
+        }
+        // With a backlog the ticks follow one another straight away, and
+        // dirty again what a pass rewrites: until it's applied, only the
+        // delete-file backstop, which readers can't wait for.
+        let deferring;
+        let config = if materializer.backlogged() {
+            deferring = config.backstop_only();
+            &deferring
+        } else {
+            config
+        };
+        let jobs = materializer.compaction_jobs(config);
+        if jobs.is_empty() {
+            return;
+        }
+        // A `tokio::spawn` for the reason `Ticks` gives: rewriting files
+        // is CPU-bound, and the passes take as long as their tables are
+        // large.
+        let span = work_span!(parent: None, "compaction.cycle");
+        self.compacting = Some(tokio::spawn(prepare_passes(jobs).instrument(span)));
+    }
+
+    /// Keep the passes that ended with `joined` for the next tick, and
+    /// start the next ones if the materializer is here.
+    fn finish_compacting<C: Coordinator + ?Sized>(
+        &mut self,
+        loop_state: &LogicalLoop<C, Cat>,
+        joined: std::result::Result<Vec<CompactionPass>, tokio::task::JoinError>,
+    ) {
+        self.compacting = None;
+        match joined {
+            Ok(passes) => self.prepared = passes,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => tracing::warn!(error = %e, "compaction task failed"),
+        }
+        if let Some(materializer) = loop_state.materializer.as_ref() {
+            self.compact(materializer, loop_state.compaction.as_ref());
+        }
     }
 
     /// Start a tick now, or as soon as the running one ends.
@@ -1208,23 +1344,6 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
     fn start_if_wanted<C: Coordinator + ?Sized>(&mut self, loop_state: &mut LogicalLoop<C, Cat>) {
         if std::mem::take(&mut self.again) {
             self.start(loop_state);
-        }
-    }
-
-    /// The running tick's end. Pending forever with none running, as a
-    /// `select!` arm guarded by [`Self::running`] never polls it.
-    async fn join(
-        &mut self,
-    ) -> std::result::Result<
-        (
-            Materializer<Cat>,
-            std::result::Result<MaterializeTickOutcome, MaterializerError>,
-        ),
-        tokio::task::JoinError,
-    > {
-        match self.running.as_mut() {
-            Some(task) => task.await,
-            None => std::future::pending().await,
         }
     }
 
@@ -1251,6 +1370,7 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
             materializer.mark_snapshot_complete(&ident);
         }
         self.again |= materializer.backlogged();
+        self.compact(&materializer, loop_state.compaction.as_ref());
         loop_state.materializer = Some(materializer);
         // `cycle` failure is fatal (propagates); compaction failure is
         // captured in the outcome and only logged.
@@ -1274,16 +1394,22 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
         }
     }
 
-    /// Wait for the running tick, if any, to end.
+    /// Wait for the running tick, if any, to end. Compaction under way is
+    /// dropped, and passes not yet committed: their outputs are left to
+    /// orphan cleanup.
     async fn wait<C: Coordinator + ?Sized>(
         &mut self,
         loop_state: &mut LogicalLoop<C, Cat>,
     ) -> Result<(), MainLoopError> {
         self.again = false;
+        if let Some(task) = self.compacting.take() {
+            task.abort();
+        }
+        self.prepared.clear();
         if !self.running() {
             return Ok(());
         }
-        let joined = self.join().await;
+        let joined = join_task(&mut self.running).await;
         self.finish(loop_state, joined)
     }
 }

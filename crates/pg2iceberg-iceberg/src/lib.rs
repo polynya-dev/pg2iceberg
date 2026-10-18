@@ -17,7 +17,8 @@ pub mod verify;
 pub mod writer;
 
 pub use compact::{
-    compact_table, retire_deletes, CompactError, CompactedFile, CompactionConfig, CompactionOutcome,
+    compact_table, prepare_pass, retire_deletes, CompactError, CompactedFile, CompactionConfig,
+    CompactionOutcome, LiveRows, PreparedPass,
 };
 pub use file_index::{catch_up_from_catalog, rebuild_from_catalog, FileIndex};
 pub use fold::{fold_events, pk_key, MaterializedRow};
