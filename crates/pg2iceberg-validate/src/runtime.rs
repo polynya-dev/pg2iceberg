@@ -1019,14 +1019,24 @@ where
     Cat: Catalog + 'static,
     F: Future<Output = ()> + Unpin + Send,
 {
+    // Flushes on a task of their own, as ticks: encoding, uploading and
+    // claiming a flush's changes would hold up the loop otherwise. (The
+    // snapshot phase, before, flushes inline: it records its progress
+    // only once a chunk is claimed.) A `tokio::spawn` for the reason
+    // `Ticks` gives; the DSTs drive it the same way.
+    loop_state.pipeline.flush_in_background(Arc::new(|flush| {
+        tokio::spawn(flush.in_current_span());
+    }));
     let mut ticks = Ticks::default();
     let out = main_loop(&mut loop_state, &mut ticks, shutdown).await;
-    // However the loop ended, a tick in flight ends first: nothing may
-    // run beside it — the drain's final cycle, or, after an error, the
-    // next process's materializer.
+    // However the loop ended, a tick and a flush in flight end first:
+    // nothing may run beside them — the drain's final cycle and flush,
+    // or, after an error, the next process.
     let ended = ticks.wait(&mut loop_state).await;
+    let flushed = loop_state.pipeline.wait_flushed().await;
     out?;
     ended?;
+    flushed?;
     drain_and_shutdown(loop_state).await
 }
 
@@ -1109,7 +1119,8 @@ where
         // running may have read the log before the marker's flush:
         // then another runs as soon as it ends.
         if loop_state.pipeline.has_pending_marker() {
-            dispatch_handler(loop_state, Handler::Flush).await?;
+            // Claimed before the tick starts, which reads it.
+            loop_state.pipeline.flush().await?;
             ticks.want(loop_state);
         }
 
@@ -1277,7 +1288,7 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
     }
 }
 
-async fn process_message<C: Coordinator + ?Sized>(
+async fn process_message<C: Coordinator + ?Sized + 'static>(
     pipeline: &mut Pipeline<C>,
     msg: DecodedMessage,
 ) -> Result<(), MainLoopError> {
@@ -1351,6 +1362,13 @@ where
     // still up (the stream failed on a message, not the connection), its
     // walsender holds the slot against the new one.
     loop_state.stream = Box::new(Disconnected);
+    // A flush in flight lands before the new stream picks its start: past
+    // what it claimed. One that failed — the outage took it too — is
+    // harmless here: the new stream starts before its changes, and sends
+    // them again.
+    if let Err(e) = loop_state.pipeline.wait_flushed().await {
+        tracing::warn!(error = %e, "flush failed as the stream dropped; its changes come again");
+    }
     loop_state.pipeline.reset_session();
     loop {
         if outage.attempts == RECONNECT_ATTEMPTS {
@@ -1435,8 +1453,10 @@ where
     Cat: Catalog + 'static,
 {
     match h {
+        // In the background (see `run_logical_main_loop`), unless one is
+        // still running; one that failed fails the loop.
         Handler::Flush => {
-            loop_state.pipeline.flush().await?;
+            loop_state.pipeline.start_flush().await?;
             loop_state.metrics.gauge(
                 names::REPLICATION_BUFFERED_MESSAGES,
                 &Labels::new(),

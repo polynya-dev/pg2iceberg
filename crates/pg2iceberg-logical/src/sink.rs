@@ -52,13 +52,38 @@ pub struct TableChunk {
     pub chunk: EncodedChunk,
 }
 
+/// Committed transactions taken from the sink, not yet encoded: the
+/// events of one chunk each per table ([`Sink::take_committed`]).
+#[derive(Debug)]
+pub struct Committed {
+    pub pieces: Vec<TablePiece>,
+    /// As [`FlushOutput::flushable_lsn`].
+    pub flushable_lsn: Lsn,
+}
+
+/// One table's events for one chunk.
+#[derive(Debug)]
+pub struct TablePiece {
+    pub table: TableIdent,
+    pub events: Vec<ChangeEvent>,
+}
+
+impl TablePiece {
+    pub fn encode(&self) -> Result<TableChunk> {
+        Ok(TableChunk {
+            table: self.table.clone(),
+            chunk: encode_chunk(&self.events)?,
+        })
+    }
+}
+
 /// Sink. Owns per-table writers and per-tx buffers; not aware of coord/blob.
 pub struct Sink {
     /// Per-table rolling writers, lazily created on first event.
     table_writers: BTreeMap<TableIdent, RollingWriter>,
     /// Chunks closed early, each because a relation event starts a new
     /// one ([`Self::append_event`]); the next flush emits them first.
-    closed: Vec<TableChunk>,
+    closed: Vec<TablePiece>,
     /// In-flight transactions keyed by xid.
     open_txns: BTreeMap<u32, TxBuffer>,
     /// Committed-but-unflushed transactions, in commit order.
@@ -113,7 +138,7 @@ impl Sink {
             }
             _ => {
                 // No tx: e.g. a snapshot-phase event. Stage immediately.
-                self.append_event(evt)?;
+                self.append_event(evt);
             }
         }
         Ok(())
@@ -192,8 +217,27 @@ impl Sink {
     /// returns the resulting chunks plus the highest commit_lsn covered.
     /// Returns `None` when nothing is ready.
     pub fn flush(&mut self) -> Result<Option<FlushOutput>> {
-        if self.committed.is_empty() {
+        let Some(Committed {
+            pieces,
+            flushable_lsn,
+        }) = self.take_committed()
+        else {
             return Ok(None);
+        };
+        Ok(Some(FlushOutput {
+            chunks: pieces
+                .iter()
+                .map(TablePiece::encode)
+                .collect::<Result<_>>()?,
+            flushable_lsn,
+        }))
+    }
+
+    /// [`Self::flush`] without the encoding: every committed transaction's
+    /// events, split into chunks as `flush` would encode them.
+    pub fn take_committed(&mut self) -> Option<Committed> {
+        if self.committed.is_empty() {
+            return None;
         }
 
         // Fold committed events into per-table writers.
@@ -206,44 +250,45 @@ impl Sink {
                 }
             }
             for evt in tx.events {
-                self.append_event(evt)?;
+                self.append_event(evt);
             }
         }
 
-        // Flush every writer that has buffered rows, after the chunks
-        // closed early (which hold earlier events).
-        let mut chunks = std::mem::take(&mut self.closed);
+        // Every writer that has buffered rows, after the chunks closed
+        // early (which hold earlier events).
+        let mut pieces = std::mem::take(&mut self.closed);
         for (table, writer) in self.table_writers.iter_mut() {
-            if let Some(chunk) = writer.flush()? {
-                chunks.push(TableChunk {
+            let events = writer.take();
+            if !events.is_empty() {
+                pieces.push(TablePiece {
                     table: table.clone(),
-                    chunk,
+                    events,
                 });
             }
         }
 
-        Ok(Some(FlushOutput {
-            chunks,
+        Some(Committed {
+            pieces,
             flushable_lsn: max_lsn,
-        }))
+        })
     }
 
     /// A relation event (a schema change) starts a new chunk: the
     /// materializer applies it at a log entry's start, once the entries
     /// before it — rows written under the old schema — are committed.
-    fn append_event(&mut self, evt: ChangeEvent) -> Result<()> {
+    fn append_event(&mut self, evt: ChangeEvent) {
         let table = evt.table.clone();
         let writer = self
             .table_writers
             .entry(table.clone())
             .or_insert_with(|| RollingWriter::new(self.flush_threshold));
         if evt.op == Op::Relation {
-            if let Some(chunk) = writer.flush()? {
-                self.closed.push(TableChunk { table, chunk });
+            let events = writer.take();
+            if !events.is_empty() {
+                self.closed.push(TablePiece { table, events });
             }
         }
         writer.append(evt);
-        Ok(())
     }
 }
 
