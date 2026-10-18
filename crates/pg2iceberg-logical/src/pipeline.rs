@@ -5,8 +5,11 @@
 //! step gated by [`CoordCommitReceipt`].
 
 use crate::relation_event;
-use crate::sink::{FlushOutput, Sink, SinkError, TableChunk};
+use crate::sink::{Committed, Sink, SinkError, TableChunk, TablePiece};
 use async_trait::async_trait;
+use futures::channel::oneshot;
+use futures::future::BoxFuture;
+use futures::{StreamExt as _, TryStreamExt as _};
 use pg2iceberg_coord::{
     CommitBatch, CoordCommitReceipt, CoordError, Coordinator, MarkerInfo, OffsetClaim,
 };
@@ -33,9 +36,18 @@ pub enum PipelineError {
     Coord(#[from] CoordError),
     #[error("source: {0}")]
     Source(#[from] PgError),
+    /// A background flush ended without landing: its task went away.
+    #[error("background flush abandoned")]
+    Abandoned,
 }
 
 pub type Result<T> = std::result::Result<T, PipelineError>;
+
+/// Runs a flush on a task of its own ([`Pipeline::flush_in_background`]).
+pub type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
+
+/// Most chunks a flush, or a spill, uploads at once.
+const CONCURRENT_UPLOADS: usize = 8;
 
 /// Names a staged Parquet object in the blob store. Real production uses
 /// `IdGen::new_uuid` for unique suffixes; the sim uses a deterministic counter
@@ -166,6 +178,11 @@ pub struct Pipeline<C: Coordinator + ?Sized> {
     /// Where relation events' column defaults come from (see
     /// [`Self::read_column_defaults`]).
     column_defaults: Option<Arc<dyn ColumnDefaultSource>>,
+    /// Runs flushes in the background, when set
+    /// ([`Self::flush_in_background`]).
+    background: Option<Spawn>,
+    /// The flush running in the background, if any: what it lands with.
+    in_flight: Option<oneshot::Receiver<Result<Flushed>>>,
 }
 
 /// What the pipeline received from the replication stream since its last
@@ -219,7 +236,7 @@ impl Received {
     }
 }
 
-impl<C: Coordinator + ?Sized> Pipeline<C> {
+impl<C: Coordinator + ?Sized + 'static> Pipeline<C> {
     pub fn new(
         coord: Arc<C>,
         blob_store: Arc<dyn BlobStore>,
@@ -264,6 +281,8 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             open_tx: None,
             relations: BTreeMap::new(),
             column_defaults: None,
+            background: None,
+            in_flight: None,
         }
     }
 
@@ -275,6 +294,17 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     /// table only.
     pub fn track_replication(&mut self) {
         self.replication = true;
+    }
+
+    /// Run the flushes a commit or [`Self::start_flush`] starts on a task
+    /// of their own, through `spawn`, while the caller goes on processing:
+    /// otherwise encoding a flush's changes, uploading and claiming them
+    /// hold up the replication loop. One runs at a time, so claims stay in
+    /// commit order, and the slot may be acked past a flush only once it
+    /// lands ([`Self::flushed_lsn`]). The next flush due waits for it, and
+    /// so does [`Self::flush`].
+    pub fn flush_in_background(&mut self, spawn: Spawn) {
+        self.background = Some(spawn);
     }
 
     /// Stage each changed table's column defaults with its columns, read
@@ -365,9 +395,9 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
                 // transactions arrive.
                 if let Some(chunks) = self.spilled.remove(&xid) {
                     self.committed_spills.extend(chunks);
-                    self.flush().await?;
+                    self.flush_due().await?;
                 } else if self.sink.committed_rows() >= self.flush_threshold {
-                    self.flush().await?;
+                    self.flush_due().await?;
                 }
             }
             DecodedMessage::Change(mut evt) => {
@@ -568,40 +598,93 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
     }
 
     /// Drain all committed-but-unflushed transactions: encode → upload →
-    /// `claim_offsets` → advance `flushedLSN` via the receipt. No-op if
-    /// nothing is ready (no staged events, no markers awaiting emission,
-    /// and no keepalive past `flushedLSN`). Runs in a `pipeline.flush`
-    /// span, unless there's nothing to do.
+    /// `claim_offsets` → advance `flushedLSN` via the receipt — once the
+    /// flush in flight, if any, has landed. No-op if nothing is ready (no
+    /// staged events, no markers awaiting emission, and no keepalive past
+    /// `flushedLSN`). Runs in a `pipeline.flush` span, unless there's
+    /// nothing to do.
     pub async fn flush(&mut self) -> Result<Option<Lsn>> {
+        let landed = self.wait_flushed().await?;
+        match self.take_flush() {
+            Some(flush) => self.land(flush.await).map(Some),
+            None => Ok(landed),
+        }
+    }
+
+    /// Start a flush — in the background with
+    /// [`Self::flush_in_background`] — unless one is still running, which
+    /// this leaves be. One that failed fails this.
+    pub async fn start_flush(&mut self) -> Result<()> {
+        if let Some(in_flight) = self.in_flight.as_mut() {
+            let done = match in_flight.try_recv() {
+                Ok(None) => return Ok(()),
+                Ok(Some(done)) => done,
+                Err(oneshot::Canceled) => Err(PipelineError::Abandoned),
+            };
+            self.in_flight = None;
+            self.land(done)?;
+        }
+        self.begin_flush().await
+    }
+
+    /// Wait for the flush in flight, if any, to land; how far it flushed.
+    pub async fn wait_flushed(&mut self) -> Result<Option<Lsn>> {
+        let Some(in_flight) = self.in_flight.take() else {
+            return Ok(None);
+        };
+        let done = in_flight.await.unwrap_or(Err(PipelineError::Abandoned));
+        self.land(done).map(Some)
+    }
+
+    /// A flush a commit made due: after the one in flight lands.
+    async fn flush_due(&mut self) -> Result<()> {
+        self.wait_flushed().await?;
+        self.begin_flush().await
+    }
+
+    /// Start a flush, with none in flight: on a task of its own, or now.
+    async fn begin_flush(&mut self) -> Result<()> {
+        let Some(flush) = self.take_flush() else {
+            return Ok(());
+        };
+        match &self.background {
+            Some(spawn) => {
+                let (landed, in_flight) = oneshot::channel();
+                spawn(Box::pin(async move {
+                    // Unheard if the pipeline is gone.
+                    let _ = landed.send(flush.await);
+                }));
+                self.in_flight = Some(in_flight);
+            }
+            None => {
+                self.land(flush.await)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The next flush, owning what it stages and claims; `None` with
+    /// nothing to flush. The committed transactions leave the sink, but
+    /// the spills and markers stay queued until it lands ([`Self::land`]):
+    /// a flush that fails leaves them for the next.
+    fn take_flush(&mut self) -> Option<BoxFuture<'static, Result<Flushed>>> {
         if !self.sink.has_committed()
             && self.committed_spills.is_empty()
             && self.ready_markers.is_empty()
             && self.keepalive_lsn <= self.flushed_lsn()
         {
-            return Ok(None);
+            return None;
         }
-        let span = crate::work_span!(
-            "pipeline.flush",
-            rows = tracing::field::Empty,
-            lsn = tracing::field::Empty,
-        );
-        let out = self.flush_committed().instrument(span.clone()).await;
-        crate::spans::record_outcome(&span, &out);
-        out
-    }
-
-    async fn flush_committed(&mut self) -> Result<Option<Lsn>> {
-        let sink_output = self.sink.flush()?;
         // Markers can ride alone in an otherwise-empty flush — a tx
         // that contains only a marker INSERT (no user-data events)
         // still needs to write the marker into coord. Use the
         // marker's commit LSN as the batch's flushable_lsn in that
         // case.
-        let (chunks, data_lsn) = match sink_output {
-            Some(FlushOutput {
-                chunks,
+        let (pieces, data_lsn) = match self.sink.take_committed() {
+            Some(Committed {
+                pieces,
                 flushable_lsn,
-            }) => (chunks, flushable_lsn),
+            }) => (pieces, flushable_lsn),
             None if !self.ready_markers.is_empty() => {
                 let max_marker_lsn = self
                     .ready_markers
@@ -615,59 +698,71 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             // what we've flushed without anything for us: flush an empty
             // batch so the receipt advances `flushedLSN` over it.
             None if self.keepalive_lsn > self.flushed_lsn() => (Vec::new(), Lsn::ZERO),
-            None => return Ok(None),
+            None => return None,
         };
         // Every transaction that arrived before the last out-of-transaction
         // keepalive is in this batch or already flushed, so the batch also
-        // covers the WAL up to that keepalive's `wal_end`.
-        let flushable_lsn = data_lsn.max(self.keepalive_lsn);
-        if chunks.is_empty() {
-            // Possible if every committed tx was empty. Still advance the LSN
-            // (we know all tx commits up to this point are durable in PG, but
-            // there's nothing for the coord to register).
-            // We still go through claim_offsets with an empty batch
-            // so the receipt is the single LSN-advance code path.
-        }
-
-        // A committed transaction's spilled chunks precede its remainder.
-        let mut claims = self.committed_spills.clone();
-        for TableChunk { table, chunk } in chunks {
-            claims.push(self.stage(table, chunk).await?);
-        }
-
-        // Drain ready markers into the batch. claim_offsets writes
-        // them atomically with the log_index rows so a crash
-        // between staging and marker-record can't drop them.
-        // Markers stay in `ready_markers` until claim_offsets
-        // returns Ok — a failed flush retries them on the next
-        // call. Re-flushing markers is idempotent (uuid is the PK
-        // in coord's pending_markers).
-        let markers_for_batch = self.ready_markers.clone();
-        let span = tracing::Span::current();
-        span.record("rows", claims.iter().map(|c| c.record_count).sum::<u64>());
-        span.record("lsn", tracing::field::display(flushable_lsn));
-        let batch = CommitBatch {
-            claims,
-            flushable_lsn,
-            markers: markers_for_batch,
-            replicated_lsn: self.replication.then_some(flushable_lsn),
+        // covers the WAL up to that keepalive's `wal_end`. An empty batch
+        // still goes through claim_offsets, so the receipt is the single
+        // LSN-advance code path.
+        let job = FlushJob {
+            pieces,
+            // A committed transaction's spilled chunks precede its
+            // remainder.
+            spills: self.committed_spills.clone(),
+            // claim_offsets writes them atomically with the log_index
+            // rows, so a crash between staging and marker-record can't
+            // drop them. Re-flushing markers is idempotent (uuid is the
+            // PK in coord's pending_markers).
+            markers: self.ready_markers.clone(),
+            flushable_lsn: data_lsn.max(self.keepalive_lsn),
+            replication: self.replication,
+            coord: self.coord.clone(),
+            stager: self.stager(),
         };
-        let receipt = self.coord.claim_offsets(&batch).await?;
-        self.ready_markers.clear();
-        self.committed_spills.clear();
+        let span = crate::work_span!(
+            "pipeline.flush",
+            rows = tracing::field::Empty,
+            lsn = tracing::field::Empty,
+        );
+        Some(Box::pin(async move {
+            let out = job.run().instrument(span.clone()).await;
+            crate::spans::record_outcome(&span, &out);
+            out
+        }))
+    }
+
+    /// Account for a flush that ran: advance `flushedLSN` past it, take
+    /// what it claimed off the queues, and record it.
+    fn land(&mut self, done: Result<Flushed>) -> Result<Lsn> {
+        let Flushed {
+            receipt,
+            lsn,
+            spills,
+            markers,
+        } = done?;
+        self.committed_spills
+            .drain(..spills.min(self.committed_spills.len()));
+        self.ready_markers
+            .drain(..markers.min(self.ready_markers.len()));
         self.advance_flushed_lsn(receipt);
 
         // Emit per-flush counters + the flushed_lsn gauge.
         let no_labels = Labels::new();
         self.metrics
             .counter(names::PIPELINE_FLUSH_TOTAL, &no_labels, 1);
-        self.metrics.gauge(
-            names::PIPELINE_FLUSHED_LSN,
-            &no_labels,
-            flushable_lsn.0 as f64,
-        );
+        self.metrics
+            .gauge(names::PIPELINE_FLUSHED_LSN, &no_labels, lsn.0 as f64);
         std::mem::take(&mut self.received).record(self.metrics.as_ref());
-        Ok(Some(flushable_lsn))
+        Ok(lsn)
+    }
+
+    fn stager(&self) -> Stager {
+        Stager {
+            blob_store: self.blob_store.clone(),
+            namer: self.namer.clone(),
+            metrics: self.metrics.clone(),
+        }
     }
 
     /// Stage the open transaction `xid` in chunks once it buffers
@@ -698,32 +793,10 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         if self.sink.has_committed() {
             self.flush().await?;
         }
-        for TableChunk { table, chunk } in self.sink.spill_open_tx(xid)? {
-            let claim = self.stage(table, chunk).await?;
-            self.spilled.entry(xid).or_default().push(claim);
-        }
+        let chunks = self.sink.spill_open_tx(xid)?;
+        let claims = self.stager().stage(chunks).await?;
+        self.spilled.entry(xid).or_default().extend(claims);
         Ok(())
-    }
-
-    /// Upload one encoded chunk; returns the claim that registers it.
-    async fn stage(&self, table: TableIdent, chunk: EncodedChunk) -> Result<OffsetClaim> {
-        let path = self.namer.next_blob_path(&table).await;
-        let byte_size = chunk.bytes.len() as u64;
-        self.blob_store.put(&path, chunk.bytes).await?;
-        let table_labels = labels([("table", &table.to_string())]);
-        self.metrics.counter(
-            names::PIPELINE_ROWS_STAGED_TOTAL,
-            &table_labels,
-            chunk.row_count,
-        );
-        self.metrics
-            .counter(names::PIPELINE_STAGED_BYTES_TOTAL, &table_labels, byte_size);
-        Ok(OffsetClaim {
-            table,
-            record_count: chunk.record_count,
-            byte_size,
-            s3_path: path,
-        })
     }
 
     /// Graceful shutdown: drain whatever's already buffered into committed
@@ -768,6 +841,10 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
             ready_markers,
             open_tx,
             relations,
+            // Landed first: a session resets once its flushes have
+            // ([`Self::wait_flushed`]).
+            in_flight: _,
+            background: _,
             coord: _,
             blob_store: _,
             namer: _,
@@ -802,5 +879,115 @@ impl<C: Coordinator + ?Sized> Pipeline<C> {
         // safely durable downstream of the slot.
         self.flushed_lsn
             .store(receipt.flushable_lsn.0, Ordering::SeqCst);
+    }
+}
+
+/// A flush that landed: its receipt, and how much of each queue it
+/// claimed.
+struct Flushed {
+    receipt: CoordCommitReceipt,
+    lsn: Lsn,
+    spills: usize,
+    markers: usize,
+}
+
+/// What a flush stages and claims, owned, so it can run on a task of its
+/// own ([`Pipeline::flush_in_background`]).
+struct FlushJob<C: ?Sized> {
+    pieces: Vec<TablePiece>,
+    spills: Vec<OffsetClaim>,
+    markers: Vec<MarkerInfo>,
+    flushable_lsn: Lsn,
+    replication: bool,
+    coord: Arc<C>,
+    stager: Stager,
+}
+
+impl<C: Coordinator + ?Sized> FlushJob<C> {
+    async fn run(self) -> Result<Flushed> {
+        let Self {
+            pieces,
+            spills,
+            markers,
+            flushable_lsn,
+            replication,
+            coord,
+            stager,
+        } = self;
+        let chunks = pieces
+            .iter()
+            .map(TablePiece::encode)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // Freed here, where the flush runs.
+        drop(pieces);
+        let spill_count = spills.len();
+        let mut claims = spills;
+        claims.extend(stager.stage(chunks).await?);
+
+        let span = tracing::Span::current();
+        span.record("rows", claims.iter().map(|c| c.record_count).sum::<u64>());
+        span.record("lsn", tracing::field::display(flushable_lsn));
+        let batch = CommitBatch {
+            claims,
+            flushable_lsn,
+            markers,
+            replicated_lsn: replication.then_some(flushable_lsn),
+        };
+        let receipt = coord.claim_offsets(&batch).await?;
+        Ok(Flushed {
+            receipt,
+            lsn: flushable_lsn,
+            spills: spill_count,
+            markers: batch.markers.len(),
+        })
+    }
+}
+
+/// Uploads staged chunks.
+struct Stager {
+    blob_store: Arc<dyn BlobStore>,
+    namer: Arc<dyn BlobNamer>,
+    metrics: Arc<dyn Metrics>,
+}
+
+impl Stager {
+    /// Upload `chunks`, at most [`CONCURRENT_UPLOADS`] at once; the claims
+    /// that register them, in order.
+    async fn stage(&self, chunks: Vec<TableChunk>) -> Result<Vec<OffsetClaim>> {
+        // Named in order, as when they uploaded one at a time.
+        let mut named = Vec::with_capacity(chunks.len());
+        for TableChunk { table, chunk } in chunks {
+            let path = self.namer.next_blob_path(&table).await;
+            named.push((table, chunk, path));
+        }
+        futures::stream::iter(named)
+            .map(|(table, chunk, path)| self.upload(table, chunk, path))
+            .buffered(CONCURRENT_UPLOADS)
+            .try_collect()
+            .await
+    }
+
+    async fn upload(
+        &self,
+        table: TableIdent,
+        chunk: EncodedChunk,
+        path: String,
+    ) -> Result<OffsetClaim> {
+        let byte_size = chunk.bytes.len() as u64;
+        self.blob_store.put(&path, chunk.bytes).await?;
+        let table_labels = labels([("table", &table.to_string())]);
+        self.metrics.counter(
+            names::PIPELINE_ROWS_STAGED_TOTAL,
+            &table_labels,
+            chunk.row_count,
+        );
+        self.metrics
+            .counter(names::PIPELINE_STAGED_BYTES_TOTAL, &table_labels, byte_size);
+        Ok(OffsetClaim {
+            table,
+            record_count: chunk.record_count,
+            byte_size,
+            s3_path: path,
+        })
     }
 }

@@ -44,6 +44,12 @@ impl RollingWriter {
         self.events.len() >= self.max_rows
     }
 
+    /// The buffered events, leaving the buffer empty: for a caller that
+    /// encodes them itself, elsewhere.
+    pub fn take(&mut self) -> Vec<ChangeEvent> {
+        std::mem::take(&mut self.events)
+    }
+
     /// Encode the buffered events into a Parquet chunk and clear the buffer.
     /// Returns `None` when the buffer is empty so callers can blindly call
     /// flush on every cycle without paying for an empty Parquet file.

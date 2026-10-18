@@ -172,7 +172,7 @@ pub async fn run_snapshot<S, C>(
 ) -> Result<Lsn>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator + ?Sized,
+    C: Coordinator + ?Sized + 'static,
 {
     run_snapshot_chunked(source, coord, schemas, pipeline, DEFAULT_CHUNK_SIZE).await
 }
@@ -196,7 +196,7 @@ pub async fn run_snapshot_chunked<S, C>(
 ) -> Result<Lsn>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator + ?Sized,
+    C: Coordinator + ?Sized + 'static,
 {
     Snapshotter::new(coord)
         .with_chunk_size(chunk_size)
@@ -261,7 +261,7 @@ impl Snapshotter {
     ) -> Result<Lsn>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator + ?Sized,
+        C: Coordinator + ?Sized + 'static,
     {
         self.run_chunks(source, schemas, pipeline, None).await
     }
@@ -280,7 +280,7 @@ impl Snapshotter {
     ) -> Result<Lsn>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator + ?Sized,
+        C: Coordinator + ?Sized + 'static,
     {
         let snap_lsn = source.snapshot_lsn().await?;
 
@@ -386,7 +386,7 @@ impl Snapshotter {
     ) -> Result<Chunk>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator + ?Sized,
+        C: Coordinator + ?Sized + 'static,
     {
         let TableRun {
             schema,
@@ -552,7 +552,7 @@ pub async fn run_snapshot_phase<S, C>(
 ) -> Result<SnapshotPhaseOutcome>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator + ?Sized,
+    C: Coordinator + ?Sized + 'static,
 {
     // Filter out operator-supplied skip-list entries.
     let to_snapshot: Vec<TableSchema> = schemas

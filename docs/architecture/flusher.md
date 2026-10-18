@@ -51,10 +51,12 @@ The coordinator role is filled by the **source PostgreSQL database** itself. Thi
 
 **Append** (flusher → log):
 
-1. Upload staged Parquet files to S3 in parallel
+1. Upload staged Parquet files to S3 in parallel (up to 8 at a time)
 2. In a single PostgreSQL transaction: increment `log_seq` by the batch size, insert per-claim rows into `log_index` with the assigned offset range, S3 path, and `flushable_lsn`, and persist any blue-green markers
 
 Step 2 is atomic — a flush is either fully registered or not registered at all. Orphaned S3 files from failed step 2s are collected by [table maintenance](maintenance.md).
+
+While streaming, a flush — encoding its changes, both steps — runs on a task of its own, and the flusher goes on receiving the next changes meanwhile. One flush runs at a time, so batches register in commit order, and the slot is acked past a flush only once its step 2 commits. A flush that fails stops pg2iceberg, which resumes from the last registered batch on restart — or, if the replication stream dropped with it, the reconnected stream starts there — so none of its changes is skipped.
 
 **Read** (materializer ← log):
 

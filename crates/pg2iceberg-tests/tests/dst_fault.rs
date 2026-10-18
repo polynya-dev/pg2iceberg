@@ -2273,6 +2273,60 @@ async fn a_backlog_is_materialized_without_waiting_between_ticks() {
     );
 }
 
+/// A flush in the background that fails stops the run before the slot is
+/// acked past it — no later flush may claim, or its changes would be
+/// skipped for good — and the next run stages them: nothing is lost.
+#[tokio::test(start_paused = true)]
+async fn a_failed_background_flush_loses_nothing() {
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let script = db.clone();
+    let plan = stores.plan.clone();
+    let workload = tokio::spawn(async move {
+        // Past startup: the third claim from here fails.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        plan.fail(ops::COORD_CLAIM, [plan.counter(ops::COORD_CLAIM) + 2]);
+        for i in 5..55 {
+            let mut tx = script.begin_tx();
+            tx.insert(&ident(), row(i, i * 10));
+            tx.commit(Timestamp(0)).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    // Ends on its own, with the failure; or this, if it doesn't.
+    let failed = pg2iceberg_validate::run_logical_lifecycle(
+        sim_lifecycle_on(&db, &stores, every_second()),
+        Box::pin(tokio::time::sleep(Duration::from_secs(600))),
+    )
+    .await;
+    assert!(failed.is_err(), "ran on past a failed flush");
+    workload.await.unwrap();
+
+    stores.plan.clear_failures();
+    let mut restarted = sim_lifecycle_on(&db, &stores, every_second());
+    // Names of its own: the store refuses to overwrite the first run's.
+    restarted.blob_namer = Arc::new(CounterBlobNamer::new("s3://stage/restarted"));
+    restarted.materializer_namer = Arc::new(CounterMaterializerNamer::new("s3://table/restarted"));
+    pg2iceberg_validate::run_logical_lifecycle(
+        restarted,
+        Box::pin(tokio::time::sleep(Duration::from_secs(30))),
+    )
+    .await
+    .unwrap();
+    let rows = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 54);
+}
+
 // ── Observability ────────────────────────────────────────────────
 
 /// What a run records, as `/metrics` serves it: what it received, staged

@@ -3724,6 +3724,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures",
  "object_store",
  "pg2iceberg-coord",
  "pg2iceberg-core",
