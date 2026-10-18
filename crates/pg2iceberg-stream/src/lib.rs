@@ -10,6 +10,7 @@ use pg2iceberg_core::{ChangeEvent, ColumnName, Lsn, Op, Row, TableIdent, Timesta
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod binrow;
 pub mod blob;
 pub mod codec;
 pub mod prod;

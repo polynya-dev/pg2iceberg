@@ -8,30 +8,38 @@
 //! | 2 | `_lsn` | int64 | not null |
 //! | 3 | `_ts` | timestamp(μs, UTC) | not null |
 //! | 4 | `_unchanged_cols` | string | nullable |
-//! | 5 | `_data` | string | not null |
+//! | 5 | `_data` | binary | not null |
 //! | 6 | `_xid` | int64 | nullable |
-//! | 7 | `_moved_from` | string | nullable |
+//! | 7 | `_moved_from` | binary | nullable |
+//!
+//! `_data` and `_moved_from` hold rows in [`crate::binrow`]'s encoding,
+//! their columns numbered into the names the file's key-value metadata
+//! lists once ([`COLUMNS_KEY`]), beside the format's version
+//! ([`FORMAT_KEY`]). A file without it is from an earlier version, which
+//! staged rows as JSON objects: refused, not misread.
 //!
 //! `_moved_from` is the old key of an `Update` that moved its row to a new
 //! key with TOAST columns unchanged (the event's `before`, which the
-//! pipeline keeps only then). Files written before it existed lack the
-//! column; they read as if it were null.
+//! pipeline keeps only then).
 //!
 //! Field IDs are persisted in Parquet column metadata under `PARQUET:field_id`
 //! so Iceberg readers resolve columns by ID, not name.
-//!
-//! The JSON inside `_data` is currently the serde-tagged form of
-//! `Row`. Switching to a more interoperable encoding (plain JSON
-//! object keyed by column name) is a tracked follow-up.
 
+use crate::binrow::{decode_row, encode_row, ColumnNames};
 use crate::{MatEvent, Result, StreamError};
-use arrow_array::builder::{Int64Builder, StringBuilder, TimestampMicrosecondBuilder};
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow_array::builder::{
+    BinaryBuilder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
+};
+use arrow_array::{
+    Array, BinaryArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use pg2iceberg_core::{ChangeEvent, ColumnName, Lsn, Op, Row, Timestamp};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,6 +55,13 @@ const COL_DATA: &str = "_data";
 const COL_XID: &str = "_xid";
 const COL_MOVED_FROM: &str = "_moved_from";
 
+/// Key-value metadata naming the staged format's version, [`FORMAT`].
+pub const FORMAT_KEY: &str = "pg2iceberg.staged.format";
+/// Rows are [`crate::binrow`]-encoded, their columns listed once.
+pub const FORMAT: &str = "2";
+/// Key-value metadata listing the columns rows number, as a JSON array.
+pub const COLUMNS_KEY: &str = "pg2iceberg.staged.columns";
+
 /// Parquet schema for staged WAL files.
 ///
 /// Returned as an Arc so the writer/reader can share without cloning.
@@ -61,9 +76,9 @@ pub fn staged_schema() -> Arc<Schema> {
             3,
         ),
         field_with_id(COL_UNCHANGED_COLS, DataType::Utf8, true, 4),
-        field_with_id(COL_DATA, DataType::Utf8, false, 5),
+        field_with_id(COL_DATA, DataType::Binary, false, 5),
         field_with_id(COL_XID, DataType::Int64, true, 6),
-        field_with_id(COL_MOVED_FROM, DataType::Utf8, true, 7),
+        field_with_id(COL_MOVED_FROM, DataType::Binary, true, 7),
     ]))
 }
 
@@ -134,8 +149,9 @@ fn unchanged_cols_from_string(s: &str) -> Vec<ColumnName> {
     }
 }
 
-/// Build a `RecordBatch` from a slice of `ChangeEvent`s. Skips non-DML events.
-pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
+/// Build a `RecordBatch` from a slice of `ChangeEvent`s, and the column
+/// names its rows number. Skips non-DML events.
+pub fn encode_batch(events: &[ChangeEvent]) -> Result<(RecordBatch, Vec<String>)> {
     let schema = staged_schema();
     let cap = events.len();
 
@@ -143,19 +159,24 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
     let mut lsn_b = Int64Builder::with_capacity(cap);
     let mut ts_b = TimestampMicrosecondBuilder::with_capacity(cap).with_timezone(TIMESTAMP_TZ);
     let mut unchanged_b = StringBuilder::with_capacity(cap, cap * 16);
-    let mut data_b = StringBuilder::with_capacity(cap, cap * 64);
+    let mut data_b = BinaryBuilder::with_capacity(cap, cap * 64);
     let mut xid_b = Int64Builder::with_capacity(cap);
-    let mut moved_from_b = StringBuilder::new();
+    let mut moved_from_b = BinaryBuilder::new();
 
+    // A truncate's row: none.
+    let no_row = Row::new();
+    let mut columns = ColumnNames::default();
+    let mut row_bytes = Vec::with_capacity(256);
     for evt in events {
         let Some(op_str) = op_to_str(evt.op) else {
             continue;
         };
         // Truncate is the one staged op without a row payload — the
-        // sentinel encodes as empty-object JSON so decode round-trips
+        // sentinel encodes as an empty row so decode round-trips
         // cleanly. Every other DML op MUST carry a row.
-        let row_json = if matches!(evt.op, Op::Truncate) {
-            String::from("{}")
+        row_bytes.clear();
+        if matches!(evt.op, Op::Truncate) {
+            encode_row(&no_row, &mut columns, &mut row_bytes);
         } else {
             let Some(row) = staged_row(evt) else {
                 return Err(StreamError::Encode(format!(
@@ -163,9 +184,8 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
                     evt.op
                 )));
             };
-            serde_json::to_string(row)
-                .map_err(|e| StreamError::Encode(format!("encode _data: {e}")))?
-        };
+            encode_row(row, &mut columns, &mut row_bytes);
+        }
 
         op_b.append_value(op_str);
         lsn_b.append_value(evt.lsn.0 as i64);
@@ -174,16 +194,17 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
             Some(s) => unchanged_b.append_value(s),
             None => unchanged_b.append_null(),
         }
-        data_b.append_value(row_json);
+        data_b.append_value(&row_bytes);
         match evt.xid {
             Some(xid) => xid_b.append_value(xid as i64),
             None => xid_b.append_null(),
         }
         match (evt.op, &evt.before) {
-            (Op::Update, Some(before)) => moved_from_b.append_value(
-                serde_json::to_string(before)
-                    .map_err(|e| StreamError::Encode(format!("encode _moved_from: {e}")))?,
-            ),
+            (Op::Update, Some(before)) => {
+                row_bytes.clear();
+                encode_row(before, &mut columns, &mut row_bytes);
+                moved_from_b.append_value(&row_bytes);
+            }
             _ => moved_from_b.append_null(),
         }
     }
@@ -198,8 +219,10 @@ pub fn encode_batch(events: &[ChangeEvent]) -> Result<RecordBatch> {
         Arc::new(moved_from_b.finish()),
     ];
 
-    RecordBatch::try_new(schema, cols)
-        .map_err(|e| StreamError::Encode(format!("build record batch: {e}")))
+    let batch = RecordBatch::try_new(schema, cols)
+        .map_err(|e| StreamError::Encode(format!("build record batch: {e}")))?;
+    let names = columns.names().iter().map(|n| n.to_string()).collect();
+    Ok((batch, names))
 }
 
 /// Encode events into a single Parquet file (one row group). Returns the
@@ -216,7 +239,7 @@ pub struct EncodedChunk {
 }
 
 pub fn encode_chunk(events: &[ChangeEvent]) -> Result<EncodedChunk> {
-    let batch = encode_batch(events)?;
+    let (batch, columns) = encode_batch(events)?;
     let max_lsn = events
         .iter()
         .filter(|e| op_to_str(e.op).is_some())
@@ -229,8 +252,18 @@ pub fn encode_chunk(events: &[ChangeEvent]) -> Result<EncodedChunk> {
         .filter(|e| op_to_str(e.op).is_some() && e.op != Op::Relation)
         .count() as u64;
 
+    let columns = serde_json::to_string(&columns)
+        .map_err(|e| StreamError::Encode(format!("encode column names: {e}")))?;
+    // Rows are all distinct: a dictionary of them would only cost.
+    let props = WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new(FORMAT_KEY.into(), FORMAT.to_string()),
+            KeyValue::new(COLUMNS_KEY.into(), columns),
+        ]))
+        .set_column_dictionary_enabled(ColumnPath::from(COL_DATA), false)
+        .set_column_dictionary_enabled(ColumnPath::from(COL_MOVED_FROM), false)
+        .build();
     let mut buf = Vec::<u8>::new();
-    let props = WriterProperties::builder().build();
     {
         let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
             .map_err(|e| StreamError::Encode(format!("parquet writer: {e}")))?;
@@ -256,6 +289,21 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Vec<MatEvent>> {
     let owned = Bytes::copy_from_slice(bytes);
     let builder = ParquetRecordBatchReaderBuilder::try_new(owned)
         .map_err(|e| StreamError::Decode(format!("parquet reader: {e}")))?;
+    let metadata = builder.metadata().file_metadata().key_value_metadata();
+    let value = |key: &str| {
+        metadata
+            .and_then(|kv| kv.iter().find(|e| e.key == key))
+            .and_then(|e| e.value.as_deref())
+    };
+    if value(FORMAT_KEY) != Some(FORMAT) {
+        return Err(StreamError::Decode(format!(
+            "staged format {:?}, not {FORMAT}: staged by an earlier pg2iceberg, which \
+             must materialize it before this one runs",
+            value(FORMAT_KEY)
+        )));
+    }
+    let columns: Vec<ColumnName> = serde_json::from_str(value(COLUMNS_KEY).unwrap_or("[]"))
+        .map_err(|e| StreamError::Decode(format!("column names: {e}")))?;
     let reader = builder
         .build()
         .map_err(|e| StreamError::Decode(format!("parquet reader build: {e}")))?;
@@ -263,12 +311,16 @@ pub fn decode_chunk(bytes: &[u8]) -> Result<Vec<MatEvent>> {
     let mut out = Vec::new();
     for batch in reader {
         let batch = batch.map_err(|e| StreamError::Decode(format!("read batch: {e}")))?;
-        decode_batch_into(&batch, &mut out)?;
+        decode_batch_into(&batch, &columns, &mut out)?;
     }
     Ok(out)
 }
 
-fn decode_batch_into(batch: &RecordBatch, out: &mut Vec<MatEvent>) -> Result<()> {
+fn decode_batch_into(
+    batch: &RecordBatch,
+    columns: &[ColumnName],
+    out: &mut Vec<MatEvent>,
+) -> Result<()> {
     let n = batch.num_rows();
 
     let op_col = batch
@@ -291,21 +343,16 @@ fn decode_batch_into(batch: &RecordBatch, out: &mut Vec<MatEvent>) -> Result<()>
         })?;
     let data_col = batch
         .column_by_name(COL_DATA)
-        .and_then(|a| a.as_any().downcast_ref::<StringArray>())
+        .and_then(|a| a.as_any().downcast_ref::<BinaryArray>())
         .ok_or_else(|| StreamError::Decode(format!("missing or wrong type: {COL_DATA}")))?;
     let xid_col = batch
         .column_by_name(COL_XID)
         .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
         .ok_or_else(|| StreamError::Decode(format!("missing or wrong type: {COL_XID}")))?;
-    // Optional: absent from files written before it existed.
-    let moved_from_col = match batch.column_by_name(COL_MOVED_FROM) {
-        None => None,
-        Some(a) => Some(
-            a.as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| StreamError::Decode(format!("wrong type: {COL_MOVED_FROM}")))?,
-        ),
-    };
+    let moved_from_col = batch
+        .column_by_name(COL_MOVED_FROM)
+        .and_then(|a| a.as_any().downcast_ref::<BinaryArray>())
+        .ok_or_else(|| StreamError::Decode(format!("missing or wrong type: {COL_MOVED_FROM}")))?;
 
     for i in 0..n {
         let op_str = op_col.value(i);
@@ -318,21 +365,20 @@ fn decode_batch_into(batch: &RecordBatch, out: &mut Vec<MatEvent>) -> Result<()>
         } else {
             unchanged_cols_from_string(unchanged_col.value(i))
         };
-        let row: Row = serde_json::from_str(data_col.value(i))
-            .map_err(|e| StreamError::Decode(format!("decode _data at row {i}: {e}")))?;
+        let row = decode_row(data_col.value(i), columns)
+            .map_err(|e| StreamError::Decode(format!("_data at row {i}: {e}")))?;
         let xid = if xid_col.is_null(i) {
             None
         } else {
             Some(xid_col.value(i) as u32)
         };
-
-        let moved_from = match moved_from_col {
-            Some(c) if !c.is_null(i) => {
-                Some(serde_json::from_str(c.value(i)).map_err(|e| {
-                    StreamError::Decode(format!("decode _moved_from at row {i}: {e}"))
-                })?)
-            }
-            _ => None,
+        let moved_from = if moved_from_col.is_null(i) {
+            None
+        } else {
+            Some(
+                decode_row(moved_from_col.value(i), columns)
+                    .map_err(|e| StreamError::Decode(format!("_moved_from at row {i}: {e}")))?,
+            )
         };
 
         out.push(MatEvent {
@@ -519,20 +565,19 @@ mod tests {
         assert_eq!(decoded[1].moved_from, None);
     }
 
+    /// An earlier version staged rows as JSON objects, in files without
+    /// the format's version: refused, rather than misread.
     #[test]
-    fn files_without_moved_from_still_decode() {
-        // A file staged before `_moved_from` existed: the first six columns.
-        let batch = encode_batch(&[update(2, Some(row(&[("id", PgValue::Int4(1))])))]).unwrap();
-        let old = batch.project(&[0, 1, 2, 3, 4, 5]).unwrap();
+    fn files_of_an_earlier_format_are_refused() {
+        let (batch, _) =
+            encode_batch(&[update(2, Some(row(&[("id", PgValue::Int4(1))])))]).unwrap();
         let mut buf = Vec::new();
-        let mut w = ArrowWriter::try_new(&mut buf, old.schema(), None).unwrap();
-        w.write(&old).unwrap();
+        let mut w = ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
         w.close().unwrap();
 
-        let decoded = decode_chunk(&buf).unwrap();
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].moved_from, None);
-        assert_eq!(decoded[0].unchanged_cols, vec![ColumnName("note".into())]);
+        let err = decode_chunk(&buf).unwrap_err().to_string();
+        assert!(err.contains("earlier pg2iceberg"), "{err}");
     }
 
     #[test]

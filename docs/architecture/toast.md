@@ -27,9 +27,9 @@ Columns marked `u` have their names recorded in an `unchangedCols` list. Their v
 The flusher serializes the `unchangedCols` list into the `_unchanged_cols` column of the staged Parquet file as a comma-separated string:
 
 ```
-_op  │ _lsn │ _ts │ _unchanged_cols    │ _data
+_op  │ _lsn │ _ts │ _unchanged_cols    │ _data (decoded)
 ──────┼──────┼─────┼────────────────────┼────────────────────────
- U   │ 1234 │ ... │ body,attachment     │ {"id":42,"subject":"…"}
+ U   │ 1234 │ ... │ body,attachment     │ id=42, subject="…"
 ```
 
 The staging schema is fixed regardless of how many columns are unresolved — the materialized Iceberg table is unaffected at this stage.

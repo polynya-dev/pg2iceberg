@@ -30,7 +30,7 @@ When the WAL decoder encounters a schema change event, the pipeline:
 
 ## Staging schema is unaffected
 
-The staged Parquet files use a fixed schema regardless of the source table structure — user columns are always stored as JSON in the `_data` field. Schema evolution only affects how the materializer reads and writes to the Iceberg table, not how events are staged.
+The staged Parquet files use a fixed schema regardless of the source table structure — user columns are always stored, binary-encoded, in the `_data` field. Schema evolution only affects how the materializer reads and writes to the Iceberg table, not how events are staged.
 
 ## Column field IDs
 
