@@ -299,7 +299,7 @@ impl SnapshotSource for PgSnapshotSource {
         let mut out = Vec::with_capacity(chunk_size.min(64));
         for msg in messages {
             if let SimpleQueryMessage::Row(row) = msg {
-                let mut decoded: Row = BTreeMap::new();
+                let mut decoded: Row = Row::new();
                 for (idx, col) in cached.schema.columns.iter().enumerate() {
                     let raw: Option<&str> = row.try_get(idx).map_err(|e| {
                         SnapshotError::Source(format!("row.try_get({}, {idx}): {e}", col.name))

@@ -1404,8 +1404,10 @@ impl TxHandle {
                     let t = s.tables.get_mut(&table).expect("validated above");
                     for (name, default) in &t.defaults {
                         if let Some(value) = default {
-                            row.entry(ColumnName(name.clone()))
-                                .or_insert_with(|| value.clone());
+                            let name = ColumnName(name.clone());
+                            if !row.contains_key(&name) {
+                                row.insert(name, value.clone());
+                            }
                         }
                     }
                     let key = t.pk_key(&row)?;

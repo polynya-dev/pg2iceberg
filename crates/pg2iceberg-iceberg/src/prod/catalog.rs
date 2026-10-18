@@ -1378,15 +1378,15 @@ mod tests {
         // Prepare via TableWriter: 2 inserts into "us", 1 into "eu" → two
         // data chunks tagged with the right partition tuples.
         let w = TableWriter::new(s.clone());
-        let mut row_a = BTreeMap::new();
+        let mut row_a = pg2iceberg_core::Row::new();
         row_a.insert(ColumnName("id".into()), PgValue::Int4(1));
         row_a.insert(ColumnName("qty".into()), PgValue::Int8(10));
         row_a.insert(ColumnName("note".into()), PgValue::Text("us".into()));
-        let mut row_b = BTreeMap::new();
+        let mut row_b = pg2iceberg_core::Row::new();
         row_b.insert(ColumnName("id".into()), PgValue::Int4(2));
         row_b.insert(ColumnName("qty".into()), PgValue::Int8(20));
         row_b.insert(ColumnName("note".into()), PgValue::Text("us".into()));
-        let mut row_c = BTreeMap::new();
+        let mut row_c = pg2iceberg_core::Row::new();
         row_c.insert(ColumnName("id".into()), PgValue::Int4(3));
         row_c.insert(ColumnName("qty".into()), PgValue::Int8(30));
         row_c.insert(ColumnName("note".into()), PgValue::Text("eu".into()));

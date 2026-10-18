@@ -2471,7 +2471,7 @@ impl<C: Catalog> Materializer<C> {
         let rows: Vec<MaterializedRow> = pending
             .iter()
             .map(|m| {
-                let mut row: Row = std::collections::BTreeMap::new();
+                let mut row: Row = Row::new();
                 row.insert(ColumnName("uuid".into()), PgValue::Text(m.uuid.clone()));
                 row.insert(
                     ColumnName("table_name".into()),

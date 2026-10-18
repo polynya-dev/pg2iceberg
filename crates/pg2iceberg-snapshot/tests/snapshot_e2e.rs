@@ -22,7 +22,6 @@ use pg2iceberg_snapshot::{
     run_snapshot, run_snapshot_chunked, Result as SnapResult, SnapshotSource, Snapshotter,
 };
 use pollster::block_on;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const TABLE: &str = "orders";
@@ -65,14 +64,14 @@ fn col(n: &str) -> ColumnName {
 }
 
 fn row(id: i32, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(col("id"), PgValue::Int4(id));
     r.insert(col("qty"), PgValue::Int4(qty));
     r
 }
 
 fn pk_only(id: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(col("id"), PgValue::Int4(id));
     r
 }

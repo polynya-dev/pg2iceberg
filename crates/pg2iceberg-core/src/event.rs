@@ -1,9 +1,7 @@
 use crate::io::Timestamp;
 use crate::lsn::Lsn;
 use crate::schema::TableIdent;
-use crate::value::PgValue;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -19,9 +17,7 @@ pub enum Op {
     Truncate,
 }
 
-/// User-row representation. Ordered by column name so BTreeMap iteration is
-/// deterministic.
-pub type Row = BTreeMap<ColumnName, PgValue>;
+pub use crate::row::Row;
 
 /// Pseudo-xid base for synthetic snapshot transactions. Real PG xids are
 /// monotonic from 1; we reserve a high range so collisions are impossible.

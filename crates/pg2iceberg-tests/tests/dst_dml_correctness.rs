@@ -28,7 +28,6 @@ use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pollster::block_on;
-use std::collections::BTreeMap;
 
 const SLOT: &str = "p2i-slot";
 const PUB: &str = "p2i-pub";
@@ -65,7 +64,7 @@ fn schema() -> TableSchema {
 }
 
 fn row(id: i32, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
     r
@@ -378,7 +377,7 @@ fn alter_table_drop_column_keeps_its_values_renamed() {
     h.db.alter_drop_column(&ident(), "qty").unwrap();
 
     // Insert a row WITHOUT the dropped column.
-    let mut row_after = BTreeMap::new();
+    let mut row_after = Row::new();
     row_after.insert(ColumnName("id".into()), PgValue::Int4(2));
     let mut tx = h.db.begin_tx();
     tx.insert(&ident(), row_after);

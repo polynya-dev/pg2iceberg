@@ -8,6 +8,7 @@ pub mod io;
 pub mod lsn;
 pub mod metrics;
 pub mod partition;
+pub mod row;
 pub mod schema;
 pub mod typemap;
 pub mod value;

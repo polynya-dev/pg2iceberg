@@ -99,14 +99,14 @@ fn markers_schema() -> TableSchema {
 // ── row helpers ────────────────────────────────────────────────────
 
 fn account_row(id: i32, balance: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("balance".into()), PgValue::Int4(balance));
     r
 }
 
 fn marker_row(uuid: &str) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("uuid".into()), PgValue::Text(uuid.into()));
     r
 }

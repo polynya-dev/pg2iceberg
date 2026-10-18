@@ -26,7 +26,6 @@ use pg2iceberg_sim::postgres::SimPostgres;
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::BlobStore;
 use pollster::block_on;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 fn ident(name: &str) -> TableIdent {
@@ -61,7 +60,7 @@ fn orders_schema() -> TableSchema {
 }
 
 fn row(pairs: &[(&str, PgValue)]) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     for (k, v) in pairs {
         r.insert(ColumnName((*k).into()), v.clone());
     }

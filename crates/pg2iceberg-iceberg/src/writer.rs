@@ -971,14 +971,14 @@ mod tests {
     }
 
     fn row(id: i32, qty: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r.insert(col("qty"), PgValue::Int4(qty));
         r
     }
 
     fn pk_only(id: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r
     }
@@ -1217,7 +1217,7 @@ mod tests {
             pg_schema: None,
         };
         let w = TableWriter::new(schema);
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(42));
         r.insert(col("name"), PgValue::Text("alice".into()));
         r.insert(col("active"), PgValue::Bool(true));
@@ -1266,7 +1266,7 @@ mod tests {
     #[test]
     fn null_in_non_nullable_column_errors() {
         let w = TableWriter::new(schema_id_qty());
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(1));
         // qty omitted entirely.
         let err = w
@@ -1326,7 +1326,7 @@ mod tests {
     }
 
     fn row_with_region(id: i32, region: &str) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r.insert(col("region"), PgValue::Text(region.into()));
         r
@@ -1410,7 +1410,7 @@ mod tests {
     }
 
     fn row_with_ts(id: i32, micros: i64) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r.insert(
             col("created_at"),
@@ -1728,7 +1728,7 @@ mod tests {
         let w = TableWriter::new(schema);
         let rows: Vec<MaterializedRow> = (1..=20)
             .map(|i| {
-                let mut r = BTreeMap::new();
+                let mut r = Row::new();
                 r.insert(col("id"), PgValue::Int4(i));
                 MaterializedRow {
                     op: Op::Insert,
@@ -1789,7 +1789,7 @@ mod tests {
         };
         let w = TableWriter::new(schema);
         let row = |id: i32, name: &str| {
-            let mut r = BTreeMap::new();
+            let mut r = Row::new();
             r.insert(col("id"), PgValue::Int4(id));
             r.insert(col("name"), PgValue::Text(name.into()));
             MaterializedRow {
@@ -1853,7 +1853,7 @@ mod tests {
             pg_schema: None,
         };
         let w = TableWriter::new(schema);
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(1));
         r.insert(col("d"), PgValue::Date(DaysSinceEpoch(20_000)));
         let p = w

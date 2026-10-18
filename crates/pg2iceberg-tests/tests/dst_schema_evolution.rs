@@ -205,7 +205,7 @@ fn type_promotion_int_to_long_succeeds() {
         .unwrap();
 
     let mut tx = h.db.begin_tx();
-    let mut row = BTreeMap::new();
+    let mut row = Row::new();
     row.insert(col("id"), PgValue::Int4(1));
     row.insert(col("qty"), PgValue::Int8(9_000_000_000));
     tx.insert(&s.ident, row);
@@ -246,7 +246,7 @@ fn type_promotion_float_to_double_succeeds() {
         .unwrap();
 
     let mut tx = h.db.begin_tx();
-    let mut row = BTreeMap::new();
+    let mut row = Row::new();
     row.insert(col("id"), PgValue::Int4(1));
     row.insert(col("price"), PgValue::Float8(std::f64::consts::PI));
     tx.insert(&s.ident, row);
@@ -753,7 +753,7 @@ fn add_column_then_insert_uses_new_column() {
     .unwrap();
 
     let mut tx = h.db.begin_tx();
-    let mut row: Row = BTreeMap::new();
+    let mut row: Row = Row::new();
     row.insert(col("id"), PgValue::Int4(1));
     row.insert(col("qty"), PgValue::Int4(10));
     row.insert(col("note"), PgValue::Text("hello".into()));
@@ -980,7 +980,7 @@ fn long_running_evolution_keeps_pg_and_iceberg_in_sync() {
         }
 
         // ── Insert one row with the current PG schema ──
-        let mut row: Row = BTreeMap::new();
+        let mut row: Row = Row::new();
         row.insert(col("id"), PgValue::Int4(step + 1));
         for (cname, cty) in &pg_cols {
             if cname == "id" {

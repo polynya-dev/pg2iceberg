@@ -68,7 +68,7 @@ pub fn read_data_file_by_field_id(bytes: Bytes, cols: &[ColumnSchema]) -> Result
             })
             .collect();
         for row_idx in 0..batch.num_rows() {
-            let mut row: Row = BTreeMap::new();
+            let mut row: Row = Row::new();
             for col in cols {
                 let key = ColumnName(col.name.clone());
                 let value = match by_id.get(&col.field_id).map(|&i| batch.column(i)) {
@@ -256,7 +256,7 @@ fn decode_batch(batch: &RecordBatch, cols: &[ColumnSchema]) -> Result<Vec<Row>> 
     let arrays = resolve_columns(batch, cols);
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
-        let mut row: Row = BTreeMap::new();
+        let mut row: Row = Row::new();
         for (col, arr) in cols.iter().zip(&arrays) {
             let key = ColumnName(col.name.clone());
             // A file written before the column was added doesn't have
@@ -396,7 +396,7 @@ mod tests {
     }
 
     fn row(id: i32, qty: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r.insert(col("qty"), PgValue::Int4(qty));
         r
@@ -509,7 +509,7 @@ mod tests {
             pg_schema: None,
         };
         let w = TableWriter::new(schema.clone());
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(7));
         r.insert(col("note"), PgValue::Null);
         let prepared = w

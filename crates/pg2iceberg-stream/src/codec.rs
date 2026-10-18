@@ -399,7 +399,6 @@ fn decode_batch_into(
 mod tests {
     use super::*;
     use pg2iceberg_core::{Namespace, PgValue, TableIdent};
-    use std::collections::BTreeMap;
 
     fn ident() -> TableIdent {
         TableIdent {
@@ -409,7 +408,7 @@ mod tests {
     }
 
     fn row(pairs: &[(&str, PgValue)]) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         for (k, v) in pairs {
             r.insert(ColumnName((*k).into()), v.clone());
         }

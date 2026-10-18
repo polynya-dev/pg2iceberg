@@ -23,7 +23,6 @@ use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_stream::{BlobStore, ObjectStoreBlobStore};
 use pollster::block_on;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 fn ident() -> TableIdent {
@@ -62,7 +61,7 @@ fn col(n: &str) -> ColumnName {
 }
 
 fn row(id: i32, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(col("id"), PgValue::Int4(id));
     r.insert(col("qty"), PgValue::Int4(qty));
     r
@@ -125,7 +124,7 @@ fn run_workload_and_read(blob_store: Arc<dyn BlobStore>) -> Vec<Row> {
     }
     {
         let mut tx = db.begin_tx();
-        let mut pk = BTreeMap::new();
+        let mut pk = Row::new();
         pk.insert(col("id"), PgValue::Int4(3));
         tx.delete(&ident(), pk);
         tx.commit(Timestamp(0)).unwrap();

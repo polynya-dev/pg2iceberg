@@ -423,7 +423,6 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn key(values: &[PgValue]) -> PkKey {
         let cols: Vec<ColumnName> = (0..values.len())
@@ -587,7 +586,7 @@ mod tests {
 
     #[test]
     fn missing_pk_columns_are_skipped_like_pk_key() {
-        let row: Row = BTreeMap::from([(ColumnName("a".into()), PgValue::Int4(1))]);
+        let row: Row = Row::from([(ColumnName("a".into()), PgValue::Int4(1))]);
         let with_missing = PkKey::from_row(&row, &[ColumnName("a".into()), ColumnName("b".into())]);
         assert_eq!(with_missing, key(&[PgValue::Int4(1)]));
     }

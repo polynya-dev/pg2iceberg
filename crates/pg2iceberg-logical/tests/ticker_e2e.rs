@@ -26,7 +26,6 @@ use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pg2iceberg_validate::{InvariantWatcher, WatcherInputs};
 use pollster::block_on;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,7 +65,7 @@ fn col(n: &str) -> ColumnName {
 }
 
 fn row(id: i32, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(col("id"), PgValue::Int4(id));
     r.insert(col("qty"), PgValue::Int4(qty));
     r

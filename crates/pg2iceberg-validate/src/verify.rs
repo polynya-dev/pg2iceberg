@@ -219,7 +219,7 @@ mod tests {
     use pg2iceberg_sim::postgres::SimPostgres;
     use pg2iceberg_snapshot::run_snapshot;
     use pollster::block_on;
-    use std::collections::BTreeMap;
+
     use std::sync::Arc;
 
     fn ident() -> TableIdent {
@@ -258,7 +258,7 @@ mod tests {
     }
 
     fn row(id: i32, qty: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r.insert(col("qty"), PgValue::Int4(qty));
         r
@@ -366,7 +366,7 @@ mod tests {
         // Delete a row from PG without re-running pipeline; Iceberg still
         // shows it.
         let mut tx = db.begin_tx();
-        let mut pk = BTreeMap::new();
+        let mut pk = Row::new();
         pk.insert(col("id"), PgValue::Int4(2));
         tx.delete(&ident(), pk);
         tx.commit(Timestamp(0)).unwrap();

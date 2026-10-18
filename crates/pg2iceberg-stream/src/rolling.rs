@@ -68,7 +68,6 @@ mod tests {
     use super::*;
     use crate::codec::decode_chunk;
     use pg2iceberg_core::{ColumnName, Lsn, Namespace, Op, PgValue, Row, TableIdent, Timestamp};
-    use std::collections::BTreeMap;
 
     fn ident() -> TableIdent {
         TableIdent {
@@ -78,7 +77,7 @@ mod tests {
     }
 
     fn row_with(id: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(ColumnName("id".into()), PgValue::Int4(id));
         r
     }

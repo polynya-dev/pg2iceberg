@@ -52,7 +52,7 @@ use pg2iceberg_sim::fault::{ops, FaultPlan, FaultyBlobStore, FaultyCatalog, Faul
 use pg2iceberg_sim::postgres::{SimPgClient, SimPostgres};
 use pg2iceberg_validate::{LogicalLifecycle, SnapshotSourceFactory};
 use proptest::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -160,7 +160,7 @@ fn wide_row(id: i32, gen: u64, payload_size: usize) -> Row {
     let payload: Vec<u8> = (0..payload_size)
         .map(|i| (h.wrapping_add(i as u64) & 0xFF) as u8)
         .collect();
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("qty_l".into()), PgValue::Int8(h as i64));
     // Float8 with values small enough that the staged-event JSON
@@ -186,7 +186,7 @@ fn wide_row(id: i32, gen: u64, payload_size: usize) -> Row {
 }
 
 fn pk_only(id: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r
 }

@@ -41,7 +41,7 @@ use pg2iceberg_logical::{CounterMaterializerNamer, Materializer, Pipeline, Sched
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::postgres::{SimPgClient, SimPostgres};
 use pg2iceberg_validate::{LogicalLifecycle, SnapshotSourceFactory};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,7 +88,7 @@ fn schema_for(ident: TableIdent) -> TableSchema {
 }
 
 fn row(id: i32, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
     r

@@ -95,21 +95,21 @@ fn pk_cols() -> Vec<ColumnName> {
 }
 
 fn row_id_qty(id: i32, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
     r
 }
 
 fn row_id_region(id: i32, region: &str) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("region".into()), PgValue::Text(region.into()));
     r
 }
 
 fn pk_only(id: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r
 }
@@ -984,7 +984,7 @@ fn older_files_are_rewritten_in_the_current_schema() {
         nullable: true,
         is_primary_key: false,
     });
-    let mut three = BTreeMap::new();
+    let mut three = Row::new();
     three.insert(ColumnName("id".into()), PgValue::Int4(3));
     three.insert(ColumnName("qty".into()), PgValue::Int8(30));
     three.insert(ColumnName("note".into()), PgValue::Text("three".into()));

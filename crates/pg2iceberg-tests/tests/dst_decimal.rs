@@ -31,7 +31,6 @@ use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pollster::block_on;
-use std::collections::BTreeMap;
 
 const SLOT: &str = "p2i-slot";
 const PUB: &str = "p2i-pub";
@@ -90,7 +89,7 @@ fn dec(unscaled: i128, scale: u8) -> Decimal {
 }
 
 fn row(id: i32, d: Decimal) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("amount".into()), PgValue::Numeric(d));
     r
