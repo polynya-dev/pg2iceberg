@@ -63,17 +63,20 @@ pub type Result<T> = std::result::Result<T, SnapshotError>;
 ///
 /// Chunked reads keep peak memory bounded for large tables. Implementations
 /// must:
-/// - Return rows sorted by canonical PK ASC.
+/// - Return rows sorted by their primary key ASC, in an order of the
+///   source's choosing.
 /// - Be stable across calls (same snapshot view).
-/// - Honor `after_pk_key` as a strict lower bound; rows whose canonical PK
-///   key (JSON form, see `pg2iceberg_iceberg::pk_key`) is `<=` the bound
-///   must be excluded.
+/// - Honor `after_pk_key` as a strict lower bound: it is [`Self::cursor`]
+///   of the last row of a chunk, and rows up to it in that order must be
+///   excluded.
 /// - Cap output at `chunk_size`. Returning fewer rows is allowed only at
 ///   end-of-table.
 ///
 /// `after_pk_key` is a string (rather than a `Row`) because resumable
 /// snapshot persists the key into the checkpoint — it can't reconstruct a
 /// `Row` without the schema, and a string is the canonical wire form.
+/// A cursor persisted by an earlier version must still resume where it
+/// left off.
 #[async_trait]
 pub trait SnapshotSource: Send + Sync {
     async fn snapshot_lsn(&self) -> Result<Lsn>;
@@ -83,6 +86,20 @@ pub trait SnapshotSource: Send + Sync {
         chunk_size: usize,
         after_pk_key: Option<&str>,
     ) -> Result<Vec<Row>>;
+
+    /// The `after_pk_key` that reads on past `last`, the last row of the
+    /// chunk of `ident` read after `after`; `pk_cols` is the table's
+    /// primary key. Default: `last`'s canonical PK key (JSON form, see
+    /// `pg2iceberg_iceberg::pk_key`).
+    fn cursor(
+        &self,
+        _ident: &TableIdent,
+        _after: Option<&str>,
+        last: &Row,
+        pk_cols: &[ColumnName],
+    ) -> String {
+        pk_key(last, pk_cols)
+    }
 }
 
 pub use pg2iceberg_core::SNAPSHOT_XID_BASE;
@@ -406,7 +423,7 @@ impl Snapshotter {
         }
 
         let last_in_chunk = chunk.last().unwrap();
-        let new_key = pk_key(last_in_chunk, pk_cols);
+        let new_key = source.cursor(&pg_ident, last_pk_key, last_in_chunk, pk_cols);
 
         if let Some(prev) = last_pk_key {
             if new_key.as_str() == prev {

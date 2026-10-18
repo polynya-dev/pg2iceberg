@@ -16,6 +16,10 @@
 //! against the in-flight transaction. All chunks see a consistent view
 //! because the tx stays open for the lifetime of the source.
 //!
+//! `pk_cols` are in the primary key index's order, so the index serves
+//! each chunk; in another order Postgres scans and sorts the whole table
+//! for every chunk.
+//!
 //! ## Why a separate connection
 //!
 //! The replication-mode connection that drives the slot can't run
@@ -58,8 +62,10 @@ use pg2iceberg_core::value::{
     DaysSinceEpoch, Decimal as CoreDecimal, PgValue, TimeMicros, TimestampMicros,
 };
 use pg2iceberg_core::{ColumnName, ColumnSchema, Lsn, Row, TableIdent, TableSchema};
+use pg2iceberg_iceberg::pk_key;
 use pg2iceberg_pg::prod::value_decode::decode_text;
 use pg2iceberg_snapshot::{Result as SnapshotResult, SnapshotError, SnapshotSource};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
@@ -70,7 +76,29 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 #[derive(Clone)]
 struct CachedSchema {
     schema: TableSchema,
+    /// The primary key in the schema's column order: the order of the
+    /// canonical PK key, and of a cursor from before chunks were read in
+    /// `index_order`.
     pk_cols: Vec<ColumnName>,
+    /// The primary key in its index's order, when that isn't `pk_cols`'s.
+    /// Chunks are read in this order, which the index serves; in any other
+    /// order each chunk scans and sorts the whole table.
+    index_order: Option<Vec<ColumnName>>,
+}
+
+/// The cursor of a table read in its index order: the last row's key, in
+/// that order. A cursor that's a bare list of values is in `pk_cols`'s.
+#[derive(Serialize, Deserialize)]
+struct OrderedCursor {
+    order: Vec<ColumnName>,
+    after: Vec<PgValue>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Cursor {
+    Ordered(OrderedCursor),
+    Canonical(Vec<PgValue>),
 }
 
 pub struct PgSnapshotSource {
@@ -140,6 +168,16 @@ impl PgSnapshotSource {
                     s.ident
                 );
             }
+            let index_order = pk_index_order(&conn.client, &s.pg_ident())
+                .await
+                .with_context(|| format!("primary key index of {}", s.pg_ident()))?;
+            // A configured key that isn't the table's primary key has no
+            // index of its order to read in.
+            let index_order = index_order.filter(|order| {
+                *order != pk_cols
+                    && order.len() == pk_cols.len()
+                    && order.iter().all(|c| pk_cols.contains(c))
+            });
             // Key by PG-side ident — `read_chunk` is called with the
             // PG identifier (the snapshotter passes `s.pg_ident()`),
             // and our SELECT issues against PG. The Iceberg-side
@@ -149,6 +187,7 @@ impl PgSnapshotSource {
                 CachedSchema {
                     schema: s.clone(),
                     pk_cols,
+                    index_order,
                 },
             );
         }
@@ -191,8 +230,33 @@ impl SnapshotSource for PgSnapshotSource {
             .map(|c| quote_ident(&c.name))
             .collect();
         let cols_csv = cols_sql.join(", ");
-        let pk_csv = cached
-            .pk_cols
+        // Read on in the cursor's order; a first chunk in the index's.
+        let (order, after) = match after_pk_key {
+            None => (
+                cached.index_order.clone().unwrap_or(cached.pk_cols.clone()),
+                None,
+            ),
+            Some(after) => {
+                let cursor = serde_json::from_str(after).map_err(|e| {
+                    SnapshotError::Source(format!("decode after_pk_key {after:?}: {e}"))
+                })?;
+                let (order, values) = match cursor {
+                    Cursor::Canonical(values) => (cached.pk_cols.clone(), values),
+                    Cursor::Ordered(c) => (c.order, c.after),
+                };
+                if order.len() != cached.pk_cols.len()
+                    || !order.iter().all(|c| cached.pk_cols.contains(c))
+                    || values.len() != order.len()
+                {
+                    return Err(SnapshotError::Source(format!(
+                        "after_pk_key {after:?} isn't a key of the primary key {:?}",
+                        cached.pk_cols
+                    )));
+                }
+                (order, Some(values))
+            }
+        };
+        let pk_csv = order
             .iter()
             .map(|c| quote_ident(&c.0))
             .collect::<Vec<_>>()
@@ -200,29 +264,20 @@ impl SnapshotSource for PgSnapshotSource {
 
         let table_sql = qualified_table(ident);
 
-        let where_sql = if let Some(after) = after_pk_key {
-            let parsed: Vec<PgValue> = serde_json::from_str(after).map_err(|e| {
-                SnapshotError::Source(format!("decode after_pk_key {after:?}: {e}"))
-            })?;
-            if parsed.len() != cached.pk_cols.len() {
-                return Err(SnapshotError::Source(format!(
-                    "after_pk_key has {} values but PK has {} columns",
-                    parsed.len(),
-                    cached.pk_cols.len()
-                )));
+        let where_sql = match after {
+            Some(values) => {
+                let lits: Vec<String> = values
+                    .iter()
+                    .map(pg_value_to_sql_literal)
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(SnapshotError::Source)?;
+                format!(
+                    " WHERE ({pk}) > ({vals})",
+                    pk = pk_csv,
+                    vals = lits.join(", ")
+                )
             }
-            let lits: Vec<String> = parsed
-                .iter()
-                .map(pg_value_to_sql_literal)
-                .collect::<std::result::Result<_, _>>()
-                .map_err(SnapshotError::Source)?;
-            format!(
-                " WHERE ({pk}) > ({vals})",
-                pk = pk_csv,
-                vals = lits.join(", ")
-            )
-        } else {
-            String::new()
+            None => String::new(),
         };
 
         let q = format!(
@@ -260,6 +315,54 @@ impl SnapshotSource for PgSnapshotSource {
         }
         Ok(out)
     }
+
+    fn cursor(
+        &self,
+        ident: &TableIdent,
+        after: Option<&str>,
+        last: &Row,
+        pk_cols: &[ColumnName],
+    ) -> String {
+        // The order `last`'s chunk was read in (see `read_chunk`).
+        let order = match after.map(serde_json::from_str::<Cursor>) {
+            Some(Ok(Cursor::Ordered(c))) => Some(c.order),
+            Some(_) => None,
+            None => self.schemas.get(ident).and_then(|c| c.index_order.clone()),
+        };
+        match order {
+            Some(order) => serde_json::to_string(&OrderedCursor {
+                after: order.iter().filter_map(|c| last.get(c).cloned()).collect(),
+                order,
+            })
+            .expect("PgValue is Serializable"),
+            None => pk_key(last, pk_cols),
+        }
+    }
+}
+
+/// The columns of `ident`'s primary key in its index's order, or `None`
+/// without one.
+async fn pk_index_order(client: &Client, ident: &TableIdent) -> Result<Option<Vec<ColumnName>>> {
+    let q = format!(
+        "SELECT a.attname \
+         FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+         WHERE i.indrelid = {table}::regclass AND i.indisprimary \
+         ORDER BY array_position(i.indkey, a.attnum)",
+        table = quote_lit(&qualified_table(ident)),
+    );
+    let mut cols = Vec::new();
+    for msg in client
+        .simple_query(&q)
+        .await
+        .with_context(|| format!("simple_query {q:?}"))?
+    {
+        if let SimpleQueryMessage::Row(row) = msg {
+            let name: Option<&str> = row.try_get(0).context("pg_attribute.attname")?;
+            cols.extend(name.map(|n| ColumnName(n.to_string())));
+        }
+    }
+    Ok((!cols.is_empty()).then_some(cols))
 }
 
 fn decode_column(col: &ColumnSchema, raw_text: &str) -> SnapshotResult<PgValue> {
