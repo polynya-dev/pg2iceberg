@@ -36,9 +36,16 @@ fn pg_value() -> impl Strategy<Value = PgValue> {
         any::<i64>().prop_map(|t| PgValue::TimestampTz(TimestampMicros(t))),
         prop::array::uniform16(any::<u8>()).prop_map(PgValue::Uuid),
         prop::collection::vec(any::<u8>(), 0..16).prop_map(PgValue::Bytea),
-        "[a-zA-Z0-9_]{0,16}".prop_map(PgValue::Text),
-        "[a-zA-Z0-9_]{0,16}".prop_map(PgValue::Json),
-        "[a-zA-Z0-9_]{0,16}".prop_map(PgValue::Jsonb),
+        "\\PC{0,16}".prop_map(PgValue::Text),
+        "\\PC{0,16}".prop_map(PgValue::Json),
+        "\\PC{0,16}".prop_map(PgValue::Jsonb),
+        // NaN only because it isn't equal to itself.
+        any::<f32>()
+            .prop_filter("not NaN", |x| !x.is_nan())
+            .prop_map(PgValue::Float4),
+        any::<f64>()
+            .prop_filter("not NaN", |x| !x.is_nan())
+            .prop_map(PgValue::Float8),
         (prop::collection::vec(any::<u8>(), 0..8), 0u8..=18).prop_map(|(b, s)| PgValue::Numeric(
             Decimal {
                 unscaled_be_bytes: b,
