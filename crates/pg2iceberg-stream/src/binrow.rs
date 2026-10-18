@@ -8,7 +8,7 @@
 
 use crate::{Result, StreamError};
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimeMicros, TimestampMicros};
-use pg2iceberg_core::{ColumnName, PgValue, Row};
+use pg2iceberg_core::{ColumnName, Columns, PgValue, Row};
 use std::collections::HashMap;
 
 const NULL: u8 = 0;
@@ -35,6 +35,9 @@ const JSONB: u8 = 17;
 pub(crate) struct ColumnNames<'a> {
     index: HashMap<&'a str, u64>,
     names: Vec<&'a str>,
+    /// The last row's columns and their numbers: rows sharing them reuse
+    /// them.
+    last: Option<(Columns, Vec<u64>)>,
 }
 
 impl<'a> ColumnNames<'a> {
@@ -53,36 +56,101 @@ impl<'a> ColumnNames<'a> {
     pub(crate) fn names(&self) -> &[&'a str] {
         &self.names
     }
+
+    /// The numbers of `row`'s columns.
+    fn numbers(&mut self, row: &'a Row) -> &[u64] {
+        if !self
+            .last
+            .as_ref()
+            .is_some_and(|(columns, _)| columns.same(row.columns()))
+        {
+            let numbers = row.keys().map(|name| self.index(&name.0)).collect();
+            self.last = Some((row.columns().clone(), numbers));
+        }
+        &self.last.as_ref().expect("set above").1
+    }
 }
 
 /// Append `row` to `out`, numbering its columns in `columns`.
 pub(crate) fn encode_row<'a>(row: &'a Row, columns: &mut ColumnNames<'a>, out: &mut Vec<u8>) {
     put_varint(out, row.len() as u64);
-    for (name, value) in row {
-        put_varint(out, columns.index(&name.0));
+    for (&number, value) in columns.numbers(row).iter().zip(row.values()) {
+        put_varint(out, number);
         encode_value(value, out);
     }
 }
 
-/// The row `bytes` encode, its columns numbered as in `names`.
-pub(crate) fn decode_row(bytes: &[u8], names: &[ColumnName]) -> Result<Row> {
-    let mut r = Reader(bytes);
-    let mut row = Row::new();
-    for _ in 0..r.varint()? {
-        let i = r.varint()?;
-        let name = usize::try_from(i)
-            .ok()
-            .and_then(|i| names.get(i))
-            .ok_or_else(|| StreamError::Decode(format!("column {i} of {}", names.len())))?;
-        row.insert(name.clone(), r.value()?);
+/// Decodes a chunk's rows, its columns numbered as in its names. Rows
+/// with the same columns — nearly all of a chunk's — share their names
+/// ([`Columns`]): a row allocates its values only.
+pub(crate) struct RowDecoder {
+    names: Vec<ColumnName>,
+    /// Each set of columns rows have had, by the indices they list them
+    /// by: their names, and where each listed value goes in them.
+    shapes: HashMap<Vec<u64>, (Columns, Vec<usize>)>,
+    /// The last row's: rows mostly repeat it.
+    last: Option<(Vec<u64>, Columns, Vec<usize>)>,
+    pairs: Vec<(u64, PgValue)>,
+}
+
+impl RowDecoder {
+    pub(crate) fn new(names: Vec<ColumnName>) -> Self {
+        Self {
+            names,
+            shapes: HashMap::new(),
+            last: None,
+            pairs: Vec::new(),
+        }
     }
-    if !r.0.is_empty() {
-        return Err(StreamError::Decode(format!(
-            "{} bytes past the row's end",
-            r.0.len()
-        )));
+
+    /// The row `bytes` encode.
+    pub(crate) fn decode(&mut self, bytes: &[u8]) -> Result<Row> {
+        let mut r = Reader(bytes);
+        self.pairs.clear();
+        for _ in 0..r.varint()? {
+            let i = r.varint()?;
+            if usize::try_from(i).map_or(true, |i| i >= self.names.len()) {
+                return Err(StreamError::Decode(format!(
+                    "column {i} of {}",
+                    self.names.len()
+                )));
+            }
+            self.pairs.push((i, r.value()?));
+        }
+        if !r.0.is_empty() {
+            return Err(StreamError::Decode(format!(
+                "{} bytes past the row's end",
+                r.0.len()
+            )));
+        }
+        let same = self.last.as_ref().is_some_and(|(indices, _, _)| {
+            indices.len() == self.pairs.len()
+                && indices.iter().zip(&self.pairs).all(|(a, (b, _))| a == b)
+        });
+        if !same {
+            let indices: Vec<u64> = self.pairs.iter().map(|(i, _)| *i).collect();
+            let (columns, places) = match self.shapes.get(&indices) {
+                Some(shape) => shape.clone(),
+                None => {
+                    let names = indices
+                        .iter()
+                        .map(|&i| self.names[i as usize].clone())
+                        .collect();
+                    let shape = Columns::sorted(names)
+                        .ok_or_else(|| StreamError::Decode("a row names a column twice".into()))?;
+                    self.shapes.insert(indices.clone(), shape.clone());
+                    shape
+                }
+            };
+            self.last = Some((indices, columns, places));
+        }
+        let (_, columns, places) = self.last.as_ref().expect("set above");
+        let mut values = vec![PgValue::Null; places.len()];
+        for ((_, value), &place) in self.pairs.drain(..).zip(places) {
+            values[place] = value;
+        }
+        Ok(Row::with_columns(columns.clone(), values))
     }
-    Ok(row)
 }
 
 fn encode_value(value: &PgValue, out: &mut Vec<u8>) {

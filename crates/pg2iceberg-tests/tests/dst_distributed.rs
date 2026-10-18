@@ -42,7 +42,6 @@ use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pg2iceberg_stream::BlobStore;
 use pollster::block_on;
-use std::collections::BTreeMap;
 
 const SLOT: &str = "p2i-slot";
 const PUB: &str = "p2i-pub";
@@ -84,7 +83,7 @@ fn schema(name: &str) -> TableSchema {
 }
 
 fn row(id: i32, v: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("v".into()), PgValue::Int4(v));
     r

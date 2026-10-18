@@ -10,7 +10,6 @@ use pg2iceberg_core::{
 };
 use pg2iceberg_pg::DecodedMessage;
 use pg2iceberg_sim::postgres::{SimError, SimPostgres};
-use std::collections::BTreeMap;
 
 fn ident(name: &str) -> TableIdent {
     TableIdent {
@@ -59,7 +58,7 @@ fn other_schema() -> TableSchema {
 }
 
 fn row(pairs: &[(&str, PgValue)]) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     for (k, v) in pairs {
         r.insert(ColumnName((*k).into()), v.clone());
     }

@@ -29,7 +29,6 @@ use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_stream::{object_key, BlobStore};
 use pollster::block_on;
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -70,7 +69,7 @@ fn schema() -> TableSchema {
 }
 
 fn row(id: i32, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), PgValue::Int4(id));
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
     r

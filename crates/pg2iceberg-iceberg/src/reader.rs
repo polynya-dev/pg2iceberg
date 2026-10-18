@@ -25,7 +25,7 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ProjectionMask;
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimestampMicros};
-use pg2iceberg_core::{ColumnName, ColumnSchema, IcebergType, PgValue, Row};
+use pg2iceberg_core::{ColumnName, ColumnSchema, Columns, IcebergType, PgValue, Row};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -68,7 +68,7 @@ pub fn read_data_file_by_field_id(bytes: Bytes, cols: &[ColumnSchema]) -> Result
             })
             .collect();
         for row_idx in 0..batch.num_rows() {
-            let mut row: Row = BTreeMap::new();
+            let mut row: Row = Row::new();
             for col in cols {
                 let key = ColumnName(col.name.clone());
                 let value = match by_id.get(&col.field_id).map(|&i| batch.column(i)) {
@@ -96,6 +96,8 @@ const DEFAULT_BATCH_ROWS: usize = 1024;
 pub struct RowBatches {
     reader: ParquetRecordBatchReader,
     cols: Vec<ColumnSchema>,
+    /// The column names every row shares, and where each of `cols` goes.
+    shape: (Columns, Vec<usize>),
 }
 
 impl RowBatches {
@@ -103,6 +105,7 @@ impl RowBatches {
         Ok(Self {
             reader: projected_reader(bytes, cols, batch_rows)?,
             cols: cols.to_vec(),
+            shape: shape_of(cols)?,
         })
     }
 }
@@ -206,7 +209,7 @@ impl Iterator for RowBatches {
             Ok(b) => b,
             Err(e) => return Some(Err(WriterError::Encode(format!("read batch: {e}")))),
         };
-        Some(decode_batch(&batch, &self.cols))
+        Some(decode_batch(&batch, &self.cols, &self.shape))
     }
 }
 
@@ -252,25 +255,32 @@ fn resolve_columns<'a>(
         .collect()
 }
 
-fn decode_batch(batch: &RecordBatch, cols: &[ColumnSchema]) -> Result<Vec<Row>> {
+fn decode_batch(
+    batch: &RecordBatch,
+    cols: &[ColumnSchema],
+    (columns, places): &(Columns, Vec<usize>),
+) -> Result<Vec<Row>> {
     let arrays = resolve_columns(batch, cols);
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
-        let mut row: Row = BTreeMap::new();
-        for (col, arr) in cols.iter().zip(&arrays) {
-            let key = ColumnName(col.name.clone());
+        let mut values = vec![PgValue::Null; cols.len()];
+        for ((col, arr), &place) in cols.iter().zip(&arrays).zip(places) {
             // A file written before the column was added doesn't have
             // it: Iceberg readers project NULL, so a mid-stream `ALTER
             // TABLE ADD COLUMN` needs no backfill of old files.
-            let Some(arr) = *arr else {
-                row.insert(key, PgValue::Null);
-                continue;
-            };
-            row.insert(key, value_at(col, arr, i)?);
+            if let Some(arr) = arr {
+                values[place] = value_at(col, *arr, i)?;
+            }
         }
-        out.push(row);
+        out.push(Row::with_columns(columns.clone(), values));
     }
     Ok(out)
+}
+
+/// The column names rows of `cols` share, and where each of `cols` goes.
+fn shape_of(cols: &[ColumnSchema]) -> Result<(Columns, Vec<usize>)> {
+    Columns::sorted(cols.iter().map(|c| ColumnName(c.name.clone())).collect())
+        .ok_or_else(|| WriterError::Encode("columns name a column twice".into()))
 }
 
 fn decode_value(ty: IcebergType, arr: &dyn Array, i: usize) -> Result<PgValue> {
@@ -396,7 +406,7 @@ mod tests {
     }
 
     fn row(id: i32, qty: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r.insert(col("qty"), PgValue::Int4(qty));
         r
@@ -509,7 +519,7 @@ mod tests {
             pg_schema: None,
         };
         let w = TableWriter::new(schema.clone());
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(7));
         r.insert(col("note"), PgValue::Null);
         let prepared = w

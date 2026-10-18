@@ -8,6 +8,7 @@ pub mod io;
 pub mod lsn;
 pub mod metrics;
 pub mod partition;
+pub mod row;
 pub mod schema;
 pub mod typemap;
 pub mod value;
@@ -21,6 +22,7 @@ pub use partition::{
     apply_transform, parse_partition_expr, parse_partition_spec, PartitionField, PartitionLiteral,
     Transform,
 };
+pub use row::Columns;
 pub use schema::{ColumnSchema, Namespace, TableIdent, TableSchema};
 pub use typemap::{map_pg_to_iceberg, IcebergType, MapError, PgType};
 pub use value::{IcebergValue, PgValue};

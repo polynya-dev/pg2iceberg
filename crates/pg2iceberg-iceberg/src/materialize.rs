@@ -118,14 +118,14 @@ mod tests {
     }
 
     fn row(id: i32, qty: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(c("id"), PgValue::Int4(id));
         r.insert(c("qty"), PgValue::Int4(qty));
         r
     }
 
     fn pk_only(id: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(c("id"), PgValue::Int4(id));
         r
     }

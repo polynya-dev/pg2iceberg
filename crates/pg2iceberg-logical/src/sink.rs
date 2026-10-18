@@ -296,7 +296,6 @@ impl Sink {
 mod tests {
     use super::*;
     use pg2iceberg_core::{ColumnName, Namespace, PgValue, Row};
-    use std::collections::BTreeMap;
 
     fn ident() -> TableIdent {
         TableIdent {
@@ -306,7 +305,7 @@ mod tests {
     }
 
     fn row(id: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(ColumnName("id".into()), PgValue::Int4(id));
         r
     }

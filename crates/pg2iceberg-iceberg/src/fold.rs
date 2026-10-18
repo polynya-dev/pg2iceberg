@@ -10,10 +10,10 @@
 //! file output. Folding upfront cuts both Parquet rows written and PG
 //! coord-update churn.
 
-use crate::pk::PkKey;
+use crate::pk::{KeyReader, PkKey};
 use pg2iceberg_core::{ColumnName, Op, PgValue, Row};
 use pg2iceberg_stream::MatEvent;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 /// Final state for one PK after the fold.
 #[derive(Clone, Debug, PartialEq)]
@@ -52,12 +52,13 @@ pub fn pk_key(row: &Row, pk_cols: &[ColumnName]) -> String {
 /// applies an equality-delete that's a no-op if no prior data exists, so this
 /// is safe even when the row was never persisted to a data file.
 pub fn fold_events(events: Vec<MatEvent>, pk_cols: &[ColumnName]) -> Vec<MaterializedRow> {
-    let mut by_pk: BTreeMap<PkKey, MaterializedRow> = BTreeMap::new();
+    let mut keys = KeyReader::new(pk_cols);
+    let mut by_pk: HashMap<PkKey, MaterializedRow> = HashMap::with_capacity(events.len());
     // Each key's state just before this cycle deleted it, for an UPDATE
     // that moves a row from that key.
-    let mut deleted: BTreeMap<PkKey, MaterializedRow> = BTreeMap::new();
+    let mut deleted: HashMap<PkKey, MaterializedRow> = HashMap::new();
     for evt in events {
-        let key = PkKey::from_row(&evt.row, pk_cols);
+        let key = keys.key(&evt.row);
         let mut row = MaterializedRow {
             op: evt.op,
             row: evt.row,
@@ -74,7 +75,7 @@ pub fn fold_events(events: Vec<MatEvent>, pk_cols: &[ColumnName]) -> Vec<Materia
         if !row.unchanged_cols.is_empty() {
             match evt.moved_from {
                 Some(old) => {
-                    let old_key = PkKey::from_row(&old, pk_cols);
+                    let old_key = keys.key(&old);
                     match deleted.get(&old_key) {
                         Some(prev) => row.inherit(prev, Some(old_key)),
                         None => row.unchanged_from = Some(old_key),
@@ -97,7 +98,9 @@ pub fn fold_events(events: Vec<MatEvent>, pk_cols: &[ColumnName]) -> Vec<Materia
             }
         }
     }
-    by_pk.into_values().collect()
+    let mut folded: Vec<(PkKey, MaterializedRow)> = by_pk.into_iter().collect();
+    folded.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    folded.into_iter().map(|(_, row)| row).collect()
 }
 
 impl MaterializedRow {
@@ -129,14 +132,14 @@ mod tests {
     }
 
     fn row(id: i32, qty: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r.insert(col("qty"), PgValue::Int4(qty));
         r
     }
 
     fn pk_only(id: i32) -> Row {
-        let mut r = BTreeMap::new();
+        let mut r = Row::new();
         r.insert(col("id"), PgValue::Int4(id));
         r
     }

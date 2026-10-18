@@ -22,7 +22,6 @@ use pg2iceberg_sim::blob::MemoryBlobStore;
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_stream::BlobStore;
 use pollster::block_on;
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 #[global_allocator]
@@ -90,7 +89,7 @@ fn pk_cols() -> Vec<ColumnName> {
 }
 
 fn row(id: PgValue, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), id);
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
     r

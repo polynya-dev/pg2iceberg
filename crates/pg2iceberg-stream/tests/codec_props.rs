@@ -6,11 +6,10 @@
 
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimeMicros, TimestampMicros};
 use pg2iceberg_core::{
-    ChangeEvent, ColumnName, Lsn, Namespace, Op, PgValue, TableIdent, Timestamp,
+    ChangeEvent, ColumnName, Lsn, Namespace, Op, PgValue, Row, TableIdent, Timestamp,
 };
 use pg2iceberg_stream::codec::{decode_chunk, encode_chunk};
 use proptest::prelude::*;
-use std::collections::BTreeMap;
 
 fn ident() -> TableIdent {
     TableIdent {
@@ -55,10 +54,10 @@ fn pg_value() -> impl Strategy<Value = PgValue> {
     ]
 }
 
-fn row() -> impl Strategy<Value = std::collections::BTreeMap<ColumnName, PgValue>> {
+fn row() -> impl Strategy<Value = Row> {
     // Column names from a small alphabet so we get duplicates across rows.
     let key = "[a-z_]{1,8}".prop_map(ColumnName);
-    prop::collection::btree_map(key, pg_value(), 0..6)
+    prop::collection::btree_map(key, pg_value(), 0..6).prop_map(|m| m.into_iter().collect())
 }
 
 fn dml_op() -> impl Strategy<Value = Op> {
@@ -113,7 +112,7 @@ proptest! {
             prop_assert_eq!(dec.xid, orig.xid);
             prop_assert_eq!(&dec.unchanged_cols, &orig.unchanged_cols);
 
-            let expected_row: &BTreeMap<_, _> = match orig.op {
+            let expected_row: &Row = match orig.op {
                 Op::Insert | Op::Update => orig.after.as_ref().unwrap(),
                 Op::Delete => orig.before.as_ref().unwrap(),
                 _ => unreachable!(),

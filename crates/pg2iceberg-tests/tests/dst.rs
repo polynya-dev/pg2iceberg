@@ -185,7 +185,7 @@ fn stored_rows(rows: Vec<Row>) -> Vec<Row> {
 }
 
 fn row(id: i32, qty: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), id_value(id));
     r.insert(ColumnName("qty".into()), PgValue::Int4(qty));
     if NOTE_PRESENT.get() {
@@ -286,7 +286,7 @@ fn other_schema() -> TableSchema {
 }
 
 fn other_row(id: i32, qty: i32) -> Row {
-    BTreeMap::from([
+    Row::from([
         (ColumnName("id".into()), PgValue::Int4(id)),
         (ColumnName("qty".into()), PgValue::Int4(qty)),
         (note(), PgValue::Text(format!("sales-{id}-{qty}"))),
@@ -336,7 +336,7 @@ fn noise_schema() -> TableSchema {
 }
 
 fn pk_only(id: i32) -> Row {
-    let mut r = BTreeMap::new();
+    let mut r = Row::new();
     r.insert(ColumnName("id".into()), id_value(id));
     r
 }
@@ -2362,7 +2362,7 @@ impl DstHarness {
             Step::OtherDelete { id } => {
                 if self.other_live.contains(id) {
                     let mut tx = self.db.begin_tx();
-                    let pk = BTreeMap::from([(ColumnName("id".into()), PgValue::Int4(*id))]);
+                    let pk = Row::from([(ColumnName("id".into()), PgValue::Int4(*id))]);
                     tx.delete(&other_pg_ident(), pk);
                     if tx.commit(Timestamp(0)).is_ok() {
                         self.other_live.remove(id);
