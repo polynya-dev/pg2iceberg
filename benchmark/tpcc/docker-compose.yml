@@ -1,0 +1,165 @@
+# HammerDB TPROC-C against Postgres, replicated by pg2iceberg into an
+# Iceberg REST catalog + MinIO. See README.md.
+name: pg2iceberg-tpcc
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports: ["5533:5432"]
+    shm_size: 1g
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - max_wal_size=16GB
+      - -c
+      - min_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - wal_compression=lz4
+      - -c
+      - synchronous_commit=${PG_SYNCHRONOUS_COMMIT:-on}
+      - -c
+      - track_io_timing=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    ports: ["9300:9000"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  create-bucket:
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: >
+      /bin/sh -c "mc alias set m http://minio:9000 admin password && mc mb --ignore-existing m/warehouse"
+
+  iceberg-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: iceberg_catalog
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  iceberg-rest:
+    build: ../../example/single/iceberg-rest
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://iceberg-postgres:5432/iceberg_catalog
+      CATALOG_JDBC_USER: iceberg
+      CATALOG_JDBC_PASSWORD: iceberg
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports: ["8381:8181"]
+    depends_on:
+      iceberg-postgres: {condition: service_healthy}
+      create-bucket: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8181/v1/config || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  # The object store and catalog a request's latency away (proxy/envoy.yaml):
+  # LATENCY=1 runs point pg2iceberg at these instead (run.sh).
+  s3-proxy: &proxy
+    image: envoyproxy/envoy:v1.32.3
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        sed -e "s/LISTEN_PORT/$$PORT/; s/UPSTREAM_HOST/$$UPSTREAM_HOST/;
+        s/UPSTREAM_PORT/$$PORT/; s/DELAY/$$DELAY/; s/RATE_KIBPS/$$RATE_KIBPS/"
+        /proxy/envoy.yaml > /tmp/envoy.yaml && exec envoy -c /tmp/envoy.yaml --log-level warn
+    environment:
+      PORT: "9000"
+      UPSTREAM_HOST: minio
+      DELAY: ${S3_DELAY:-0.025s}
+      # A GET's ~90 MB/s on one S3 connection.
+      RATE_KIBPS: ${S3_RATE_KIBPS:-87890}
+    volumes:
+      - ./proxy:/proxy:ro
+    depends_on:
+      minio: {condition: service_healthy}
+
+  catalog-proxy:
+    <<: *proxy
+    environment:
+      PORT: "8181"
+      UPSTREAM_HOST: iceberg-rest
+      DELAY: ${CATALOG_DELAY:-0.05s}
+      RATE_KIBPS: "100000000"
+    depends_on:
+      iceberg-rest: {condition: service_healthy}
+
+  # Started after the schema is built (run.sh), so it snapshots it.
+  pg2iceberg:
+    build:
+      context: ../..
+      dockerfile: benchmark/tpcc/pg2iceberg.Dockerfile
+    image: ${PG2ICEBERG_IMAGE:-pg2iceberg-tpcc:dev}
+    profiles: ["pg2iceberg"]
+    command: ["run", "--config", "/etc/pg2iceberg/config.yaml"]
+    restart: "no"
+    # perf needs it to read the process's stacks.
+    cap_add: [SYS_PTRACE, PERFMON, SYS_ADMIN]
+    security_opt: ["seccomp=unconfined"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    ports: ["9391:9090"]
+    volumes:
+      - ${PG2ICEBERG_CONFIG:-./config.yaml}:/etc/pg2iceberg/config.yaml:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+      iceberg-rest: {condition: service_healthy}
+
+  hammerdb:
+    image: tpcorg/hammerdb:v6.0-postgres
+    profiles: ["hammerdb"]
+    working_dir: /home/hammerdb
+    environment:
+      PG_HOST: postgres
+      WAREHOUSES: ${WAREHOUSES:-10}
+      BUILD_VUS: ${BUILD_VUS:-8}
+      VUS: ${VUS:-8}
+      RAMPUP: ${RAMPUP:-1}
+      DURATION: ${DURATION:-5}
+      TMP: /tmp
+    volumes:
+      - ./hammerdb:/bench:ro
+    depends_on:
+      postgres: {condition: service_healthy}
