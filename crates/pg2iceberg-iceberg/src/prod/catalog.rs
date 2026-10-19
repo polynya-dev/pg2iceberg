@@ -235,7 +235,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             .chain(log_ends_property(&ends))
             .collect();
         let appends = !files.is_empty();
-        let tx = Transaction::new(&table);
+        // Loaded just above: no reload before the first attempt.
+        let tx = Transaction::new(&table).with_fresh_base();
         let tx = match files.len() {
             // No work — match the sim-catalog noop semantics so the
             // materializer can flush "no data, no deletes" without a
@@ -322,7 +323,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             );
         }
 
-        let tx = Transaction::new(&table);
+        // Loaded just above: no reload before the first attempt.
+        let tx = Transaction::new(&table).with_fresh_base();
         let mut action = tx
             .rewrite_files()
             .add_data_files(iceberg_added)
@@ -389,7 +391,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let action = ExpireSnapshotsAction {
             snapshot_ids: to_remove,
         };
-        let tx = Transaction::new(&table);
+        // Loaded just above: no reload before the first attempt.
+        let tx = Transaction::new(&table).with_fresh_base();
         let tx = action.apply(tx).map_err(map_iceberg_err)?;
         tx.commit(self.inner.as_ref())
             .await
@@ -424,7 +427,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         apply_schema_changes(&mut our_schema, &changes)?;
         let new_iceberg_schema = to_iceberg_schema(&our_schema)?;
 
-        let mut tx = Transaction::new(&table);
+        // Loaded just above: no reload before the first attempt.
+        let mut tx = Transaction::new(&table).with_fresh_base();
         if !changes.is_empty() {
             let action = tx.replace_schema().set_schema(new_iceberg_schema);
             tx = action.apply(tx).map_err(map_iceberg_err)?;
