@@ -16,10 +16,10 @@ For each table:
     - `INSERT` / `UPDATE`: keep the latest row state
     - `DELETE`: mark the primary key for deletion
     - `UPDATE` with unresolved TOAST columns: read the row's previous version and backfill the missing columns (the data files holding them, up to eight at once)
-4. **Prepare** — serialize each step's folded rows into Iceberg data and delete files and upload them:
+4. **Prepare** — serialize each step's folded rows into Iceberg data and delete files and upload them, together:
     - Inserts and updates → Parquet data files (partitioned by the table's partition spec)
     - Deletes, and the previous version of updated rows → Parquet equality delete files (PK columns only)
-5. **Commit** — at a transaction boundary, commit every step prepared so far as **one atomic catalog update**: each step becomes its own snapshot, but the table's `main` branch moves once. The last snapshot's summary records the log range the commit applied (`pg2iceberg.log-group`, `pg2iceberg.log-start`, `pg2iceberg.log-end`), and how far each cursor group has applied the log (`pg2iceberg.log-ends`)
+5. **Commit** — at a transaction boundary, commit every step prepared so far as **one atomic catalog update**: each step becomes its own snapshot, but the table's `main` branch moves once. With more than a step to apply — catching up — a commit waits for four steps (or the cycle's row budget, or the end of the log): each commit is a round of catalog requests, whatever it carries. The last snapshot's summary records the log range the commit applied (`pg2iceberg.log-group`, `pg2iceberg.log-start`, `pg2iceberg.log-end`), and how far each cursor group has applied the log (`pg2iceberg.log-ends`)
 6. **Advance cursor** — only after the commit succeeds; then continue with the next entries until the log is drained or the cycle has read its row budget. A cycle that stops at its budget is followed by the next as soon as it ends; one that drained the log waits `materializer_interval`
 
 ### Applying each change once
