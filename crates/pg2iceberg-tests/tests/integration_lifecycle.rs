@@ -246,6 +246,7 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             // commit against a real REST catalog.
             flush_rows: 2,
             materializer_batch_rows: 1,
+            materializer_concurrency: 4,
             materializer_interval: "1s".into(),
             compaction_data_files: 8,
             compaction_delete_files: 4,

@@ -433,6 +433,8 @@ const DEFAULT_STEPS_PER_CYCLE: usize = 8;
 pub const STEPS_PER_COMMIT: usize = 4;
 /// Most files a step uploads at once.
 const STEP_UPLOADS: usize = 8;
+/// Default most tables a cycle applies at once.
+pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
 
 /// Steps read but not yet committed. Committed together, as one atomic
 /// `commit_snapshots`, so a transaction spanning several steps becomes
@@ -626,6 +628,8 @@ pub struct Materializer<C: Catalog> {
     /// worker drops out of the active list.
     distributed: Option<DistributedMode>,
     maintenance: Maintenance,
+    /// Most tables a cycle applies at once ([`Self::with_table_concurrency`]).
+    table_concurrency: usize,
 }
 
 /// Distributed-mode parameters. Built by
@@ -747,6 +751,7 @@ impl<C: Catalog> Materializer<C> {
             meta_recorder: None,
             distributed: None,
             maintenance: Maintenance::default(),
+            table_concurrency: DEFAULT_TABLE_CONCURRENCY,
         }
     }
 
@@ -1622,11 +1627,84 @@ impl<C: Catalog> Materializer<C> {
             idents.retain(|t| assigned.contains(t));
         }
 
-        let mut total = 0;
-        for ident in idents {
-            total += self.cycle_table(&ident).await?;
+        // Meta tables and markers are written as each table commits,
+        // through one writer each: their tables go one after another.
+        let shared_meta = self.meta_recorder.is_some() || self.meta_marker.is_some();
+        if self.table_concurrency == 1 || idents.len() < 2 || shared_meta {
+            let mut total = 0;
+            for ident in idents {
+                total += self.cycle_table(&ident).await?;
+            }
+            return Ok(total);
         }
-        Ok(total)
+        self.cycle_tables_together(idents).await
+    }
+
+    /// Apply `idents` together, at most `table_concurrency` at once: each a
+    /// round trip after another to the object store and catalog, waiting
+    /// on its own is most of what a table does. Each runs on a materializer
+    /// of its own ([`Self::split_off`]), sharing this one's stores and
+    /// catalog cache, and comes back into it ([`Self::rejoin`]) once all
+    /// are done — failed or not, so a table that fails doesn't stop the
+    /// others, nor loses its state. The first error is returned.
+    async fn cycle_tables_together(&mut self, idents: Vec<TableIdent>) -> Result<usize> {
+        let parts: Vec<(TableIdent, Self)> = idents
+            .into_iter()
+            .filter_map(|ident| self.split_off(&ident).map(|part| (ident, part)))
+            .collect();
+        let done: Vec<(Self, Result<usize>)> = stream::iter(parts)
+            .map(|(ident, mut part)| async move {
+                let out = part.cycle_table(&ident).await;
+                (part, out)
+            })
+            .buffer_unordered(self.table_concurrency)
+            .collect()
+            .await;
+        let mut total = 0;
+        let mut failed = None;
+        for (part, out) in done {
+            self.rejoin(part);
+            match out {
+                Ok(rows) => total += rows,
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
+    }
+
+    /// A materializer for `ident` alone: the table's state moves into it,
+    /// and it shares this one's stores, catalog cache, namer and metrics.
+    /// No meta tables or markers: their writers stay here.
+    fn split_off(&mut self, ident: &TableIdent) -> Option<Self> {
+        let entry = self.tables.remove(ident)?;
+        Some(Self {
+            coord: self.coord.clone(),
+            blob_store: self.blob_store.clone(),
+            catalog: self.catalog.clone(),
+            namer: self.namer.clone(),
+            tables: BTreeMap::from([(ident.clone(), entry)]),
+            group: self.group.clone(),
+            batch_rows: self.batch_rows,
+            cycle_rows: self.cycle_rows,
+            backlogged: false,
+            metrics: self.metrics.clone(),
+            meta_marker: None,
+            meta_recorder: None,
+            distributed: None,
+            maintenance: self.maintenance,
+            table_concurrency: 1,
+        })
+    }
+
+    /// Take back a table [`Self::split_off`] moved out.
+    fn rejoin(&mut self, part: Self) {
+        self.backlogged |= part.backlogged;
+        self.tables.extend(part.tables);
     }
 
     /// Run a compaction pass over every registered table. Returns the
@@ -2062,6 +2140,13 @@ impl<C: Catalog> Materializer<C> {
     pub fn with_cycle_rows(mut self, cycle_rows: usize) -> Self {
         assert!(cycle_rows > 0);
         self.cycle_rows = cycle_rows;
+        self
+    }
+
+    /// Override how many tables a cycle applies at once. Defaults to 4.
+    pub fn with_table_concurrency(mut self, tables: usize) -> Self {
+        assert!(tables > 0);
+        self.table_concurrency = tables;
         self
     }
 

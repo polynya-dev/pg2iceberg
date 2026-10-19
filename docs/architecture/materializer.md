@@ -8,6 +8,8 @@ The materializer runs on a configurable interval (default: 30 seconds) and appli
 
 ## Materialization cycle
 
+A cycle applies up to `materializer_concurrency` tables at once (default 4): each is a round trip after another to the object store and catalog, so waiting is most of what one table does. A table that fails doesn't stop the others; the cycle reports the failure once they're done, and the next cycle takes the table up again. With meta tables (`meta_namespace`) on, tables go one after another: their rows and markers are written as each table commits.
+
 For each table:
 
 1. **Read cursor** — fetch the last committed offset from `mat_cursor`

@@ -283,6 +283,9 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// Materializer step size in change events — the bound on its memory
     /// (see [`Materializer::new`]).
     pub mat_batch_rows: usize,
+    /// Most tables the materializer applies at once
+    /// ([`Materializer::with_table_concurrency`]).
+    pub mat_table_concurrency: usize,
     /// Built lazily — only invoked if the snapshot phase actually
     /// needs to run (fresh slot, snapshot not already complete). The
     /// binary's factory builds a `PgSnapshotSource`; the DST's factory
@@ -384,6 +387,7 @@ fn instrument<Cat: Catalog + 'static>(
         maintenance,
         flush_rows,
         mat_batch_rows,
+        mat_table_concurrency,
         snapshot_source_factory,
         materializer_namer,
         blob_namer,
@@ -408,6 +412,7 @@ fn instrument<Cat: Catalog + 'static>(
         maintenance,
         flush_rows,
         mat_batch_rows,
+        mat_table_concurrency,
         snapshot_source_factory,
         materializer_namer,
         blob_namer,
@@ -616,7 +621,8 @@ async fn start<Cat: Catalog + 'static>(
         &lc.group,
         lc.mat_batch_rows,
         Arc::clone(&lc.metrics),
-    );
+    )
+    .with_table_concurrency(lc.mat_table_concurrency);
     materializer.set_catalog_cache_ttl(
         Arc::clone(&lc.clock),
         pg2iceberg_logical::CachingCatalog::<Cat>::DEFAULT_TTL,

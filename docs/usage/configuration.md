@@ -147,6 +147,7 @@ sink:
   # Flush thresholds — flush when any threshold is reached
   flush_rows: 10000              # also caps change events held in memory
   materializer_batch_rows: 50000 # change events per materializer step
+  materializer_concurrency: 4    # tables the materializer applies at once
   flush_interval: 10s            # how often changes are staged
 
   # How often the materializer commits staged changes to Iceberg
@@ -199,10 +200,11 @@ snapshot_only: false             # legacy field; prefer the `snapshot` subcomman
 - **`source.logical.snapshot_concurrency` / `snapshot_chunk_pages` / `snapshot_target_file_size`** — not yet exposed; snapshot uses fixed defaults.
 - **`sink.flush_rows`** — the most change events pg2iceberg holds in memory before staging them. A transaction bigger than this is staged in chunks of this size as it streams in, and claimed in one step when it commits, so readers never see part of it. Larger values mean fewer, larger staged files.
 - **`sink.materializer_batch_rows`** — the most change events the materializer folds into one Iceberg snapshot, which bounds its memory, along with the up to eight staged files it reads ahead (each at most `flush_rows` events). A transaction larger than this is written as several snapshots committed in one atomic catalog update, so readers of the table never see part of it; catching up, the materializer commits up to four snapshots at a time anyway.
+- **`sink.materializer_concurrency`** — the most tables the materializer applies at once (default 4; 1 applies them one after another). A table's work is mostly waiting on the object store and catalog, so more at once catch up faster on many tables; each holds its own `materializer_batch_rows` events and staged files read ahead, and commits on its own, so memory and the catalog's request rate grow with it. With meta tables on (`meta_namespace`), tables go one at a time.
 - **`sink.flush_interval` / `sink.materializer_interval`** — the micro-batch cadence: changes are staged every `flush_interval` (or sooner, once `flush_rows` are buffered) and committed to Iceberg every `materializer_interval` (or back to back, while catching up on a backlog). A change typically reaches Iceberg within about the two added together. Shorter intervals mean fresher tables, and more, smaller Iceberg snapshots and files for compaction to merge.
 - **`sink.compaction_delete_files` / `sink.compaction_delete_ratio`** — when compaction drops deleted rows. An update or delete leaves the old row in its data file, hidden by an equality delete that every reader applies; dropping it means rewriting the files holding such rows, and every older one, before the delete file can go. Under updates spread across a large table that's most of the table, so pg2iceberg waits until the deleted rows are `compaction_delete_ratio` of the rows those files hold (rewriting then reads at most 10 rows per row deleted, at 0.1), or until there are `compaction_delete_files` delete files for readers to open. Lower values keep reads cheaper; higher ones rewrite less.
 - **`sink.flush_bytes`** — not yet exposed; flush threshold is `flush_rows` + `flush_interval` only.
-- **`sink.materializer_target_file_size` / `materializer_concurrency`** — not yet exposed; uses `target_file_size` + a fixed concurrency.
+- **`sink.materializer_target_file_size`** — not yet exposed; uses `target_file_size`.
 - **`sink.materializer_worker_id`** — replaced by the `--worker-id` flag on `pg2iceberg materializer-only`.
 - **`sink.meta_enabled`** — inferred from `meta_namespace`: setting it enables meta-table writes.
 - **`metrics_addr`** / **`liveness_timeout`** — where `run`, `stream-only`, `materializer-only` and `snapshot` serve `/metrics`, `/healthz` and `/readyz`, and how long nothing may complete before `/healthz` fails. See [Observability](observability.md).
