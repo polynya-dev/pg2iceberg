@@ -51,7 +51,8 @@ pollster = "0.4"
 # Iceberg's Transaction::commit uses tokio::time::sleep in its retry backoff.
 # Smoke tests under `--features prod` therefore need a tokio runtime; the
 # non-prod tests still run on pollster.
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+# `test-util`: paused time, for a storage a round trip away.
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }
 # A counting `iceberg::io::Storage` in the prod catalog's tests: iceberg's
 # storage traits are `#[typetag::serde]`.
 typetag = "0.2"
