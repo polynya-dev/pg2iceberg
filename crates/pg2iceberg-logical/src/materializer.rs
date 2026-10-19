@@ -426,6 +426,13 @@ const SNAPSHOT_APPLIED: i64 = i64::MAX;
 
 /// Default `cycle_rows`, in multiples of `batch_rows`.
 const DEFAULT_STEPS_PER_CYCLE: usize = 8;
+/// Most steps one catalog commit carries. A cycle with more than a step
+/// to apply — catching up — stages its full steps and commits them
+/// together, one round of catalog requests for several, rather than a
+/// commit each; each is still a snapshot of its own.
+pub const STEPS_PER_COMMIT: usize = 4;
+/// Most files a step uploads at once.
+const STEP_UPLOADS: usize = 8;
 
 /// Steps read but not yet committed. Committed together, as one atomic
 /// `commit_snapshots`, so a transaction spanning several steps becomes
@@ -2151,7 +2158,12 @@ impl<C: Catalog> Materializer<C> {
                 }
             }
             if !unit.buf.is_empty() && unit.buf.len() + events.len() > self.batch_rows {
-                if is_tx_boundary(unit.buf.last(), events.first()) {
+                // A full step. At a transaction boundary the unit can end
+                // here: it does once it holds `STEPS_PER_COMMIT` steps, or
+                // the cycle has read its budget.
+                let ends =
+                    unit.steps.len() + 1 >= STEPS_PER_COMMIT || events_read >= self.cycle_rows;
+                if ends && is_tx_boundary(unit.buf.last(), events.first()) {
                     folded += log.alongside(self.commit_unit(ident, &mut unit)).await?;
                     if events_read >= self.cycle_rows {
                         // Leave this entry for the next cycle.
@@ -2159,8 +2171,9 @@ impl<C: Catalog> Materializer<C> {
                         break;
                     }
                 } else {
-                    // A transaction spans this boundary: stage what's
-                    // buffered as an intermediate step and keep going.
+                    // Stage what's buffered as a step and keep going: more
+                    // steps for this commit, or a transaction spans this
+                    // boundary.
                     log.alongside(self.prepare_step(ident, &mut unit)).await?;
                 }
             }
@@ -2275,14 +2288,15 @@ impl<C: Catalog> Materializer<C> {
             Vec::with_capacity(prepared_files.data.len());
         let mut deleted_pks: Vec<PkKey> = Vec::new();
 
+        // The step's files, uploaded together below.
+        let mut uploads: Vec<(String, Bytes)> =
+            Vec::with_capacity(prepared_files.data.len() + prepared_files.equality_deletes.len());
         for chunk in prepared_files.data {
             let segment =
                 render_partition_segment(&entry.schema.partition_spec, &chunk.partition_values);
             let path = self.namer.next_path(ident, "data", &segment).await;
             let byte_size = chunk.chunk.bytes.len() as u64;
-            self.blob_store
-                .put(&path, Bytes::clone(&chunk.chunk.bytes))
-                .await?;
+            uploads.push((path.clone(), chunk.chunk.bytes));
             data_files.push(DataFile {
                 path: path.clone(),
                 record_count: chunk.chunk.record_count,
@@ -2301,9 +2315,7 @@ impl<C: Catalog> Materializer<C> {
                 render_partition_segment(&entry.schema.partition_spec, &chunk.partition_values);
             let path = self.namer.next_path(ident, "eq-delete", &segment).await;
             let byte_size = chunk.chunk.bytes.len() as u64;
-            self.blob_store
-                .put(&path, Bytes::clone(&chunk.chunk.bytes))
-                .await?;
+            uploads.push((path.clone(), chunk.chunk.bytes));
             delete_files.push(DataFile {
                 path,
                 record_count: chunk.chunk.record_count,
@@ -2314,6 +2326,15 @@ impl<C: Catalog> Materializer<C> {
             });
             deleted_pks.extend(chunk.pk_keys);
         }
+        let blob_store = &self.blob_store;
+        stream::iter(uploads)
+            .map(|(path, bytes)| {
+                let blob_store = blob_store.clone();
+                async move { blob_store.put(&path, bytes).await }
+            })
+            .buffer_unordered(STEP_UPLOADS)
+            .try_collect::<Vec<()>>()
+            .await?;
 
         let entry_mut = self.tables.get_mut(ident).expect("checked above");
         // Removed PKs first (so a later add for the same PK overrides cleanly).

@@ -24,7 +24,9 @@ use pg2iceberg_core::{
 };
 use pg2iceberg_iceberg::compact::READ_AHEAD as PASS_READ_AHEAD;
 use pg2iceberg_iceberg::{read_materialized_state, Catalog, CompactionConfig, CompactionOutcome};
-use pg2iceberg_logical::materializer::{CounterMaterializerNamer, Materializer, MaterializerNamer};
+use pg2iceberg_logical::materializer::{
+    CounterMaterializerNamer, Materializer, MaterializerNamer, STEPS_PER_COMMIT,
+};
 use pg2iceberg_logical::pipeline::{CounterBlobNamer, Pipeline};
 use pg2iceberg_logical::staged_log::READ_AHEAD;
 use pg2iceberg_sim::blob::MemoryBlobStore;
@@ -1077,4 +1079,85 @@ async fn a_pass_reads_the_table_as_of_its_plan() {
     assert_eq!(outcome.input_data_files, 1);
     h.assert_iceberg_matches_pg().await;
     h.assert_index_matches_catalog().await;
+}
+
+/// The catalog commits that made the table: each marks its last snapshot
+/// with the log it applied.
+async fn commits(h: &Harness) -> usize {
+    h.catalog
+        .snapshots(&ident())
+        .await
+        .unwrap()
+        .iter()
+        .filter(|s| s.log_range.is_some())
+        .count()
+}
+
+/// A cycle with more than a step to apply — catching up — commits its
+/// steps several at a time: a round of catalog requests for each commit,
+/// not each step. Each step is still a snapshot of its own.
+#[tokio::test(start_paused = true)]
+async fn a_backlog_commits_several_steps_at_once() {
+    const STEPS: usize = 16;
+    // A step a transaction.
+    let mut h = Harness::boot(Stores::new(10)).await;
+    for t in 0..STEPS {
+        h.stage(|tx| {
+            for i in 0..10 {
+                tx.insert(&ident(), row((t * 10 + i) as i32, 0));
+            }
+        })
+        .await;
+    }
+
+    h.cycle().await;
+
+    assert_eq!(commits(&h).await, STEPS / STEPS_PER_COMMIT);
+    h.assert_iceberg_matches_pg().await;
+    h.assert_index_matches_catalog().await;
+}
+
+/// A step uploads its files together: here an update's data file and its
+/// equality-delete file.
+#[tokio::test(start_paused = true)]
+async fn a_step_uploads_its_files_together() {
+    let mut h = Harness::boot(Stores::new(1024)).await;
+    h.data_files(1, 4).await;
+    h.stage(|tx| {
+        tx.update(&ident(), row(0, 1));
+        tx.update(&ident(), row(1, 1));
+    })
+    .await;
+    h.blob.writes.reset_peak();
+
+    h.cycle().await;
+
+    assert_eq!(h.blob.writes.peak(), 2, "uploads in flight at once");
+    h.assert_iceberg_matches_pg().await;
+}
+
+/// A cycle still stops at its budget: it commits there, though that
+/// leaves its commit short of `STEPS_PER_COMMIT` steps.
+#[tokio::test(start_paused = true)]
+async fn a_cycle_commits_at_its_budget() {
+    // Three steps' worth.
+    let mut h = Harness::boot(Stores {
+        cycle_rows: 30,
+        ..Stores::new(10)
+    })
+    .await;
+    for t in 0..8 {
+        h.stage(|tx| {
+            for i in 0..10 {
+                tx.insert(&ident(), row(t * 10 + i, 0));
+            }
+        })
+        .await;
+    }
+
+    let applied = h.cycle().await;
+
+    assert_eq!(applied, 30);
+    assert!(h.materializer.backlogged());
+    assert_eq!(commits(&h).await, 1);
 }
