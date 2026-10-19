@@ -34,7 +34,7 @@ use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
-use pg2iceberg_snapshot::{SnapshotSource, Snapshotter};
+use pg2iceberg_snapshot::{Concurrency, SnapshotSource, Snapshotter};
 use pg2iceberg_stream::{BlobInfo, BlobStore, Result as BlobResult};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
@@ -1270,10 +1270,10 @@ async fn a_failing_table_keeps_the_others_going() {
 
 /// `SimPostgres`'s snapshot a round trip away: each chunk read takes
 /// `LATENCY`.
-struct SlowSource<'a>(&'a SimPostgres);
+struct SlowSource(SimPostgres);
 
 #[async_trait]
-impl SnapshotSource for SlowSource<'_> {
+impl SnapshotSource for SlowSource {
     async fn snapshot_lsn(&self) -> pg2iceberg_snapshot::Result<Lsn> {
         self.0.snapshot_lsn().await
     }
@@ -1301,19 +1301,9 @@ async fn a_snapshot_reads_its_next_chunk_while_one_stages() {
         tx.insert(&ident(), row(id, 0));
     }
     tx.commit(Timestamp(0)).unwrap();
-    let coord: Arc<dyn Coordinator> = Arc::new(MemoryCoordinator::new(
-        CoordSchema::default_name(),
-        Arc::new(TestClock::at(0)),
-    ));
-    // Staged into the slow store: an upload a chunk.
-    let mut pipeline = Pipeline::new(
-        coord.clone(),
-        h.blob.clone() as Arc<dyn BlobStore>,
-        Arc::new(CounterBlobNamer::new("s3://snapshot")),
-        1000,
-    );
-    pipeline.register_primary_keys(ident(), vec![ColumnName("id".into())]);
-    let source = SlowSource(&h.db);
+    let coord = snapshot_coord();
+    let mut pipeline = snapshot_pipeline(&h, &coord, 1);
+    let source = SlowSource(h.db.clone());
 
     let start = Instant::now();
     Snapshotter::new(coord.clone())
@@ -1332,4 +1322,149 @@ async fn a_snapshot_reads_its_next_chunk_while_one_stages() {
     );
     let staged = coord.read_log(&ident(), 0, 1000).await.unwrap();
     assert_eq!(staged.len(), CHUNKS);
+}
+
+/// A coordinator for a snapshot to stage into, of its own.
+fn snapshot_coord() -> Arc<dyn Coordinator> {
+    Arc::new(MemoryCoordinator::new(
+        CoordSchema::default_name(),
+        Arc::new(TestClock::at(0)),
+    ))
+}
+
+/// A pipeline staging the first `tables` tables' snapshot into the slow
+/// store: an upload a chunk.
+fn snapshot_pipeline(
+    h: &Harness,
+    coord: &Arc<dyn Coordinator>,
+    tables: usize,
+) -> Pipeline<dyn Coordinator> {
+    let mut pipeline = Pipeline::new(
+        coord.clone(),
+        h.blob.clone() as Arc<dyn BlobStore>,
+        Arc::new(CounterBlobNamer::new("s3://snapshot")),
+        1000,
+    );
+    for t in 0..tables {
+        pipeline.register_primary_keys(ident_n(t), vec![ColumnName("id".into())]);
+    }
+    pipeline
+}
+
+/// Up to `tables` tables at once, on tokio tasks.
+fn on_tasks(tables: usize) -> Concurrency {
+    Concurrency {
+        tables,
+        spawn: Arc::new(|table| {
+            tokio::spawn(table);
+        }),
+    }
+}
+
+/// `rows` rows in each of the first `tables` tables.
+fn fill_tables(h: &Harness, tables: usize, rows: usize) {
+    let mut tx = h.db.begin_tx();
+    for t in 0..tables {
+        for id in 0..rows as i32 {
+            tx.insert(&ident_n(t), row(id, 0));
+        }
+    }
+    tx.commit(Timestamp(0)).unwrap();
+}
+
+async fn snapshot_complete(coord: &Arc<dyn Coordinator>, table: usize) -> bool {
+    coord
+        .table_state(&ident_n(table))
+        .await
+        .unwrap()
+        .is_some_and(|s| s.snapshot_complete)
+}
+
+/// A snapshot reads its tables together, each on a task of its own:
+/// four tables cost one table's round trips. Staged through pipelines of
+/// their own, they leave the snapshot's flushed as far as theirs.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_reads_its_tables_together() {
+    const TABLES: usize = 4;
+    const CHUNKS: usize = 5;
+    const CHUNK: usize = 10;
+    let h = Harness::boot(Stores {
+        tables: TABLES,
+        ..Stores::new(1024)
+    })
+    .await;
+    fill_tables(&h, TABLES, CHUNKS * CHUNK);
+    let coord = snapshot_coord();
+    let mut pipeline = snapshot_pipeline(&h, &coord, TABLES);
+    let schemas: Vec<TableSchema> = (0..TABLES).map(|t| schema_n(t, false)).collect();
+
+    let start = Instant::now();
+    let snap_lsn = Snapshotter::new(coord.clone())
+        .with_chunk_size(CHUNK)
+        .with_concurrency(on_tasks(TABLES))
+        .run_concurrently(Arc::new(SlowSource(h.db.clone())), &schemas, &mut pipeline)
+        .await
+        .unwrap();
+    let took = start.elapsed();
+
+    // A table's round trips: its first read, then a chunk's upload with
+    // the next read beside it.
+    assert!(
+        took <= LATENCY * (CHUNKS as u32 + 3),
+        "{TABLES} tables of {CHUNKS} chunks took {took:?}, {} round trips",
+        took.as_millis() / LATENCY.as_millis(),
+    );
+    for t in 0..TABLES {
+        let staged = coord.read_log(&ident_n(t), 0, 1000).await.unwrap();
+        assert_eq!(staged.len(), CHUNKS, "table {t}");
+        assert!(snapshot_complete(&coord, t).await, "table {t}");
+    }
+    assert!(snap_lsn > Lsn::ZERO);
+    assert_eq!(pipeline.flushed_lsn(), snap_lsn);
+}
+
+/// A table whose snapshot fails ends the snapshot once the tables beside
+/// it finish, and no other table starts after it; the next run picks up
+/// the rest, staging nothing twice.
+#[tokio::test(start_paused = true)]
+async fn a_failing_snapshot_table_ends_the_snapshot_once_the_others_finish() {
+    const TABLES: usize = 3;
+    const CHUNKS: usize = 3;
+    const CHUNK: usize = 10;
+    let h = Harness::boot(Stores {
+        tables: TABLES,
+        ..Stores::new(1024)
+    })
+    .await;
+    fill_tables(&h, TABLES, CHUNKS * CHUNK);
+    let coord = snapshot_coord();
+    let schemas: Vec<TableSchema> = (0..TABLES).map(|t| schema_n(t, false)).collect();
+    let source = Arc::new(SlowSource(h.db.clone()));
+    let snapshotter = Snapshotter::new(coord.clone())
+        .with_chunk_size(CHUNK)
+        .with_concurrency(on_tasks(2));
+    *h.blob.failing_puts.lock().unwrap() = Some("orders_1".into());
+
+    let mut pipeline = snapshot_pipeline(&h, &coord, TABLES);
+    let failed = snapshotter
+        .run_concurrently(source.clone(), &schemas, &mut pipeline)
+        .await;
+
+    assert!(failed.is_err(), "the failing table's snapshot succeeded");
+    assert!(snapshot_complete(&coord, 0).await, "the table beside it");
+    assert!(!snapshot_complete(&coord, 1).await, "the failing table");
+    let after = coord.read_log(&ident_n(2), 0, 1000).await.unwrap();
+    assert!(after.is_empty(), "the table after it started");
+
+    *h.blob.failing_puts.lock().unwrap() = None;
+    let mut pipeline = snapshot_pipeline(&h, &coord, TABLES);
+    snapshotter
+        .run_concurrently(source, &schemas, &mut pipeline)
+        .await
+        .unwrap();
+    for t in 0..TABLES {
+        let staged = coord.read_log(&ident_n(t), 0, 1000).await.unwrap();
+        assert_eq!(staged.len(), CHUNKS, "table {t}");
+        assert!(snapshot_complete(&coord, t).await, "table {t}");
+    }
 }

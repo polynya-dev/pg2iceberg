@@ -250,6 +250,11 @@ pub struct LogicalConfig {
     pub slot_name: String,
     #[serde(default)]
     pub standby_interval: String,
+    /// Most tables the initial snapshot reads at once, each over a
+    /// Postgres connection of its own and holding up to two chunks of
+    /// `sink.flush_rows` rows; 1 reads them one after another.
+    #[serde(default = "default_snapshot_concurrency")]
+    pub snapshot_concurrency: usize,
 }
 
 impl Default for LogicalConfig {
@@ -258,8 +263,23 @@ impl Default for LogicalConfig {
             publication_name: default_publication(),
             slot_name: default_slot(),
             standby_interval: String::new(),
+            snapshot_concurrency: default_snapshot_concurrency(),
         }
     }
+}
+
+impl LogicalConfig {
+    /// The snapshot reads at least one table at a time.
+    pub fn validate_snapshot(&self) -> Result<()> {
+        if self.snapshot_concurrency == 0 {
+            anyhow::bail!("source.logical.snapshot_concurrency must be 1 or more");
+        }
+        Ok(())
+    }
+}
+
+fn default_snapshot_concurrency() -> usize {
+    pg2iceberg_snapshot::DEFAULT_TABLE_CONCURRENCY
 }
 
 fn default_publication() -> String {
@@ -696,6 +716,7 @@ impl Config {
         self.sink.schedule()?;
         self.sink.validate_compaction()?;
         self.sink.validate_materializer()?;
+        self.source.logical.validate_snapshot()?;
         self.metrics_addr()?;
         self.liveness_timeout()?;
         self.sink.resolved_maintenance()?;
@@ -1285,6 +1306,23 @@ state:
     }
 
     #[test]
+    fn snapshot_concurrency_is_at_least_one() {
+        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        for ok in [1, 8] {
+            cfg.source.logical.snapshot_concurrency = ok;
+            cfg.source.logical.validate_snapshot().unwrap();
+        }
+        cfg.source.logical.snapshot_concurrency = 0;
+        let err = cfg
+            .source
+            .logical
+            .validate_snapshot()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("snapshot_concurrency"), "{err}");
+    }
+
+    #[test]
     fn materializer_concurrency_is_at_least_one() {
         let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
         for ok in [1, 8] {
@@ -1546,6 +1584,7 @@ sink:
         assert_eq!(cfg.sink.flush_rows, 10_000);
         assert_eq!(cfg.sink.materializer_batch_rows, 50_000);
         assert_eq!(cfg.sink.materializer_concurrency, 4);
+        assert_eq!(cfg.source.logical.snapshot_concurrency, 4);
         assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
         assert_eq!(cfg.state.group, "default");
     }

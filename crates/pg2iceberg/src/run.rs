@@ -889,7 +889,7 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
         schemas.push(schema);
     }
 
-    let source = PgSnapshotSource::open(&cfg.source.postgres, &schemas)
+    let source = PgSnapshotSource::open(&cfg.source.postgres, &schemas, 1)
         .await
         .context("open verify source")?;
 
@@ -1170,7 +1170,10 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     // ── run snapshot phase ─────────────────────────────────────────
     let pg_cfg = cfg.source.postgres.clone();
     let to_snapshot = schemas.clone();
-    let source = crate::snapshot_src::PgSnapshotSource::open(&pg_cfg, &to_snapshot)
+    let tables = cfg.source.logical.snapshot_concurrency;
+    // A connection for each table read at once.
+    let connections = tables.min(to_snapshot.len()).max(1);
+    let source = crate::snapshot_src::PgSnapshotSource::open(&pg_cfg, &to_snapshot, connections)
         .await
         .map_err(|e| {
             anyhow::Error::from(LifecycleError::Snapshot(
@@ -1193,7 +1196,7 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
 
     Phase::Snapshotting.set(metrics.as_ref());
     let outcome = run_snapshot_phase(
-        &source,
+        Arc::new(source),
         Arc::clone(&coord),
         &schemas,
         &std::collections::BTreeSet::new(),
@@ -1201,6 +1204,12 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
         &mut pipeline,
         // A chunk is what the pipeline holds anyway.
         cfg.sink.flush_rows,
+        Some(pg2iceberg_snapshot::Concurrency {
+            tables,
+            spawn: Arc::new(|table| {
+                tokio::spawn(table);
+            }),
+        }),
     )
     .await
     .context("run_snapshot_phase")?;

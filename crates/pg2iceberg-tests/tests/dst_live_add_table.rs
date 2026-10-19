@@ -237,6 +237,7 @@ async fn live_add_table_backfills_via_background_snapshot() {
         flush_rows: 64,
         mat_batch_rows: 128,
         mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
+        snapshot_concurrency: pg2iceberg_snapshot::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(CounterMaterializerNamer::new("s3://table")),
         blob_namer: Arc::new(CounterBlobNamer::new("s3://stage")),

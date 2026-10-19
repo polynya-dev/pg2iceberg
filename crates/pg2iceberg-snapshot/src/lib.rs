@@ -4,9 +4,9 @@
 //! slot past that LSN so live replication picks up exactly where the
 //! snapshot left off.
 //!
-//! The current implementation does a single sequential read per
-//! table; CTID-page-chunked parallel reads (useful for very large
-//! source tables) are a tracked follow-up.
+//! Each table is read in primary key order, a chunk at a time; several
+//! tables can be read at once ([`Snapshotter::run_concurrently`]).
+//! Splitting one large table's reads is a tracked follow-up.
 //!
 //! ## Why this exists
 //!
@@ -31,9 +31,12 @@
 //! lossy.
 
 use async_trait::async_trait;
+use futures::channel::oneshot;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::{ChangeEvent, ColumnName, Lsn, Op, Row, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{pk_key, Catalog};
+use pg2iceberg_logical::pipeline::Spawn;
 use pg2iceberg_logical::work_span;
 use pg2iceberg_logical::{Pipeline, PipelineError};
 use pg2iceberg_pg::DecodedMessage;
@@ -48,6 +51,9 @@ pub enum SnapshotError {
     Source(String),
     #[error("pipeline: {0}")]
     Pipeline(#[from] PipelineError),
+    /// A table's task was dropped before it finished.
+    #[error("snapshot task abandoned")]
+    Abandoned,
 }
 
 pub type Result<T> = std::result::Result<T, SnapshotError>;
@@ -159,6 +165,11 @@ pub enum MarkerKind {
 /// each chunk is a staged file and a claim.
 pub const DEFAULT_CHUNK_SIZE: usize = 1024;
 
+/// Most tables pg2iceberg's snapshot reads at once by default
+/// ([`Snapshotter::with_concurrency`]): each holds a Postgres connection,
+/// and up to two chunks in memory.
+pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
+
 /// Drive a fresh pipeline through the initial-snapshot phase using the
 /// default chunk size.
 ///
@@ -218,6 +229,7 @@ where
 ///
 /// Replaces the old `Checkpoint`-driven design — see the module-level
 /// docs for the rationale.
+#[derive(Clone)]
 pub struct Snapshotter {
     coord: Arc<dyn Coordinator>,
     chunk_size: usize,
@@ -227,6 +239,16 @@ pub struct Snapshotter {
     /// startup invariant. Empty in sim runs (oid 0 means "unknown";
     /// the invariant skips on 0).
     table_oids: BTreeMap<TableIdent, u32>,
+    /// How many tables [`Self::run_concurrently`] reads at once.
+    concurrency: Option<Concurrency>,
+}
+
+/// Up to `tables` tables snapshotted at once, each on a task of its own
+/// that `spawn` starts ([`Snapshotter::run_concurrently`]).
+#[derive(Clone)]
+pub struct Concurrency {
+    pub tables: usize,
+    pub spawn: Spawn,
 }
 
 impl Snapshotter {
@@ -235,6 +257,7 @@ impl Snapshotter {
             coord,
             chunk_size: DEFAULT_CHUNK_SIZE,
             table_oids: BTreeMap::new(),
+            concurrency: None,
         }
     }
 
@@ -254,7 +277,16 @@ impl Snapshotter {
         self
     }
 
-    /// Run the snapshot to completion (all tables, all chunks).
+    /// Read up to `concurrency.tables` tables at once in
+    /// [`Self::run_concurrently`].
+    pub fn with_concurrency(mut self, concurrency: Concurrency) -> Self {
+        assert!(concurrency.tables > 0, "tables must be > 0");
+        self.concurrency = Some(concurrency);
+        self
+    }
+
+    /// Run the snapshot to completion (all tables, all chunks), one
+    /// table at a time.
     pub async fn run<S, C>(
         &self,
         source: &S,
@@ -285,80 +317,137 @@ impl Snapshotter {
         C: Coordinator + ?Sized + 'static,
     {
         let snap_lsn = source.snapshot_lsn().await?;
-
-        // Per-table snapshot loop. For each schema, read its progress
-        // cursor from coord, drive chunks until empty, stamp progress
-        // after each, mark the table complete on finish. A
-        // mid-snapshot fault leaves only the in-progress table's row
-        // in `snapshot_progress`; on resume the inner loop picks up
-        // at the saved PK.
-        let mut total_chunks = 0usize;
-        // A table can take hours: each chunk is a trace of its own
-        // (`snapshot.chunk`), not part of one for the table.
-        'tables: for (i, schema) in schemas.iter().enumerate() {
-            let pk_cols: Vec<ColumnName> = schema
-                .primary_key_columns()
-                .map(|c| ColumnName(c.name.clone()))
-                .collect();
-            if pk_cols.is_empty() {
-                return Err(SnapshotError::Source(format!(
-                    "table {} has no primary key; pg2iceberg requires one",
-                    schema.ident
-                )));
+        let mut budget = max_chunks;
+        for (i, schema) in schemas.iter().enumerate() {
+            let table = TableRun::new(schema, i, snap_lsn)?;
+            if !self.table(source, &table, pipeline, &mut budget).await? {
+                break;
             }
-            let table = TableRun {
-                schema,
-                xid: SNAPSHOT_XID_BASE.wrapping_add(i as u32),
-                pk_cols,
-                snap_lsn,
-            };
+        }
+        Ok(snap_lsn)
+    }
 
-            let resume = {
-                // Closed here, before the chunks: a span is exported once closed.
-                let span = work_span!(parent: None, "snapshot.table", table = %schema.ident);
-                let resume = self.resume(schema).instrument(span.clone()).await;
-                pg2iceberg_logical::spans::record_outcome(&span, &resume);
-                resume
-            };
-            let Resume::From(mut last_pk_key) = resume? else {
-                continue;
-            };
-            // The table's first chunk; each next one is read while the
-            // one before it stages ([`Self::chunk`]).
-            let mut rows = source
-                .read_chunk(&schema.pg_ident(), self.chunk_size, last_pk_key.as_deref())
-                .await?;
-            loop {
-                if let Some(cap) = max_chunks {
-                    if total_chunks >= cap {
-                        break 'tables;
-                    }
+    /// Like [`Self::run`], but up to [`Self::with_concurrency`] tables at
+    /// once, each read on a task of its own and staged through a pipeline
+    /// of its own ([`Pipeline::split_off`]): a table's reads and stagings
+    /// are CPU and round trips that don't wait on another's. `source`
+    /// serves them all at once. A table that fails stops the snapshot
+    /// once the others running finish.
+    pub async fn run_concurrently<S, C>(
+        &self,
+        source: Arc<S>,
+        schemas: &[TableSchema],
+        pipeline: &mut Pipeline<C>,
+    ) -> Result<Lsn>
+    where
+        S: SnapshotSource + ?Sized + 'static,
+        C: Coordinator + ?Sized + 'static,
+    {
+        let Some(Concurrency { tables, spawn }) = self.concurrency.clone() else {
+            return self.run(source.as_ref(), schemas, pipeline).await;
+        };
+        let snap_lsn = source.snapshot_lsn().await?;
+        let mut waiting = schemas.iter().cloned().enumerate();
+        let mut running = FuturesUnordered::new();
+        let mut failed = None;
+        loop {
+            while failed.is_none() && running.len() < tables {
+                let Some((i, schema)) = waiting.next() else {
+                    break;
+                };
+                let this = self.clone();
+                let source = source.clone();
+                let mut part = pipeline.split_off();
+                let (done, landed) = oneshot::channel();
+                spawn(Box::pin(async move {
+                    let out = async {
+                        let table = TableRun::new(&schema, i, snap_lsn)?;
+                        this.table(source.as_ref(), &table, &mut part, &mut None)
+                            .await?;
+                        Ok(part)
+                    };
+                    // Unheard if the snapshot is gone.
+                    let _ = done.send(out.await);
+                }));
+                running.push(async move { landed.await.unwrap_or(Err(SnapshotError::Abandoned)) });
+            }
+            match running.next().await {
+                Some(Ok(part)) => pipeline.rejoin(part),
+                Some(Err(e)) => {
+                    failed.get_or_insert(e);
                 }
-                let span = work_span!(
-                    parent: None,
-                    "snapshot.chunk",
-                    table = %schema.ident,
-                    rows = tracing::field::Empty,
-                );
-                let chunk = self
-                    .chunk(source, &table, pipeline, last_pk_key.as_deref(), rows)
-                    .instrument(span.clone())
-                    .await;
-                pg2iceberg_logical::spans::record_outcome(&span, &chunk);
-                match chunk? {
-                    Chunk::TableDone => break,
-                    Chunk::Staged {
-                        last_pk_key: key,
-                        next,
-                    } => {
-                        last_pk_key = Some(key);
-                        rows = next;
-                        total_chunks += 1;
+                None => break,
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(snap_lsn),
+        }
+    }
+
+    /// Snapshot `table`: resume it, then stage its chunks until it's read
+    /// to the end and marked complete, or until `budget` chunks are
+    /// staged. Whether the budget lasted. A mid-snapshot fault leaves the
+    /// table's progress row in `snapshot_progress`; a resumed pass picks
+    /// up at the saved PK.
+    async fn table<S, C>(
+        &self,
+        source: &S,
+        table: &TableRun<'_>,
+        pipeline: &mut Pipeline<C>,
+        budget: &mut Option<usize>,
+    ) -> Result<bool>
+    where
+        S: SnapshotSource + ?Sized,
+        C: Coordinator + ?Sized + 'static,
+    {
+        let schema = table.schema;
+        let resume = {
+            // Closed here, before the chunks: a span is exported once closed.
+            let span = work_span!(parent: None, "snapshot.table", table = %schema.ident);
+            let resume = self.resume(schema).instrument(span.clone()).await;
+            pg2iceberg_logical::spans::record_outcome(&span, &resume);
+            resume
+        };
+        let Resume::From(mut last_pk_key) = resume? else {
+            return Ok(true);
+        };
+        // The table's first chunk; each next one is read while the one
+        // before it stages ([`Self::chunk`]).
+        let mut rows = source
+            .read_chunk(&schema.pg_ident(), self.chunk_size, last_pk_key.as_deref())
+            .await?;
+        loop {
+            if *budget == Some(0) {
+                return Ok(false);
+            }
+            // A table can take hours: each chunk is a trace of its own
+            // (`snapshot.chunk`), not part of one for the table.
+            let span = work_span!(
+                parent: None,
+                "snapshot.chunk",
+                table = %schema.ident,
+                rows = tracing::field::Empty,
+            );
+            let chunk = self
+                .chunk(source, table, pipeline, last_pk_key.as_deref(), rows)
+                .instrument(span.clone())
+                .await;
+            pg2iceberg_logical::spans::record_outcome(&span, &chunk);
+            match chunk? {
+                Chunk::TableDone => return Ok(true),
+                Chunk::Staged {
+                    last_pk_key: key,
+                    next,
+                } => {
+                    last_pk_key = Some(key);
+                    rows = next;
+                    if let Some(left) = budget {
+                        *left -= 1;
                     }
                 }
             }
         }
-        Ok(snap_lsn)
     }
 
     /// Where `schema`'s snapshot resumes: after the last chunk a prior
@@ -523,6 +612,28 @@ struct TableRun<'a> {
     snap_lsn: Lsn,
 }
 
+impl<'a> TableRun<'a> {
+    /// The `i`th table of a run.
+    fn new(schema: &'a TableSchema, i: usize, snap_lsn: Lsn) -> Result<Self> {
+        let pk_cols: Vec<ColumnName> = schema
+            .primary_key_columns()
+            .map(|c| ColumnName(c.name.clone()))
+            .collect();
+        if pk_cols.is_empty() {
+            return Err(SnapshotError::Source(format!(
+                "table {} has no primary key; pg2iceberg requires one",
+                schema.ident
+            )));
+        }
+        Ok(Self {
+            schema,
+            xid: SNAPSHOT_XID_BASE.wrapping_add(i as u32),
+            pk_cols,
+            snap_lsn,
+        })
+    }
+}
+
 /// Where a table's snapshot resumes.
 enum Resume {
     Complete,
@@ -561,7 +672,8 @@ pub enum SnapshotPhaseOutcome {
 ///    opt-out).
 /// 3. Run [`Snapshotter`] (resumable surface — progress persists into
 ///    `Checkpoint::snapshot_progress` after each chunk, so a
-///    mid-snapshot crash + restart resumes at the next chunk).
+///    mid-snapshot crash + restart resumes at the next chunk), up to
+///    `concurrency` tables at once.
 /// 4. Defensive `pipeline.flush()` to drain.
 /// 5. Persist `snapshot_state: Complete` + `flushed_lsn` +
 ///    `tracked_tables` + cleared progress map.
@@ -580,16 +692,17 @@ pub enum SnapshotPhaseOutcome {
 /// `binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_snapshot_phase<S, C>(
-    source: &S,
+    source: Arc<S>,
     coord: Arc<dyn Coordinator>,
     schemas: &[TableSchema],
     skip_idents: &std::collections::BTreeSet<TableIdent>,
     table_oids: &std::collections::BTreeMap<TableIdent, u32>,
     pipeline: &mut Pipeline<C>,
     chunk_size: usize,
+    concurrency: Option<Concurrency>,
 ) -> Result<SnapshotPhaseOutcome>
 where
-    S: SnapshotSource + ?Sized,
+    S: SnapshotSource + ?Sized + 'static,
     C: Coordinator + ?Sized + 'static,
 {
     // Filter out operator-supplied skip-list entries.
@@ -627,10 +740,15 @@ where
     // post-pass coord writes itself. A mid-snapshot fault leaves the
     // world in a state where the next call picks up exactly where the
     // previous one left off.
-    let snapshotter = Snapshotter::new(coord.clone())
+    let mut snapshotter = Snapshotter::new(coord.clone())
         .with_chunk_size(chunk_size)
         .with_table_oids(table_oids.clone());
-    let snap_lsn = snapshotter.run(source, &to_snapshot, pipeline).await?;
+    if let Some(concurrency) = concurrency {
+        snapshotter = snapshotter.with_concurrency(concurrency);
+    }
+    let snap_lsn = snapshotter
+        .run_concurrently(source, &to_snapshot, pipeline)
+        .await?;
 
     // Defensive final flush — the Snapshotter::run loop already
     // flushes after each chunk, but a final pass is cheap insurance

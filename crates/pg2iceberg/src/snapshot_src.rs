@@ -16,6 +16,11 @@
 //! against the in-flight transaction. All chunks see a consistent view
 //! because the tx stays open for the lifetime of the source.
 //!
+//! To read several tables at once, the source opens more connections:
+//! each imports the first's snapshot (`pg_export_snapshot()`, then `SET
+//! TRANSACTION SNAPSHOT`), so a chunk sees the same rows whichever reads
+//! it.
+//!
 //! `pk_cols` are in the primary key index's order, so the index serves
 //! each chunk; in another order Postgres scans and sorts the whole table
 //! for every chunk.
@@ -67,7 +72,7 @@ use pg2iceberg_pg::prod::value_decode::decode_text;
 use pg2iceberg_snapshot::{Result as SnapshotResult, SnapshotError, SnapshotSource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::AbortHandle;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
@@ -106,17 +111,25 @@ enum Cursor {
 }
 
 pub struct PgSnapshotSource {
-    /// REPEATABLE READ tx is open on this client for the lifetime of
-    /// the source. Wrapped in a mutex because `tokio_postgres::Client`
-    /// is `Send + Sync` but the trait method takes `&self`.
-    client: Mutex<Client>,
-    _conn: AbortHandle,
+    /// REPEATABLE READ tx is open on these clients, all in the same
+    /// snapshot, for the lifetime of the source. A read takes one that's
+    /// free: `tokio_postgres` queues a client's queries, one at a time.
+    clients: Vec<Mutex<Client>>,
+    /// One per client: a read holds one while it takes a free client.
+    readers: Semaphore,
+    _conns: Vec<AbortHandle>,
     snapshot_lsn: Lsn,
     schemas: BTreeMap<TableIdent, CachedSchema>,
 }
 
 impl PgSnapshotSource {
-    pub async fn open(pg_cfg: &PostgresConfig, schemas: &[TableSchema]) -> Result<Self> {
+    /// Open the snapshot over `connections` connections, so as many
+    /// chunks can be read at once.
+    pub async fn open(
+        pg_cfg: &PostgresConfig,
+        schemas: &[TableSchema],
+        connections: usize,
+    ) -> Result<Self> {
         let tls = match pg_cfg.tls_label() {
             "webpki" => CoordTls::Webpki,
             _ => CoordTls::Disable,
@@ -205,9 +218,37 @@ impl PgSnapshotSource {
             );
         }
 
+        let mut clients = vec![Mutex::new(conn.client)];
+        let mut conns = vec![conn.abort];
+        if connections > 1 {
+            // Exported while this transaction stays open; queried already,
+            // it has taken its snapshot.
+            let first = clients[0].get_mut();
+            let id = simple_query_one_value(first, "SELECT pg_export_snapshot()")
+                .await
+                .context("pg_export_snapshot")?
+                .ok_or_else(|| anyhow::anyhow!("pg_export_snapshot returned no rows"))?;
+            for _ in 1..connections {
+                let conn = coord_connect_with(&pg_cfg.dsn(), tls)
+                    .await
+                    .context("connect snapshot reader")?;
+                conn.client
+                    .simple_query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .await
+                    .context("BEGIN snapshot reader tx")?;
+                conn.client
+                    .simple_query(&format!("SET TRANSACTION SNAPSHOT '{id}'"))
+                    .await
+                    .with_context(|| format!("import snapshot {id}"))?;
+                clients.push(Mutex::new(conn.client));
+                conns.push(conn.abort);
+            }
+        }
+
         Ok(Self {
-            client: Mutex::new(conn.client),
-            _conn: conn.abort,
+            readers: Semaphore::new(clients.len()),
+            clients,
+            _conns: conns,
             snapshot_lsn,
             schemas: by_ident,
         })
@@ -302,12 +343,23 @@ impl SnapshotSource for PgSnapshotSource {
             limit = chunk_size,
         );
 
-        let client = self.client.lock().await;
-        let messages = client
-            .simple_query(&q)
-            .await
-            .map_err(|e| SnapshotError::Source(format!("snapshot SELECT {ident}: {e}")))?;
-        drop(client);
+        let messages = {
+            let _reader = self
+                .readers
+                .acquire()
+                .await
+                .map_err(|e| SnapshotError::Source(format!("snapshot readers: {e}")))?;
+            // Each reader holds at most one client, so one is free.
+            let client = self
+                .clients
+                .iter()
+                .find_map(|c| c.try_lock().ok())
+                .expect("a free client per reader");
+            client
+                .simple_query(&q)
+                .await
+                .map_err(|e| SnapshotError::Source(format!("snapshot SELECT {ident}: {e}")))?
+        };
 
         let mut out = Vec::with_capacity(chunk_size.min(64));
         for msg in messages {
