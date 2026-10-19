@@ -11,6 +11,8 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+# A chunk stages while the next is read (`futures::join!`).
+futures = "0.3"
 pg2iceberg-core.workspace = true
 pg2iceberg-pg.workspace = true
 pg2iceberg-coord.workspace = true

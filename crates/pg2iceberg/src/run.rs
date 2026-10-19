@@ -1199,7 +1199,8 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
         &std::collections::BTreeSet::new(),
         &table_oids,
         &mut pipeline,
-        pg2iceberg_snapshot::DEFAULT_CHUNK_SIZE,
+        // A chunk is what the pipeline holds anyway.
+        cfg.sink.flush_rows,
     )
     .await
     .context("run_snapshot_phase")?;

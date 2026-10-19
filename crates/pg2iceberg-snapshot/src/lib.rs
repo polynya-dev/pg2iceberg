@@ -154,7 +154,9 @@ pub enum MarkerKind {
 
 /// Default chunk size for [`run_snapshot`]. Trades off peak memory against
 /// coord-write amplification — ~1k rows per chunk is a reasonable
-/// balance for the typical OLTP-row-size workload.
+/// balance for the typical OLTP-row-size workload. pg2iceberg itself
+/// reads `flush_rows` a chunk: the pipeline holds that many anyway, and
+/// each chunk is a staged file and a claim.
 pub const DEFAULT_CHUNK_SIZE: usize = 1024;
 
 /// Drive a fresh pipeline through the initial-snapshot phase using the
@@ -321,7 +323,11 @@ impl Snapshotter {
             let Resume::From(mut last_pk_key) = resume? else {
                 continue;
             };
-
+            // The table's first chunk; each next one is read while the
+            // one before it stages ([`Self::chunk`]).
+            let mut rows = source
+                .read_chunk(&schema.pg_ident(), self.chunk_size, last_pk_key.as_deref())
+                .await?;
             loop {
                 if let Some(cap) = max_chunks {
                     if total_chunks >= cap {
@@ -335,14 +341,18 @@ impl Snapshotter {
                     rows = tracing::field::Empty,
                 );
                 let chunk = self
-                    .chunk(source, &table, pipeline, last_pk_key.as_deref())
+                    .chunk(source, &table, pipeline, last_pk_key.as_deref(), rows)
                     .instrument(span.clone())
                     .await;
                 pg2iceberg_logical::spans::record_outcome(&span, &chunk);
                 match chunk? {
                     Chunk::TableDone => break,
-                    Chunk::Staged { last_pk_key: key } => {
+                    Chunk::Staged {
+                        last_pk_key: key,
+                        next,
+                    } => {
                         last_pk_key = Some(key);
+                        rows = next;
                         total_chunks += 1;
                     }
                 }
@@ -374,15 +384,18 @@ impl Snapshotter {
         Ok(Resume::From(last_pk_key))
     }
 
-    /// Stage the chunk of `table` after `last_pk_key`, then stamp the
-    /// resume cursor past it — or, with nothing left to read, mark the
-    /// table complete.
+    /// Stage `chunk`, the rows of `table` after `last_pk_key`, then stamp
+    /// the resume cursor past it — or, with nothing left to read, mark the
+    /// table complete. The next chunk is read from Postgres meanwhile: a
+    /// read and a staging are each a round trip or more, and neither needs
+    /// the other.
     async fn chunk<S, C>(
         &self,
         source: &S,
         table: &TableRun<'_>,
         pipeline: &mut Pipeline<C>,
         last_pk_key: Option<&str>,
+        chunk: Vec<Row>,
     ) -> Result<Chunk>
     where
         S: SnapshotSource + ?Sized,
@@ -390,17 +403,14 @@ impl Snapshotter {
     {
         let TableRun {
             schema,
-            xid,
             ref pk_cols,
             snap_lsn,
+            ..
         } = *table;
         // PG-side ident — `read_chunk` issues a SELECT against
         // the source PG table, so namespace must be the PG
         // schema (not the Iceberg `sink.namespace`).
         let pg_ident = schema.pg_ident();
-        let chunk = source
-            .read_chunk(&pg_ident, self.chunk_size, last_pk_key)
-            .await?;
         tracing::Span::current().record("rows", chunk.len());
         if chunk.is_empty() {
             // Table done — drop the resume cursor and stamp
@@ -434,6 +444,35 @@ impl Snapshotter {
             }
         }
 
+        let (staged, next) = futures::join!(
+            self.stage(table, pipeline, chunk, &new_key),
+            source.read_chunk(&pg_ident, self.chunk_size, Some(&new_key)),
+        );
+        staged?;
+        Ok(Chunk::Staged {
+            last_pk_key: new_key,
+            next: next?,
+        })
+    }
+
+    /// Stage `chunk` as one transaction of `table`'s, and once it's
+    /// claimed, stamp the resume cursor at `new_key`, its last row's.
+    async fn stage<C>(
+        &self,
+        table: &TableRun<'_>,
+        pipeline: &mut Pipeline<C>,
+        chunk: Vec<Row>,
+        new_key: &str,
+    ) -> Result<()>
+    where
+        C: Coordinator + ?Sized + 'static,
+    {
+        let TableRun {
+            schema,
+            xid,
+            snap_lsn,
+            ..
+        } = *table;
         pipeline
             .process(DecodedMessage::Begin {
                 final_lsn: snap_lsn,
@@ -468,12 +507,10 @@ impl Snapshotter {
         // materializer's fold-by-PK absorbs the duplicate
         // staged events).
         self.coord
-            .set_snapshot_progress(&schema.ident, &new_key)
+            .set_snapshot_progress(&schema.ident, new_key)
             .await
             .map_err(|e| SnapshotError::Source(format!("set_snapshot_progress: {e}")))?;
-        Ok(Chunk::Staged {
-            last_pk_key: new_key,
-        })
+        Ok(())
     }
 }
 
@@ -497,8 +534,9 @@ enum Resume {
 enum Chunk {
     /// Nothing left: the table is marked complete.
     TableDone,
-    /// Staged, through the row with this primary key.
-    Staged { last_pk_key: String },
+    /// Staged, through the row with this primary key; the chunk after it,
+    /// read meanwhile.
+    Staged { last_pk_key: String, next: Vec<Row> },
 }
 
 /// Outcome of [`run_snapshot_phase`].

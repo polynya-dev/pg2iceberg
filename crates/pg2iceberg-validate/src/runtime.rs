@@ -742,7 +742,8 @@ async fn start<Cat: Catalog + 'static>(
                 &lc.skip_snapshot_idents,
                 &table_oids,
                 &mut pipeline,
-                pg2iceberg_snapshot::DEFAULT_CHUNK_SIZE,
+                // A chunk is what the pipeline holds anyway.
+                lc.flush_rows,
             )
             .await?
             {
@@ -824,7 +825,7 @@ async fn start<Cat: Catalog + 'static>(
                 pk_per_table,
                 translation_per_table,
                 table_oids,
-                pg2iceberg_snapshot::DEFAULT_CHUNK_SIZE,
+                flush_rows,
                 tx,
             )
             .await;
