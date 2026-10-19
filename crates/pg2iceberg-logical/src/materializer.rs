@@ -34,7 +34,7 @@ use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
     is_snapshot_xid, ColumnName, ColumnSchema, IdGen, Lsn, Metrics, Namespace, NoopMetrics, Op,
-    PgValue, Row, TableIdent, TableSchema,
+    PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
 use pg2iceberg_iceberg::meta::{
     self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
@@ -396,6 +396,10 @@ struct TableEntry {
     gated_until_snapshot: bool,
     /// A backfill staged alongside the table's changes.
     backfill: Backfill,
+    /// The initial snapshot's rows applied straight from Postgres, but
+    /// not yet committed ([`Materializer::apply_snapshot_chunk`]); `None`
+    /// with no snapshot being applied.
+    snapshot: Option<Unit>,
 }
 
 /// A table backfilled mid-stream ([`Materializer::register_table_pending`])
@@ -456,6 +460,9 @@ struct Unit {
     /// Snapshot rows of a backfill: committing advances the snapshot
     /// cursor (see [`Backfill`]).
     snapshot: bool,
+    /// The initial snapshot's rows, read straight from Postgres: no log
+    /// range to record, nor cursor to advance.
+    direct: bool,
     /// Columns filled with their default ([`FILL_PROPERTY`]), by field id.
     filled: BTreeSet<i32>,
     /// Table properties the commit removes.
@@ -1048,6 +1055,7 @@ impl<C: Catalog> Materializer<C> {
                 writer,
                 gated_until_snapshot: false,
                 backfill: Backfill::Unknown,
+                snapshot: None,
             },
         );
         Ok(())
@@ -1305,6 +1313,16 @@ impl<C: Catalog> Materializer<C> {
         format!("{}#snapshot", self.group)
     }
 
+    /// The `mat_cursor` group recording, for each table, the LSN of the
+    /// initial snapshot applied straight to it
+    /// ([`Self::apply_snapshot_chunk`]) — an LSN, not a log offset. The
+    /// backfill that resumes a snapshot that failed, or never got marked
+    /// complete, applies the changes since: rows the snapshot committed
+    /// may predate them.
+    fn snapshot_lsn_group(&self) -> String {
+        format!("{}#snapshot-lsn", self.group)
+    }
+
     /// The `mat_cursor` group `unit` advances.
     fn unit_group(&self, unit: &Unit) -> String {
         if unit.snapshot {
@@ -1333,9 +1351,19 @@ impl<C: Catalog> Materializer<C> {
         Ok(backfill)
     }
 
-    /// The LSN of the table's first snapshot row: the earliest snapshot,
-    /// since backfill runs stage in order.
+    /// The LSN of the table's earliest snapshot: of an initial snapshot
+    /// applied straight to it, if one began, which predates any backfill;
+    /// otherwise of its first staged snapshot row, since backfill runs
+    /// stage in order.
     async fn first_snapshot_lsn(&self, ident: &TableIdent) -> Result<Option<Lsn>> {
+        let direct = self
+            .coord
+            .get_cursor(&self.snapshot_lsn_group(), ident)
+            .await?
+            .filter(|lsn| *lsn >= 0);
+        if let Some(lsn) = direct {
+            return Ok(Some(Lsn(lsn as u64)));
+        }
         let mut after = 0;
         loop {
             let entries = self.coord.read_log(ident, after, LOG_PAGE_ENTRIES).await?;
@@ -1439,6 +1467,109 @@ impl<C: Catalog> Materializer<C> {
             self.apply_columns(ident, unit, &evt, &relation).await?;
         }
         Ok(())
+    }
+
+    /// Apply `rows`, a chunk of `ident`'s initial snapshot read at `lsn`,
+    /// straight from Postgres rather than through the staged log: should
+    /// it fail, Postgres serves them again. They're folded and uploaded
+    /// in steps of at least `batch_rows`, and committed by
+    /// [`Self::commit_snapshot`] together, as one update: the table goes
+    /// from empty to its snapshot, never shown half loaded. Before the
+    /// first, `lsn` is recorded ([`Self::snapshot_lsn_group`]).
+    pub async fn apply_snapshot_chunk(
+        &mut self,
+        ident: &TableIdent,
+        xid: u32,
+        lsn: Lsn,
+        rows: Vec<Row>,
+    ) -> Result<()> {
+        let entry = self
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        let mut unit = match entry.snapshot.take() {
+            Some(unit) => unit,
+            None => {
+                self.begin_snapshot(ident, lsn).await?;
+                Unit {
+                    direct: true,
+                    ..Unit::default()
+                }
+            }
+        };
+        unit.buf.extend(rows.into_iter().map(|row| MatEvent {
+            op: Op::Insert,
+            lsn,
+            commit_ts: Timestamp(0),
+            xid: Some(xid),
+            unchanged_cols: vec![],
+            row,
+            moved_from: None,
+        }));
+        let step = if unit.buf.len() >= self.batch_rows {
+            self.prepare_step(ident, &mut unit).await
+        } else {
+            Ok(())
+        };
+        // Kept to commit, or to abandon.
+        if let Some(entry) = self.tables.get_mut(ident) {
+            entry.snapshot = Some(unit);
+        }
+        step
+    }
+
+    /// Before `ident`'s snapshot is applied: record its LSN — the first's,
+    /// should a failed one have recorded it already, since its rows may
+    /// be committed — and catch the FileIndex up with the table.
+    async fn begin_snapshot(&mut self, ident: &TableIdent, lsn: Lsn) -> Result<()> {
+        let group = self.snapshot_lsn_group();
+        self.coord.ensure_cursor(&group, ident).await?;
+        let recorded = self.coord.get_cursor(&group, ident).await?;
+        if recorded.is_none_or(|at| at < 0) {
+            self.coord.set_cursor(&group, ident, lsn.0 as i64).await?;
+        }
+        self.sync_file_index(ident).await?;
+        Ok(())
+    }
+
+    /// Commit the chunks of `ident`'s snapshot applied so far
+    /// ([`Self::apply_snapshot_chunk`]) as one update of the table. Returns
+    /// rows committed.
+    pub async fn commit_snapshot(&mut self, ident: &TableIdent) -> Result<usize> {
+        let entry = self
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        let Some(mut unit) = entry.snapshot.take() else {
+            return Ok(0);
+        };
+        let committed = self.commit_unit(ident, &mut unit).await;
+        if committed.is_err() {
+            // Its steps uploaded before one failed are in FileIndex.
+            self.forget_file_index(ident);
+        }
+        committed
+    }
+
+    /// Forget the chunks of `ident`'s snapshot applied but not committed:
+    /// the snapshot failed.
+    pub fn abandon_snapshot(&mut self, ident: &TableIdent) {
+        let applied = self
+            .tables
+            .get_mut(ident)
+            .and_then(|entry| entry.snapshot.take());
+        if applied.is_some() {
+            self.forget_file_index(ident);
+        }
+    }
+
+    /// Forget what `ident`'s FileIndex holds, as rows never committed may
+    /// be in it: it's rebuilt from the table when next needed.
+    fn forget_file_index(&mut self, ident: &TableIdent) {
+        if let Some(entry) = self.tables.get_mut(ident) {
+            entry.file_index = FileIndex::new();
+            entry.index_at = None;
+        }
     }
 
     /// Who maintains the tables (default: pg2iceberg). See
@@ -1627,10 +1758,7 @@ impl<C: Catalog> Materializer<C> {
             idents.retain(|t| assigned.contains(t));
         }
 
-        // Meta tables and markers are written as each table commits,
-        // through one writer each: their tables go one after another.
-        let shared_meta = self.meta_recorder.is_some() || self.meta_marker.is_some();
-        if self.table_concurrency == 1 || idents.len() < 2 || shared_meta {
+        if self.table_concurrency == 1 || idents.len() < 2 || !self.splits() {
             let mut total = 0;
             for ident in idents {
                 total += self.cycle_table(&ident).await?;
@@ -1677,10 +1805,17 @@ impl<C: Catalog> Materializer<C> {
         }
     }
 
+    /// Whether tables can be applied apart, by materializers of their own
+    /// ([`Self::split_off`]). Not with meta tables or markers: they're
+    /// written as each table commits, through one writer each.
+    pub fn splits(&self) -> bool {
+        self.meta_recorder.is_none() && self.meta_marker.is_none()
+    }
+
     /// A materializer for `ident` alone: the table's state moves into it,
     /// and it shares this one's stores, catalog cache, namer and metrics.
     /// No meta tables or markers: their writers stay here.
-    fn split_off(&mut self, ident: &TableIdent) -> Option<Self> {
+    pub fn split_off(&mut self, ident: &TableIdent) -> Option<Self> {
         let entry = self.tables.remove(ident)?;
         Some(Self {
             coord: self.coord.clone(),
@@ -1702,7 +1837,7 @@ impl<C: Catalog> Materializer<C> {
     }
 
     /// Take back a table [`Self::split_off`] moved out.
-    fn rejoin(&mut self, part: Self) {
+    pub fn rejoin(&mut self, part: Self) {
         self.backlogged |= part.backlogged;
         self.tables.extend(part.tables);
     }
@@ -2439,7 +2574,7 @@ impl<C: Catalog> Materializer<C> {
     /// advance the cursor past it. Returns rows folded.
     async fn commit_unit(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<usize> {
         // Nothing read: nothing to commit, and no span for it.
-        if unit.end_offset.is_none() {
+        if unit.end_offset.is_none() && !unit.direct {
             return self.commit(ident, unit).await;
         }
         let span = crate::work_span!(
@@ -2459,8 +2594,11 @@ impl<C: Catalog> Materializer<C> {
     async fn commit(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<usize> {
         self.prepare_step(ident, unit).await?;
         let unit = std::mem::take(unit);
-        let Some(end_offset) = unit.end_offset else {
-            return Ok(0);
+        // How far it read the log: not at all, for rows read straight
+        // from Postgres.
+        let log_end = match unit.end_offset {
+            None if !unit.direct => return Ok(0),
+            end => end,
         };
         let files = || unit.steps.iter().flat_map(|s| s.data_files.iter());
         let data_files_count = files().count() as i32;
@@ -2490,11 +2628,11 @@ impl<C: Catalog> Materializer<C> {
             .count() as i64;
 
         let group = self.unit_group(&unit);
-        let log_range = LogRange {
+        let log_range = log_end.map(|end| LogRange {
             group: group.clone(),
-            start: unit.start_offset.unwrap_or(end_offset),
-            end: end_offset,
-        };
+            start: unit.start_offset.unwrap_or(end),
+            end,
+        });
 
         // Commit catalog snapshots — durability gate.
         let started_micros = now_micros();
@@ -2504,7 +2642,7 @@ impl<C: Catalog> Materializer<C> {
         } else {
             match self
                 .catalog
-                .commit_snapshots(unit.steps, Some(log_range), unit.remove_properties)
+                .commit_snapshots(unit.steps, log_range, unit.remove_properties)
                 .await
             {
                 Ok(meta) => {
@@ -2534,7 +2672,11 @@ impl<C: Catalog> Materializer<C> {
                     self.rebuild_file_index(ident).await?;
                     // Unless they did, the response lost: then carry on as
                     // committed, rather than fail and have the next cycle
-                    // find out.
+                    // find out. (Rows read straight from Postgres record
+                    // no log range to tell by: they're read again.)
+                    let Some(end_offset) = log_end else {
+                        return Err(e.into());
+                    };
                     let applied = self
                         .catalog
                         .load_table(ident)
@@ -2552,9 +2694,11 @@ impl<C: Catalog> Materializer<C> {
         let commit_duration_ms = commit_duration_micros / 1000;
 
         // Advance cursor only after commit success.
-        self.coord
-            .set_cursor(&group, ident, end_offset as i64)
-            .await?;
+        if let Some(end_offset) = log_end {
+            self.coord
+                .set_cursor(&group, ident, end_offset as i64)
+                .await?;
+        }
 
         // Blue-green meta-marker emission. After cursor + FileIndex are
         // durable, query the coord for any pending markers covered by
@@ -2564,7 +2708,7 @@ impl<C: Catalog> Materializer<C> {
         // cursor so the coord's eligibility check considers everything we
         // just committed as processed.
         // (Snapshot rows carry no markers; their cursor isn't this one.)
-        if self.meta_marker.is_some() && !unit.snapshot {
+        if let (Some(end_offset), true) = (log_end, self.meta_marker.is_some() && !unit.snapshot) {
             self.emit_pending_markers(ident, end_offset as i64).await?;
         }
 

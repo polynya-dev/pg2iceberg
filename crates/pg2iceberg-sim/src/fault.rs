@@ -86,6 +86,9 @@ pub mod ops {
     /// drives the resumability fault DSTs (mid-chunk crash → resume
     /// at next PK).
     pub const COORD_SAVE_CP: &str = "coord.set_snapshot_progress";
+    /// Fault key for `Coordinator::mark_table_snapshot_complete`: a
+    /// snapshot that wrote its table dies before recording it complete.
+    pub const COORD_MARK_COMPLETE: &str = "coord.mark_table_snapshot_complete";
     /// Fault key for `Coordinator::bump_table_epoch`: a process that
     /// wrote a table dies, or loses the coordinator, before it records
     /// the write.
@@ -369,6 +372,11 @@ impl Coordinator for FaultyCoordinator {
         pg_oid: u32,
         snapshot_lsn: Lsn,
     ) -> CoordResult<()> {
+        if self.plan.tick(ops::COORD_MARK_COMPLETE) {
+            return Err(CoordError::Pg(
+                "injected fault: mark_table_snapshot_complete".into(),
+            ));
+        }
         self.inner
             .mark_table_snapshot_complete(ident, pg_oid, snapshot_lsn)
             .await

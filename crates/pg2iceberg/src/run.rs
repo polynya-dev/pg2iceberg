@@ -1018,7 +1018,6 @@ pub async fn run_snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result
 }
 
 async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
-    use pg2iceberg_logical::pipeline::Pipeline;
     use pg2iceberg_logical::Materializer;
     use pg2iceberg_pg::PgClient;
     use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome};
@@ -1026,9 +1025,10 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
 
     cfg.require_catalog()?;
     let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?));
+    // The snapshot is written straight to the tables: nothing to stage.
     let Storage {
         blob,
-        blob_namer,
+        blob_namer: _,
         materializer_namer,
     } = build_storage(&cfg, &catalog)
         .await
@@ -1124,31 +1124,7 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
         );
     }
 
-    // ── pipeline + materializer ────────────────────────────────────
-    let mut pipeline: Pipeline<dyn Coordinator> = Pipeline::with_metrics(
-        Arc::clone(&coord),
-        Arc::clone(&blob),
-        blob_namer,
-        cfg.sink.flush_rows,
-        metrics.clone(),
-    );
-    for s in &schemas {
-        let pk_cols: Vec<pg2iceberg_core::ColumnName> = s
-            .primary_key_columns()
-            .map(|c| pg2iceberg_core::ColumnName(c.name.clone()))
-            .collect();
-        if !pk_cols.is_empty() {
-            pipeline.register_primary_keys(s.ident.clone(), pk_cols);
-        }
-        // PG → Iceberg ident translation. Mirrors the same call in
-        // `run_logical_lifecycle`; needed because this path drives
-        // its own pipeline + materializer outside the lifecycle.
-        let pg_ident = s.pg_ident();
-        if pg_ident != s.ident {
-            pipeline.register_table_translation(pg_ident, s.ident.clone());
-        }
-    }
-
+    // ── materializer ───────────────────────────────────────────────
     let mut materializer: Materializer<OneShotCatalog> = Materializer::with_metrics(
         Arc::clone(&coord),
         Arc::clone(&blob),
@@ -1201,8 +1177,8 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
         &schemas,
         &std::collections::BTreeSet::new(),
         &table_oids,
-        &mut pipeline,
-        // A chunk is what the pipeline holds anyway.
+        &mut materializer,
+        // A chunk is what the pipeline holds of changes.
         cfg.sink.flush_rows,
         Some(pg2iceberg_snapshot::Concurrency {
             tables,
@@ -1219,12 +1195,11 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
             println!("OK: snapshot already complete; nothing to do");
         }
         SnapshotPhaseOutcome::Completed { snapshot_lsn } => {
-            // Publish staged snapshot rows to Iceberg via one
-            // materializer cycle. Without this, the staged Parquet
-            // sits in coord but no Iceberg snapshot exists, and a
-            // later `Run` would commit them — which works, but
-            // surprises the operator who'd expect snapshot-only to
-            // produce visible Iceberg state.
+            // The snapshot's rows are in the tables. A run of an earlier
+            // version may have staged some: publish them too, or a later
+            // `Run` would — which works, but surprises the operator
+            // who'd expect snapshot-only to produce visible Iceberg
+            // state.
             materializer
                 .cycle()
                 .await

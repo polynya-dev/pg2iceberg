@@ -742,14 +742,16 @@ async fn start<Cat: Catalog + 'static>(
                     table_oids.insert(s.ident.clone(), v);
                 }
             }
+            // Written straight to the tables, not staged: Postgres serves
+            // the rows again should it fail.
             match run_snapshot_phase(
                 source,
                 Arc::clone(&lc.coord),
                 &lc.schemas,
                 &lc.skip_snapshot_idents,
                 &table_oids,
-                &mut pipeline,
-                // A chunk is what the pipeline holds anyway.
+                &mut materializer,
+                // A chunk is what the pipeline holds of changes.
                 lc.flush_rows,
                 Some(pg2iceberg_snapshot::Concurrency {
                     tables: lc.snapshot_concurrency,
@@ -767,7 +769,6 @@ async fn start<Cat: Catalog + 'static>(
                     None
                 }
                 SnapshotPhaseOutcome::Completed { snapshot_lsn } => {
-                    run_materialize_tick(&mut materializer, None).await?;
                     tracing::info!(?snapshot_lsn, "snapshot phase complete");
                     Some(snapshot_lsn)
                 }
