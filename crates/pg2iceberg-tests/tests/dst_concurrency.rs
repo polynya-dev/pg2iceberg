@@ -46,9 +46,17 @@ const LATENCY: Duration = Duration::from_millis(100);
 const STALLED: Duration = Duration::from_secs(3600);
 
 fn ident() -> TableIdent {
+    ident_n(0)
+}
+
+/// The `n`th table: `orders`, then `orders_1`, `orders_2`, ...
+fn ident_n(n: usize) -> TableIdent {
     TableIdent {
         namespace: Namespace(vec!["public".into()]),
-        name: "orders".into(),
+        name: match n {
+            0 => "orders".into(),
+            n => format!("orders_{n}"),
+        },
     }
 }
 
@@ -62,10 +70,10 @@ fn column(name: &str, field_id: i32, ty: IcebergType, pk: bool) -> ColumnSchema 
     }
 }
 
-/// The table; `partitioned` by `qty`.
-fn schema(partitioned: bool) -> TableSchema {
+/// The `n`th table's schema; `partitioned` by `qty`.
+fn schema_n(n: usize, partitioned: bool) -> TableSchema {
     TableSchema {
-        ident: ident(),
+        ident: ident_n(n),
         columns: vec![
             column("id", 1, IcebergType::Int, true),
             column("qty", 2, IcebergType::Int, false),
@@ -152,6 +160,8 @@ struct Stores {
     compact_namer_latency: Duration,
     /// Whether the table is partitioned (by `qty`).
     partitioned: bool,
+    /// How many tables (`ident_n`).
+    tables: usize,
 }
 
 impl Stores {
@@ -165,6 +175,7 @@ impl Stores {
             one_connection: false,
             compact_namer_latency: Duration::ZERO,
             partitioned: false,
+            tables: 1,
         }
     }
 }
@@ -185,6 +196,8 @@ struct SlowBlobStore {
     /// `Stores::expire_at`, or a later one ([`Self::expire_in`]).
     expire_at: AtomicUsize,
     credentials: RwLock<()>,
+    /// Uploads to paths with this in them fail.
+    failing_puts: std::sync::Mutex<Option<String>>,
 }
 
 impl SlowBlobStore {
@@ -210,6 +223,13 @@ impl BlobStore for SlowBlobStore {
     async fn put(&self, path: &str, bytes: Bytes) -> BlobResult<()> {
         let _writing = Reading::start(&self.writes);
         self.authorize().await;
+        let failing = self.failing_puts.lock().unwrap().clone();
+        if failing.is_some_and(|f| path.contains(&f)) {
+            tokio::time::sleep(LATENCY).await;
+            return Err(pg2iceberg_stream::StreamError::Io(format!(
+                "injected: {path}"
+            )));
+        }
         tokio::time::sleep(LATENCY).await;
         self.inner.put(path, bytes).await
     }
@@ -422,10 +442,16 @@ struct Harness {
 
 impl Harness {
     async fn boot(stores: Stores) -> Self {
-        let schema = schema(stores.partitioned);
+        let schemas: Vec<TableSchema> = (0..stores.tables)
+            .map(|n| schema_n(n, stores.partitioned))
+            .collect();
+        let schema = schemas[0].clone();
         let db = SimPostgres::new();
-        db.create_table(schema.clone()).unwrap();
-        db.create_publication(PUB, &[ident()]).unwrap();
+        for s in &schemas {
+            db.create_table(s.clone()).unwrap();
+        }
+        let idents: Vec<TableIdent> = schemas.iter().map(|s| s.ident.clone()).collect();
+        db.create_publication(PUB, &idents).unwrap();
         db.create_slot(SLOT, PUB).unwrap();
         let stream = db.start_replication(SLOT).unwrap();
 
@@ -451,6 +477,7 @@ impl Harness {
             requests: AtomicUsize::new(0),
             expire_at: AtomicUsize::new(stores.expire_at.unwrap_or(usize::MAX)),
             credentials: RwLock::new(()),
+            failing_puts: std::sync::Mutex::new(None),
         });
         let catalog = Arc::new(MemoryCatalog::new());
         let mut pipeline = Pipeline::new(
@@ -459,7 +486,9 @@ impl Harness {
             Arc::new(CounterBlobNamer::new("s3://stage")),
             64,
         );
-        pipeline.register_primary_keys(ident(), vec![ColumnName("id".into())]);
+        for ident in &idents {
+            pipeline.register_primary_keys(ident.clone(), vec![ColumnName("id".into())]);
+        }
         let mut materializer = Materializer::new(
             coord,
             blob.clone(),
@@ -472,7 +501,9 @@ impl Harness {
             stores.batch_rows,
         )
         .with_cycle_rows(stores.cycle_rows);
-        materializer.register_table(schema.clone()).await.unwrap();
+        for s in &schemas {
+            materializer.register_table(s.clone()).await.unwrap();
+        }
         Self {
             db,
             stream,
@@ -569,20 +600,30 @@ impl Harness {
     }
 
     async fn assert_iceberg_matches_pg(&self) {
+        self.assert_table_matches_pg(0).await;
+    }
+
+    /// The `n`th table in Iceberg holds what it does in Postgres.
+    async fn assert_table_matches_pg(&self, n: usize) {
         let id = |r: &Row| match r.get(&ColumnName("id".into())) {
             Some(PgValue::Int4(v)) => *v,
             _ => 0,
         };
+        let ident = ident_n(n);
+        let schema = TableSchema {
+            ident: ident.clone(),
+            ..self.schema.clone()
+        };
         let mut iceberg = read_materialized_state(
             self.catalog.as_ref(),
             self.blob.inner.as_ref(),
-            &ident(),
-            &self.schema,
+            &ident,
+            &schema,
             &[ColumnName("id".into())],
         )
         .await
         .unwrap();
-        let mut pg = self.db.read_table(&ident()).unwrap();
+        let mut pg = self.db.read_table(&ident).unwrap();
         iceberg.sort_by_key(id);
         pg.sort_by_key(id);
         assert_eq!(iceberg, pg);
@@ -1160,4 +1201,68 @@ async fn a_cycle_commits_at_its_budget() {
     assert_eq!(applied, 30);
     assert!(h.materializer.backlogged());
     assert_eq!(commits(&h).await, 1);
+}
+
+/// A cycle applies its tables together, not one after another: four
+/// tables' reads and uploads cost one table's round trips.
+#[tokio::test(start_paused = true)]
+async fn a_cycle_applies_its_tables_together() {
+    const TABLES: usize = 4;
+    let mut h = Harness::boot(Stores {
+        tables: TABLES,
+        ..Stores::new(1024)
+    })
+    .await;
+    h.stage(|tx| {
+        for t in 0..TABLES {
+            tx.insert(&ident_n(t), row(t as i32, 0));
+        }
+    })
+    .await;
+
+    let took = h.timed_cycle().await;
+
+    // Each table reads its staged chunk and uploads its data file.
+    assert!(
+        took <= 3 * LATENCY,
+        "{TABLES} tables took {took:?}, {} round trips",
+        took.as_millis() / LATENCY.as_millis(),
+    );
+    for t in 0..TABLES {
+        h.assert_table_matches_pg(t).await;
+    }
+}
+
+/// A table that fails doesn't stop the others: they commit, the cycle
+/// reports the failure, and the next cycle applies the failed table —
+/// none lost its state.
+#[tokio::test(start_paused = true)]
+async fn a_failing_table_keeps_the_others_going() {
+    const TABLES: usize = 3;
+    let mut h = Harness::boot(Stores {
+        tables: TABLES,
+        ..Stores::new(1024)
+    })
+    .await;
+    h.stage(|tx| {
+        for t in 0..TABLES {
+            tx.insert(&ident_n(t), row(t as i32, 0));
+        }
+    })
+    .await;
+    *h.blob.failing_puts.lock().unwrap() = Some("orders_1".into());
+
+    let failed = tokio::time::timeout(STALLED, h.materializer.cycle())
+        .await
+        .expect("the cycle stalled");
+
+    assert!(failed.is_err(), "the failing table's cycle succeeded");
+    h.assert_table_matches_pg(0).await;
+    h.assert_table_matches_pg(2).await;
+
+    *h.blob.failing_puts.lock().unwrap() = None;
+    h.cycle().await;
+    for t in 0..TABLES {
+        h.assert_table_matches_pg(t).await;
+    }
 }
