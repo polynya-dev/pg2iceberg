@@ -324,6 +324,12 @@ pub struct SinkConfig {
     /// still committed atomically.
     #[serde(default = "default_materializer_batch_rows")]
     pub materializer_batch_rows: usize,
+    /// Most tables the materializer applies at once; 1 applies them one
+    /// after another. Each holds up to `materializer_batch_rows` events
+    /// and the staged files it reads ahead, and commits to the catalog on
+    /// its own. With meta tables on, they're applied one at a time.
+    #[serde(default = "default_materializer_concurrency")]
+    pub materializer_concurrency: usize,
     /// How often the materializer commits staged changes to Iceberg —
     /// in `run` and `materializer-only`. Matches Go's
     /// `materializer_interval`. Empty = 10s.
@@ -415,6 +421,7 @@ impl Default for SinkConfig {
             flush_interval: String::new(),
             flush_rows: default_flush_rows(),
             materializer_batch_rows: default_materializer_batch_rows(),
+            materializer_concurrency: default_materializer_concurrency(),
             materializer_interval: String::new(),
             compaction_data_files: default_compaction_data_files(),
             compaction_delete_files: default_compaction_delete_files(),
@@ -490,6 +497,14 @@ impl SinkConfig {
         let ratio = self.compaction_delete_ratio;
         if !(ratio.is_finite() && ratio >= 0.0) {
             anyhow::bail!("sink.compaction_delete_ratio must be 0 or more, not {ratio}");
+        }
+        Ok(())
+    }
+
+    /// The materializer applies at least one table at a time.
+    pub fn validate_materializer(&self) -> Result<()> {
+        if self.materializer_concurrency == 0 {
+            anyhow::bail!("sink.materializer_concurrency must be 1 or more");
         }
         Ok(())
     }
@@ -572,6 +587,10 @@ fn default_flush_rows() -> usize {
 
 fn default_materializer_batch_rows() -> usize {
     50_000
+}
+
+fn default_materializer_concurrency() -> usize {
+    pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY
 }
 
 fn default_compaction_data_files() -> usize {
@@ -676,6 +695,7 @@ impl Config {
         self.validate_tables()?;
         self.sink.schedule()?;
         self.sink.validate_compaction()?;
+        self.sink.validate_materializer()?;
         self.metrics_addr()?;
         self.liveness_timeout()?;
         self.sink.resolved_maintenance()?;
@@ -1265,6 +1285,18 @@ state:
     }
 
     #[test]
+    fn materializer_concurrency_is_at_least_one() {
+        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        for ok in [1, 8] {
+            cfg.sink.materializer_concurrency = ok;
+            cfg.sink.validate_materializer().unwrap();
+        }
+        cfg.sink.materializer_concurrency = 0;
+        let err = cfg.sink.validate_materializer().unwrap_err().to_string();
+        assert!(err.contains("materializer_concurrency"), "{err}");
+    }
+
+    #[test]
     fn logical_or_unset_mode_is_accepted() {
         let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
         for mode in ["", "logical"] {
@@ -1513,6 +1545,7 @@ sink:
         assert_eq!(cfg.sink.resolved_region(), "us-east-1");
         assert_eq!(cfg.sink.flush_rows, 10_000);
         assert_eq!(cfg.sink.materializer_batch_rows, 50_000);
+        assert_eq!(cfg.sink.materializer_concurrency, 4);
         assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
         assert_eq!(cfg.state.group, "default");
     }

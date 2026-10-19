@@ -433,6 +433,7 @@ impl ChaosHarness {
             maintenance: Default::default(),
             flush_rows: 64,
             mat_batch_rows: 128,
+            mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
             snapshot_source_factory: snapshot_factory,
             materializer_namer: Arc::clone(&self.materializer_namer)
                 as Arc<dyn pg2iceberg_logical::materializer::MaterializerNamer>,

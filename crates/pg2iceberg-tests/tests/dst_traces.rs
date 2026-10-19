@@ -118,6 +118,7 @@ fn lifecycle(
         maintenance: Default::default(),
         flush_rows: 64,
         mat_batch_rows: 128,
+        mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: Box::new(move |_| {
             Box::pin(async move {
                 Ok::<

@@ -1178,6 +1178,7 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
         maintenance: Default::default(),
         flush_rows: 64,
         mat_batch_rows: 128,
+        mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://fence-table",
@@ -1328,6 +1329,7 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
         maintenance: Default::default(),
         flush_rows: 64,
         mat_batch_rows: 128,
+        mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://fence-conc",
@@ -1448,6 +1450,7 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
         maintenance: Default::default(),
         flush_rows: 64,
         mat_batch_rows: 128,
+        mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://table",
@@ -1598,6 +1601,7 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
         maintenance: Default::default(),
         flush_rows: 64,
         mat_batch_rows: 128,
+        mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://table",
@@ -1850,6 +1854,7 @@ fn sim_lifecycle_with<Cat: pg2iceberg_iceberg::Catalog + 'static>(
         maintenance: Default::default(),
         flush_rows: 64,
         mat_batch_rows: 128,
+        mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: Box::new(move |_| {
             Box::pin(async move {
                 Ok::<

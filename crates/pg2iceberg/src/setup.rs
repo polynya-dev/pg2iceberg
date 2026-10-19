@@ -136,6 +136,7 @@ where
         maintenance: cfg.sink.resolved_maintenance()?,
         flush_rows: cfg.sink.flush_rows,
         mat_batch_rows: cfg.sink.materializer_batch_rows,
+        mat_table_concurrency: cfg.sink.materializer_concurrency,
         snapshot_source_factory,
         materializer_namer,
         blob_namer,

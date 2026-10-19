@@ -434,7 +434,7 @@ pub const STEPS_PER_COMMIT: usize = 4;
 /// Most files a step uploads at once.
 const STEP_UPLOADS: usize = 8;
 /// Default most tables a cycle applies at once.
-const DEFAULT_TABLE_CONCURRENCY: usize = 4;
+pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
 
 /// Steps read but not yet committed. Committed together, as one atomic
 /// `commit_snapshots`, so a transaction spanning several steps becomes
