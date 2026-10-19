@@ -83,7 +83,7 @@ async fn open(f: &Fixture) -> PgSnapshotSource {
         url: f.dsn.clone(),
         ..Default::default()
     };
-    PgSnapshotSource::open(&cfg, std::slice::from_ref(&f.schema))
+    PgSnapshotSource::open(&cfg, std::slice::from_ref(&f.schema), 1)
         .await
         .expect("open source")
 }
@@ -211,4 +211,39 @@ async fn a_cursor_in_the_columns_order_resumes_in_it() {
     assert_eq!(rows.len(), resumed.len(), "a row read twice");
     assert!(staged.is_disjoint(&resumed), "a row read twice");
     assert_eq!(staged.len() + resumed.len(), ROWS as usize, "rows skipped");
+}
+
+/// Over several connections, the source reads one snapshot: rows changed
+/// after it opened are as they were on every connection.
+#[tokio::test]
+async fn every_connection_reads_the_same_snapshot() {
+    let f = fixture().await;
+    let cfg = PostgresConfig {
+        url: f.dsn.clone(),
+        ..Default::default()
+    };
+    let source = PgSnapshotSource::open(&cfg, std::slice::from_ref(&f.schema), 3)
+        .await
+        .expect("open source");
+    f.regular
+        .batch_execute(&format!(
+            "INSERT INTO lines
+                SELECT i, 'late', i % 10, i % 13 FROM generate_series({}, {}) i;
+            DELETE FROM lines WHERE c <= 100;",
+            ROWS + 1,
+            ROWS + 1000
+        ))
+        .await
+        .expect("change the table");
+
+    // Three readers at once: each read takes a connection of its own.
+    let (a, b, c) = tokio::join!(
+        read_from(&source, &f.schema, None),
+        read_from(&source, &f.schema, None),
+        read_from(&source, &f.schema, None),
+    );
+    for (rows, _) in [a, b, c] {
+        let seen: BTreeSet<i32> = rows.iter().map(|r| int(r, "c")).collect();
+        assert_eq!(seen, (1..=ROWS).collect::<BTreeSet<_>>());
+    }
 }

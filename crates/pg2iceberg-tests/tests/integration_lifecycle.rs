@@ -221,6 +221,7 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
                 publication_name: publication.into(),
                 slot_name: slot.into(),
                 standby_interval: String::new(),
+                snapshot_concurrency: 4,
             },
         },
         sink: SinkConfig {

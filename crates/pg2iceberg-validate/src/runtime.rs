@@ -286,6 +286,10 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// Most tables the materializer applies at once
     /// ([`Materializer::with_table_concurrency`]).
     pub mat_table_concurrency: usize,
+    /// Most tables the initial snapshot reads at once, each on a task of
+    /// its own ([`pg2iceberg_snapshot::Snapshotter::run_concurrently`]);
+    /// the snapshot source serves them all at once.
+    pub snapshot_concurrency: usize,
     /// Built lazily — only invoked if the snapshot phase actually
     /// needs to run (fresh slot, snapshot not already complete). The
     /// binary's factory builds a `PgSnapshotSource`; the DST's factory
@@ -388,6 +392,7 @@ fn instrument<Cat: Catalog + 'static>(
         flush_rows,
         mat_batch_rows,
         mat_table_concurrency,
+        snapshot_concurrency,
         snapshot_source_factory,
         materializer_namer,
         blob_namer,
@@ -413,6 +418,7 @@ fn instrument<Cat: Catalog + 'static>(
         flush_rows,
         mat_batch_rows,
         mat_table_concurrency,
+        snapshot_concurrency,
         snapshot_source_factory,
         materializer_namer,
         blob_namer,
@@ -711,12 +717,13 @@ async fn start<Cat: Catalog + 'static>(
             );
             None
         } else {
-            let source = (factory_slot
+            let source: Arc<dyn pg2iceberg_snapshot::SnapshotSource> = (factory_slot
                 .take()
                 .expect("factory_slot consumed before fresh-slot snapshot path"))(
                 &to_snapshot
             )
-            .await?;
+            .await?
+            .into();
             tracing::info!(
                 count = to_snapshot.len(),
                 snap_lsn = ?source.snapshot_lsn().await?,
@@ -736,7 +743,7 @@ async fn start<Cat: Catalog + 'static>(
                 }
             }
             match run_snapshot_phase(
-                source.as_ref(),
+                source,
                 Arc::clone(&lc.coord),
                 &lc.schemas,
                 &lc.skip_snapshot_idents,
@@ -744,6 +751,14 @@ async fn start<Cat: Catalog + 'static>(
                 &mut pipeline,
                 // A chunk is what the pipeline holds anyway.
                 lc.flush_rows,
+                Some(pg2iceberg_snapshot::Concurrency {
+                    tables: lc.snapshot_concurrency,
+                    // A task of its own, for its CPU: reading and staging a
+                    // chunk is mostly decoding and encoding rows.
+                    spawn: Arc::new(|table| {
+                        tokio::spawn(table.in_current_span());
+                    }),
+                }),
             )
             .await?
             {

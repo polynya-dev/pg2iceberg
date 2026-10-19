@@ -544,13 +544,14 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
     // production wiring under test.
     let skip: std::collections::BTreeSet<TableIdent> = std::collections::BTreeSet::new();
     let err = block_on(run_snapshot_phase(
-        &h.db,
+        Arc::new(h.db.clone()),
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
         &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
+        None,
     ))
     .expect_err("mid-chunk fault should bubble up");
     assert!(format!("{err:?}").contains("blob.put"), "got: {err:?}");
@@ -575,13 +576,14 @@ fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
     h.crash_and_restart();
     h.clear_faults();
     let outcome = block_on(run_snapshot_phase(
-        &h.db,
+        Arc::new(h.db.clone()),
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
         &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
+        None,
     ))
     .expect("resume should succeed");
     let snap_lsn = match outcome {
@@ -627,26 +629,28 @@ fn binary_snapshot_phase_skips_when_checkpoint_already_complete() {
     let mut h = FaultHarness::boot_with_seeds(&seeds);
     let skip: std::collections::BTreeSet<TableIdent> = std::collections::BTreeSet::new();
     let outcome = block_on(run_snapshot_phase(
-        &h.db,
+        Arc::new(h.db.clone()),
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
         &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
+        None,
     ))
     .unwrap();
     assert!(matches!(outcome, SnapshotPhaseOutcome::Completed { .. }));
 
     // Second call: same checkpoint says Complete → Skipped.
     let outcome2 = block_on(run_snapshot_phase(
-        &h.db,
+        Arc::new(h.db.clone()),
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
         &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
+        None,
     ))
     .unwrap();
     assert_eq!(outcome2, SnapshotPhaseOutcome::Skipped);
@@ -661,13 +665,14 @@ fn binary_snapshot_phase_skips_when_all_tables_in_skip_set() {
     let mut skip = std::collections::BTreeSet::new();
     skip.insert(ident());
     let outcome = block_on(run_snapshot_phase(
-        &h.db,
+        Arc::new(h.db.clone()),
         h.coord.clone() as Arc<dyn Coordinator>,
         &[schema()],
         &skip,
         &std::collections::BTreeMap::new(),
         &mut h.pipeline,
         2,
+        None,
     ))
     .unwrap();
     assert_eq!(outcome, SnapshotPhaseOutcome::Skipped);
@@ -1179,6 +1184,7 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
         flush_rows: 64,
         mat_batch_rows: 128,
         mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
+        snapshot_concurrency: pg2iceberg_snapshot::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://fence-table",
@@ -1330,6 +1336,7 @@ fn fence_with_concurrent_writes_during_snapshot_keeps_pg_iceberg_parity() {
         flush_rows: 64,
         mat_batch_rows: 128,
         mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
+        snapshot_concurrency: pg2iceberg_snapshot::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://fence-conc",
@@ -1451,6 +1458,7 @@ fn full_lifecycle_creates_publication_slot_and_runs_to_quiescence() {
         flush_rows: 64,
         mat_batch_rows: 128,
         mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
+        snapshot_concurrency: pg2iceberg_snapshot::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://table",
@@ -1602,6 +1610,7 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
         flush_rows: 64,
         mat_batch_rows: 128,
         mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
+        snapshot_concurrency: pg2iceberg_snapshot::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: snapshot_factory,
         materializer_namer: Arc::new(pg2iceberg_logical::CounterMaterializerNamer::new(
             "s3://table",
@@ -1855,6 +1864,7 @@ fn sim_lifecycle_with<Cat: pg2iceberg_iceberg::Catalog + 'static>(
         flush_rows: 64,
         mat_batch_rows: 128,
         mat_table_concurrency: pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY,
+        snapshot_concurrency: pg2iceberg_snapshot::DEFAULT_TABLE_CONCURRENCY,
         snapshot_source_factory: Box::new(move |_| {
             Box::pin(async move {
                 Ok::<
@@ -2320,6 +2330,56 @@ async fn the_snapshot_stages_flush_rows_a_chunk() {
     .await
     .unwrap();
     assert_eq!(rows.len(), ROWS as usize);
+}
+
+/// The snapshot reads up to `snapshot_concurrency` tables at once, and
+/// starts the next as one finishes: every table lands whole.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_lands_every_table_it_reads_together() {
+    use std::time::Duration;
+
+    const TABLES: usize = 3;
+    const ROWS: i32 = 250;
+    let schemas: Vec<TableSchema> = (0..TABLES)
+        .map(|t| {
+            let mut s = schema();
+            s.ident.name = format!("{TABLE}_{t}");
+            s
+        })
+        .collect();
+    let db = SimPostgres::new();
+    for s in &schemas {
+        db.create_table(s.clone()).unwrap();
+    }
+    let mut tx = db.begin_tx();
+    for s in &schemas {
+        for i in 1..=ROWS {
+            tx.insert(&s.ident, row(i, i * 10));
+        }
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    let stores = SimStores::new();
+    let mut lifecycle = sim_lifecycle_on(&db, &stores, every_second());
+    lifecycle.schemas = schemas.clone();
+    lifecycle.flush_rows = 100;
+    lifecycle.snapshot_concurrency = 2;
+    let shutdown = Box::pin(tokio::time::sleep(Duration::from_secs(30)));
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    for s in &schemas {
+        let rows = read_materialized_state(
+            stores.catalog.as_ref(),
+            stores.blob.as_ref(),
+            &s.ident,
+            s,
+            &[ColumnName("id".into())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), ROWS as usize, "{}", s.ident);
+    }
 }
 
 /// `MemoryBlobStore`, but a compaction output takes `latency` to upload.

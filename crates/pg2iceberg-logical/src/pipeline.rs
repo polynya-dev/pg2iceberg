@@ -43,7 +43,8 @@ pub enum PipelineError {
 
 pub type Result<T> = std::result::Result<T, PipelineError>;
 
-/// Runs a flush on a task of its own ([`Pipeline::flush_in_background`]).
+/// Runs a future on a task of its own: a flush
+/// ([`Pipeline::flush_in_background`]), or a table's snapshot.
 pub type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
 
 /// Most chunks a flush, or a spill, uploads at once.
@@ -818,6 +819,51 @@ impl<C: Coordinator + ?Sized + 'static> Pipeline<C> {
 
     pub fn is_shut_down(&self) -> bool {
         self.shut_down
+    }
+
+    /// A pipeline to stage alongside this one, say a table's snapshot on
+    /// a task of its own: the same stores, namer, metrics and
+    /// configuration, with nothing buffered, staged or in flight.
+    pub fn split_off(&self) -> Self {
+        Self {
+            sink: Sink::new(self.flush_threshold),
+            flush_threshold: self.flush_threshold,
+            spilled: BTreeMap::new(),
+            committed_spills: Vec::new(),
+            coord: self.coord.clone(),
+            blob_store: self.blob_store.clone(),
+            namer: self.namer.clone(),
+            flushed_lsn: AtomicU64::new(0),
+            keepalive_lsn: Lsn::ZERO,
+            metrics: self.metrics.clone(),
+            received: Received::default(),
+            shut_down: false,
+            markers_table: self.markers_table.clone(),
+            pending_markers_by_xid: BTreeMap::new(),
+            ready_markers: Vec::new(),
+            primary_keys: self.primary_keys.clone(),
+            table_translation: self.table_translation.clone(),
+            replication: self.replication,
+            open_tx: None,
+            relations: BTreeMap::new(),
+            column_defaults: self.column_defaults.clone(),
+            background: self.background.clone(),
+            in_flight: None,
+        }
+    }
+
+    /// Take back a pipeline [`Self::split_off`] made, once it has flushed
+    /// all it was given: this one has then flushed as far as it has.
+    pub fn rejoin(&mut self, part: Self) {
+        debug_assert!(
+            !part.sink.has_committed()
+                && part.spilled.is_empty()
+                && part.committed_spills.is_empty()
+                && part.in_flight.is_none(),
+            "rejoined a pipeline with changes left to flush"
+        );
+        self.flushed_lsn
+            .fetch_max(part.flushed_lsn.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 
     /// Forget the replication session, for a new stream that starts at

@@ -99,11 +99,14 @@ where
     // (REPEATABLE READ tx + LSN capture) only happens if the snapshot
     // phase actually needs to run.
     let pg_cfg = cfg.source.postgres.clone();
+    let snapshot_concurrency = cfg.source.logical.snapshot_concurrency;
     let snapshot_source_factory = Box::new(move |to_snapshot: &[TableSchema]| {
         let pg_cfg = pg_cfg.clone();
         let to_snapshot = to_snapshot.to_vec();
+        // A connection for each table read at once.
+        let connections = snapshot_concurrency.min(to_snapshot.len()).max(1);
         Box::pin(async move {
-            let source = PgSnapshotSource::open(&pg_cfg, &to_snapshot)
+            let source = PgSnapshotSource::open(&pg_cfg, &to_snapshot, connections)
                 .await
                 .map_err(|e| {
                     LifecycleError::Snapshot(pg2iceberg_snapshot::SnapshotError::Source(format!(
@@ -137,6 +140,7 @@ where
         flush_rows: cfg.sink.flush_rows,
         mat_batch_rows: cfg.sink.materializer_batch_rows,
         mat_table_concurrency: cfg.sink.materializer_concurrency,
+        snapshot_concurrency,
         snapshot_source_factory,
         materializer_namer,
         blob_namer,

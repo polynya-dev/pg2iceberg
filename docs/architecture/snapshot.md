@@ -22,7 +22,9 @@ SELECT * FROM orders WHERE (o_w_id, o_d_id, o_id) > (3, 7, 2511)
 ORDER BY o_w_id, o_d_id, o_id LIMIT 10000
 ```
 
-The primary key's index serves each chunk. A chunk is staged like a replicated transaction, and the next one is read from Postgres while it stages, so up to two chunks are in memory. Tables are read one at a time.
+The primary key's index serves each chunk. A chunk is staged like a replicated transaction, and the next one is read from Postgres while it stages, so up to two chunks of a table are in memory.
+
+Up to `source.logical.snapshot_concurrency` tables (default 4) are read at once, each on a task and a connection of its own. The first connection exports its snapshot (`pg_export_snapshot()`) and the others import it (`SET TRANSACTION SNAPSHOT`), so every table is read as of the same moment, whichever connection reads it. A table's rows are read in order by one connection, so the largest table bounds how long the snapshot takes.
 
 ## Resumability
 
