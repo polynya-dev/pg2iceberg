@@ -34,6 +34,7 @@ use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
+use pg2iceberg_snapshot::{SnapshotSource, Snapshotter};
 use pg2iceberg_stream::{BlobInfo, BlobStore, Result as BlobResult};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
@@ -1265,4 +1266,70 @@ async fn a_failing_table_keeps_the_others_going() {
     for t in 0..TABLES {
         h.assert_table_matches_pg(t).await;
     }
+}
+
+/// `SimPostgres`'s snapshot a round trip away: each chunk read takes
+/// `LATENCY`.
+struct SlowSource<'a>(&'a SimPostgres);
+
+#[async_trait]
+impl SnapshotSource for SlowSource<'_> {
+    async fn snapshot_lsn(&self) -> pg2iceberg_snapshot::Result<Lsn> {
+        self.0.snapshot_lsn().await
+    }
+
+    async fn read_chunk(
+        &self,
+        ident: &TableIdent,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> pg2iceberg_snapshot::Result<Vec<Row>> {
+        tokio::time::sleep(LATENCY).await;
+        self.0.read_chunk(ident, chunk_size, after_pk_key).await
+    }
+}
+
+/// A snapshot reads its next chunk from Postgres while the one before it
+/// stages: a chunk costs the slower of the two, not both.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_reads_its_next_chunk_while_one_stages() {
+    const CHUNKS: usize = 10;
+    const CHUNK: usize = 10;
+    let h = Harness::boot(Stores::new(1024)).await;
+    let mut tx = h.db.begin_tx();
+    for id in 0..(CHUNKS * CHUNK) as i32 {
+        tx.insert(&ident(), row(id, 0));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    let coord: Arc<dyn Coordinator> = Arc::new(MemoryCoordinator::new(
+        CoordSchema::default_name(),
+        Arc::new(TestClock::at(0)),
+    ));
+    // Staged into the slow store: an upload a chunk.
+    let mut pipeline = Pipeline::new(
+        coord.clone(),
+        h.blob.clone() as Arc<dyn BlobStore>,
+        Arc::new(CounterBlobNamer::new("s3://snapshot")),
+        1000,
+    );
+    pipeline.register_primary_keys(ident(), vec![ColumnName("id".into())]);
+    let source = SlowSource(&h.db);
+
+    let start = Instant::now();
+    Snapshotter::new(coord.clone())
+        .with_chunk_size(CHUNK)
+        .run(&source, &[schema_n(0, false)], &mut pipeline)
+        .await
+        .unwrap();
+    let took = start.elapsed();
+
+    // The first read, then a chunk's upload with the next read beside
+    // it, and the read that finds the table done.
+    assert!(
+        took <= LATENCY * (CHUNKS as u32 + 3),
+        "{CHUNKS} chunks took {took:?}, {} round trips",
+        took.as_millis() / LATENCY.as_millis(),
+    );
+    let staged = coord.read_log(&ident(), 0, 1000).await.unwrap();
+    assert_eq!(staged.len(), CHUNKS);
 }

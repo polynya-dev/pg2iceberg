@@ -3788,6 +3788,7 @@ name = "pg2iceberg-snapshot"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "futures",
  "pg2iceberg-coord",
  "pg2iceberg-core",
  "pg2iceberg-iceberg",

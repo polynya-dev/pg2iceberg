@@ -2278,6 +2278,50 @@ async fn a_backlog_is_materialized_without_waiting_between_ticks() {
     );
 }
 
+/// The initial snapshot reads and stages a table `flush_rows` rows a
+/// chunk — what the pipeline holds in memory anyway — not 1024 at a
+/// time: each chunk is a round of requests to Postgres, the object store
+/// and the coordinator.
+#[tokio::test(start_paused = true)]
+async fn the_snapshot_stages_flush_rows_a_chunk() {
+    use std::time::Duration;
+
+    const ROWS: i32 = 3000;
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let mut tx = db.begin_tx();
+    for i in 1..=ROWS {
+        tx.insert(&ident(), row(i, i * 10));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    let stores = SimStores::new();
+    let mut lifecycle = sim_lifecycle_on(&db, &stores, every_second());
+    lifecycle.flush_rows = ROWS as usize;
+    let shutdown = Box::pin(tokio::time::sleep(Duration::from_secs(30)));
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let staged = stores.coord.read_log(&ident(), 0, 1000).await.unwrap();
+    assert_eq!(
+        staged.len(),
+        1,
+        "{} rows staged as {} chunks",
+        ROWS,
+        staged.len()
+    );
+    let rows = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), ROWS as usize);
+}
+
 /// `MemoryBlobStore`, but a compaction output takes `latency` to upload.
 struct SlowCompactionUploads {
     inner: Arc<MemoryBlobStore>,
