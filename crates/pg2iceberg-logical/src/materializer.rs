@@ -43,8 +43,8 @@ use pg2iceberg_iceberg::reader::RowBatches;
 use pg2iceberg_iceberg::{
     apply_schema_changes, catch_up_from_catalog, fold_events, is_dropped_column,
     promote_re_inserts, read_data_file, reconcile_columns, resolve_unchanged_cols, toast_source,
-    Catalog, DataFile, FileIndex, IcebergError, LogRange, MaterializedRow, PkKey, PreparedCommit,
-    SchemaChange, TableMetadata, TableWriter, WriterError,
+    Catalog, DataFile, FileIndex, IcebergError, LiveRows, LogRange, MaterializedRow, PkKey,
+    PreparedCommit, SchemaChange, TableMetadata, TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -490,6 +490,84 @@ pub enum Maintenance {
     /// behind. And it rereads what it knows of the tables every cycle:
     /// the catalog's commits tell no pg2iceberg process.
     Managed,
+}
+
+/// A compaction pass over one table, all but its commit
+/// ([`Materializer::compaction_job`]): it owns what it needs, so it runs
+/// on a task of its own while the materializer goes on.
+pub struct CompactionJob<C> {
+    catalog: Arc<CachingCatalog<C>>,
+    blob_store: Arc<dyn BlobStore>,
+    namer: Arc<dyn MaterializerNamer>,
+    ident: TableIdent,
+    schema: TableSchema,
+    pk_cols: Vec<ColumnName>,
+    live: LiveRows,
+    config: pg2iceberg_iceberg::CompactionConfig,
+}
+
+impl<C: Catalog> CompactionJob<C> {
+    pub fn ident(&self) -> &TableIdent {
+        &self.ident
+    }
+
+    /// Prepare the pass: plan it, rewrite its inputs, upload its outputs.
+    pub async fn run(self) -> CompactionPass {
+        let started_micros = now_micros();
+        let pass = self.prepare().await;
+        CompactionPass {
+            ident: self.ident,
+            started_micros,
+            seconds: seconds_since(started_micros),
+            pass,
+        }
+    }
+
+    async fn prepare(
+        &self,
+    ) -> std::result::Result<
+        Option<pg2iceberg_iceberg::PreparedPass>,
+        pg2iceberg_iceberg::CompactError,
+    > {
+        let snapshots = self.catalog.snapshots(&self.ident).await?;
+        let namer = self.namer.clone();
+        pg2iceberg_iceberg::prepare_pass(
+            &snapshots,
+            self.blob_store.as_ref(),
+            move |t, _idx| {
+                let n = namer.clone();
+                let t = t.clone();
+                // Compaction always rewrites whole partitions, so we
+                // don't yet thread per-partition compaction outputs into
+                // separate dirs. The empty segment groups all compaction
+                // outputs under `<table>/compact/`.
+                async move { n.next_path(&t, "compact", "").await }
+            },
+            &self.ident,
+            &self.schema,
+            &self.pk_cols,
+            Some(&self.live),
+            &self.config,
+        )
+        .await
+    }
+}
+
+/// A [`CompactionJob`]'s pass, for [`Materializer::commit_compaction_pass`].
+pub struct CompactionPass {
+    ident: TableIdent,
+    started_micros: i64,
+    seconds: f64,
+    pass: std::result::Result<
+        Option<pg2iceberg_iceberg::PreparedPass>,
+        pg2iceberg_iceberg::CompactError,
+    >,
+}
+
+impl CompactionPass {
+    pub fn ident(&self) -> &TableIdent {
+        &self.ident
+    }
 }
 
 pub struct Materializer<C: Catalog> {
@@ -1754,54 +1832,129 @@ impl<C: Catalog> Materializer<C> {
         }
         // The pass picks files by the index's live counts.
         self.sync_file_index(ident).await?;
-        let entry = self.tables.get(ident).expect("checked above");
-        let schema = entry.schema.clone();
-        let pk_cols = entry.pk_cols.clone();
-
-        let namer = self.namer.clone();
-        let started_micros = now_micros();
-        let outcome = match self.maintenance {
-            Maintenance::Pg2iceberg => {
-                pg2iceberg_iceberg::compact_table(
-                    self.catalog.as_ref(),
-                    self.blob_store.as_ref(),
-                    move |t, _idx| {
-                        let n = namer.clone();
-                        let t = t.clone();
-                        // Compaction always rewrites whole partitions, so
-                        // we don't yet thread per-partition compaction
-                        // outputs into separate dirs. The empty segment
-                        // groups all compaction outputs under
-                        // `<table>/compact/`.
-                        async move { n.next_path(&t, "compact", "").await }
-                    },
-                    ident,
-                    &schema,
-                    &pk_cols,
-                    // Lets the pass find files with deleted rows without
-                    // reading the table; the index tracks exactly this
-                    // catalog's state.
-                    Some(&entry.file_index),
-                    config,
-                )
-                .await
-            }
+        match self.maintenance {
+            Maintenance::Pg2iceberg => match self.compaction_job(ident, config) {
+                Some(job) => {
+                    let pass = job.run().await;
+                    self.commit_compaction_pass(pass).await
+                }
+                None => Ok(None),
+            },
             // The catalog rewrites the data files; the deletes its
             // rewrites leave behind are pg2iceberg's to retire.
             Maintenance::Managed => {
-                pg2iceberg_iceberg::retire_deletes(
+                let started_micros = now_micros();
+                let entry = self.tables.get(ident).expect("checked above");
+                let outcome = pg2iceberg_iceberg::retire_deletes(
                     self.catalog.as_ref(),
                     ident,
                     Some(&entry.file_index),
                     config,
                 )
-                .await
+                .await;
+                let seconds = seconds_since(started_micros);
+                self.compaction_done(ident, started_micros, seconds, outcome)
+                    .await
             }
+        }
+    }
+
+    /// A compaction pass over `ident`, all but its commit, to run apart
+    /// from the materializer: while cycles go on, on a task of its own.
+    /// Its result goes back to [`Self::commit_compaction_pass`]. `None`
+    /// when the catalog compacts the tables, or the table has nothing
+    /// committed yet.
+    ///
+    /// The pass plans from the table's FileIndex as it is now, so reads
+    /// the table as of the snapshot it reflects ([`LiveRows`]): what's
+    /// committed meanwhile waits for the next pass.
+    pub fn compaction_job(
+        &self,
+        ident: &TableIdent,
+        config: &pg2iceberg_iceberg::CompactionConfig,
+    ) -> Option<CompactionJob<C>> {
+        if self.maintenance == Maintenance::Managed {
+            return None;
+        }
+        let entry = self.tables.get(ident)?;
+        let as_of = entry.index_at?;
+        Some(CompactionJob {
+            catalog: self.catalog.clone(),
+            blob_store: self.blob_store.clone(),
+            namer: self.namer.clone(),
+            ident: ident.clone(),
+            schema: entry.schema.clone(),
+            pk_cols: entry.pk_cols.clone(),
+            live: LiveRows::new(&entry.file_index, Some(as_of)),
+            config: config.clone(),
+        })
+    }
+
+    /// [`Self::compaction_job`] for every table.
+    pub fn compaction_jobs(
+        &self,
+        config: &pg2iceberg_iceberg::CompactionConfig,
+    ) -> Vec<CompactionJob<C>> {
+        self.tables
+            .keys()
+            .filter_map(|ident| self.compaction_job(ident, config))
+            .collect()
+    }
+
+    /// Commit a pass a [`CompactionJob`] prepared, and take its rewrite
+    /// into the table's FileIndex. `Ok(None)` if it had nothing to do, or
+    /// its table is gone — its outputs are left to orphan cleanup. A
+    /// schema change meanwhile doesn't matter: Iceberg reads a file by
+    /// its columns' field ids, as files from before any schema change.
+    pub async fn commit_compaction_pass(
+        &mut self,
+        pass: CompactionPass,
+    ) -> Result<Option<pg2iceberg_iceberg::CompactionOutcome>> {
+        let CompactionPass {
+            ident,
+            started_micros,
+            mut seconds,
+            pass,
+        } = pass;
+        if !self.tables.contains_key(&ident) {
+            return Ok(None);
+        }
+        let outcome = match pass {
+            Ok(None) => return Ok(None),
+            Ok(Some(prepared)) => {
+                let committing = now_micros();
+                let committed = self.catalog.commit_compaction(prepared.commit).await;
+                seconds += seconds_since(committing);
+                committed
+                    .map(|meta| {
+                        Some(pg2iceberg_iceberg::CompactionOutcome {
+                            snapshot_id: meta.current_snapshot_id,
+                            ..prepared.outcome
+                        })
+                    })
+                    .map_err(Into::into)
+            }
+            Err(e) => Err(e),
         };
+        self.compaction_done(&ident, started_micros, seconds, outcome)
+            .await
+    }
+
+    /// Account for a compaction pass that ran for `seconds`: its metrics,
+    /// its rewrite in the table's FileIndex, its `compactions` meta row.
+    async fn compaction_done(
+        &mut self,
+        ident: &TableIdent,
+        started_micros: i64,
+        seconds: f64,
+        outcome: std::result::Result<
+            Option<pg2iceberg_iceberg::CompactionOutcome>,
+            pg2iceberg_iceberg::CompactError,
+        >,
+    ) -> Result<Option<pg2iceberg_iceberg::CompactionOutcome>> {
         let table = ident.to_string();
         let ran = |outcome: &str| labels([("table", &table), ("outcome", outcome)]);
         if !matches!(outcome, Ok(None)) {
-            let seconds = (now_micros() - started_micros).max(0) as f64 / 1e6;
             self.metrics
                 .histogram(names::COMPACTION_DURATION, &Labels::new(), seconds);
         }
@@ -1828,16 +1981,28 @@ impl<C: Catalog> Materializer<C> {
                 &labels([("table", &table)]),
                 (o.input_data_files + o.input_delete_files) as u64,
             );
-            let entry_mut = self.tables.get_mut(ident).expect("checked above");
+            let entry_mut = self.tables.get_mut(ident).expect("checked by caller");
             if o.snapshot_id == Some(entry_mut.index_at.unwrap_or(0) + 1) {
                 // Remap what the pass rewrote rather than replaying its
                 // snapshot, which would re-read the outputs. Outputs
-                // first: they take over every live PK of the inputs, so
+                // first: they take over the live PKs of the inputs, so
                 // removing the inputs then has nothing left to scan for.
+                // Only the PKs still in the inputs: a pass prepared while
+                // cycles went on rewrote rows they've updated or deleted
+                // since, whose PKs are in newer files now, or nowhere.
+                let rewritten: std::collections::HashSet<&str> =
+                    o.rewritten_files.iter().map(String::as_str).collect();
                 for f in &o.added_files {
+                    let index = &entry_mut.file_index;
+                    let moved: Vec<PkKey> = f
+                        .pk_keys
+                        .iter()
+                        .filter(|k| index.lookup(k).is_some_and(|p| rewritten.contains(p)))
+                        .cloned()
+                        .collect();
                     entry_mut.file_index.add_file(
                         f.path.clone(),
-                        f.pk_keys.clone(),
+                        moved,
                         f.partition_values.clone(),
                     );
                 }
@@ -1873,7 +2038,7 @@ impl<C: Catalog> Materializer<C> {
                     rows_removed: o.rows_removed_by_deletes as i64,
                     bytes_before: o.bytes_before as i64,
                     bytes_after: o.bytes_after as i64,
-                    duration_ms: (now_micros() - started_micros) / 1000,
+                    duration_ms: (seconds * 1000.0) as i64,
                     pg2iceberg_commit_sha: String::new(),
                 });
                 if let Err(e) = self.flush_meta().await {
@@ -2558,6 +2723,11 @@ impl<C: Catalog> Materializer<C> {
 /// `ts` / `last_flush_at`. We don't read this from a `Clock` trait
 /// because the meta tables are observability-only — drift between
 /// `Clock`-driven test time and wall-clock here is acceptable.
+/// Seconds since `started` ([`now_micros`]).
+fn seconds_since(started: i64) -> f64 {
+    (now_micros() - started).max(0) as f64 / 1e6
+}
+
 fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

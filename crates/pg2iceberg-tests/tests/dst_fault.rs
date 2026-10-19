@@ -2273,6 +2273,156 @@ async fn a_backlog_is_materialized_without_waiting_between_ticks() {
     );
 }
 
+/// `MemoryBlobStore`, but a compaction output takes `latency` to upload.
+struct SlowCompactionUploads {
+    inner: Arc<MemoryBlobStore>,
+    latency: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl pg2iceberg_stream::BlobStore for SlowCompactionUploads {
+    async fn put(&self, path: &str, bytes: bytes::Bytes) -> pg2iceberg_stream::Result<()> {
+        if path.contains("/compact/") {
+            tokio::time::sleep(self.latency).await;
+        }
+        self.inner.put(path, bytes).await
+    }
+    async fn get(&self, path: &str) -> pg2iceberg_stream::Result<bytes::Bytes> {
+        self.inner.get(path).await
+    }
+    async fn list(
+        &self,
+        prefix: &str,
+    ) -> pg2iceberg_stream::Result<Vec<pg2iceberg_stream::BlobInfo>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, path: &str) -> pg2iceberg_stream::Result<()> {
+        self.inner.delete(path).await
+    }
+}
+
+/// Compaction doesn't stop the materializer catching up: it runs beside
+/// the ticks, so a pass whose output takes ten minutes to upload holds up
+/// neither the backlog's cycles nor their commits. The tick after it's
+/// done commits it.
+#[tokio::test(start_paused = true)]
+async fn a_backlog_is_materialized_while_a_compaction_pass_runs() {
+    use pg2iceberg_iceberg::Catalog;
+    use std::time::Duration;
+
+    const INTERVAL: Duration = Duration::from_secs(60);
+    const UPLOAD: Duration = Duration::from_secs(600);
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let second = Duration::from_secs(1);
+    let schedule = pg2iceberg_logical::Schedule {
+        flush: second,
+        materialize: INTERVAL,
+        standby: second,
+        watcher: second,
+    };
+    let mut lifecycle = sim_lifecycle_on(&db, &stores, schedule);
+    // A budget of 80 rows a tick (8 steps of 10).
+    lifecycle.mat_batch_rows = 10;
+    // A pass as soon as there's a delete file: the backstop, which runs
+    // during a backlog too.
+    lifecycle.compaction = Some(CompactionConfig {
+        delete_file_threshold: 1,
+        ..CompactionConfig::default()
+    });
+    lifecycle.blob = Arc::new(SlowCompactionUploads {
+        inner: stores.blob.clone(),
+        latency: UPLOAD,
+    });
+    let metrics = Arc::new(pg2iceberg_core::InMemoryMetrics::new());
+    lifecycle.metrics = metrics.clone();
+    let script = db.clone();
+    let catalog = stores.catalog.clone();
+    let blob = stores.blob.clone();
+    let observer = tokio::spawn(async move {
+        // Past startup and the first tick.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        // A delete file, and a tick later a pass uploading.
+        let mut tx = script.begin_tx();
+        tx.update(&ident(), row(1, 11));
+        tx.commit(Timestamp(0)).unwrap();
+        tokio::time::sleep(3 * INTERVAL).await;
+        // A thousand rows: a dozen budgets.
+        for t in 0..100 {
+            let mut tx = script.begin_tx();
+            for i in 0..10 {
+                let id = 5 + t * 10 + i;
+                tx.insert(&ident(), row(id, id * 10));
+            }
+            tx.commit(Timestamp(0)).unwrap();
+        }
+        let start = tokio::time::Instant::now();
+        loop {
+            tokio::time::sleep(second).await;
+            let rows = read_materialized_state(
+                catalog.as_ref(),
+                blob.as_ref(),
+                &ident(),
+                &schema(),
+                &[ColumnName("id".into())],
+            )
+            .await
+            .unwrap();
+            if rows.len() == 1004 {
+                let took = start.elapsed();
+                // And the pass, once its upload is done — and any after.
+                tokio::time::sleep(2 * UPLOAD + 2 * INTERVAL).await;
+                return took;
+            }
+        }
+    });
+    let took = Arc::new(std::sync::Mutex::new(None));
+    let record = took.clone();
+    let shutdown = Box::pin(async move {
+        *record.lock().unwrap() = Some(observer.await.unwrap());
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let took = took.lock().unwrap().expect("the observer ran");
+    assert!(
+        took <= 2 * INTERVAL,
+        "took {took:?} to apply a dozen budgets, beside a pass uploading for {UPLOAD:?}"
+    );
+    let compacted = stores
+        .catalog
+        .snapshots(&ident())
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| !s.removed_paths.is_empty());
+    assert!(compacted, "the pass was never committed");
+    // Each pass planned after the last was committed: one planned before
+    // would rewrite the same files, and fail to commit.
+    let table = ident().to_string();
+    let failed =
+        pg2iceberg_core::metrics::labels([("table", table.as_str()), ("outcome", "failed")]);
+    assert_eq!(
+        metrics.counter_value(
+            pg2iceberg_core::metrics::names::COMPACTION_RUNS_TOTAL,
+            &failed
+        ),
+        0,
+        "compaction passes failed"
+    );
+    let rows = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1004);
+}
+
 /// A flush in the background that fails stops the run before the slot is
 /// acked past it — no later flush may claim, or its changes would be
 /// skipped for good — and the next run stages them: nothing is lost.

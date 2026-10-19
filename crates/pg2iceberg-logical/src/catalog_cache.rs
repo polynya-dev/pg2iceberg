@@ -49,6 +49,11 @@ struct State {
     ttl: Option<(Arc<dyn Clock>, Duration)>,
     /// Whether something other than pg2iceberg writes the tables.
     other_writers: bool,
+    /// Bumped whenever a table's entry is written or dropped. A read
+    /// keeps what it read only if it wasn't meanwhile — reads run beside
+    /// writes (compaction beside the materializer), and one that finished
+    /// after a write would keep the table from before it.
+    generation: u64,
 }
 
 #[derive(Default)]
@@ -79,8 +84,12 @@ impl State {
         let now = clock.now().0;
         let ttl = i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX);
         // One read before the TTL was set is of unknown age.
+        let before = self.tables.len();
         self.tables
             .retain(|_, e| e.read_at.is_some_and(|t| now.saturating_sub(t.0) < ttl));
+        if self.tables.len() != before {
+            self.generation += 1;
+        }
     }
 }
 
@@ -130,6 +139,7 @@ impl<C: Catalog> CachingCatalog<C> {
             let mut s = self.lock();
             if s.other_writers {
                 s.tables.clear();
+                s.generation += 1;
                 return;
             }
         }
@@ -150,6 +160,7 @@ impl<C: Catalog> CachingCatalog<C> {
                     let epoch = epochs.get(&t).copied().unwrap_or(0);
                     if s.epochs.insert(t.clone(), epoch) != Some(epoch) {
                         s.tables.remove(&t);
+                        s.generation += 1;
                     }
                 }
             }
@@ -157,6 +168,7 @@ impl<C: Catalog> CachingCatalog<C> {
                 tracing::warn!(error = %e, "can't read table epochs: dropping the catalog cache");
                 s.tables.clear();
                 s.epochs.clear();
+                s.generation += 1;
             }
         }
         s.expire();
@@ -167,6 +179,7 @@ impl<C: Catalog> CachingCatalog<C> {
     async fn wrote(&self, ident: &TableIdent, meta: Option<&TableMetadata>) {
         let bumped = self.coord.bump_table_epoch(ident).await;
         let mut s = self.lock();
+        s.generation += 1;
         let known = s.epochs.get(ident).copied().unwrap_or(0);
         match bumped {
             Ok(epoch) => {
@@ -219,12 +232,19 @@ impl<C: Catalog> Catalog for CachingCatalog<C> {
     }
 
     async fn load_table(&self, ident: &TableIdent) -> Result<Option<TableMetadata>> {
-        if let Some(meta) = self.lock().tables.get(ident).and_then(|e| e.meta.clone()) {
-            return Ok(Some(meta));
-        }
+        let generation = {
+            let s = self.lock();
+            if let Some(meta) = s.tables.get(ident).and_then(|e| e.meta.clone()) {
+                return Ok(Some(meta));
+            }
+            s.generation
+        };
         let meta = self.inner.load_table(ident).await?;
         if let Some(meta) = &meta {
-            self.lock().entry(ident).meta = Some(meta.clone());
+            let mut s = self.lock();
+            if s.generation == generation {
+                s.entry(ident).meta = Some(meta.clone());
+            }
         }
         Ok(meta)
     }
@@ -283,16 +303,18 @@ impl<C: Catalog> Catalog for CachingCatalog<C> {
     }
 
     async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>> {
-        if let Some(snapshots) = self
-            .lock()
-            .tables
-            .get(ident)
-            .and_then(|e| e.snapshots.clone())
-        {
-            return Ok(snapshots);
-        }
+        let generation = {
+            let s = self.lock();
+            if let Some(snapshots) = s.tables.get(ident).and_then(|e| e.snapshots.clone()) {
+                return Ok(snapshots);
+            }
+            s.generation
+        };
         let snapshots = self.inner.snapshots(ident).await?;
-        self.lock().entry(ident).snapshots = Some(snapshots.clone());
+        let mut s = self.lock();
+        if s.generation == generation {
+            s.entry(ident).snapshots = Some(snapshots.clone());
+        }
         Ok(snapshots)
     }
 }
@@ -387,6 +409,77 @@ mod tests {
         async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>> {
             self.inner.snapshots(ident).await
         }
+    }
+
+    /// A catalog whose next history read, once it has read, waits for
+    /// `gate` before it answers.
+    struct ReadThenWait {
+        inner: Arc<MemoryCatalog>,
+        gate: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl Catalog for ReadThenWait {
+        async fn ensure_namespace(&self, ns: &Namespace) -> Result<()> {
+            self.inner.ensure_namespace(ns).await
+        }
+        async fn load_table(&self, ident: &TableIdent) -> Result<Option<TableMetadata>> {
+            self.inner.load_table(ident).await
+        }
+        async fn create_table(&self, schema: &TableSchema) -> Result<TableMetadata> {
+            self.inner.create_table(schema).await
+        }
+        async fn commit_snapshot(&self, prepared: PreparedCommit) -> Result<TableMetadata> {
+            self.inner.commit_snapshot(prepared).await
+        }
+        async fn evolve_schema(
+            &self,
+            ident: &TableIdent,
+            changes: Vec<SchemaChange>,
+            set_properties: std::collections::BTreeMap<String, String>,
+        ) -> Result<TableMetadata> {
+            self.inner
+                .evolve_schema(ident, changes, set_properties)
+                .await
+        }
+        async fn snapshots(&self, ident: &TableIdent) -> Result<Vec<Snapshot>> {
+            let snapshots = self.inner.snapshots(ident).await;
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.await.ok();
+            }
+            snapshots
+        }
+    }
+
+    /// A read running beside this process's writes — compaction planning
+    /// beside the materializer — that answers after one of them doesn't
+    /// keep what it read: the history from before the write.
+    #[test]
+    fn a_read_that_answers_after_a_write_keeps_nothing() {
+        use std::future::Future;
+        let (coord, _clock) = MemoryCoordinator::with_test_clock(TestClock::at(0));
+        let coord: Arc<dyn Coordinator> = Arc::new(coord);
+        let (open, gate) = futures::channel::oneshot::channel();
+        let inner = Arc::new(ReadThenWait {
+            inner: Arc::new(MemoryCatalog::new()),
+            gate: Mutex::new(None),
+        });
+        let catalog = CachingCatalog::new(inner.clone(), coord);
+        block_on(catalog.ensure_namespace(&ident().namespace)).unwrap();
+        block_on(catalog.create_table(&schema())).unwrap();
+        block_on(catalog.commit_snapshot(append("s3://t/a.parquet"))).unwrap();
+
+        *inner.gate.lock().unwrap() = Some(gate);
+        let table = ident();
+        let mut read = Box::pin(catalog.snapshots(&table));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(read.as_mut().poll(&mut cx).is_pending(), "read, waiting");
+        block_on(catalog.commit_snapshot(append("s3://t/b.parquet"))).unwrap();
+        open.send(()).unwrap();
+        assert_eq!(block_on(read).unwrap().len(), 1, "the history it read");
+
+        assert_eq!(block_on(catalog.snapshots(&ident())).unwrap().len(), 2);
     }
 
     /// Another engine — a managed catalog compacting the table — writes
