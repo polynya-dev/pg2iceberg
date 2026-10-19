@@ -29,12 +29,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use iceberg::spec::{
     DataContentType, DataFile as IcebergDataFile, DataFileBuilder, DataFileFormat, FormatVersion,
-    Literal, NestedField, PrimitiveLiteral, PrimitiveType, Schema as IcebergSchema, Struct, Type,
+    Literal, ManifestFile, NestedField, PrimitiveLiteral, PrimitiveType, Schema as IcebergSchema,
+    Struct, Type,
 };
 use iceberg::table::Table;
-use iceberg::transaction::{ActionCommit, ApplyTransactionAction, Transaction, TransactionAction};
+use iceberg::transaction::{
+    ActionCommit, ApplyTransactionAction, StagedSnapshot, Transaction, TransactionAction,
+};
 use iceberg::TableUpdate;
 use iceberg::{
     Catalog as IcebergCatalogTrait, ErrorKind, NamespaceIdent, TableCreation,
@@ -700,9 +704,77 @@ struct ChainedAppendAction {
     properties: HashMap<String, String>,
 }
 
+/// Most snapshots of a chain written at once.
+const CHAIN_WRITES: usize = 16;
+
 #[async_trait]
 impl TransactionAction for ChainedAppendAction {
+    /// Each step a snapshot on the last, planned in memory, then written
+    /// together: every step's manifests at once, then every step's manifest
+    /// list, each naming its parent's manifests and its own. Written one
+    /// step at a time, each took four round trips to object storage — its
+    /// manifests, its list, and reading that list back for the next.
     async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        if table.metadata().format_version() == FormatVersion::V3 {
+            return self.commit_one_by_one(table).await;
+        }
+        // The manifests the first step's list carries forward: as a fast
+        // append keeps them.
+        let mut parent: Vec<ManifestFile> = match table.metadata().current_snapshot() {
+            Some(snapshot) => table
+                .manifest_list_reader(snapshot)
+                .load()
+                .await?
+                .entries()
+                .iter()
+                .filter(|m| m.has_added_files() || m.has_existing_files() || m.has_deleted_files())
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut local = table.clone();
+        let mut updates = Vec::new();
+        let mut requirements = None;
+        let mut staged = Vec::with_capacity(self.steps.len());
+        for (i, files) in self.steps.iter().enumerate() {
+            let mut append = Transaction::new(&local)
+                .fast_append()
+                .with_check_duplicate(false)
+                .add_data_files(files.clone());
+            if i + 1 == self.steps.len() {
+                append = append.set_snapshot_properties(self.properties.clone());
+            }
+            let (mut step, snapshot) = append.stage(&local).await?;
+            staged.push(snapshot);
+            let step_updates = step.take_updates();
+            requirements.get_or_insert(step.take_requirements());
+            local = with_updates(&local, &step_updates)?;
+            updates.extend(step_updates);
+        }
+        let added: Vec<Vec<ManifestFile>> = stream::iter(staged.iter_mut())
+            .map(StagedSnapshot::write_manifests)
+            .buffered(CHAIN_WRITES)
+            .try_collect()
+            .await?;
+        let mut lists = Vec::with_capacity(staged.len());
+        for (snapshot, added) in staged.into_iter().zip(added) {
+            let manifests: Vec<ManifestFile> = parent.into_iter().chain(added).collect();
+            parent = manifests.clone();
+            lists.push(snapshot.write_manifest_list(manifests));
+        }
+        stream::iter(lists)
+            .buffered(CHAIN_WRITES)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(ActionCommit::new(updates, requirements.unwrap_or_default()))
+    }
+}
+
+impl ChainedAppendAction {
+    /// One step after another, each a fast append on the last: for v3
+    /// tables, whose snapshots take their row range from their written
+    /// manifest list.
+    async fn commit_one_by_one(&self, table: &Table) -> iceberg::Result<ActionCommit> {
         let mut local = table.clone();
         let mut updates = Vec::new();
         let mut requirements = None;
@@ -717,28 +789,33 @@ impl TransactionAction for ChainedAppendAction {
             let mut step = Arc::new(append).commit(&local).await?;
             let step_updates = step.take_updates();
             requirements.get_or_insert(step.take_requirements());
-            let mut builder = local
-                .metadata()
-                .clone()
-                .into_builder(local.metadata_location().map(str::to_string));
-            for update in &step_updates {
-                builder = update.clone().apply(builder)?;
-            }
-            // `local`'s runtime isn't public; pg2iceberg always runs
-            // inside the tokio runtime iceberg-rust was given.
-            let mut next = Table::builder()
-                .identifier(local.identifier().clone())
-                .file_io(local.file_io().clone())
-                .metadata(builder.build()?.metadata)
-                .runtime(iceberg::Runtime::try_current()?);
-            if let Some(location) = local.metadata_location() {
-                next = next.metadata_location(location);
-            }
-            local = next.build()?;
+            local = with_updates(&local, &step_updates)?;
             updates.extend(step_updates);
         }
         Ok(ActionCommit::new(updates, requirements.unwrap_or_default()))
     }
+}
+
+/// `table` with `updates` applied: the next step's base.
+fn with_updates(table: &Table, updates: &[TableUpdate]) -> iceberg::Result<Table> {
+    let mut builder = table
+        .metadata()
+        .clone()
+        .into_builder(table.metadata_location().map(str::to_string));
+    for update in updates {
+        builder = update.clone().apply(builder)?;
+    }
+    // `table`'s runtime isn't public; pg2iceberg always runs inside the
+    // tokio runtime iceberg-rust was given.
+    let mut next = Table::builder()
+        .identifier(table.identifier().clone())
+        .file_io(table.file_io().clone())
+        .metadata(builder.build()?.metadata)
+        .runtime(iceberg::Runtime::try_current()?);
+    if let Some(location) = table.metadata_location() {
+        next = next.metadata_location(location);
+    }
+    next.build()
 }
 
 /// Sets the table's `pg2iceberg.log-ends` property to each group's end:
@@ -1988,13 +2065,35 @@ mod tests {
         assert!(snaps.is_empty());
     }
 
-    /// In-memory storage that records the path of every read.
+    /// In-memory storage that records the path of every read — and with a
+    /// `latency`, is a round trip away, in tokio's (paused) time: each read,
+    /// and each write as it completes.
     #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
     struct CountingStorage {
         #[serde(skip)]
         inner: iceberg::io::MemoryStorage,
         #[serde(skip)]
         reads: Arc<std::sync::Mutex<Vec<String>>>,
+        #[serde(skip)]
+        latency: std::time::Duration,
+    }
+
+    /// A write that takes `latency` to complete.
+    struct SlowWrite {
+        inner: Box<dyn iceberg::io::FileWrite>,
+        latency: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl iceberg::io::FileWrite for SlowWrite {
+        async fn write(&mut self, bs: bytes::Bytes) -> iceberg::Result<()> {
+            self.inner.write(bs).await
+        }
+
+        async fn close(&mut self) -> iceberg::Result<()> {
+            tokio::time::sleep(self.latency).await;
+            self.inner.close().await
+        }
     }
 
     impl CountingStorage {
@@ -2017,20 +2116,26 @@ mod tests {
 
         async fn read(&self, path: &str) -> iceberg::Result<bytes::Bytes> {
             self.reads.lock().unwrap().push(path.to_string());
+            tokio::time::sleep(self.latency).await;
             self.inner.read(path).await
         }
 
         async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn iceberg::io::FileRead>> {
             self.reads.lock().unwrap().push(path.to_string());
+            tokio::time::sleep(self.latency).await;
             self.inner.reader(path).await
         }
 
         async fn write(&self, path: &str, bs: bytes::Bytes) -> iceberg::Result<()> {
+            tokio::time::sleep(self.latency).await;
             self.inner.write(path, bs).await
         }
 
         async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn iceberg::io::FileWrite>> {
-            self.inner.writer(path).await
+            Ok(Box::new(SlowWrite {
+                inner: self.inner.writer(path).await?,
+                latency: self.latency,
+            }))
         }
 
         async fn delete(&self, path: &str) -> iceberg::Result<()> {
@@ -2225,6 +2330,67 @@ mod tests {
         assert!(again.is_empty(), "read again: {again:?}");
         // The new snapshot's manifest list and its one new manifest.
         assert_eq!(second_reads.len(), 2, "{second_reads:?}");
+    }
+
+    /// Step `i` of a commit: a data file and an equality-delete file.
+    fn step(i: usize) -> PreparedCommit {
+        let file = |kind: &str, equality_field_ids: Vec<i32>| DataFile {
+            path: format!("memory:///warehouse/public/orders/step-{kind}-{i}.parquet"),
+            record_count: 1,
+            byte_size: 100,
+            equality_field_ids,
+            partition_values: Vec::new(),
+            sequence_number: None,
+        };
+        PreparedCommit {
+            ident: ident(),
+            data_files: vec![file("data", vec![])],
+            equality_deletes: vec![file("eq-delete", vec![1])],
+        }
+    }
+
+    /// A commit of several steps — a large transaction, or a materializer
+    /// catching up — writes every step's manifests at once, then every
+    /// step's manifest list, and reads back nothing it wrote: a few round
+    /// trips to object storage, however many steps. Each step is still a
+    /// snapshot on the last.
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_of_several_steps_writes_them_together() {
+        const LATENCY: std::time::Duration = std::time::Duration::from_millis(100);
+        const STEPS: usize = 4;
+        let storage = CountingStorage {
+            latency: LATENCY,
+            ..Default::default()
+        };
+        let c = fresh_on(storage.clone()).await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        append(&c, 0).await;
+        storage.take_reads();
+
+        let start = tokio::time::Instant::now();
+        c.commit_snapshots((0..STEPS).map(step).collect(), None, BTreeSet::new())
+            .await
+            .unwrap();
+        let took = start.elapsed();
+
+        let reads = storage.take_reads();
+        let lists: Vec<&String> = reads.iter().filter(|p| p.ends_with(".avro")).collect();
+        // The table's manifest list, which the first step carries forward.
+        assert_eq!(lists.len(), 1, "{lists:?}");
+        // That read, every manifest, every list — and the table's metadata,
+        // read and written.
+        assert!(took <= 6 * LATENCY, "{STEPS} steps took {took:?}");
+        let snapshots = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(snapshots.len(), 1 + STEPS);
+        // The first commit's file, and each step's data and delete files.
+        assert_eq!(live_files(&snapshots).len(), 1 + 2 * STEPS);
+        let deletes: Vec<i64> = snapshots
+            .iter()
+            .flat_map(|s| s.delete_files.iter().map(move |_| s.id))
+            .collect();
+        assert_eq!(deletes.len(), STEPS);
+        assert!(deletes.windows(2).all(|w| w[0] < w[1]), "{deletes:?}");
     }
 
     #[tokio::test]

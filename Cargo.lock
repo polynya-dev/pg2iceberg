@@ -2450,7 +2450,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.1"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.10.1#55d6a3c7a5c462b7aba3867b6626ded24ded2935"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.10.1#0ded76c9e9f627822b7a7a4d032771c410fc7a48"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2506,7 +2506,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.1"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.10.1#55d6a3c7a5c462b7aba3867b6626ded24ded2935"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.10.1#0ded76c9e9f627822b7a7a4d032771c410fc7a48"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2529,7 +2529,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.1"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.10.1#55d6a3c7a5c462b7aba3867b6626ded24ded2935"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.10.1#0ded76c9e9f627822b7a7a4d032771c410fc7a48"
 dependencies = [
  "anyhow",
  "async-trait",
