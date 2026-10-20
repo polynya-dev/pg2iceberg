@@ -730,10 +730,11 @@ impl FileIndex {
         }
     }
 
-    /// Evict the oldest files' keys, down to three quarters of the most
-    /// the map holds, and at least one fewer: they leave it for the filter.
+    /// Evict the oldest files' keys, down to half the most the map holds:
+    /// they leave it for the filter. Each eviction moves the keys kept to
+    /// a table of their own, so it's done rarely, half a map at a time.
     fn evict(&mut self) {
-        let target = (self.max_keys - self.max_keys / 4).min(self.max_keys - 1);
+        let target = self.max_keys / 2;
         let mut oldest: Vec<(u64, FileId)> = self
             .files
             .iter()
