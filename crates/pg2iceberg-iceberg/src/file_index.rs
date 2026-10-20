@@ -297,8 +297,8 @@ impl FileIndex {
     }
 
     /// An index of at most about `bytes`: a quarter for the filter of
-    /// evicted keys, the rest for the map, at its largest — while it
-    /// grows, its old table and new one both.
+    /// evicted keys, the rest for the map, at its largest — while it grows,
+    /// or evicts, its old table and new one both.
     pub fn with_memory(bytes: usize) -> Self {
         let mut index = Self::default();
         index.set_memory(bytes);
@@ -321,9 +321,10 @@ impl FileIndex {
     pub fn set_memory(&mut self, bytes: usize) {
         let map_bytes = bytes / 4 * 3;
         // The map grows by doubling its table, of a power of two buckets,
-        // once 7/8 of them hold keys; both tables live while it grows.
+        // once 7/8 of them hold keys; evicting, it moves to a table of the
+        // most. Both tables live meanwhile.
         let mut buckets: usize = 1;
-        while (buckets * 2).saturating_mul(KEY_BYTES) * 3 / 2 <= map_bytes {
+        while (buckets * 2).saturating_mul(KEY_BYTES) * 2 <= map_bytes {
             buckets *= 2;
         }
         self.max_keys = (buckets / 8 * 7).max(1);
@@ -367,6 +368,10 @@ impl FileIndex {
                     }
                 }
             }
+            // Room first: a key past its most would grow the map's table.
+            if self.keys.len() >= self.max_keys && !self.keys.contains_key(&slot) {
+                self.evict();
+            }
             match self.keys.insert(slot, id) {
                 Some(prev) if prev == id => {}
                 Some(prev) => {
@@ -381,7 +386,6 @@ impl FileIndex {
                     file.mapped += 1;
                     // Its row before this one, if any, is dead now.
                     self.lose_unseen(&slot, &pk, Some(id));
-                    self.evict_if_full();
                 }
             }
         }
@@ -726,13 +730,10 @@ impl FileIndex {
         }
     }
 
-    /// Past its most keys, evict the oldest files' down to three quarters
-    /// of it: their keys leave the map for the filter.
-    fn evict_if_full(&mut self) {
-        if self.keys.len() <= self.max_keys {
-            return;
-        }
-        let target = self.max_keys - self.max_keys / 4;
+    /// Evict the oldest files' keys, down to three quarters of the most
+    /// the map holds, and at least one fewer: they leave it for the filter.
+    fn evict(&mut self) {
+        let target = (self.max_keys - self.max_keys / 4).min(self.max_keys - 1);
         let mut oldest: Vec<(u64, FileId)> = self
             .files
             .iter()
@@ -751,14 +752,17 @@ impl FileIndex {
             evicting[id as usize] = true;
             left -= self.file(id).mapped as usize;
         }
-        let filter = &mut self.evicted_keys;
-        self.keys.retain(|slot, id| {
-            let evict = evicting[*id as usize];
-            if evict {
-                filter.insert(slot);
+        // Into a table of its own: removed in place, the keys would leave
+        // tombstones, which the inserts after would grow the table past.
+        let mut kept = HashMap::with_capacity(self.max_keys);
+        for (slot, id) in std::mem::take(&mut self.keys) {
+            if evicting[id as usize] {
+                self.evicted_keys.insert(&slot);
+            } else {
+                kept.insert(slot, id);
             }
-            !evict
-        });
+        }
+        self.keys = kept;
         for (id, evict) in evicting.into_iter().enumerate() {
             if evict {
                 let file = self.files[id].as_mut().expect("live file id");
@@ -1208,6 +1212,12 @@ mod tests {
             let keys = (0..10_000).map(|i| n(f * 10_000 + i));
             fi.add_file(format!("f{f}"), keys, Vec::new());
             assert!(fi.memory_bytes() <= BUDGET, "{} bytes", fi.memory_bytes());
+            // Its table never grows past what the budget planned.
+            assert!(
+                fi.keys.capacity() <= fi.max_keys,
+                "{} keys' room",
+                fi.keys.capacity()
+            );
         }
         assert!(!fi.evicted_files().is_empty());
         for id in 0..2_000_000 {
