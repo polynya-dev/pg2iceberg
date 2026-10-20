@@ -286,6 +286,9 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// Most tables the materializer applies at once
     /// ([`Materializer::with_table_concurrency`]).
     pub mat_table_concurrency: usize,
+    /// Most bytes of a table's keys the materializer holds
+    /// ([`Materializer::with_pk_index_memory`]).
+    pub pk_index_memory: usize,
     /// Most tables the initial snapshot reads at once, each on a task of
     /// its own ([`pg2iceberg_snapshot::Snapshotter::run_concurrently`]);
     /// the snapshot source serves them all at once.
@@ -392,6 +395,7 @@ fn instrument<Cat: Catalog + 'static>(
         flush_rows,
         mat_batch_rows,
         mat_table_concurrency,
+        pk_index_memory,
         snapshot_concurrency,
         snapshot_source_factory,
         materializer_namer,
@@ -418,6 +422,7 @@ fn instrument<Cat: Catalog + 'static>(
         flush_rows,
         mat_batch_rows,
         mat_table_concurrency,
+        pk_index_memory,
         snapshot_concurrency,
         snapshot_source_factory,
         materializer_namer,
@@ -628,7 +633,8 @@ async fn start<Cat: Catalog + 'static>(
         lc.mat_batch_rows,
         Arc::clone(&lc.metrics),
     )
-    .with_table_concurrency(lc.mat_table_concurrency);
+    .with_table_concurrency(lc.mat_table_concurrency)
+    .with_pk_index_memory(lc.pk_index_memory);
     materializer.set_catalog_cache_ttl(
         Arc::clone(&lc.clock),
         pg2iceberg_logical::CachingCatalog::<Cat>::DEFAULT_TTL,

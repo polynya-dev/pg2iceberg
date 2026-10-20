@@ -105,6 +105,8 @@ Read from `pg_replication_slots` every watcher tick (30 s).
 |---|---|---|---|
 | `pg2iceberg_materializer_backlog_rows` | gauge | `table` | Rows staged but not yet materialized. Gauged by the watcher, so in distributed mode by `stream-only`. |
 | `pg2iceberg_materializer_source_commit_timestamp_seconds` | gauge | `table` | Source commit time of the newest change materialized. |
+| `pg2iceberg_materializer_pk_index_bytes` | gauge | `table` | Memory the table's primary-key index takes, about: at most `sink.pk_index_memory`. |
+| `pg2iceberg_materializer_pk_index_evicted_files` | gauge | `table` | Data files whose keys the index evicted to keep to its budget: a change to one of their rows may read them. |
 | `pg2iceberg_materializer_rows_total` | counter | `table` | Rows written to Iceberg, deletes included: each key once per step it changed in. |
 | `pg2iceberg_materializer_commits_total` | counter | `table` | Iceberg commits of materialized rows. |
 | `pg2iceberg_materializer_files_written_total` | counter | `table`, `kind` | Files those commits added: `data` or `delete`. |

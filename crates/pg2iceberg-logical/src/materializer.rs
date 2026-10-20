@@ -42,9 +42,9 @@ use pg2iceberg_iceberg::meta::{
 use pg2iceberg_iceberg::reader::RowBatches;
 use pg2iceberg_iceberg::{
     apply_schema_changes, catch_up_from_catalog, fold_events, is_dropped_column,
-    promote_re_inserts, read_data_file, reconcile_columns, resolve_unchanged_cols, toast_source,
-    Catalog, DataFile, FileIndex, IcebergError, LiveRows, LogRange, MaterializedRow, PkKey,
-    PreparedCommit, SchemaChange, TableMetadata, TableWriter, WriterError,
+    promote_re_inserts, read_data_file, reconcile_columns, resolve_unchanged_cols, toast_files,
+    Catalog, DataFile, Deletes, FileIndex, IcebergError, LiveRows, LogRange, MaterializedRow,
+    PkKey, PreparedCommit, SchemaChange, TableMetadata, TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -439,6 +439,10 @@ pub const STEPS_PER_COMMIT: usize = 4;
 const STEP_UPLOADS: usize = 8;
 /// Default most tables a cycle applies at once.
 pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
+/// Default most bytes a table's FileIndex holds
+/// ([`Materializer::with_pk_index_memory`]): pg2iceberg's, not a bare
+/// `Materializer`'s.
+pub const DEFAULT_PK_INDEX_MEMORY: usize = 512 << 20;
 
 /// Steps read but not yet committed. Committed together, as one atomic
 /// `commit_snapshots`, so a transaction spanning several steps becomes
@@ -519,6 +523,8 @@ pub struct CompactionJob<C> {
     schema: TableSchema,
     pk_cols: Vec<ColumnName>,
     live: LiveRows,
+    /// The FileIndex's [`FileIndex::unseen_deaths`] as the pass began.
+    unseen_deaths: BTreeMap<String, u64>,
     config: pg2iceberg_iceberg::CompactionConfig,
 }
 
@@ -535,6 +541,7 @@ impl<C: Catalog> CompactionJob<C> {
             ident: self.ident,
             started_micros,
             seconds: seconds_since(started_micros),
+            unseen_deaths: self.unseen_deaths,
             pass,
         }
     }
@@ -574,6 +581,7 @@ pub struct CompactionPass {
     ident: TableIdent,
     started_micros: i64,
     seconds: f64,
+    unseen_deaths: BTreeMap<String, u64>,
     pass: std::result::Result<
         Option<pg2iceberg_iceberg::PreparedPass>,
         pg2iceberg_iceberg::CompactError,
@@ -637,6 +645,9 @@ pub struct Materializer<C: Catalog> {
     maintenance: Maintenance,
     /// Most tables a cycle applies at once ([`Self::with_table_concurrency`]).
     table_concurrency: usize,
+    /// Most bytes a table's FileIndex holds ([`Self::with_pk_index_memory`]);
+    /// `None`: every key.
+    pk_index_memory: Option<usize>,
 }
 
 /// Distributed-mode parameters. Built by
@@ -759,6 +770,7 @@ impl<C: Catalog> Materializer<C> {
             distributed: None,
             maintenance: Maintenance::default(),
             table_concurrency: DEFAULT_TABLE_CONCURRENCY,
+            pk_index_memory: None,
         }
     }
 
@@ -1032,7 +1044,10 @@ impl<C: Catalog> Materializer<C> {
             .collect();
         let writer = TableWriter::new(schema.clone());
 
-        let mut file_index = FileIndex::new();
+        let mut file_index = match self.pk_index_memory {
+            Some(bytes) => FileIndex::with_memory(bytes),
+            None => FileIndex::new(),
+        };
         let index_at = catch_up_from_catalog(
             &mut file_index,
             None,
@@ -1169,7 +1184,7 @@ impl<C: Catalog> Materializer<C> {
     ) -> Result<BTreeMap<String, String>> {
         let mut marks = BTreeMap::new();
         let entry = self.tables.get(ident).expect("checked by caller");
-        if entry.file_index.live_pk_count() == 0 {
+        if !entry.file_index.holds_rows() {
             return Ok(marks);
         }
         let mut evolved = schema.clone();
@@ -1276,16 +1291,40 @@ impl<C: Catalog> Materializer<C> {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let (columns, pk_cols) = (entry.schema.columns.clone(), entry.pk_cols.clone());
+        let (schema, pk_cols) = (entry.schema.clone(), entry.pk_cols.clone());
+        // Whether an evicted file's row is live, the index can't tell:
+        // the table's deletes can.
+        let deletes = match entry.file_index.evicted_files().is_empty() {
+            true => None,
+            false => {
+                let snapshots = self.catalog.snapshots(ident).await?;
+                let deletes =
+                    Deletes::read(&snapshots, self.blob_store.as_ref(), &schema, &pk_cols)
+                        .await
+                        .map_err(|e| MaterializerError::Compact(e.to_string()))?;
+                Some(deletes)
+            }
+        };
         for path in files {
             let bytes = self.blob_store.get(&path).await?;
-            for batch in RowBatches::new(bytes, &columns, self.batch_rows.max(1))? {
+            for batch in RowBatches::new(bytes, &schema.columns, self.batch_rows.max(1))? {
                 for mut row in batch? {
                     // A row deleted or updated since lives elsewhere, or
                     // nowhere.
-                    let entry = self.tables.get(ident).expect("checked by caller");
+                    let index = &self
+                        .tables
+                        .get(ident)
+                        .expect("checked by caller")
+                        .file_index;
                     let key = PkKey::from_row(&row, &pk_cols);
-                    if entry.file_index.lookup(&key) != Some(path.as_str()) {
+                    let live = match index.lookup(&key) {
+                        Some(holding) => holding == path,
+                        None => {
+                            index.is_evicted(&path)
+                                && deletes.as_ref().is_some_and(|d| !d.hides(&path, &key))
+                        }
+                    };
+                    if !live {
                         continue;
                     }
                     row.insert(column.clone(), value.clone());
@@ -1563,11 +1602,38 @@ impl<C: Catalog> Materializer<C> {
         }
     }
 
+    /// Every key the table holds: from its FileIndex, or, if that can't
+    /// give them all back, read from its data files — dead rows' too,
+    /// whose deletes delete nothing.
+    async fn table_keys(&self, ident: &TableIdent) -> Result<Vec<PkKey>> {
+        let entry = self
+            .tables
+            .get(ident)
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        if let Some(keys) = entry.file_index.all_pks() {
+            return Ok(keys);
+        }
+        let pk_schema: Vec<ColumnSchema> = entry
+            .pk_cols
+            .iter()
+            .filter_map(|pk| entry.schema.columns.iter().find(|c| c.name == pk.0))
+            .cloned()
+            .collect();
+        let mut keys = Vec::new();
+        for path in entry.file_index.live_files() {
+            let bytes = self.blob_store.get(path).await?;
+            for batch in RowBatches::new(bytes, &pk_schema, self.batch_rows.max(1))? {
+                keys.extend(batch?.iter().map(|r| PkKey::from_row(r, &entry.pk_cols)));
+            }
+        }
+        Ok(keys)
+    }
+
     /// Forget what `ident`'s FileIndex holds, as rows never committed may
     /// be in it: it's rebuilt from the table when next needed.
     fn forget_file_index(&mut self, ident: &TableIdent) {
         if let Some(entry) = self.tables.get_mut(ident) {
-            entry.file_index = FileIndex::new();
+            entry.file_index = entry.file_index.cleared();
             entry.index_at = None;
         }
     }
@@ -1833,6 +1899,7 @@ impl<C: Catalog> Materializer<C> {
             distributed: None,
             maintenance: self.maintenance,
             table_concurrency: 1,
+            pk_index_memory: self.pk_index_memory,
         })
     }
 
@@ -2073,7 +2140,7 @@ impl<C: Catalog> Materializer<C> {
                 )
                 .await;
                 let seconds = seconds_since(started_micros);
-                self.compaction_done(ident, started_micros, seconds, outcome)
+                self.compaction_done(ident, started_micros, seconds, &BTreeMap::new(), outcome)
                     .await
             }
         }
@@ -2106,6 +2173,7 @@ impl<C: Catalog> Materializer<C> {
             schema: entry.schema.clone(),
             pk_cols: entry.pk_cols.clone(),
             live: LiveRows::new(&entry.file_index, Some(as_of)),
+            unseen_deaths: entry.file_index.unseen_deaths(),
             config: config.clone(),
         })
     }
@@ -2134,6 +2202,7 @@ impl<C: Catalog> Materializer<C> {
             ident,
             started_micros,
             mut seconds,
+            unseen_deaths,
             pass,
         } = pass;
         if !self.tables.contains_key(&ident) {
@@ -2156,17 +2225,19 @@ impl<C: Catalog> Materializer<C> {
             }
             Err(e) => Err(e),
         };
-        self.compaction_done(&ident, started_micros, seconds, outcome)
+        self.compaction_done(&ident, started_micros, seconds, &unseen_deaths, outcome)
             .await
     }
 
     /// Account for a compaction pass that ran for `seconds`: its metrics,
     /// its rewrite in the table's FileIndex, its `compactions` meta row.
+    /// `unseen_deaths` is the FileIndex's as the pass began.
     async fn compaction_done(
         &mut self,
         ident: &TableIdent,
         started_micros: i64,
         seconds: f64,
+        unseen_deaths: &BTreeMap<String, u64>,
         outcome: std::result::Result<
             Option<pg2iceberg_iceberg::CompactionOutcome>,
             pg2iceberg_iceberg::CompactError,
@@ -2212,19 +2283,53 @@ impl<C: Catalog> Materializer<C> {
                 // since, whose PKs are in newer files now, or nowhere.
                 let rewritten: std::collections::HashSet<&str> =
                     o.rewritten_files.iter().map(String::as_str).collect();
+                // A row of an evicted input, whose key the index doesn't
+                // hold, is live — but for those that died unseen since the
+                // pass read them: each output carrying such rows counts
+                // that many fewer, which is never too few.
+                let now = entry_mut.file_index.unseen_deaths();
+                let died_unseen: u64 = now
+                    .iter()
+                    .filter(|(path, _)| rewritten.contains(path.as_str()))
+                    .map(|(path, n)| n - unseen_deaths.get(path).copied().unwrap_or(0).min(*n))
+                    .sum();
+                // Outputs stand where their newest input did.
+                let generation = o
+                    .rewritten_files
+                    .iter()
+                    .filter_map(|p| entry_mut.file_index.generation(p))
+                    .max();
                 for f in &o.added_files {
                     let index = &entry_mut.file_index;
-                    let moved: Vec<PkKey> = f
-                        .pk_keys
-                        .iter()
-                        .filter(|k| index.lookup(k).is_some_and(|p| rewritten.contains(p)))
-                        .cloned()
-                        .collect();
-                    entry_mut.file_index.add_file(
+                    let mut moved: Vec<PkKey> = Vec::new();
+                    let mut unseen: u64 = 0;
+                    for (k, &source) in f.pk_keys.iter().zip(&f.pk_sources) {
+                        match index.lookup(k) {
+                            Some(p) if rewritten.contains(p) => moved.push(k.clone()),
+                            // Updated or deleted since.
+                            Some(_) => {}
+                            None if index.is_evicted(&o.rewritten_files[source as usize]) => {
+                                unseen += 1
+                            }
+                            // Its key left the index with its row.
+                            None => {}
+                        }
+                    }
+                    entry_mut.file_index.add_file_at(
                         f.path.clone(),
                         moved,
                         f.partition_values.clone(),
+                        generation,
                     );
+                    if unseen > 0 {
+                        entry_mut.file_index.add_unseen(
+                            f.path.clone(),
+                            unseen.saturating_sub(died_unseen),
+                            f.pk_keys.iter().cloned(),
+                            f.partition_values.clone(),
+                            generation,
+                        );
+                    }
                 }
                 for path in &o.rewritten_files {
                     entry_mut.file_index.remove_file(path);
@@ -2285,6 +2390,23 @@ impl<C: Catalog> Materializer<C> {
         self
     }
 
+    /// Hold at most about `bytes` of each table's keys in its FileIndex
+    /// (see [`FileIndex::with_memory`]): past it, its oldest files' keys
+    /// are evicted, and finding one takes reading those files. Defaults
+    /// to every key.
+    pub fn with_pk_index_memory(mut self, bytes: usize) -> Self {
+        self.set_pk_index_memory(bytes);
+        self
+    }
+
+    /// [`Self::with_pk_index_memory`], in place.
+    pub fn set_pk_index_memory(&mut self, bytes: usize) {
+        self.pk_index_memory = Some(bytes);
+        for entry in self.tables.values_mut() {
+            entry.file_index.set_memory(bytes);
+        }
+    }
+
     /// Whether the last [`Self::cycle`] stopped at its row budget
     /// (`cycle_rows`) with log entries left to read: the next can start
     /// straight away, rather than a materializer interval later.
@@ -2306,7 +2428,26 @@ impl<C: Catalog> Materializer<C> {
             span.record("rows", rows);
         }
         crate::spans::record_outcome(&span, &out);
+        self.record_file_index(ident);
         out
+    }
+
+    /// Gauge `ident`'s FileIndex: its memory, and the files it evicted.
+    fn record_file_index(&self, ident: &TableIdent) {
+        if let Some(entry) = self.tables.get(ident) {
+            let table = labels([("table", &ident.to_string())]);
+            let index = &entry.file_index;
+            self.metrics.gauge(
+                names::MATERIALIZER_PK_INDEX_BYTES,
+                &table,
+                index.memory_bytes() as f64,
+            );
+            self.metrics.gauge(
+                names::MATERIALIZER_PK_INDEX_EVICTED_FILES,
+                &table,
+                index.evicted_files().len() as f64,
+            );
+        }
     }
 
     async fn materialize_table(&mut self, ident: &TableIdent) -> Result<usize> {
@@ -2465,16 +2606,20 @@ impl<C: Catalog> Materializer<C> {
             }
         }
 
+        // Expand any TRUNCATE events into per-PK deletes of every key the
+        // table holds. A `TRUNCATE` in PG drops every row; in Iceberg we
+        // model that as one equality-delete per known PK so the next
+        // snapshot's MoR reads return zero rows. Subsequent same-tx
+        // INSERTs survive the fold's last-write-wins on the same PK.
+        let truncated = match events.iter().any(|e| e.op == Op::Truncate) {
+            true => self.table_keys(ident).await?,
+            false => Vec::new(),
+        };
         let entry = self
             .tables
             .get(ident)
             .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
-        // Expand any TRUNCATE events into per-PK deletes against the
-        // current FileIndex. A `TRUNCATE` in PG drops every row; in
-        // Iceberg we model that as one equality-delete per known PK so the
-        // next snapshot's MoR reads return zero rows. Subsequent same-tx
-        // INSERTs survive the fold's last-write-wins on the same PK.
-        let events = expand_truncates(events, &entry.file_index, &entry.schema);
+        let events = expand_truncates(events, &truncated, &entry.schema);
 
         // Fold + TOAST + re-insert. Pre-fetch any prior data files needed
         // for TOAST resolution; that's cheap when no UPDATE has unchanged_cols.
@@ -2784,7 +2929,7 @@ impl<C: Catalog> Materializer<C> {
 
     async fn rebuild_file_index(&mut self, ident: &TableIdent) -> Result<()> {
         let entry = self.tables.get_mut(ident).expect("checked by caller");
-        entry.file_index = FileIndex::new();
+        entry.file_index = entry.file_index.cleared();
         entry.index_at = None;
         self.catch_up_file_index(ident).await
     }
@@ -2985,12 +3130,13 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-/// Expand `Op::Truncate` events into per-PK `Op::Delete` events
-/// against the current FileIndex. Mirrors PG's TRUNCATE semantics:
-/// every row known to Iceberg right now is wiped, so the materializer
-/// emits an equality-delete for each — and the events before it in this
-/// step, rows the FileIndex doesn't hold yet, are dropped. (Earlier
-/// steps of the unit are in the FileIndex already.)
+/// Expand `Op::Truncate` events into per-PK `Op::Delete` events of
+/// `keys`, every key the table holds ([`Materializer::table_keys`]).
+/// Mirrors PG's TRUNCATE semantics: every row known to Iceberg right now
+/// is wiped, so the materializer emits an equality-delete for each — and
+/// the events before it in this step, rows the FileIndex doesn't hold
+/// yet, are dropped. (Earlier steps of the unit are in the FileIndex
+/// already.)
 ///
 /// Subsequent post-truncate Insert/Update events for the same PK
 /// will overwrite the synthetic Delete during the fold (last-write-
@@ -2999,15 +3145,11 @@ fn now_micros() -> i64 {
 /// The Truncate sentinel events are dropped from the output — they
 /// have no row payload of their own and the writer would reject
 /// them.
-fn expand_truncates(
-    events: Vec<MatEvent>,
-    file_index: &FileIndex,
-    schema: &TableSchema,
-) -> Vec<MatEvent> {
+fn expand_truncates(events: Vec<MatEvent>, keys: &[PkKey], schema: &TableSchema) -> Vec<MatEvent> {
     if !events.iter().any(|e| e.op == Op::Truncate) {
         return events;
     }
-    let mut out: Vec<MatEvent> = Vec::with_capacity(events.len() + file_index.live_pk_count());
+    let mut out: Vec<MatEvent> = Vec::with_capacity(events.len() + keys.len());
     for evt in events {
         if evt.op != Op::Truncate {
             out.push(evt);
@@ -3020,7 +3162,7 @@ fn expand_truncates(
         // `PkKey::from_row` produces) are skipped rather than crashing
         // the cycle.
         let pk_schema: Vec<ColumnSchema> = schema.primary_key_columns().cloned().collect();
-        for pk in file_index.all_pks() {
+        for pk in keys {
             let Some(row) = pk.to_row(&pk_schema) else {
                 continue;
             };
@@ -3039,7 +3181,8 @@ fn expand_truncates(
     out
 }
 
-/// The columns of `schema` that `source` doesn't have.
+/// The files to fetch to resolve `rows`' unchanged TOAST columns
+/// ([`toast_files`]).
 fn collect_toast_paths(
     rows: &[MaterializedRow],
     file_index: &FileIndex,
@@ -3050,9 +3193,11 @@ fn collect_toast_paths(
         if r.unchanged_cols.is_empty() || r.op == Op::Delete {
             continue;
         }
-        if let Some(p) = file_index.lookup(&toast_source(r, pk_cols, file_index)) {
-            paths.insert(p.to_string());
-        }
+        paths.extend(
+            toast_files(r, pk_cols, file_index)
+                .into_iter()
+                .map(str::to_string),
+        );
     }
     paths
 }

@@ -42,7 +42,7 @@ During materialization, after events are folded by primary key, the materializer
 2. **Downloads and scans** — downloads only the affected Parquet files from S3 and reads the relevant column values.
 3. **Backfills** — copies each missing column value from the scanned file into the pending row, then clears `unchangedCols`.
 
-If the FileIndex has no entry for a primary key — for example on the very first materialization after a cold start — the unresolved columns remain `nil` in the output.
+If the FileIndex has no entry for a primary key — for example on the very first materialization after a cold start — the unresolved columns remain `nil` in the output. A key whose file the index evicted to keep to its budget ([file index](materializer.md#file-index)) is looked for in each evicted file whose range of keys holds it, newest first.
 
 ## FileIndex
 

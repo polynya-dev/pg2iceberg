@@ -289,6 +289,7 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
             flush_rows: 1000,
             materializer_batch_rows: 50_000,
             materializer_concurrency: 4,
+            pk_index_memory: 512 << 20,
             materializer_interval: String::new(),
             compaction_data_files: 8,
             compaction_delete_files: 4,

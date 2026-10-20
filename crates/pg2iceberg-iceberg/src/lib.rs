@@ -18,11 +18,11 @@ pub mod writer;
 
 pub use compact::{
     compact_table, prepare_pass, retire_deletes, CompactError, CompactedFile, CompactionConfig,
-    CompactionOutcome, LiveRows, PreparedPass,
+    CompactionOutcome, Deletes, LiveRows, PreparedPass,
 };
 pub use file_index::{catch_up_from_catalog, rebuild_from_catalog, FileIndex};
 pub use fold::{fold_events, pk_key, MaterializedRow};
-pub use materialize::{promote_re_inserts, resolve_unchanged_cols, toast_source};
+pub use materialize::{promote_re_inserts, resolve_unchanged_cols, toast_files};
 pub use orphan::{cleanup_orphans, CleanupError, CleanupOutcome};
 pub use pk::PkKey;
 pub use reader::{read_data_file, read_data_file_by_field_id};

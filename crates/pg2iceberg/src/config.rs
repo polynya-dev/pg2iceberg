@@ -350,6 +350,14 @@ pub struct SinkConfig {
     /// its own. With meta tables on, they're applied one at a time.
     #[serde(default = "default_materializer_concurrency")]
     pub materializer_concurrency: usize,
+    /// Most bytes of a table's primary keys the materializer holds in
+    /// memory. Past it, the oldest data files' keys are evicted: a change
+    /// to one of their rows then takes reading them where the materializer
+    /// needs the row (an unchanged TOAST value, a partitioned table's
+    /// delete), and an insert of a key that may be theirs writes an
+    /// equality delete.
+    #[serde(default = "default_pk_index_memory")]
+    pub pk_index_memory: usize,
     /// How often the materializer commits staged changes to Iceberg —
     /// in `run` and `materializer-only`. Matches Go's
     /// `materializer_interval`. Empty = 10s.
@@ -442,6 +450,7 @@ impl Default for SinkConfig {
             flush_rows: default_flush_rows(),
             materializer_batch_rows: default_materializer_batch_rows(),
             materializer_concurrency: default_materializer_concurrency(),
+            pk_index_memory: default_pk_index_memory(),
             materializer_interval: String::new(),
             compaction_data_files: default_compaction_data_files(),
             compaction_delete_files: default_compaction_delete_files(),
@@ -611,6 +620,10 @@ fn default_materializer_batch_rows() -> usize {
 
 fn default_materializer_concurrency() -> usize {
     pg2iceberg_logical::materializer::DEFAULT_TABLE_CONCURRENCY
+}
+
+fn default_pk_index_memory() -> usize {
+    pg2iceberg_logical::materializer::DEFAULT_PK_INDEX_MEMORY
 }
 
 fn default_compaction_data_files() -> usize {
@@ -1584,6 +1597,7 @@ sink:
         assert_eq!(cfg.sink.flush_rows, 10_000);
         assert_eq!(cfg.sink.materializer_batch_rows, 50_000);
         assert_eq!(cfg.sink.materializer_concurrency, 4);
+        assert_eq!(cfg.sink.pk_index_memory, 512 << 20);
         assert_eq!(cfg.source.logical.snapshot_concurrency, 4);
         assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
         assert_eq!(cfg.state.group, "default");

@@ -223,6 +223,10 @@ catalog! {
         "Rows staged but not yet materialized.";
     MATERIALIZER_SOURCE_TIMESTAMP: Gauge "pg2iceberg_materializer_source_commit_timestamp_seconds" ["table"]
         "Source commit time of the newest change materialized, in Unix seconds; with a backlog, time() minus it is how stale the table is.";
+    MATERIALIZER_PK_INDEX_BYTES: Gauge "pg2iceberg_materializer_pk_index_bytes" ["table"]
+        "Memory the table's primary-key index takes, about; at most sink.pk_index_memory.";
+    MATERIALIZER_PK_INDEX_EVICTED_FILES: Gauge "pg2iceberg_materializer_pk_index_evicted_files" ["table"]
+        "Data files whose keys the table's primary-key index evicted to keep to its budget.";
     UNFILLED_COLUMN_DEFAULTS: Counter "pg2iceberg_unfilled_column_defaults_total" ["table", "column", "reason"]
         "Columns added with a default Postgres no longer had for the rows already in the table, which read NULL in Iceberg, by reason (not_stored, column_gone).";
     DISTRIBUTED_WORKERS: Gauge "pg2iceberg_distributed_workers" []

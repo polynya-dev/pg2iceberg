@@ -48,6 +48,26 @@ A writer that dies between its commit and the bump leaves the epoch behind: long
 
 A catalog that maintains the tables itself (`sink.maintenance: managed`) commits to them without bumping any epoch. Then the materializer forgets what it read at the start of every cycle, and rereads the tables it works on.
 
+## File index
+
+For each table, the materializer keeps a map from each live row's primary key to the data file holding it, built from the table's data files at startup and updated with every commit. It uses it to:
+
+- turn an insert of a key the table already holds into an update, whose equality delete hides the old row;
+- find the values an update leaves out — unchanged TOAST columns, which Postgres doesn't send — in the old row's file ([TOAST](toast.md));
+- place an equality delete in the partition of the row it deletes, on a partitioned table;
+- expand a `TRUNCATE` into a delete of each key, and fill a column added with a default into the rows that predate it;
+- count each file's live rows, for [compaction](compaction.md).
+
+A key a row makes the map a table's worth of keys: `sink.pk_index_memory` (512 MiB by default) bounds it for each table. Within the budget — about 7 million keys at 512 MiB — the map holds every key, in about 21 bytes each. Past it, the oldest files' keys are evicted, into a Bloom filter that tells a key that may be theirs from one that surely isn't, and each evicted file keeps the range of its keys and a count of its live rows that's never too high. The cost falls on the rows of evicted files:
+
+- an insert of a key the filter may hold writes an equality delete, which deletes nothing if the key wasn't there;
+- an update leaving TOAST columns out reads the evicted files whose range holds its key, to find the old row;
+- a delete on a partitioned table goes to each partition such a file is in;
+- a `TRUNCATE`, or a column added with a default, reads those files;
+- compaction may rewrite an evicted file it needn't, counting its rows conservatively.
+
+`pg2iceberg_materializer_pk_index_bytes` and `pg2iceberg_materializer_pk_index_evicted_files` show how much of the budget a table uses, and how many of its files are evicted ([observability](../usage/observability.md)).
+
 ## Merge-on-read
 
 pg2iceberg uses Iceberg's **merge-on-read** write mode. Rather than rewriting existing data files on every update or delete, it appends:

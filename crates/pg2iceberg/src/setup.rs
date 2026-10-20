@@ -140,6 +140,7 @@ where
         flush_rows: cfg.sink.flush_rows,
         mat_batch_rows: cfg.sink.materializer_batch_rows,
         mat_table_concurrency: cfg.sink.materializer_concurrency,
+        pk_index_memory: cfg.sink.pk_index_memory,
         snapshot_concurrency,
         snapshot_source_factory,
         materializer_namer,
