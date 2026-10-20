@@ -22,15 +22,15 @@ SELECT * FROM orders WHERE (o_w_id, o_d_id, o_id) > (3, 7, 2511)
 ORDER BY o_w_id, o_d_id, o_id LIMIT 10000
 ```
 
-The primary key's index serves each chunk. A chunk is staged like a replicated transaction, and the next one is read from Postgres while it stages, so up to two chunks of a table are in memory.
+The primary key's index serves each chunk. A chunk is written to the table's data files, and the next one is read from Postgres meanwhile, so up to two chunks of a table are in memory. The table is committed once, when all of it is read: readers see it empty, then complete, never part of it.
 
 Up to `source.logical.snapshot_concurrency` tables (default 4) are read at once, each on a task and a connection of its own. The first connection exports its snapshot (`pg_export_snapshot()`) and the others import it (`SET TRANSACTION SNAPSHOT`), so every table is read as of the same moment, whichever connection reads it. A table's rows are read in order by one connection, so the largest table bounds how long the snapshot takes.
 
 ## Resumability
 
-Once a chunk is staged, the coordinator records its last row's primary key as the table's progress. Once a table's last chunk is staged, its progress is cleared and the table is marked complete.
+Once a table is committed, it's marked complete. On restart, pg2iceberg skips the complete tables and reads the others again, from the start: Postgres still has their rows, and the slot the WAL since the snapshot began, so the changes made meanwhile are applied over them. The snapshot isn't staged: staging makes changes durable that Postgres can't serve again, which a snapshot's rows aren't. If no table was complete, pg2iceberg refuses to start on the slot the snapshot left; drop it, or run `pg2iceberg cleanup`, to start over.
 
-On restart, pg2iceberg skips the complete tables and resumes the others after their recorded key. A crash mid-chunk means the chunk is staged again, which is safe because the materializer deduplicates by primary key.
+A table added to the configuration later is backfilled while its changes stream, so its rows are staged with them, to be applied ahead of them. As each chunk is staged, the coordinator records its last row's primary key as the table's progress, and a restart resumes the backfill there.
 
 ## Handoff to streaming
 

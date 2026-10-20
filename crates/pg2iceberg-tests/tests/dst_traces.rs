@@ -335,11 +335,20 @@ async fn every_request_is_traced_within_its_unit_of_work() {
         .collect();
     assert!(open.is_empty(), "spans never closed: {open:?}");
 
-    // A commit: within its table's materialization, within the cycle.
+    // The snapshot's commit: within the chunk that finished its table.
+    let in_table = |c: &&RecordedSpan| c.fields.get("table") == Some(&ident().to_string());
+    let under = |c: &&RecordedSpan, name: &str| parent(c).is_some_and(|p| p.name == name);
+    let snapshot = named("materializer.commit")
+        .filter(in_table)
+        .find(|c| under(c, "snapshot.chunk"))
+        .expect("the snapshot's commit");
+    assert!(field(snapshot, "rows").is_some_and(|r| r != "0"));
+    // A change's commit: within its table's materialization, within the
+    // cycle.
     let commit = named("materializer.commit")
-        .find(|c| c.fields.get("table") == Some(&ident().to_string()))
-        .expect("a commit");
-    assert_eq!(parent(commit).map(|p| p.name), Some("materializer.table"));
+        .filter(in_table)
+        .find(|c| under(c, "materializer.table"))
+        .expect("a change's commit");
     assert_eq!(
         parent(commit).and_then(|t| t.parent).map(|c| spans[c].name),
         Some("materializer.cycle")

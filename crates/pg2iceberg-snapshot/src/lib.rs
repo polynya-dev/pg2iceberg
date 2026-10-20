@@ -1,8 +1,10 @@
 //! Initial-snapshot phase: bootstrap a fresh pg2iceberg deployment by
-//! reading every row from each tracked table at a known LSN, staging them
-//! through the same pipeline as logical replication, then advancing the
-//! slot past that LSN so live replication picks up exactly where the
-//! snapshot left off.
+//! reading every row from each tracked table at a known LSN, writing them
+//! to the tables, then advancing the slot past that LSN so live
+//! replication picks up exactly where the snapshot left off. A table
+//! backfilled mid-stream, while its changes stream, has its rows staged
+//! instead, through the same pipeline as logical replication
+//! ([`SnapshotSink`]).
 //!
 //! Each table is read in primary key order, a chunk at a time; several
 //! tables can be read at once ([`Snapshotter::run_concurrently`]).
@@ -21,8 +23,7 @@
 //!    set to the LSN at slot-creation time, call it `K`).
 //! 2. Read each table's current rows at the source's "current LSN" `N` —
 //!    `N >= K` always.
-//! 3. Stage the rows through the pipeline as a synthetic transaction with
-//!    `commit_lsn = N`. The receipt-gated `flushed_lsn` advances to `N`.
+//! 3. Write the rows to the tables, each as one update, as of `N`.
 //! 4. Caller acks the slot at `N` via `send_standby`. `restart_lsn` jumps
 //!    to `N`, so future replication reads start at `N`.
 //!
@@ -36,9 +37,10 @@ use futures::stream::{FuturesUnordered, StreamExt as _};
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::{ChangeEvent, ColumnName, Lsn, Op, Row, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{pk_key, Catalog};
+use pg2iceberg_logical::materializer::MaterializerError;
 use pg2iceberg_logical::pipeline::Spawn;
 use pg2iceberg_logical::work_span;
-use pg2iceberg_logical::{Pipeline, PipelineError};
+use pg2iceberg_logical::{Materializer, Pipeline, PipelineError};
 use pg2iceberg_pg::DecodedMessage;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -51,6 +53,8 @@ pub enum SnapshotError {
     Source(String),
     #[error("pipeline: {0}")]
     Pipeline(#[from] PipelineError),
+    #[error("materializer: {0}")]
+    Materializer(#[from] MaterializerError),
     /// A table's task was dropped before it finished.
     #[error("snapshot task abandoned")]
     Abandoned,
@@ -161,14 +165,143 @@ pub enum MarkerKind {
 /// Default chunk size for [`run_snapshot`]. Trades off peak memory against
 /// coord-write amplification — ~1k rows per chunk is a reasonable
 /// balance for the typical OLTP-row-size workload. pg2iceberg itself
-/// reads `flush_rows` a chunk: the pipeline holds that many anyway, and
-/// each chunk is a staged file and a claim.
+/// reads `flush_rows` a chunk: the pipeline holds that many changes
+/// anyway, and each chunk staged is a file and a claim.
 pub const DEFAULT_CHUNK_SIZE: usize = 1024;
 
 /// Most tables pg2iceberg's snapshot reads at once by default
 /// ([`Snapshotter::with_concurrency`]): each holds a Postgres connection,
 /// and up to two chunks in memory.
 pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
+
+/// Where a [`Snapshotter`] puts the tables' rows: written to the tables
+/// ([`Materializer`]), or staged ([`Pipeline`]) — for a table backfilled
+/// mid-stream, whose changes stage meanwhile, and are applied after its
+/// rows.
+#[async_trait]
+pub trait SnapshotSink: Send + Sized + 'static {
+    /// Put `rows`, the next chunk of `table`'s snapshot, read at `lsn`,
+    /// as a transaction `xid`. Whether every chunk of the table's put so
+    /// far is durable, so a restart can resume past them.
+    async fn put(&mut self, table: &TableIdent, xid: u32, lsn: Lsn, rows: Vec<Row>)
+        -> Result<bool>;
+
+    /// Make every chunk of `table`'s put durable: its snapshot is read.
+    async fn finish(&mut self, table: &TableIdent) -> Result<()>;
+
+    /// Forget the chunks of `table`'s put but not durable: its snapshot
+    /// failed.
+    fn abandon(&mut self, table: &TableIdent);
+
+    /// Whether tables can be put alongside each other
+    /// ([`Self::split_off`]).
+    fn splits(&self) -> bool;
+
+    /// A sink for `table` alone, to put it alongside this one.
+    fn split_off(&mut self, table: &TableIdent) -> Result<Self>;
+
+    /// Take back a sink [`Self::split_off`] made, its table done or
+    /// abandoned.
+    fn rejoin(&mut self, part: Self);
+}
+
+/// Each chunk is staged and claimed as it's put: durable at once.
+#[async_trait]
+impl<C: Coordinator + ?Sized + 'static> SnapshotSink for Pipeline<C> {
+    async fn put(
+        &mut self,
+        table: &TableIdent,
+        xid: u32,
+        lsn: Lsn,
+        rows: Vec<Row>,
+    ) -> Result<bool> {
+        self.process(DecodedMessage::Begin {
+            final_lsn: lsn,
+            xid,
+        })
+        .await?;
+        for row in rows {
+            self.process(DecodedMessage::Change(ChangeEvent {
+                table: table.clone(),
+                op: Op::Insert,
+                lsn,
+                commit_ts: Timestamp(0),
+                xid: Some(xid),
+                before: None,
+                after: Some(row),
+                unchanged_cols: vec![],
+            }))
+            .await?;
+        }
+        self.process(DecodedMessage::Commit {
+            commit_lsn: lsn,
+            xid,
+        })
+        .await?;
+        self.flush().await?;
+        Ok(true)
+    }
+
+    async fn finish(&mut self, _table: &TableIdent) -> Result<()> {
+        Ok(())
+    }
+
+    fn abandon(&mut self, _table: &TableIdent) {
+        // What a failed flush left; the chunk is read again.
+        self.reset_session();
+    }
+
+    fn splits(&self) -> bool {
+        true
+    }
+
+    fn split_off(&mut self, _table: &TableIdent) -> Result<Self> {
+        Ok(Pipeline::split_off(self))
+    }
+
+    fn rejoin(&mut self, part: Self) {
+        Pipeline::rejoin(self, part)
+    }
+}
+
+/// The chunks are written to the table as they're put, and committed when
+/// it's read, as one update ([`Materializer::apply_snapshot_chunk`]):
+/// durable only then. A restart reads the table again.
+#[async_trait]
+impl<Cat: Catalog + 'static> SnapshotSink for Materializer<Cat> {
+    async fn put(
+        &mut self,
+        table: &TableIdent,
+        xid: u32,
+        lsn: Lsn,
+        rows: Vec<Row>,
+    ) -> Result<bool> {
+        self.apply_snapshot_chunk(table, xid, lsn, rows).await?;
+        Ok(false)
+    }
+
+    async fn finish(&mut self, table: &TableIdent) -> Result<()> {
+        self.commit_snapshot(table).await?;
+        Ok(())
+    }
+
+    fn abandon(&mut self, table: &TableIdent) {
+        self.abandon_snapshot(table);
+    }
+
+    fn splits(&self) -> bool {
+        Materializer::splits(self)
+    }
+
+    fn split_off(&mut self, table: &TableIdent) -> Result<Self> {
+        Materializer::split_off(self, table)
+            .ok_or_else(|| MaterializerError::UnknownTable(table.clone()).into())
+    }
+
+    fn rejoin(&mut self, part: Self) {
+        Materializer::rejoin(self, part)
+    }
+}
 
 /// Drive a fresh pipeline through the initial-snapshot phase using the
 /// default chunk size.
@@ -177,43 +310,42 @@ pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
 /// slot picks up live replication from the right point. The caller should
 /// also drive the materializer at least once after this returns to flush
 /// snapshot rows out to Iceberg.
-pub async fn run_snapshot<S, C>(
+pub async fn run_snapshot<S, K>(
     source: &S,
     coord: Arc<dyn Coordinator>,
     schemas: &[TableSchema],
-    pipeline: &mut Pipeline<C>,
+    sink: &mut K,
 ) -> Result<Lsn>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator + ?Sized + 'static,
+    K: SnapshotSink,
 {
-    run_snapshot_chunked(source, coord, schemas, pipeline, DEFAULT_CHUNK_SIZE).await
+    run_snapshot_chunked(source, coord, schemas, sink, DEFAULT_CHUNK_SIZE).await
 }
 
-/// Like [`run_snapshot`] but with an explicit `chunk_size`. Each chunk
-/// is staged + coord-committed independently; peak memory is bounded
-/// by `chunk_size` rows. The materializer later coalesces all chunks
-/// into one Iceberg snapshot per table.
+/// Like [`run_snapshot`] but with an explicit `chunk_size`: peak memory
+/// is bounded by `chunk_size` rows, two chunks a table.
 ///
-/// Resumability: each chunk persists a per-table cursor in
-/// `_pg2iceberg.snapshot_progress`, and a completed table writes a
-/// row to `_pg2iceberg.tables`. A subsequent call against the same
-/// coord will skip already-complete tables and resume mid-table from
-/// the last saved cursor.
-pub async fn run_snapshot_chunked<S, C>(
+/// Resumability: a completed table writes a row to
+/// `_pg2iceberg.tables`, and a table's chunks, once durable
+/// ([`SnapshotSink::put`]), its progress to
+/// `_pg2iceberg.snapshot_progress`. A subsequent call against the same
+/// coord will skip already-complete tables and resume the others from
+/// their progress.
+pub async fn run_snapshot_chunked<S, K>(
     source: &S,
     coord: Arc<dyn Coordinator>,
     schemas: &[TableSchema],
-    pipeline: &mut Pipeline<C>,
+    sink: &mut K,
     chunk_size: usize,
 ) -> Result<Lsn>
 where
     S: SnapshotSource + ?Sized,
-    C: Coordinator + ?Sized + 'static,
+    K: SnapshotSink,
 {
     Snapshotter::new(coord)
         .with_chunk_size(chunk_size)
-        .run(source, schemas, pipeline)
+        .run(source, schemas, sink)
         .await
 }
 
@@ -221,7 +353,7 @@ where
 ///
 /// On `run`, loads each table's per-row resume cursor from
 /// `_pg2iceberg.snapshot_progress`; for each table, resumes reading
-/// at PKs strictly greater than the saved key. After every chunk,
+/// at PKs strictly greater than the saved key. Once chunks are durable,
 /// stamps the new cursor so a crash mid-snapshot resumes from the
 /// right place. When a table finishes, the cursor row is dropped
 /// and `mark_table_snapshot_complete` upserts the per-table flag in
@@ -287,17 +419,12 @@ impl Snapshotter {
 
     /// Run the snapshot to completion (all tables, all chunks), one
     /// table at a time.
-    pub async fn run<S, C>(
-        &self,
-        source: &S,
-        schemas: &[TableSchema],
-        pipeline: &mut Pipeline<C>,
-    ) -> Result<Lsn>
+    pub async fn run<S, K>(&self, source: &S, schemas: &[TableSchema], sink: &mut K) -> Result<Lsn>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator + ?Sized + 'static,
+        K: SnapshotSink,
     {
-        self.run_chunks(source, schemas, pipeline, None).await
+        self.run_chunks(source, schemas, sink, None).await
     }
 
     /// Run at most `max_chunks` chunks across all tables, then return.
@@ -305,22 +432,22 @@ impl Snapshotter {
     /// crash: after `run_chunks(.., Some(N))`, drop the pipeline +
     /// Snapshotter, recreate them, and call `run` to finish — the
     /// per-table progress rows drive correct resumption.
-    pub async fn run_chunks<S, C>(
+    pub async fn run_chunks<S, K>(
         &self,
         source: &S,
         schemas: &[TableSchema],
-        pipeline: &mut Pipeline<C>,
+        sink: &mut K,
         max_chunks: Option<usize>,
     ) -> Result<Lsn>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator + ?Sized + 'static,
+        K: SnapshotSink,
     {
         let snap_lsn = source.snapshot_lsn().await?;
         let mut budget = max_chunks;
         for (i, schema) in schemas.iter().enumerate() {
             let table = TableRun::new(schema, i, snap_lsn)?;
-            if !self.table(source, &table, pipeline, &mut budget).await? {
+            if !self.table(source, &table, sink, &mut budget).await? {
                 break;
             }
         }
@@ -328,23 +455,24 @@ impl Snapshotter {
     }
 
     /// Like [`Self::run`], but up to [`Self::with_concurrency`] tables at
-    /// once, each read on a task of its own and staged through a pipeline
-    /// of its own ([`Pipeline::split_off`]): a table's reads and stagings
-    /// are CPU and round trips that don't wait on another's. `source`
-    /// serves them all at once. A table that fails stops the snapshot
-    /// once the others running finish.
-    pub async fn run_concurrently<S, C>(
+    /// once, each read on a task of its own and put into a sink of its
+    /// own ([`SnapshotSink::split_off`]): a table's reads and writes are
+    /// CPU and round trips that don't wait on another's. `source` serves
+    /// them all at once. A table that fails stops the snapshot once the
+    /// others running finish. One at a time, if the sink can't split.
+    pub async fn run_concurrently<S, K>(
         &self,
         source: Arc<S>,
         schemas: &[TableSchema],
-        pipeline: &mut Pipeline<C>,
+        sink: &mut K,
     ) -> Result<Lsn>
     where
         S: SnapshotSource + ?Sized + 'static,
-        C: Coordinator + ?Sized + 'static,
+        K: SnapshotSink,
     {
-        let Some(Concurrency { tables, spawn }) = self.concurrency.clone() else {
-            return self.run(source.as_ref(), schemas, pipeline).await;
+        let concurrency = self.concurrency.clone().filter(|_| sink.splits());
+        let Some(Concurrency { tables, spawn }) = concurrency else {
+            return self.run(source.as_ref(), schemas, sink).await;
         };
         let snap_lsn = source.snapshot_lsn().await?;
         let mut waiting = schemas.iter().cloned().enumerate();
@@ -355,26 +483,39 @@ impl Snapshotter {
                 let Some((i, schema)) = waiting.next() else {
                     break;
                 };
+                let mut part = match sink.split_off(&schema.ident) {
+                    Ok(part) => part,
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                };
                 let this = self.clone();
                 let source = source.clone();
-                let mut part = pipeline.split_off();
                 let (done, landed) = oneshot::channel();
                 spawn(Box::pin(async move {
-                    let out = async {
-                        let table = TableRun::new(&schema, i, snap_lsn)?;
-                        this.table(source.as_ref(), &table, &mut part, &mut None)
-                            .await?;
-                        Ok(part)
+                    let out = match TableRun::new(&schema, i, snap_lsn) {
+                        Ok(table) => this
+                            .table(source.as_ref(), &table, &mut part, &mut None)
+                            .await
+                            .map(|_| ()),
+                        Err(e) => Err(e),
                     };
                     // Unheard if the snapshot is gone.
-                    let _ = done.send(out.await);
+                    let _ = done.send((part, out));
                 }));
-                running.push(async move { landed.await.unwrap_or(Err(SnapshotError::Abandoned)) });
+                running.push(landed);
             }
             match running.next().await {
-                Some(Ok(part)) => pipeline.rejoin(part),
-                Some(Err(e)) => {
-                    failed.get_or_insert(e);
+                Some(Ok((part, out))) => {
+                    // Its table done or abandoned, either way.
+                    sink.rejoin(part);
+                    if let Err(e) = out {
+                        failed.get_or_insert(e);
+                    }
+                }
+                Some(Err(oneshot::Canceled)) => {
+                    failed.get_or_insert(SnapshotError::Abandoned);
                 }
                 None => break,
             }
@@ -385,21 +526,39 @@ impl Snapshotter {
         }
     }
 
-    /// Snapshot `table`: resume it, then stage its chunks until it's read
-    /// to the end and marked complete, or until `budget` chunks are
-    /// staged. Whether the budget lasted. A mid-snapshot fault leaves the
-    /// table's progress row in `snapshot_progress`; a resumed pass picks
-    /// up at the saved PK.
-    async fn table<S, C>(
+    /// Snapshot `table`: resume it, then put its chunks until it's read
+    /// to the end and marked complete, or until `budget` chunks are put.
+    /// Whether the budget lasted. A mid-snapshot fault leaves the table's
+    /// progress row in `snapshot_progress`, past the chunks durable: a
+    /// resumed pass picks up there. What isn't durable is abandoned.
+    async fn table<S, K>(
         &self,
         source: &S,
         table: &TableRun<'_>,
-        pipeline: &mut Pipeline<C>,
+        sink: &mut K,
         budget: &mut Option<usize>,
     ) -> Result<bool>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator + ?Sized + 'static,
+        K: SnapshotSink,
+    {
+        let out = self.read_table(source, table, sink, budget).await;
+        if out.is_err() {
+            sink.abandon(&table.schema.ident);
+        }
+        out
+    }
+
+    async fn read_table<S, K>(
+        &self,
+        source: &S,
+        table: &TableRun<'_>,
+        sink: &mut K,
+        budget: &mut Option<usize>,
+    ) -> Result<bool>
+    where
+        S: SnapshotSource + ?Sized,
+        K: SnapshotSink,
     {
         let schema = table.schema;
         let resume = {
@@ -413,7 +572,7 @@ impl Snapshotter {
             return Ok(true);
         };
         // The table's first chunk; each next one is read while the one
-        // before it stages ([`Self::chunk`]).
+        // before it is put ([`Self::chunk`]).
         let mut rows = source
             .read_chunk(&schema.pg_ident(), self.chunk_size, last_pk_key.as_deref())
             .await?;
@@ -430,7 +589,7 @@ impl Snapshotter {
                 rows = tracing::field::Empty,
             );
             let chunk = self
-                .chunk(source, table, pipeline, last_pk_key.as_deref(), rows)
+                .chunk(source, table, sink, last_pk_key.as_deref(), rows)
                 .instrument(span.clone())
                 .await;
             pg2iceberg_logical::spans::record_outcome(&span, &chunk);
@@ -451,7 +610,7 @@ impl Snapshotter {
     }
 
     /// Where `schema`'s snapshot resumes: after the last chunk a prior
-    /// pass staged, if any — or nowhere, the table being complete.
+    /// pass made durable, if any — or nowhere, the table being complete.
     async fn resume(&self, schema: &TableSchema) -> Result<Resume> {
         // Cheap single-row read; avoids re-reading the source for
         // already-snapshotted data.
@@ -473,22 +632,22 @@ impl Snapshotter {
         Ok(Resume::From(last_pk_key))
     }
 
-    /// Stage `chunk`, the rows of `table` after `last_pk_key`, then stamp
-    /// the resume cursor past it — or, with nothing left to read, mark the
-    /// table complete. The next chunk is read from Postgres meanwhile: a
-    /// read and a staging are each a round trip or more, and neither needs
-    /// the other.
-    async fn chunk<S, C>(
+    /// Put `chunk`, the rows of `table` after `last_pk_key` — or, with
+    /// nothing left to read, make the table's chunks durable and mark it
+    /// complete. The next chunk is read from Postgres meanwhile: a read
+    /// and a put are each a round trip or more, and neither needs the
+    /// other.
+    async fn chunk<S, K>(
         &self,
         source: &S,
         table: &TableRun<'_>,
-        pipeline: &mut Pipeline<C>,
+        sink: &mut K,
         last_pk_key: Option<&str>,
         chunk: Vec<Row>,
     ) -> Result<Chunk>
     where
         S: SnapshotSource + ?Sized,
-        C: Coordinator + ?Sized + 'static,
+        K: SnapshotSink,
     {
         let TableRun {
             schema,
@@ -502,6 +661,7 @@ impl Snapshotter {
         let pg_ident = schema.pg_ident();
         tracing::Span::current().record("rows", chunk.len());
         if chunk.is_empty() {
+            sink.finish(&schema.ident).await?;
             // Table done — drop the resume cursor and stamp
             // the per-table completion row. Order matters: we
             // clear progress *first* so a crash between the
@@ -533,68 +693,38 @@ impl Snapshotter {
             }
         }
 
-        let (staged, next) = futures::join!(
-            self.stage(table, pipeline, chunk, &new_key),
+        let (put, next) = futures::join!(
+            self.put(table, sink, chunk, &new_key),
             source.read_chunk(&pg_ident, self.chunk_size, Some(&new_key)),
         );
-        staged?;
+        put?;
         Ok(Chunk::Staged {
             last_pk_key: new_key,
             next: next?,
         })
     }
 
-    /// Stage `chunk` as one transaction of `table`'s, and once it's
-    /// claimed, stamp the resume cursor at `new_key`, its last row's.
-    async fn stage<C>(
+    /// Put `chunk`, `table`'s through `new_key`; once the chunks put are
+    /// durable, stamp the resume cursor there.
+    async fn put<K: SnapshotSink>(
         &self,
         table: &TableRun<'_>,
-        pipeline: &mut Pipeline<C>,
+        sink: &mut K,
         chunk: Vec<Row>,
         new_key: &str,
-    ) -> Result<()>
-    where
-        C: Coordinator + ?Sized + 'static,
-    {
+    ) -> Result<()> {
         let TableRun {
             schema,
             xid,
             snap_lsn,
             ..
         } = *table;
-        pipeline
-            .process(DecodedMessage::Begin {
-                final_lsn: snap_lsn,
-                xid,
-            })
-            .await?;
-        for row in chunk {
-            pipeline
-                .process(DecodedMessage::Change(ChangeEvent {
-                    table: schema.ident.clone(),
-                    op: Op::Insert,
-                    lsn: snap_lsn,
-                    commit_ts: Timestamp(0),
-                    xid: Some(xid),
-                    before: None,
-                    after: Some(row),
-                    unchanged_cols: vec![],
-                }))
-                .await?;
+        if !sink.put(&schema.ident, xid, snap_lsn, chunk).await? {
+            return Ok(());
         }
-        pipeline
-            .process(DecodedMessage::Commit {
-                commit_lsn: snap_lsn,
-                xid,
-            })
-            .await?;
-        pipeline.flush().await?;
-
-        // Chunk fully durable in coord. Stamp the resume
-        // cursor *after* the flush — if we crash before this
-        // write, resume re-reads the chunk (idempotent: the
-        // materializer's fold-by-PK absorbs the duplicate
-        // staged events).
+        // Stamp the resume cursor *after* the chunk's durable — if we
+        // crash before this write, resume re-reads the chunk (idempotent:
+        // the materializer's fold-by-PK absorbs the duplicate rows).
         self.coord
             .set_snapshot_progress(&schema.ident, new_key)
             .await
@@ -606,7 +736,7 @@ impl Snapshotter {
 /// One table of a [`Snapshotter`] run.
 struct TableRun<'a> {
     schema: &'a TableSchema,
-    /// The synthetic transaction id its chunks are staged under.
+    /// The synthetic transaction id its chunks are put under.
     xid: u32,
     pk_cols: Vec<ColumnName>,
     snap_lsn: Lsn,
@@ -645,7 +775,7 @@ enum Resume {
 enum Chunk {
     /// Nothing left: the table is marked complete.
     TableDone,
-    /// Staged, through the row with this primary key; the chunk after it,
+    /// Put, through the row with this primary key; the chunk after it,
     /// read meanwhile.
     Staged { last_pk_key: String, next: Vec<Row> },
 }
@@ -670,40 +800,36 @@ pub enum SnapshotPhaseOutcome {
 ///    Complete`.
 /// 2. Filter `schemas` by `skip_idents` (per-table `skip_snapshot`
 ///    opt-out).
-/// 3. Run [`Snapshotter`] (resumable surface — progress persists into
-///    `Checkpoint::snapshot_progress` after each chunk, so a
-///    mid-snapshot crash + restart resumes at the next chunk), up to
-///    `concurrency` tables at once.
-/// 4. Defensive `pipeline.flush()` to drain.
-/// 5. Persist `snapshot_state: Complete` + `flushed_lsn` +
-///    `tracked_tables` + cleared progress map.
+/// 3. Run [`Snapshotter`] into `sink`, up to `concurrency` tables at
+///    once. Progress persists into `snapshot_progress` as chunks are
+///    durable, so a crash + restart resumes past them.
 ///
 /// **What this function does not do** (caller's responsibility):
 /// - `stream.send_standby(snap_lsn, snap_lsn)` to advance the slot.
-/// - `materializer.cycle()` to publish snapshot rows to Iceberg.
+/// - With a staging sink, `materializer.cycle()` to publish snapshot
+///   rows to Iceberg.
 ///
-/// These are tied to the caller's replication-stream and materializer
-/// types, which the snapshot crate doesn't depend on.
-///
-/// **Resumability:** uses `Snapshotter` (not the free `run_snapshot`)
-/// so a fault during chunk K leaves the checkpoint at progress K-1.
-/// On restart, the next call re-loads progress and resumes — no
-/// re-staging of completed chunks. The fault-DST proves this:
-/// `binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault`.
+/// **Resumability:** a fault leaves each table's progress past its
+/// durable chunks — with a staging sink, every chunk before the one that
+/// failed; with a writing one, none until the table's committed. On
+/// restart, the next call re-loads progress and resumes there. The
+/// fault-DSTs prove this:
+/// `binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault`,
+/// `a_snapshot_retried_after_a_failed_chunk_starts_its_table_over`.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_snapshot_phase<S, C>(
+pub async fn run_snapshot_phase<S, K>(
     source: Arc<S>,
     coord: Arc<dyn Coordinator>,
     schemas: &[TableSchema],
     skip_idents: &std::collections::BTreeSet<TableIdent>,
     table_oids: &std::collections::BTreeMap<TableIdent, u32>,
-    pipeline: &mut Pipeline<C>,
+    sink: &mut K,
     chunk_size: usize,
     concurrency: Option<Concurrency>,
 ) -> Result<SnapshotPhaseOutcome>
 where
     S: SnapshotSource + ?Sized + 'static,
-    C: Coordinator + ?Sized + 'static,
+    K: SnapshotSink,
 {
     // Filter out operator-supplied skip-list entries.
     let to_snapshot: Vec<TableSchema> = schemas
@@ -747,14 +873,8 @@ where
         snapshotter = snapshotter.with_concurrency(concurrency);
     }
     let snap_lsn = snapshotter
-        .run_concurrently(source, &to_snapshot, pipeline)
+        .run_concurrently(source, &to_snapshot, sink)
         .await?;
-
-    // Defensive final flush — the Snapshotter::run loop already
-    // flushes after each chunk, but a final pass is cheap insurance
-    // that every staged chunk is durable in coord before the caller
-    // acks the slot.
-    pipeline.flush().await?;
 
     Ok(SnapshotPhaseOutcome::Completed {
         snapshot_lsn: snap_lsn,

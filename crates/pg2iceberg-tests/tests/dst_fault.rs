@@ -517,6 +517,65 @@ fn mid_snapshot_blob_put_fault_recovers_via_resumable_snapshotter() {
     assert_eq!(iceberg, pg, "snapshot resumed correctly");
 }
 
+/// Snapshot `rows` rows, 100 a chunk, written in steps of at least 128
+/// rows, with the second step's upload failing; then again, in the same
+/// process. The run again starts the table over: the rows of the failed
+/// run, never committed, aren't left to fold the new ones against —
+/// which would turn them into updates, deleting rows the table never
+/// held.
+fn retry_after_the_second_step_fails(rows: i32) {
+    let seeds: Vec<(i32, i32)> = (1..=rows).map(|i| (i, i * 10)).collect();
+    let mut h = FaultHarness::boot_with_seeds(&seeds);
+    h.set_fault(ops::BLOB_PUT, [1]);
+    let snapshot = |h: &mut FaultHarness| {
+        block_on(run_snapshot_phase(
+            Arc::new(h.db.clone()),
+            h.coord.clone() as Arc<dyn Coordinator>,
+            &[schema()],
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &mut h.materializer,
+            100,
+            None,
+        ))
+    };
+
+    snapshot(&mut h).expect_err("the second step's upload failed");
+    let outcome = snapshot(&mut h).unwrap();
+
+    assert!(matches!(outcome, SnapshotPhaseOutcome::Completed { .. }));
+    let materialized = block_on(read_materialized_state(
+        h.catalog_inner.as_ref(),
+        h.blob_inner.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    ))
+    .unwrap();
+    assert_eq!(materialized.len(), rows as usize);
+    let deletes = block_on(pg2iceberg_stream::BlobStore::list(
+        h.blob_inner.as_ref(),
+        "s3://table",
+    ))
+    .unwrap()
+    .into_iter()
+    .filter(|b| b.path.contains("eq-delete"))
+    .count();
+    assert_eq!(deletes, 0, "the retry deleted rows");
+}
+
+/// The second step fails as a chunk is applied: the fourth.
+#[test]
+fn a_snapshot_retried_after_a_failed_chunk_starts_its_table_over() {
+    retry_after_the_second_step_fails(500);
+}
+
+/// The second step fails as the table is committed: it's the last.
+#[test]
+fn a_snapshot_retried_after_a_failed_commit_starts_its_table_over() {
+    retry_after_the_second_step_fails(300);
+}
+
 #[test]
 fn binary_snapshot_phase_resumes_after_mid_chunk_blob_put_fault() {
     // The headline test for "wiring logic shouldn't be in the binary":
@@ -1204,18 +1263,18 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
         rt.block_on(async move { run_logical_main_loop_with_immediate_shutdown(lifecycle).await });
     assert!(outcome.is_ok(), "lifecycle: {outcome:?}");
 
-    // The fence proof: no log_index entries for the table beyond
-    // those produced by the snapshot phase. If the fence were
-    // missing, replication would re-stage the 4 pre-seed inserts
-    // as additional log_index entries (or worse, treat them as
-    // re-inserts triggering equality deletes).
+    // The fence proof: no log_index entries for the table — the
+    // snapshot writes its rows straight to the table. If the fence were
+    // missing, replication would re-stage the 4 pre-seed inserts as log
+    // entries (or worse, treat them as re-inserts triggering equality
+    // deletes).
     let entries = block_on(coord_inner.read_log(&ident(), 0, 1_000_000)).unwrap();
     let total_records: u64 = entries.iter().map(|e| e.record_count).sum();
     assert_eq!(
-        total_records, 4,
-        "expected exactly 4 staged events (the 4 pre-seed rows via snapshot); \
-         got {total_records}. If this is higher, replication is re-emitting \
-         pre-snapshot events — the fence broke."
+        total_records, 0,
+        "expected no staged events (the 4 pre-seed rows are the snapshot's); \
+         got {total_records}: replication is re-emitting pre-snapshot \
+         events — the fence broke."
     );
 
     // Iceberg state == PG ground truth.
@@ -2288,12 +2347,78 @@ async fn a_backlog_is_materialized_without_waiting_between_ticks() {
     );
 }
 
-/// The initial snapshot reads and stages a table `flush_rows` rows a
-/// chunk — what the pipeline holds in memory anyway — not 1024 at a
-/// time: each chunk is a round of requests to Postgres, the object store
-/// and the coordinator.
+/// `SimPostgres`'s snapshot, counting what it reads.
+struct CountingSource {
+    db: SimPostgres,
+    reads: Arc<SnapshotReads>,
+}
+
+#[derive(Default)]
+struct SnapshotReads {
+    chunks: std::sync::atomic::AtomicUsize,
+    rows: std::sync::atomic::AtomicUsize,
+}
+
+impl SnapshotReads {
+    fn chunks(&self) -> usize {
+        self.chunks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn rows(&self) -> usize {
+        self.rows.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl pg2iceberg_snapshot::SnapshotSource for CountingSource {
+    async fn snapshot_lsn(&self) -> pg2iceberg_snapshot::Result<pg2iceberg_core::Lsn> {
+        self.db.snapshot_lsn().await
+    }
+
+    async fn read_chunk(
+        &self,
+        ident: &TableIdent,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> pg2iceberg_snapshot::Result<Vec<Row>> {
+        let chunk = self.db.read_chunk(ident, chunk_size, after_pk_key).await?;
+        self.reads
+            .chunks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reads
+            .rows
+            .fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+        Ok(chunk)
+    }
+}
+
+/// `lifecycle`'s snapshots read `db` through a [`CountingSource`]: what
+/// they read.
+fn count_snapshot_reads<Cat: pg2iceberg_iceberg::Catalog>(
+    lifecycle: &mut pg2iceberg_validate::LogicalLifecycle<Cat>,
+    db: &SimPostgres,
+) -> Arc<SnapshotReads> {
+    let reads = Arc::new(SnapshotReads::default());
+    let source = CountingSource {
+        db: db.clone(),
+        reads: reads.clone(),
+    };
+    lifecycle.snapshot_source_factory = Box::new(move |_| {
+        Box::pin(async move {
+            Ok::<Box<dyn pg2iceberg_snapshot::SnapshotSource>, pg2iceberg_validate::LifecycleError>(
+                Box::new(source),
+            )
+        })
+    });
+    reads
+}
+
+/// The initial snapshot goes straight into the table, not through the
+/// staged log: Postgres serves its rows again after a crash, so they
+/// needn't be made durable first. It reads `flush_rows` a chunk: the
+/// rows it holds anyway.
 #[tokio::test(start_paused = true)]
-async fn the_snapshot_stages_flush_rows_a_chunk() {
+async fn the_snapshot_reads_flush_rows_a_chunk_straight_into_the_table() {
     use std::time::Duration;
 
     const ROWS: i32 = 3000;
@@ -2307,18 +2432,24 @@ async fn the_snapshot_stages_flush_rows_a_chunk() {
     let stores = SimStores::new();
     let mut lifecycle = sim_lifecycle_on(&db, &stores, every_second());
     lifecycle.flush_rows = ROWS as usize;
+    let reads = count_snapshot_reads(&mut lifecycle, &db);
     let shutdown = Box::pin(tokio::time::sleep(Duration::from_secs(30)));
     pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
         .await
         .unwrap();
 
     let staged = stores.coord.read_log(&ident(), 0, 1000).await.unwrap();
-    assert_eq!(
-        staged.len(),
-        1,
-        "{} rows staged as {} chunks",
-        ROWS,
+    assert!(
+        staged.is_empty(),
+        "the snapshot staged {} chunks",
         staged.len()
+    );
+    // The rows, then the read that finds the table done.
+    assert_eq!(
+        reads.chunks(),
+        2,
+        "{ROWS} rows read in {} chunks",
+        reads.chunks()
     );
     let rows = read_materialized_state(
         stores.catalog.as_ref(),
@@ -2332,8 +2463,140 @@ async fn the_snapshot_stages_flush_rows_a_chunk() {
     assert_eq!(rows.len(), ROWS as usize);
 }
 
+/// A table snapshotted ahead of `orders`, as its own: a restart finds
+/// some snapshot recorded, rather than refuse to start on a slot with
+/// nothing on record.
+fn first_schema() -> TableSchema {
+    let mut s = schema();
+    s.ident.name = "accounts".into();
+    s
+}
+
+/// A row in `accounts`, and a thousand in `orders`.
+fn thousand_row_db() -> SimPostgres {
+    let db = SimPostgres::new();
+    db.create_table(first_schema()).unwrap();
+    db.create_table(schema()).unwrap();
+    let mut tx = db.begin_tx();
+    tx.insert(&first_schema().ident, row(1, 10));
+    for i in 1..=1000 {
+        tx.insert(&ident(), row(i, i * 10));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    db
+}
+
+/// A lifecycle over `db` and `stores`, failing as `stores.plan` says. It
+/// snapshots `accounts`, then `orders`: each table's commit and record of
+/// completion are its second.
+fn faulty_lifecycle(
+    db: &SimPostgres,
+    stores: &SimStores,
+) -> pg2iceberg_validate::LogicalLifecycle<FaultyCatalog> {
+    let catalog = Arc::new(FaultyCatalog::new(
+        stores.catalog.clone(),
+        stores.plan.clone(),
+    ));
+    let mut lifecycle = sim_lifecycle_with(db, stores, every_second(), catalog);
+    lifecycle.schemas = vec![first_schema(), schema()];
+    lifecycle.snapshot_concurrency = 1;
+    lifecycle.flush_rows = 100;
+    lifecycle.mat_batch_rows = 100;
+    lifecycle
+}
+
+/// Run the lifecycle failed by `stores.plan`; change rows meanwhile —
+/// one the first run read, one it removes, one it read later; then
+/// restart it. What the restart's snapshot read.
+async fn fail_change_and_restart(db: &SimPostgres, stores: &SimStores) -> Arc<SnapshotReads> {
+    use std::time::Duration;
+
+    pg2iceberg_validate::run_logical_lifecycle(
+        faulty_lifecycle(db, stores),
+        Box::pin(tokio::time::sleep(Duration::from_secs(30))),
+    )
+    .await
+    .expect_err("the first run failed");
+
+    let mut tx = db.begin_tx();
+    tx.update(&ident(), row(5, 55_555));
+    tx.delete(
+        &ident(),
+        Row::from([(ColumnName("id".into()), PgValue::Int4(6))]),
+    );
+    tx.update(&ident(), row(900, 99_999));
+    tx.commit(Timestamp(0)).unwrap();
+
+    stores.plan.clear_failures();
+    let mut restarted = faulty_lifecycle(db, stores);
+    // Names of its own: the store refuses to overwrite the first run's.
+    restarted.blob_namer = Arc::new(CounterBlobNamer::new("s3://stage/restarted"));
+    restarted.materializer_namer = Arc::new(CounterMaterializerNamer::new("s3://table/restarted"));
+    let reads = count_snapshot_reads(&mut restarted, db);
+    pg2iceberg_validate::run_logical_lifecycle(
+        restarted,
+        Box::pin(tokio::time::sleep(Duration::from_secs(30))),
+    )
+    .await
+    .unwrap();
+    reads
+}
+
+/// The table holds what Postgres does after [`fail_change_and_restart`].
+async fn assert_changes_landed(stores: &SimStores) {
+    let rows = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 999);
+    let qty = |id: i32| {
+        rows.iter()
+            .find(|r| r.get(&ColumnName("id".into())) == Some(&PgValue::Int4(id)))
+            .map(|r| r.get(&ColumnName("qty".into())).cloned())
+    };
+    assert_eq!(qty(5), Some(Some(PgValue::Int4(55_555))));
+    assert_eq!(qty(6), None, "a row deleted since the first run");
+    assert_eq!(qty(900), Some(Some(PgValue::Int4(99_999))));
+}
+
+/// A snapshot that fails before a table's commit leaves the table empty,
+/// and the restart reads it again from the start; a table complete
+/// before stays so.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_failing_before_its_commit_reads_the_table_again() {
+    let db = thousand_row_db();
+    let stores = SimStores::new();
+    stores.plan.fail(ops::CAT_COMMIT_SNAPSHOT, [1]);
+
+    let reads = fail_change_and_restart(&db, &stores).await;
+
+    assert_eq!(reads.rows(), 999, "the restart read {} rows", reads.rows());
+    assert_changes_landed(&stores).await;
+}
+
+/// A snapshot whose table's commit landed, but that failed before
+/// recording the table complete, is read again by the restart: its
+/// committed rows are as of the first run, older than the restart's, and
+/// the changes made between the two still reach them.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_committed_but_not_marked_complete_keeps_the_changes_since() {
+    let db = thousand_row_db();
+    let stores = SimStores::new();
+    stores.plan.fail(ops::COORD_MARK_COMPLETE, [1]);
+
+    fail_change_and_restart(&db, &stores).await;
+
+    assert_changes_landed(&stores).await;
+}
+
 /// The snapshot reads up to `snapshot_concurrency` tables at once, and
-/// starts the next as one finishes: every table lands whole.
+/// starts the next as one finishes: every table lands whole, and takes
+/// the changes after it.
 #[tokio::test(start_paused = true)]
 async fn a_snapshot_lands_every_table_it_reads_together() {
     use std::time::Duration;
@@ -2363,7 +2626,19 @@ async fn a_snapshot_lands_every_table_it_reads_together() {
     lifecycle.schemas = schemas.clone();
     lifecycle.flush_rows = 100;
     lifecycle.snapshot_concurrency = 2;
-    let shutdown = Box::pin(tokio::time::sleep(Duration::from_secs(30)));
+    let script = db.clone();
+    let changes = schemas.clone();
+    let shutdown = Box::pin(async move {
+        // Past the snapshot.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut tx = script.begin_tx();
+        for s in &changes {
+            tx.update(&s.ident, row(1, -1));
+            tx.insert(&s.ident, row(ROWS + 1, 0));
+        }
+        tx.commit(Timestamp(0)).unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    });
     pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
         .await
         .unwrap();
@@ -2378,7 +2653,12 @@ async fn a_snapshot_lands_every_table_it_reads_together() {
         )
         .await
         .unwrap();
-        assert_eq!(rows.len(), ROWS as usize, "{}", s.ident);
+        assert_eq!(rows.len(), ROWS as usize + 1, "{}", s.ident);
+        let first = rows
+            .iter()
+            .find(|r| r.get(&ColumnName("id".into())) == Some(&PgValue::Int4(1)))
+            .and_then(|r| r.get(&ColumnName("qty".into())));
+        assert_eq!(first, Some(&PgValue::Int4(-1)), "{}", s.ident);
     }
 }
 
@@ -3009,10 +3289,8 @@ async fn lifecycle_reopens_a_dropped_replication_stream() {
             .filter(|e| e.op != pg2iceberg_core::Op::Relation)
             .count();
     }
-    assert_eq!(
-        staged, 9,
-        "rows staged: the 4 snapshotted, then the 5 changes after"
-    );
+    // The snapshot's 4 went straight to the table.
+    assert_eq!(staged, 5, "rows staged: the 5 changes after the snapshot");
 }
 
 /// A replication stream that can't be reopened stops the process once
