@@ -634,7 +634,14 @@ thread_local! {
     /// from another engine: they carry nothing of pg2iceberg's, and no
     /// pg2iceberg process hears of them.
     static MANAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this case's materializers hold a FileIndex of one key:
+    /// past it, files are evicted, and keys found by reading them.
+    static BOUNDED_INDEX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// A FileIndex budget of one key (see `FileIndex::with_memory`): the
+/// workloads' keys are a handful.
+const TINY_INDEX_BYTES: usize = 64;
 
 thread_local! {
     /// What this thread's materializers record (see [`metrics`]).
@@ -1406,6 +1413,9 @@ fn like_production(m: &mut Materializer<AuditedCatalog>, clock: &TestClock) {
     );
     if MANAGED.get() {
         m.set_maintenance(Maintenance::Managed);
+    }
+    if BOUNDED_INDEX.get() {
+        m.set_pk_index_memory(TINY_INDEX_BYTES);
     }
 }
 
@@ -2643,8 +2653,24 @@ fn file_index_matches_catalog(
             "invariant 11: after a commit, the FileIndex reflects snapshot {at:?}, the table is at {current:?}"
         ));
     }
+    let rebuilt = block_on(pg2iceberg_iceberg::rebuild_from_catalog(
+        h.audited.as_ref(),
+        h.blob_store.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    ))
+    .map_err(|e| format!("rebuild_from_catalog: {e}"))?;
+    let Some(keys) = index.all_pks() else {
+        // A bounded index, past its budget: it errs, only ever safely.
+        return if at == current {
+            bounded_index_is_safe(index, &rebuilt)
+        } else {
+            Ok(())
+        };
+    };
     let mut pks_per_file: BTreeMap<&str, u64> = BTreeMap::new();
-    for pk in index.all_pks() {
+    for pk in &keys {
         let path = index.lookup(pk).expect("an indexed PK has a file");
         *pks_per_file.entry(path).or_default() += 1;
     }
@@ -2654,23 +2680,12 @@ fn file_index_matches_catalog(
             index.live_rows_per_file()
         ));
     }
-    let rebuilt = block_on(pg2iceberg_iceberg::rebuild_from_catalog(
-        h.audited.as_ref(),
-        h.blob_store.as_ref(),
-        &ident(),
-        &schema(),
-        &[ColumnName("id".into())],
-    ))
-    .map_err(|e| format!("rebuild_from_catalog: {e}"))?;
     let drifted = if at != current {
         let keys = |fi: &pg2iceberg_iceberg::FileIndex| -> BTreeMap<String, String> {
             fi.all_pks()
-                .map(|pk| {
-                    (
-                        pk.to_string(),
-                        format!("{:?}", fi.partition_values_for_pk(pk)),
-                    )
-                })
+                .expect("an index without a budget gives its keys back")
+                .iter()
+                .map(|pk| (pk.to_string(), format!("{:?}", fi.partitions_for_pk(pk))))
                 .collect()
         };
         keys(index) != keys(&rebuilt)
@@ -2681,6 +2696,52 @@ fn file_index_matches_catalog(
         return Err(format!(
             "invariant 11: FileIndex drifted from the catalog:\n  materializer={index:?}\n  rebuilt={rebuilt:?}"
         ));
+    }
+    Ok(())
+}
+
+/// Invariant 11, of an index past its budget, against `exact`, the
+/// table's without one: it never counts a file's live rows too high,
+/// holds no key wrongly, and finds every live key — in the map, or among
+/// the evicted files it names for it.
+fn bounded_index_is_safe(
+    index: &pg2iceberg_iceberg::FileIndex,
+    exact: &pg2iceberg_iceberg::FileIndex,
+) -> Result<(), String> {
+    let exact_live = exact.live_rows_per_file();
+    for (path, live) in index.live_rows_per_file() {
+        let truly = exact_live.get(path).copied().unwrap_or(0);
+        if live > truly {
+            return Err(format!(
+                "invariant 11: bounded FileIndex counts {live} live rows in {path}, which holds {truly}"
+            ));
+        }
+    }
+    for pk in index.mapped_pks() {
+        if index.lookup(&pk) != exact.lookup(&pk) {
+            return Err(format!(
+                "invariant 11: bounded FileIndex holds {pk} in {:?}, the table in {:?}",
+                index.lookup(&pk),
+                exact.lookup(&pk)
+            ));
+        }
+    }
+    for pk in exact
+        .all_pks()
+        .expect("an index without a budget gives its keys back")
+    {
+        let holding = exact.lookup(&pk).expect("an indexed PK has a file");
+        let found = match index.lookup(&pk) {
+            Some(path) => path == holding,
+            None => index.may_contain(&pk) && index.candidates(&pk).contains(&holding),
+        };
+        if !found {
+            return Err(format!(
+                "invariant 11: bounded FileIndex can't find {pk}, in {holding}: map {:?}, candidates {:?}",
+                index.lookup(&pk),
+                index.candidates(&pk)
+            ));
+        }
     }
     Ok(())
 }
@@ -3503,8 +3564,10 @@ proptest! {
         distributed in any::<bool>(),
         second_table in 0u8..3,
         managed in any::<bool>(),
+        bounded_index in any::<bool>(),
     ) {
         MANAGED.set(managed);
+        BOUNDED_INDEX.set(bounded_index);
         SECOND_TABLE.set(second_table);
         DISTRIBUTED.set(distributed);
         BACKFILL.set(backfill);
@@ -4010,6 +4073,168 @@ fn dirty_file() -> Vec<Step> {
         Step::DriveFlush,
         Step::MaterializerCycle,
     ]
+}
+
+/// Six rows, each committed in a file of its own, then one updated: past
+/// a one-key FileIndex ([`BOUNDED_INDEX`]), all but the newest files are
+/// evicted.
+fn evicted_files() -> Vec<Step> {
+    let mut steps = Vec::new();
+    for id in 1..=6 {
+        steps.extend([
+            Step::Insert { id, qty: id * 10 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ]);
+    }
+    steps.extend([
+        Step::Update { id: 2, qty: 21 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]);
+    steps
+}
+
+/// Run `steps` over a one-key FileIndex, checking the invariants after
+/// each, and that it evicted a file.
+fn run_bounded(steps: &[Step]) -> DstHarness {
+    let h = run_bounded_unchecked(steps);
+    let evicted = h
+        .materializer
+        .file_index(&ident())
+        .is_some_and(|i| !i.evicted_files().is_empty());
+    assert!(evicted, "the FileIndex evicted no file");
+    h
+}
+
+/// Compacting files the FileIndex evicted moves their rows — those whose
+/// keys it doesn't hold too — to the pass's outputs: it finds each there
+/// after, and counts none too many (invariant 11, checked after a pass).
+#[test]
+fn a_bounded_index_follows_rows_compaction_moves_from_evicted_files() {
+    let mut h = run_bounded(&[&evicted_files()[..], &[Step::Compact, Step::Compact]].concat());
+    check_invariants(&mut h).unwrap();
+}
+
+/// Rows of evicted files a pass rewrites may die while it runs, unseen:
+/// its outputs count that many fewer of them.
+#[test]
+fn a_bounded_index_counts_rows_dying_while_a_pass_runs() {
+    let mut h = run_bounded(&evicted_files());
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        delete_ratio: 0.0,
+        target_size_bytes: 1 << 20,
+        max_input_bytes_per_pass: u64::MAX,
+    };
+    let job = h
+        .materializer
+        .compaction_job(&ident(), &cfg)
+        .expect("a pass to prepare");
+    let pass = block_on(job.run());
+    // Meanwhile, rows of the evicted files die.
+    for step in [
+        Step::Delete { id: 1 },
+        Step::Delete { id: 3 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+    }
+    let outcome = block_on(h.materializer.commit_compaction_pass(pass)).unwrap();
+    assert!(
+        outcome.is_some_and(|o| !o.added_files.is_empty()),
+        "the pass rewrote nothing"
+    );
+    file_index_matches_catalog(&h, &h.materializer, true).unwrap();
+    check_invariants(&mut h).unwrap();
+}
+
+/// Another process compacting files the FileIndex evicted: catching up,
+/// it finds their rows in the outputs.
+#[test]
+fn a_bounded_index_follows_another_process_compacting_evicted_files() {
+    let mut h = run_bounded(&evicted_files());
+    // `pg2iceberg compact`, say: every file, in one pass.
+    let pk_cols = [ColumnName("id".into())];
+    let index = block_on(pg2iceberg_iceberg::rebuild_from_catalog(
+        h.audited.as_ref(),
+        h.blob_store.as_ref(),
+        &ident(),
+        &schema(),
+        &pk_cols,
+    ))
+    .unwrap();
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        delete_ratio: 0.0,
+        target_size_bytes: 1 << 20,
+        max_input_bytes_per_pass: u64::MAX,
+    };
+    let namer = mat_namer(&h.id_gen);
+    let outcome = block_on(pg2iceberg_iceberg::compact_table(
+        h.audited.as_ref(),
+        h.blob_store.as_ref(),
+        |t, _| {
+            let namer = namer.clone();
+            let t = t.clone();
+            async move { namer.next_path(&t, "compact", "").await }
+        },
+        &ident(),
+        &schema(),
+        &pk_cols,
+        Some(&index),
+        &cfg,
+    ))
+    .unwrap();
+    assert!(
+        outcome.is_some_and(|o| !o.added_files.is_empty()),
+        "the pass rewrote nothing"
+    );
+    // Once its catalog cache lapses, the materializer learns of the pass,
+    // and replays it.
+    h.clock
+        .advance(CachingCatalog::<AuditedCatalog>::DEFAULT_TTL + std::time::Duration::from_secs(1));
+    for step in [
+        Step::Insert { id: 7, qty: 70 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// A TRUNCATE of a partitioned table, past a one-key FileIndex, reads
+/// the keys of the evicted files — those of rows a truncate before
+/// deleted too, which the index knows the table surely doesn't hold: no
+/// delete is written for them, with no partition to write it to.
+#[test]
+fn a_bounded_index_truncates_a_partitioned_table_twice() {
+    PARTITIONED.set(true);
+    let mut h = run_bounded_unchecked(&[
+        Step::BigTx { inserts: 3, qty: 0 },
+        Step::Truncate { reinsert: None },
+        Step::DriveFlush,
+        Step::Truncate { reinsert: None },
+    ]);
+    check_invariants(&mut h).unwrap();
+}
+
+/// Run `steps` over a one-key FileIndex, checking the invariants after
+/// each.
+fn run_bounded_unchecked(steps: &[Step]) -> DstHarness {
+    BOUNDED_INDEX.set(true);
+    let mut h = DstHarness::boot();
+    for (i, step) in steps.iter().enumerate() {
+        h.run_step(step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("failed after step {i} ({step:?}): {e}");
+        }
+    }
+    h
 }
 
 /// The catalog's compaction pass, planned and committed.

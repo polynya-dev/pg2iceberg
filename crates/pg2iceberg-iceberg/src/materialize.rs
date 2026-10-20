@@ -15,9 +15,11 @@ use std::collections::BTreeMap;
 
 pub type Result<T> = std::result::Result<T, WriterError>;
 
-/// Promote `Insert` ops to `Update` when their PK already exists in the
+/// Promote `Insert` ops to `Update` when their PK may already exist in the
 /// FileIndex. The downstream `TableWriter` then emits an equality delete on
-/// that PK so readers see only the new row, not both.
+/// that PK so readers see only the new row, not both — for a key the table
+/// doesn't hold after all ([`FileIndex::may_contain`]), one that deletes
+/// nothing.
 ///
 /// Required after a `D`-then-`I` sequence in the same batch *or* an `I` for a
 /// PK that lives in a prior committed data file. Mirrors the implicit
@@ -32,31 +34,101 @@ pub fn promote_re_inserts(
     for r in rows {
         if r.op == Op::Insert {
             let key = PkKey::from_row(&r.row, pk_cols);
-            if file_index.contains_pk(&key) {
+            if file_index.may_contain(&key) {
                 r.op = Op::Update;
             }
         }
     }
 }
 
-/// The key whose committed row holds `r`'s unchanged values: the key it
-/// moved from ([`MaterializedRow::unchanged_from`]), else its own. A row
-/// that moved from a key the table no longer has is a replay — a
-/// key-changing transaction the pipeline staged again after a crash,
+/// Where `key`'s committed row may be: the file the index holds it in,
+/// else the evicted files that may hold it, newest first.
+fn locations<'a>(key: &PkKey, file_index: &'a FileIndex) -> Vec<&'a str> {
+    match file_index.lookup(key) {
+        Some(path) => vec![path],
+        None => file_index.candidates(key),
+    }
+}
+
+/// The files to fetch for [`resolve_unchanged_cols`] to resolve `r`.
+pub fn toast_files<'a>(
+    r: &MaterializedRow,
+    pk_cols: &[ColumnName],
+    file_index: &'a FileIndex,
+) -> Vec<&'a str> {
+    let own = || locations(&PkKey::from_row(&r.row, pk_cols), file_index);
+    match &r.unchanged_from {
+        Some(from) if file_index.lookup(from).is_some() => locations(from, file_index),
+        Some(from) => {
+            let mut files = locations(from, file_index);
+            files.extend(own());
+            files
+        }
+        None => own(),
+    }
+}
+
+/// `key`'s committed row: in the file the index holds it in — an error
+/// if it isn't there — else in the newest evicted file holding it.
+fn prior_row<'a>(
+    key: &PkKey,
+    pk_cols: &[ColumnName],
+    file_index: &FileIndex,
+    prior_rows_by_path: &'a BTreeMap<String, Vec<Row>>,
+) -> Result<Option<&'a Row>> {
+    let find = |path: &str| {
+        let priors = prior_rows_by_path.get(path).ok_or_else(|| {
+            WriterError::Encode(format!(
+                "TOAST resolution failed: file {path} was not pre-fetched by the materializer"
+            ))
+        })?;
+        Ok(priors.iter().find(|p| PkKey::from_row(p, pk_cols) == *key))
+    };
+    if let Some(path) = file_index.lookup(key) {
+        return match find(path)? {
+            Some(row) => Ok(Some(row)),
+            None => Err(WriterError::Encode(format!(
+                "TOAST resolution failed: PK {key} expected in file {path} but not found"
+            ))),
+        };
+    }
+    for path in file_index.candidates(key) {
+        if let Some(row) = find(path)? {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+/// The key whose committed row holds `r`'s unchanged values, and that row:
+/// the key it moved from ([`MaterializedRow::unchanged_from`]), else its
+/// own. A row that moved from a key the table no longer has is a replay —
+/// a key-changing transaction the pipeline staged again after a crash,
 /// directly after its first copy — which already moved the row: its own
 /// key has the values.
-pub fn toast_source(r: &MaterializedRow, pk_cols: &[ColumnName], file_index: &FileIndex) -> PkKey {
-    r.unchanged_from
-        .clone()
-        .filter(|from| file_index.contains_pk(from))
-        .unwrap_or_else(|| PkKey::from_row(&r.row, pk_cols))
+fn toast_source<'a>(
+    r: &MaterializedRow,
+    pk_cols: &[ColumnName],
+    file_index: &FileIndex,
+    prior_rows_by_path: &'a BTreeMap<String, Vec<Row>>,
+) -> Result<(PkKey, Option<&'a Row>)> {
+    if let Some(from) = &r.unchanged_from {
+        if let Some(row) = prior_row(from, pk_cols, file_index, prior_rows_by_path)? {
+            return Ok((from.clone(), Some(row)));
+        }
+    }
+    let own = PkKey::from_row(&r.row, pk_cols);
+    let row = prior_row(&own, pk_cols, file_index, prior_rows_by_path)?;
+    Ok((own, row))
 }
 
 /// Fill in `unchanged_cols` placeholders by reading the prior data file.
 ///
 /// For each row with non-empty `unchanged_cols`:
 /// - Look up the file path containing its PK — or, for a row that moved
-///   from another key, that key ([`toast_source`]) — via `FileIndex`.
+///   from another key, that key ([`toast_source`]) — via `FileIndex`: the
+///   one it holds the key in, or the evicted ones that may hold it
+///   ([`toast_files`]).
 /// - Find the corresponding row in `prior_rows_by_path` (caller pre-fetched
 ///   and decoded the file via `BlobStore` + [`crate::reader::read_data_file`]).
 /// - Copy each unchanged column's value into the row, then clear
@@ -79,25 +151,12 @@ pub fn resolve_unchanged_cols(
         if r.unchanged_cols.is_empty() || r.op == Op::Delete {
             continue;
         }
-        let key = toast_source(r, pk_cols, file_index);
-        let path = file_index.lookup(&key).ok_or_else(|| {
+        let (key, prior) = toast_source(r, pk_cols, file_index, prior_rows_by_path)?;
+        let prior = prior.ok_or_else(|| {
             WriterError::Encode(format!(
                 "TOAST resolution failed: PK {key} is not in any indexed data file"
             ))
         })?;
-        let priors = prior_rows_by_path.get(path).ok_or_else(|| {
-            WriterError::Encode(format!(
-                "TOAST resolution failed: file {path} was not pre-fetched by the materializer"
-            ))
-        })?;
-        let prior = priors
-            .iter()
-            .find(|p| PkKey::from_row(p, pk_cols) == key)
-            .ok_or_else(|| {
-                WriterError::Encode(format!(
-                    "TOAST resolution failed: PK {key} expected in file {path} but not found"
-                ))
-            })?;
         for col in &r.unchanged_cols {
             if let Some(v) = prior.get(col) {
                 r.row.insert(col.clone(), v.clone());

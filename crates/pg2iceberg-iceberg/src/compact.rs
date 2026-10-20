@@ -164,7 +164,8 @@ pub struct CompactionOutcome {
     pub peak_rows_in_memory: u64,
     /// Candidate files left over for a later pass by the input budget.
     pub pending_files: usize,
-    /// Data files the pass rewrote (now removed from the table).
+    /// Data files the pass rewrote (now removed from the table), in the
+    /// order it read them.
     pub rewritten_files: Vec<String>,
     /// Files the pass added, with the PKs each holds — so the caller can
     /// update its `FileIndex` without replaying the table. Bounded by the
@@ -179,6 +180,9 @@ pub struct CompactionOutcome {
 pub struct CompactedFile {
     pub path: String,
     pub pk_keys: Vec<PkKey>,
+    /// Which of [`CompactionOutcome::rewritten_files`] each key's row came
+    /// from, parallel to `pk_keys`.
+    pub pk_sources: Vec<u32>,
     pub partition_values: Vec<PartitionLiteral>,
 }
 
@@ -406,7 +410,14 @@ where
         .filter_map(|f| schema.columns.iter().find(|c| c.name == f.source_column))
         .cloned()
         .collect();
-    while let Some(((_, meta), bytes)) = io.next_input().await? {
+    let sources: HashMap<&str, u32> = plan
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (path, _))| (path.as_str(), i as u32))
+        .collect();
+    while let Some(((path, meta), bytes)) = io.next_input().await? {
+        let source = sources[path.as_str()];
         bytes_before += meta.byte_size;
         for batch in ArrowBatches::new(bytes, &schema.columns, DECODE_BATCH_ROWS)? {
             let batch = batch?;
@@ -445,6 +456,7 @@ where
                     &tuple,
                     &survivors.slice(start, len),
                     survivor_keys.by_ref().take(len),
+                    source,
                 )?;
                 if out.open_size() >= config.target_size_bytes {
                     out.close(&mut io, &path_for_chunk, ident).await?;
@@ -471,9 +483,11 @@ where
         .added
         .iter()
         .zip(std::mem::take(&mut out.added_pks))
-        .map(|(f, pk_keys)| CompactedFile {
+        .zip(std::mem::take(&mut out.added_sources))
+        .map(|((f, pk_keys), pk_sources)| CompactedFile {
             path: f.path.clone(),
             pk_keys,
+            pk_sources,
             partition_values: f.partition_values.clone(),
         })
         .collect();
@@ -555,27 +569,35 @@ struct OutputFiles {
     open: Option<(Vec<PartitionLiteral>, StreamingDataFile)>,
     /// PK keys of the rows in the open file.
     open_pks: Vec<PkKey>,
+    /// The input each of `open_pks` came from.
+    open_sources: Vec<u32>,
     added: Vec<DataFile>,
     /// PK keys of each added file, parallel to `added`.
     added_pks: Vec<Vec<PkKey>>,
+    /// Their inputs, parallel to `added_pks`.
+    added_sources: Vec<Vec<u32>>,
 }
 
 impl OutputFiles {
-    /// Append rows of partition `tuple`, whose keys are `keys`; the caller
-    /// closes any open file of another tuple first.
+    /// Append rows of partition `tuple`, whose keys are `keys`, from input
+    /// `source`; the caller closes any open file of another tuple first.
     fn write(
         &mut self,
         writer: &TableWriter,
         tuple: &[PartitionLiteral],
         rows: &RecordBatch,
         keys: impl Iterator<Item = PkKey>,
+        source: u32,
     ) -> Result<()> {
         if self.open.is_none() {
             self.open = Some((tuple.to_vec(), writer.start_data_file()?));
         }
         let (_, file) = self.open.as_mut().expect("opened above");
         file.write_batch(rows)?;
+        let before = self.open_pks.len();
         self.open_pks.extend(keys);
+        let added = self.open_pks.len() - before;
+        self.open_sources.extend(std::iter::repeat_n(source, added));
         Ok(())
     }
 
@@ -602,6 +624,7 @@ impl OutputFiles {
             return Ok(());
         };
         let pks = std::mem::take(&mut self.open_pks);
+        let sources = std::mem::take(&mut self.open_sources);
         if file.record_count() == 0 {
             return Ok(());
         }
@@ -618,7 +641,53 @@ impl OutputFiles {
             sequence_number: None,
         });
         self.added_pks.push(pks);
+        self.added_sources.push(sources);
         Ok(())
+    }
+}
+
+/// What a table's equality deletes hide: a data file's row is deleted iff
+/// a delete of its key is newer than the file — the rule a pass applies.
+pub struct Deletes {
+    /// Each live data file's sequence number.
+    data_seqs: BTreeMap<String, i64>,
+    /// Each key a live delete names → the newest such delete's.
+    newest: HashMap<PkKey, i64>,
+}
+
+impl Deletes {
+    /// The deletes live as of `snapshots`, the table's, read from
+    /// `blob_store`. `pk_cols` is the table's key, in its order.
+    pub async fn read(
+        snapshots: &[Snapshot],
+        blob_store: &dyn BlobStore,
+        schema: &TableSchema,
+        pk_cols: &[ColumnName],
+    ) -> Result<Self> {
+        let (data, deletes) = compute_live_files(snapshots);
+        let pk_schema: Vec<ColumnSchema> = pk_cols
+            .iter()
+            .filter_map(|pk| schema.columns.iter().find(|c| c.name == pk.0))
+            .cloned()
+            .collect();
+        let mut peak_rows = 0;
+        let newest = load_deletes(
+            blob_store,
+            deletes.iter().map(|(path, f)| (path, f.seq)).collect(),
+            &pk_schema,
+            &mut peak_rows,
+        )
+        .await?;
+        Ok(Self {
+            data_seqs: data.into_iter().map(|(path, f)| (path, f.seq)).collect(),
+            newest,
+        })
+    }
+
+    /// Whether the row of `key` in data file `path` is deleted.
+    pub fn hides(&self, path: &str, key: &PkKey) -> bool {
+        let seq = self.data_seqs.get(path).copied().unwrap_or(i64::MAX);
+        self.newest.get(key).is_some_and(|deleted| *deleted > seq)
     }
 }
 

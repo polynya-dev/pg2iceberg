@@ -27,7 +27,7 @@ A table is compacted when:
 
 While the materializer catches up on a backlog, only the delete-file count compacts a table: the next cycle follows straight away and would dirty again what a pass rewrote. Merges and ratio-triggered rewrites wait until it has caught up, and then cover everything the backlog deleted at once.
 
-The ratio bounds the work: rewriting reads at most 1 / `compaction_delete_ratio` rows per row deleted (10, by default). pg2iceberg knows which file holds each row (its [file index](materializer.md)), so it counts hidden rows without reading any file, and rewrites only files that have some.
+The ratio bounds the work: rewriting reads at most 1 / `compaction_delete_ratio` rows per row deleted (10, by default). pg2iceberg knows which file holds each row (its [file index](materializer.md#file-index)), so it counts hidden rows without reading any file, and rewrites only files that have some. Of a file whose keys the index evicted to keep to its budget, it counts hidden rows conservatively, and may rewrite it a pass early.
 
 ## A pass
 

@@ -801,7 +801,8 @@ async fn build_one_shot_materializer(
         cfg.sink.materializer_batch_rows,
         metrics,
     )
-    .with_table_concurrency(cfg.sink.materializer_concurrency);
+    .with_table_concurrency(cfg.sink.materializer_concurrency)
+    .with_pk_index_memory(cfg.sink.pk_index_memory);
     materializer.set_maintenance(cfg.sink.resolved_maintenance()?);
     for s in &resolved_schemas {
         materializer
@@ -1134,7 +1135,8 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
         cfg.sink.materializer_batch_rows,
         metrics.clone(),
     )
-    .with_table_concurrency(cfg.sink.materializer_concurrency);
+    .with_table_concurrency(cfg.sink.materializer_concurrency)
+    .with_pk_index_memory(cfg.sink.pk_index_memory);
     materializer.set_maintenance(cfg.sink.resolved_maintenance()?);
     for schema in &schemas {
         materializer

@@ -78,7 +78,7 @@ impl PkKey {
         Self::from_bytes(&buf)
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
         if bytes.len() <= INLINE {
             let mut buf = [0u8; INLINE];
             buf[..bytes.len()].copy_from_slice(bytes);

@@ -157,7 +157,9 @@ impl TableWriter {
     ///
     /// `file_index` places equality deletes on partitioned tables: a
     /// delete goes to the partition its key is indexed in, where the row
-    /// lives. An unindexed key falls back to the row payload, then
+    /// lives — or to each it may be in, if its file was evicted from the
+    /// index: in one without the row, it deletes nothing. An unindexed
+    /// key falls back to the row payload, then
     /// errors: a key-only `Delete` (replica identity DEFAULT, partition
     /// col outside the PK) with nowhere to look surfaces as
     /// `WriterError::DeletePartitionUnresolved` rather than a silent
@@ -255,14 +257,16 @@ impl TableWriter {
         type Group<'a> = (Vec<PartitionLiteral>, Vec<&'a MaterializedRow>);
         let mut groups: Vec<Group> = Vec::new();
         for r in rows {
-            let tuple = match self.indexed_partition(r, file_index) {
-                Some(tuple) if deletes => tuple,
-                _ => self.compute_partition_tuple(r, file_index)?,
+            let tuples = match self.indexed_partitions(r, file_index) {
+                indexed if deletes && !indexed.is_empty() => indexed,
+                _ => vec![self.compute_partition_tuple(r, file_index)?],
             };
-            if let Some(slot) = groups.iter_mut().find(|(k, _)| k == &tuple) {
-                slot.1.push(r);
-            } else {
-                groups.push((tuple, vec![r]));
+            for tuple in tuples {
+                if let Some(slot) = groups.iter_mut().find(|(k, _)| k == &tuple) {
+                    slot.1.push(r);
+                } else {
+                    groups.push((tuple, vec![r]));
+                }
             }
         }
 
@@ -336,22 +340,24 @@ impl TableWriter {
     /// partition, and the row payload can't tell where that is — a
     /// key-only delete (REPLICA IDENTITY DEFAULT) carries NULLs, and an
     /// update's new values may name another partition than its old row's.
-    fn indexed_partition(
+    fn indexed_partitions(
         &self,
         r: &MaterializedRow,
         file_index: &FileIndex,
-    ) -> Option<Vec<PartitionLiteral>> {
+    ) -> Vec<Vec<PartitionLiteral>> {
         let key = PkKey::from_row(&r.row, &self.pk_col_names);
         file_index
-            .partition_values_for_pk(&key)
+            .partitions_for_pk(&key)
+            .into_iter()
             .filter(|values| values.len() == self.schema.partition_spec.len())
             .map(<[PartitionLiteral]>::to_vec)
+            .collect()
     }
 
     /// Compute the partition tuple for one row. Tier-1: read partition
     /// source columns from the row. Tier-2 (Delete only): consult FileIndex.
     /// Tier-3 (Delete only): error. (An equality delete whose key is
-    /// indexed takes the indexed partition first — [`Self::indexed_partition`].)
+    /// indexed takes the indexed partitions first — [`Self::indexed_partitions`].)
     fn compute_partition_tuple(
         &self,
         r: &MaterializedRow,
@@ -396,7 +402,7 @@ impl TableWriter {
         // Tier 2: FileIndex resolves Delete to its prior data file's
         // partition tuple.
         let key = PkKey::from_row(&r.row, &self.pk_col_names);
-        if let Some(values) = file_index.partition_values_for_pk(&key) {
+        if let Some(values) = file_index.partitions_for_pk(&key).into_iter().next() {
             if values.len() == self.schema.partition_spec.len() {
                 return Ok(values.to_vec());
             }
