@@ -1149,8 +1149,8 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     let pg_cfg = cfg.source.postgres.clone();
     let to_snapshot = schemas.clone();
     let tables = cfg.source.logical.snapshot_concurrency;
-    // A connection for each table read at once.
-    let connections = tables.min(to_snapshot.len()).max(1);
+    // A connection for each table, or range of one, read at once.
+    let connections = tables;
     let source = crate::snapshot_src::PgSnapshotSource::open(&pg_cfg, &to_snapshot, connections)
         .await
         .map_err(|e| {

@@ -78,6 +78,8 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = [
 ] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
 async-trait = { workspace = true }
+# The snapshot's binary `COPY` output arrives as a stream.
+futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 # Snapshot/verify SnapshotSource impl needs to format dates/timestamps
 # back into SQL literals for keyset pagination cursors.
