@@ -42,7 +42,7 @@ use pg2iceberg_logical::pipeline::Spawn;
 use pg2iceberg_logical::work_span;
 use pg2iceberg_logical::{Materializer, Pipeline, PipelineError};
 use pg2iceberg_pg::DecodedMessage;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::Instrument as _;
@@ -97,6 +97,33 @@ pub trait SnapshotSource: Send + Sync {
         after_pk_key: Option<&str>,
     ) -> Result<Vec<Row>>;
 
+    /// Split `ident` into ranges of its keys to read apart
+    /// ([`Self::read_range`]), in order, together covering it: at most
+    /// `parts`, each of about `min_rows` rows or more. None — or one — if
+    /// it can't, or needn't. Default: none.
+    async fn split(
+        &self,
+        _ident: &TableIdent,
+        _parts: usize,
+        _min_rows: usize,
+    ) -> Result<Vec<KeyRange>> {
+        Ok(Vec::new())
+    }
+
+    /// [`Self::read_chunk`], of `range` of the table only — one
+    /// [`Self::split`] gave.
+    async fn read_range(
+        &self,
+        ident: &TableIdent,
+        _range: &KeyRange,
+        _chunk_size: usize,
+        _after_pk_key: Option<&str>,
+    ) -> Result<Vec<Row>> {
+        Err(SnapshotError::Source(format!(
+            "this source reads {ident} whole"
+        )))
+    }
+
     /// The `after_pk_key` that reads on past `last`, the last row of the
     /// chunk of `ident` read after `after`; `pk_cols` is the table's
     /// primary key. Default: `last`'s canonical PK key (JSON form, see
@@ -110,6 +137,15 @@ pub trait SnapshotSource: Send + Sync {
     ) -> String {
         pk_key(last, pk_cols)
     }
+}
+
+/// A range of a table's keys, read apart from the rest
+/// ([`SnapshotSource::split`]): from `from`, inclusive, to `to`, exclusive,
+/// each in the source's own encoding; `None` is the table's start, or end.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyRange {
+    pub from: Option<String>,
+    pub to: Option<String>,
 }
 
 pub use pg2iceberg_core::SNAPSHOT_XID_BASE;
@@ -203,6 +239,25 @@ pub trait SnapshotSink: Send + Sized + 'static {
     /// Take back a sink [`Self::split_off`] made, its table done or
     /// abandoned.
     fn rejoin(&mut self, part: Self);
+
+    /// A sink for one of `ranges` key ranges of `table`, read apart from
+    /// the others: what's put to it joins the table's
+    /// ([`Self::rejoin_range`]), durable with it once [`Self::finish`]ed.
+    /// `None` if this sink puts a table only whole, or `table` holds rows
+    /// already. Default: `None`.
+    fn split_range(&mut self, _table: &TableIdent, _ranges: usize) -> Option<Self> {
+        None
+    }
+
+    /// Ready what's been put of `table`'s range to join it: its own work,
+    /// done on its own task. Default: nothing to do.
+    async fn seal(&mut self, _table: &TableIdent) -> Result<()> {
+        Ok(())
+    }
+
+    /// Take back a sink [`Self::split_range`] made, sealed: what's been
+    /// put to it joins `table`'s.
+    fn rejoin_range(&mut self, _table: &TableIdent, _part: Self) {}
 }
 
 /// Each chunk is staged and claimed as it's put: durable at once.
@@ -300,6 +355,19 @@ impl<Cat: Catalog + 'static> SnapshotSink for Materializer<Cat> {
 
     fn rejoin(&mut self, part: Self) {
         Materializer::rejoin(self, part)
+    }
+
+    fn split_range(&mut self, table: &TableIdent, ranges: usize) -> Option<Self> {
+        Materializer::split_range(self, table, ranges)
+    }
+
+    async fn seal(&mut self, table: &TableIdent) -> Result<()> {
+        self.seal_snapshot(table).await?;
+        Ok(())
+    }
+
+    fn rejoin_range(&mut self, table: &TableIdent, part: Self) {
+        Materializer::rejoin_range(self, table, part)
     }
 }
 
@@ -454,12 +522,14 @@ impl Snapshotter {
         Ok(snap_lsn)
     }
 
-    /// Like [`Self::run`], but up to [`Self::with_concurrency`] tables at
-    /// once, each read on a task of its own and put into a sink of its
-    /// own ([`SnapshotSink::split_off`]): a table's reads and writes are
-    /// CPU and round trips that don't wait on another's. `source` serves
-    /// them all at once. A table that fails stops the snapshot once the
-    /// others running finish. One at a time, if the sink can't split.
+    /// Like [`Self::run`], but up to [`Self::with_concurrency`] tasks at
+    /// once, each reading a table — or a range of a large table's keys —
+    /// and putting it to a sink of its own ([`SnapshotSink::split_off`],
+    /// [`SnapshotSink::split_range`]): reads and puts are CPU and round
+    /// trips that don't wait on one another. `source` serves them all at
+    /// once. A table whose snapshot fails, or a range of it, stops the
+    /// snapshot once the tasks running finish. One at a time, if the sink
+    /// can't split.
     pub async fn run_concurrently<S, K>(
         &self,
         source: Arc<S>,
@@ -471,48 +541,130 @@ impl Snapshotter {
         K: SnapshotSink,
     {
         let concurrency = self.concurrency.clone().filter(|_| sink.splits());
-        let Some(Concurrency { tables, spawn }) = concurrency else {
+        let Some(Concurrency {
+            tables: tasks,
+            spawn,
+        }) = concurrency
+        else {
             return self.run(source.as_ref(), schemas, sink).await;
         };
         let snap_lsn = source.snapshot_lsn().await?;
-        let mut waiting = schemas.iter().cloned().enumerate();
+        let mut tables = schemas.iter().cloned().enumerate();
+        let mut queue: VecDeque<Work<K>> = VecDeque::new();
+        // Tables read in ranges, not yet complete: their ranges yet to land.
+        let mut ranged: BTreeMap<TableIdent, usize> = BTreeMap::new();
         let mut running = FuturesUnordered::new();
         let mut failed = None;
         loop {
-            while failed.is_none() && running.len() < tables {
-                let Some((i, schema)) = waiting.next() else {
-                    break;
-                };
-                let mut part = match sink.split_off(&schema.ident) {
-                    Ok(part) => part,
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
+            while failed.is_none() && running.len() < tasks {
+                let work = match queue.pop_front() {
+                    Some(work) => work,
+                    None => {
+                        let Some((i, schema)) = tables.next() else {
+                            break;
+                        };
+                        match self.plan(source.as_ref(), sink, i, schema, tasks).await {
+                            Ok(works) => {
+                                if let Some(Work::Range { schema, .. }) = works.first() {
+                                    ranged.insert(schema.ident.clone(), works.len());
+                                }
+                                queue.extend(works);
+                            }
+                            Err(e) => failed = Some(e),
+                        }
+                        continue;
                     }
                 };
                 let this = self.clone();
                 let source = source.clone();
                 let (done, landed) = oneshot::channel();
-                spawn(Box::pin(async move {
-                    let out = match TableRun::new(&schema, i, snap_lsn) {
-                        Ok(table) => this
-                            .table(source.as_ref(), &table, &mut part, &mut None)
-                            .await
-                            .map(|_| ()),
-                        Err(e) => Err(e),
-                    };
-                    // Unheard if the snapshot is gone.
-                    let _ = done.send((part, out));
-                }));
+                match work {
+                    Work::Table { i, schema } => {
+                        let mut part = match sink.split_off(&schema.ident) {
+                            Ok(part) => part,
+                            Err(e) => {
+                                failed = Some(e);
+                                break;
+                            }
+                        };
+                        spawn(Box::pin(async move {
+                            let out = match TableRun::new(&schema, i, snap_lsn) {
+                                Ok(table) => this
+                                    .table(source.as_ref(), &table, &mut part, &mut None)
+                                    .await
+                                    .map(|_| ()),
+                                Err(e) => Err(e),
+                            };
+                            // Unheard if the snapshot is gone.
+                            let _ = done.send(Done::Table { part, out });
+                        }));
+                    }
+                    Work::Range {
+                        i,
+                        schema,
+                        range,
+                        mut part,
+                    } => {
+                        spawn(Box::pin(async move {
+                            let out = async {
+                                let table = TableRun::new(&schema, i, snap_lsn)?;
+                                this.read_range(source.as_ref(), &table, &range, &mut part)
+                                    .await?;
+                                part.seal(&schema.ident).await
+                            }
+                            .await;
+                            // Unheard if the snapshot is gone. Failed, the
+                            // part is dropped: what it put, with it.
+                            let _ = done.send(Done::Range { schema, part, out });
+                        }));
+                    }
+                }
                 running.push(landed);
             }
             match running.next().await {
-                Some(Ok((part, out))) => {
+                Some(Ok(Done::Table { part, out })) => {
                     // Its table done or abandoned, either way.
                     sink.rejoin(part);
                     if let Err(e) = out {
                         failed.get_or_insert(e);
                     }
+                }
+                Some(Ok(Done::Range { schema, part, out })) => {
+                    if let Err(e) = out {
+                        failed.get_or_insert(e);
+                        continue;
+                    }
+                    let ident = &schema.ident;
+                    sink.rejoin_range(ident, part);
+                    let left = ranged.get_mut(ident).expect("a ranged table");
+                    *left -= 1;
+                    if *left > 0 {
+                        continue;
+                    }
+                    // Its last range landed: the table is whole, committed
+                    // on a task of its own, as one read whole is — even
+                    // with another table failed, like one read whole that
+                    // was running.
+                    ranged.remove(ident);
+                    let mut part = match sink.split_off(ident) {
+                        Ok(part) => part,
+                        Err(e) => {
+                            sink.abandon(ident);
+                            failed = Some(e);
+                            continue;
+                        }
+                    };
+                    let this = self.clone();
+                    let (done, landed) = oneshot::channel();
+                    spawn(Box::pin(async move {
+                        let out = this.complete(&schema, snap_lsn, &mut part).await;
+                        if out.is_err() {
+                            part.abandon(&schema.ident);
+                        }
+                        // Unheard if the snapshot is gone.
+                        let _ = done.send(Done::Table { part, out });
+                    }));
+                    running.push(landed);
                 }
                 Some(Err(oneshot::Canceled)) => {
                     failed.get_or_insert(SnapshotError::Abandoned);
@@ -521,9 +673,162 @@ impl Snapshotter {
             }
         }
         match failed {
-            Some(e) => Err(e),
+            Some(e) => {
+                // What the ranges of a table not complete put is abandoned,
+                // and those not read yet are dropped.
+                for ident in ranged.keys() {
+                    sink.abandon(ident);
+                }
+                Err(e)
+            }
             None => Ok(snap_lsn),
         }
+    }
+
+    /// How `schema`'s table, the `i`th, is read: whole, or — read from its
+    /// start, of `tasks` more than one, the sink and the source able — in
+    /// ranges of its keys ([`SnapshotSource::split`]), each a task's, to a
+    /// sink of its own. Nothing, if complete.
+    async fn plan<S, K>(
+        &self,
+        source: &S,
+        sink: &mut K,
+        i: usize,
+        schema: TableSchema,
+        tasks: usize,
+    ) -> Result<Vec<Work<K>>>
+    where
+        S: SnapshotSource + ?Sized,
+        K: SnapshotSink,
+    {
+        match self.resume(&schema).await? {
+            Resume::Complete => return Ok(Vec::new()),
+            // Read on from its progress.
+            Resume::From(Some(_)) => return Ok(vec![Work::Table { i, schema }]),
+            Resume::From(None) => {}
+        }
+        if tasks < 2 || sink.split_range(&schema.ident, 2).is_none() {
+            return Ok(vec![Work::Table { i, schema }]);
+        }
+        let ranges = source
+            .split(
+                &schema.pg_ident(),
+                MAX_RANGES,
+                self.chunk_size.saturating_mul(RANGE_CHUNKS),
+            )
+            .await?;
+        if ranges.len() < 2 {
+            return Ok(vec![Work::Table { i, schema }]);
+        }
+        // Each now: once one joins the table, the table holds rows.
+        let n = ranges.len();
+        ranges
+            .into_iter()
+            .map(|range| {
+                let part = sink.split_range(&schema.ident, n).ok_or_else(|| {
+                    SnapshotError::Source(format!("{} can't be read in ranges", schema.ident))
+                })?;
+                Ok(Work::Range {
+                    i,
+                    schema: schema.clone(),
+                    range,
+                    part,
+                })
+            })
+            .collect()
+    }
+
+    /// Put the chunks of `range` of `table` to `sink`: no progress recorded,
+    /// nor the table complete — that's for once every range of it landed
+    /// ([`Self::complete`]).
+    async fn read_range<S, K>(
+        &self,
+        source: &S,
+        table: &TableRun<'_>,
+        range: &KeyRange,
+        sink: &mut K,
+    ) -> Result<()>
+    where
+        S: SnapshotSource + ?Sized,
+        K: SnapshotSink,
+    {
+        let pg_ident = table.schema.pg_ident();
+        let mut last_pk_key: Option<String> = None;
+        let mut rows = self.read(source, &pg_ident, Some(range), None).await?;
+        loop {
+            let span = work_span!(
+                parent: None,
+                "snapshot.chunk",
+                table = %table.schema.ident,
+                rows = tracing::field::Empty,
+            );
+            let chunk = self
+                .chunk(
+                    source,
+                    table,
+                    sink,
+                    last_pk_key.as_deref(),
+                    rows,
+                    Some(range),
+                )
+                .instrument(span.clone())
+                .await;
+            pg2iceberg_logical::spans::record_outcome(&span, &chunk);
+            match chunk? {
+                Chunk::TableDone => return Ok(()),
+                Chunk::Staged {
+                    last_pk_key: key,
+                    next,
+                } => {
+                    last_pk_key = Some(key);
+                    rows = next;
+                }
+            }
+        }
+    }
+
+    /// The chunk of `ident` after `after`, of `range` if given.
+    async fn read<S: SnapshotSource + ?Sized>(
+        &self,
+        source: &S,
+        ident: &TableIdent,
+        range: Option<&KeyRange>,
+        after: Option<&str>,
+    ) -> Result<Vec<Row>> {
+        match range {
+            None => source.read_chunk(ident, self.chunk_size, after).await,
+            Some(range) => {
+                source
+                    .read_range(ident, range, self.chunk_size, after)
+                    .await
+            }
+        }
+    }
+
+    /// `schema`'s table is read: make what's been put of it durable, and
+    /// mark it complete.
+    async fn complete<K: SnapshotSink>(
+        &self,
+        schema: &TableSchema,
+        snap_lsn: Lsn,
+        sink: &mut K,
+    ) -> Result<()> {
+        sink.finish(&schema.ident).await?;
+        // Drop the resume cursor and stamp the per-table completion row.
+        // Order matters: we clear progress *first* so a crash between the
+        // two writes leaves the table marked not-yet-complete (snapshotter
+        // retries cleanly) rather than complete-without-cursor (no-op
+        // resume; correct).
+        self.coord
+            .clear_snapshot_progress(&schema.ident)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("clear_snapshot_progress: {e}")))?;
+        let oid = self.table_oids.get(&schema.ident).copied().unwrap_or(0);
+        self.coord
+            .mark_table_snapshot_complete(&schema.ident, oid, snap_lsn)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("mark_table_snapshot_complete: {e}")))?;
+        Ok(())
     }
 
     /// Snapshot `table`: resume it, then put its chunks until it's read
@@ -573,8 +878,8 @@ impl Snapshotter {
         };
         // The table's first chunk; each next one is read while the one
         // before it is put ([`Self::chunk`]).
-        let mut rows = source
-            .read_chunk(&schema.pg_ident(), self.chunk_size, last_pk_key.as_deref())
+        let mut rows = self
+            .read(source, &schema.pg_ident(), None, last_pk_key.as_deref())
             .await?;
         loop {
             if *budget == Some(0) {
@@ -589,7 +894,7 @@ impl Snapshotter {
                 rows = tracing::field::Empty,
             );
             let chunk = self
-                .chunk(source, table, sink, last_pk_key.as_deref(), rows)
+                .chunk(source, table, sink, last_pk_key.as_deref(), rows, None)
                 .instrument(span.clone())
                 .await;
             pg2iceberg_logical::spans::record_outcome(&span, &chunk);
@@ -632,11 +937,11 @@ impl Snapshotter {
         Ok(Resume::From(last_pk_key))
     }
 
-    /// Put `chunk`, the rows of `table` after `last_pk_key` — or, with
-    /// nothing left to read, make the table's chunks durable and mark it
-    /// complete. The next chunk is read from Postgres meanwhile: a read
-    /// and a put are each a round trip or more, and neither needs the
-    /// other.
+    /// Put `chunk`, the rows of `table` after `last_pk_key`, of `range` if
+    /// given — or, with nothing left to read of the whole table, make its
+    /// chunks durable and mark it complete. The next chunk is read from
+    /// Postgres meanwhile: a read and a put are each a round trip or more,
+    /// and neither needs the other.
     async fn chunk<S, K>(
         &self,
         source: &S,
@@ -644,6 +949,7 @@ impl Snapshotter {
         sink: &mut K,
         last_pk_key: Option<&str>,
         chunk: Vec<Row>,
+        range: Option<&KeyRange>,
     ) -> Result<Chunk>
     where
         S: SnapshotSource + ?Sized,
@@ -661,23 +967,9 @@ impl Snapshotter {
         let pg_ident = schema.pg_ident();
         tracing::Span::current().record("rows", chunk.len());
         if chunk.is_empty() {
-            sink.finish(&schema.ident).await?;
-            // Table done — drop the resume cursor and stamp
-            // the per-table completion row. Order matters: we
-            // clear progress *first* so a crash between the
-            // two writes leaves the table marked
-            // not-yet-complete (snapshotter retries cleanly)
-            // rather than complete-without-cursor (no-op
-            // resume; correct).
-            self.coord
-                .clear_snapshot_progress(&schema.ident)
-                .await
-                .map_err(|e| SnapshotError::Source(format!("clear_snapshot_progress: {e}")))?;
-            let oid = self.table_oids.get(&schema.ident).copied().unwrap_or(0);
-            self.coord
-                .mark_table_snapshot_complete(&schema.ident, oid, snap_lsn)
-                .await
-                .map_err(|e| SnapshotError::Source(format!("mark_table_snapshot_complete: {e}")))?;
+            if range.is_none() {
+                self.complete(schema, snap_lsn, sink).await?;
+            }
             return Ok(Chunk::TableDone);
         }
 
@@ -693,9 +985,11 @@ impl Snapshotter {
             }
         }
 
+        // A range's progress isn't the table's: none is recorded.
+        let progress = range.is_none().then_some(new_key.as_str());
         let (put, next) = futures::join!(
-            self.put(table, sink, chunk, &new_key),
-            source.read_chunk(&pg_ident, self.chunk_size, Some(&new_key)),
+            self.put(table, sink, chunk, progress),
+            self.read(source, &pg_ident, range, Some(&new_key)),
         );
         put?;
         Ok(Chunk::Staged {
@@ -705,13 +999,13 @@ impl Snapshotter {
     }
 
     /// Put `chunk`, `table`'s through `new_key`; once the chunks put are
-    /// durable, stamp the resume cursor there.
+    /// durable, stamp the resume cursor there, if given.
     async fn put<K: SnapshotSink>(
         &self,
         table: &TableRun<'_>,
         sink: &mut K,
         chunk: Vec<Row>,
-        new_key: &str,
+        new_key: Option<&str>,
     ) -> Result<()> {
         let TableRun {
             schema,
@@ -719,9 +1013,10 @@ impl Snapshotter {
             snap_lsn,
             ..
         } = *table;
-        if !sink.put(&schema.ident, xid, snap_lsn, chunk).await? {
+        let durable = sink.put(&schema.ident, xid, snap_lsn, chunk).await?;
+        let Some(new_key) = new_key.filter(|_| durable) else {
             return Ok(());
-        }
+        };
         // Stamp the resume cursor *after* the chunk's durable — if we
         // crash before this write, resume re-reads the chunk (idempotent:
         // the materializer's fold-by-PK absorbs the duplicate rows).
@@ -731,6 +1026,38 @@ impl Snapshotter {
             .map_err(|e| SnapshotError::Source(format!("set_snapshot_progress: {e}")))?;
         Ok(())
     }
+}
+
+/// Most ranges a table is read in ([`SnapshotSource::split`]).
+const MAX_RANGES: usize = 64;
+/// Fewest chunks a range of a table holds, about: each is a task, and a
+/// part of the table's index of its own.
+const RANGE_CHUNKS: usize = 10;
+
+/// A [`Snapshotter::run_concurrently`] task's work.
+enum Work<K> {
+    /// The `i`th table, read whole.
+    Table { i: usize, schema: TableSchema },
+    /// A range of the `i`th table's keys, put to `part`.
+    Range {
+        i: usize,
+        schema: TableSchema,
+        range: KeyRange,
+        part: K,
+    },
+}
+
+/// A [`Work`] done, its sink to take back.
+enum Done<K> {
+    Table {
+        part: K,
+        out: Result<()>,
+    },
+    Range {
+        schema: TableSchema,
+        part: K,
+        out: Result<()>,
+    },
 }
 
 /// One table of a [`Snapshotter`] run.
