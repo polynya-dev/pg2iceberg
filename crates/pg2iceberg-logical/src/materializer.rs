@@ -1603,8 +1603,8 @@ impl<C: Catalog> Materializer<C> {
     }
 
     /// Every key the table holds: from its FileIndex, or, if that can't
-    /// give them all back, read from its data files — dead rows' too,
-    /// whose deletes delete nothing.
+    /// give them all back, read from its data files — less those it surely
+    /// doesn't hold; dead rows' it may hold, whose deletes delete nothing.
     async fn table_keys(&self, ident: &TableIdent) -> Result<Vec<PkKey>> {
         let entry = self
             .tables
@@ -1623,7 +1623,12 @@ impl<C: Catalog> Materializer<C> {
         for path in entry.file_index.live_files() {
             let bytes = self.blob_store.get(path).await?;
             for batch in RowBatches::new(bytes, &pk_schema, self.batch_rows.max(1))? {
-                keys.extend(batch?.iter().map(|r| PkKey::from_row(r, &entry.pk_cols)));
+                keys.extend(
+                    batch?
+                        .iter()
+                        .map(|r| PkKey::from_row(r, &entry.pk_cols))
+                        .filter(|k| entry.file_index.may_contain(k)),
+                );
             }
         }
         Ok(keys)

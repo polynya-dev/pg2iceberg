@@ -4096,16 +4096,9 @@ fn evicted_files() -> Vec<Step> {
 }
 
 /// Run `steps` over a one-key FileIndex, checking the invariants after
-/// each and at the end.
+/// each, and that it evicted a file.
 fn run_bounded(steps: &[Step]) -> DstHarness {
-    BOUNDED_INDEX.set(true);
-    let mut h = DstHarness::boot();
-    for (i, step) in steps.iter().enumerate() {
-        h.run_step(step);
-        if let Err(e) = check_step_invariants(&h) {
-            panic!("failed after step {i} ({step:?}): {e}");
-        }
-    }
+    let h = run_bounded_unchecked(steps);
     let evicted = h
         .materializer
         .file_index(&ident())
@@ -4212,6 +4205,36 @@ fn a_bounded_index_follows_another_process_compacting_evicted_files() {
         h.run_step(&step);
     }
     check_invariants(&mut h).unwrap();
+}
+
+/// A TRUNCATE of a partitioned table, past a one-key FileIndex, reads
+/// the keys of the evicted files — those of rows a truncate before
+/// deleted too, which the index knows the table surely doesn't hold: no
+/// delete is written for them, with no partition to write it to.
+#[test]
+fn a_bounded_index_truncates_a_partitioned_table_twice() {
+    PARTITIONED.set(true);
+    let mut h = run_bounded_unchecked(&[
+        Step::BigTx { inserts: 3, qty: 0 },
+        Step::Truncate { reinsert: None },
+        Step::DriveFlush,
+        Step::Truncate { reinsert: None },
+    ]);
+    check_invariants(&mut h).unwrap();
+}
+
+/// Run `steps` over a one-key FileIndex, checking the invariants after
+/// each.
+fn run_bounded_unchecked(steps: &[Step]) -> DstHarness {
+    BOUNDED_INDEX.set(true);
+    let mut h = DstHarness::boot();
+    for (i, step) in steps.iter().enumerate() {
+        h.run_step(step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("failed after step {i} ({step:?}): {e}");
+        }
+    }
+    h
 }
 
 /// The catalog's compaction pass, planned and committed.

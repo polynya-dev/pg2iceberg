@@ -108,6 +108,10 @@ fn mix(mut x: u64) -> u64 {
 struct KeyFilter {
     layers: Vec<Layer>,
     max_bytes: usize,
+    /// The bytes `layers` take.
+    bytes: usize,
+    /// Its budget holds no more layers: the last takes the rest.
+    full: bool,
 }
 
 #[derive(Clone)]
@@ -126,19 +130,23 @@ const FIRST_LAYER: usize = 1 << 16;
 
 impl Layer {
     fn new(capacity: usize, error: f64) -> Self {
-        let ln2 = std::f64::consts::LN_2;
-        let bits = (capacity as f64 * -error.ln() / (ln2 * ln2)).ceil() as usize;
-        let probes = (bits as f64 / capacity as f64 * ln2).round().max(1.0) as u32;
+        let words = Self::words(capacity, error);
+        let probes = (words as f64 * 64.0 / capacity as f64 * std::f64::consts::LN_2)
+            .round()
+            .max(1.0) as u32;
         Self {
-            bits: vec![0; bits.div_ceil(64).max(1)],
+            bits: vec![0; words],
             probes,
             capacity,
             len: 0,
         }
     }
 
-    fn bytes(&self) -> usize {
-        self.bits.len() * 8
+    /// The 64-bit words a layer of `capacity` keys erring `error` takes.
+    fn words(capacity: usize, error: f64) -> usize {
+        let ln2 = std::f64::consts::LN_2;
+        let bits = (capacity as f64 * -error.ln() / (ln2 * ln2)).ceil() as usize;
+        bits.div_ceil(64).max(1)
     }
 
     fn positions(&self, slot: &Slot) -> impl Iterator<Item = usize> {
@@ -163,12 +171,15 @@ impl Layer {
 
 impl KeyFilter {
     fn insert(&mut self, slot: &Slot) {
-        if self.layers.last().is_none_or(|l| l.len >= l.capacity) {
+        if !self.full && self.layers.last().is_none_or(|l| l.len >= l.capacity) {
             let capacity = self.layers.last().map_or(FIRST_LAYER, |l| l.capacity * 2);
             let error = FILTER_ERROR * 0.5f64.powi(self.layers.len() as i32 + 1);
-            let layer = Layer::new(capacity, error);
-            if self.layers.is_empty() || self.bytes() + layer.bytes() <= self.max_bytes {
-                self.layers.push(layer);
+            let bytes = Layer::words(capacity, error) * 8;
+            if self.layers.is_empty() || self.bytes + bytes <= self.max_bytes {
+                self.layers.push(Layer::new(capacity, error));
+                self.bytes += bytes;
+            } else {
+                self.full = true;
             }
         }
         self.layers.last_mut().expect("a layer").insert(slot);
@@ -179,7 +190,7 @@ impl KeyFilter {
     }
 
     fn bytes(&self) -> usize {
-        self.layers.iter().map(Layer::bytes).sum()
+        self.bytes
     }
 }
 
@@ -203,6 +214,9 @@ pub struct FileIndex {
     evicted_keys: KeyFilter,
     /// Files evicted, while in the index.
     evicted: usize,
+    /// The smallest and largest keys of the files evicted, ever: a key
+    /// outside them is in none.
+    evicted_range: Option<(PkKey, PkKey)>,
     /// Most keys `keys` holds before files are evicted.
     max_keys: usize,
     /// Files added so far: the next one's [`IndexedFile::generation`].
@@ -268,6 +282,7 @@ impl Default for FileIndex {
             ids: HashMap::new(),
             evicted_keys: KeyFilter::default(),
             evicted: 0,
+            evicted_range: None,
             max_keys: usize::MAX,
             added: 0,
             hashed: false,
@@ -295,8 +310,8 @@ impl FileIndex {
         Self {
             max_keys: self.max_keys,
             evicted_keys: KeyFilter {
-                layers: Vec::new(),
                 max_bytes: self.evicted_keys.max_bytes,
+                ..KeyFilter::default()
             },
             ..Self::default()
         }
@@ -374,6 +389,8 @@ impl FileIndex {
             if let Some(file) = self.files[id as usize].as_mut() {
                 file.widen(&lo);
                 file.widen(&hi);
+                // Evicted while its keys went in, maybe.
+                self.widen_evicted_range(id);
             }
         }
         if self.files[id as usize]
@@ -404,6 +421,26 @@ impl FileIndex {
         if !file.evicted {
             file.evicted = true;
             self.evicted += 1;
+        }
+        self.widen_evicted_range(id);
+    }
+
+    /// Take `id`'s range into [`Self::evicted_range`], if it's evicted.
+    fn widen_evicted_range(&mut self, id: FileId) {
+        let file = self.files[id as usize].as_ref().expect("live file id");
+        let Some((lo, hi)) = file.range.as_ref().filter(|_| file.evicted) else {
+            return;
+        };
+        match &mut self.evicted_range {
+            None => self.evicted_range = Some((lo.clone(), hi.clone())),
+            Some((min, max)) => {
+                if lo < min {
+                    *min = lo.clone();
+                }
+                if hi > max {
+                    *max = hi.clone();
+                }
+            }
         }
     }
 
@@ -437,11 +474,18 @@ impl FileIndex {
     /// no file is evicted.
     pub fn may_contain(&self, pk_key: &PkKey) -> bool {
         let slot = Slot::of(pk_key);
-        self.keys.contains_key(&slot) || self.may_be_evicted(&slot)
+        self.keys.contains_key(&slot) || self.may_be_evicted(&slot, pk_key)
     }
 
-    fn may_be_evicted(&self, slot: &Slot) -> bool {
-        self.evicted > 0 && self.evicted_keys.may_contain(slot)
+    /// Whether `pk_key` may be an evicted file's: in their range, and the
+    /// filter's.
+    fn may_be_evicted(&self, slot: &Slot, pk_key: &PkKey) -> bool {
+        self.evicted > 0
+            && self
+                .evicted_range
+                .as_ref()
+                .is_some_and(|(lo, hi)| lo <= pk_key && pk_key <= hi)
+            && self.evicted_keys.may_contain(slot)
     }
 
     /// The evicted files that may hold `pk_key`'s current row, newest
@@ -483,7 +527,7 @@ impl FileIndex {
     /// The evicted files, but `except`, whose range holds `pk_key`, if the
     /// filter says an evicted file may.
     fn evicted_holding(&self, slot: &Slot, pk_key: &PkKey, except: Option<FileId>) -> Vec<FileId> {
-        if !self.may_be_evicted(slot) {
+        if !self.may_be_evicted(slot, pk_key) {
             return Vec::new();
         }
         self.files
@@ -723,6 +767,7 @@ impl FileIndex {
                     file.evicted = true;
                     self.evicted += 1;
                 }
+                self.widen_evicted_range(id as FileId);
             }
         }
     }
