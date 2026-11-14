@@ -104,6 +104,10 @@ fn mix(mut x: u64) -> u64 {
 /// of them — never wrongly not. It grows a layer at a time, each holding
 /// twice the keys of the last and erring half as often, while its budget
 /// lasts; past it, the last layer takes the rest, erring more and more.
+/// Each layer knows the range of its keys, and a key outside it isn't
+/// looked for there: files are evicted oldest first, mostly a range of
+/// keys at a time — and an index of a range of keys, absorbed
+/// ([`FileIndex::absorb`]), brings layers of that range alone.
 #[derive(Clone, Default)]
 struct KeyFilter {
     layers: Vec<Layer>,
@@ -120,6 +124,10 @@ struct Layer {
     probes: u32,
     capacity: usize,
     len: usize,
+    /// How often it takes a key for one it holds, at most, full.
+    error: f64,
+    /// Its smallest and largest key, about: none outside.
+    range: Option<(PkKey, PkKey)>,
 }
 
 /// How often the filter takes a key for one it holds, at most, while its
@@ -139,6 +147,8 @@ impl Layer {
             probes,
             capacity,
             len: 0,
+            error,
+            range: None,
         }
     }
 
@@ -163,17 +173,25 @@ impl Layer {
         self.len += 1;
     }
 
-    fn may_contain(&self, slot: &Slot) -> bool {
-        self.positions(slot)
-            .all(|p| self.bits[p / 64] & (1 << (p % 64)) != 0)
+    fn may_contain(&self, slot: &Slot, key: &PkKey) -> bool {
+        self.range
+            .as_ref()
+            .is_some_and(|(lo, hi)| lo <= key && key <= hi)
+            && self
+                .positions(slot)
+                .all(|p| self.bits[p / 64] & (1 << (p % 64)) != 0)
     }
 }
 
 impl KeyFilter {
     fn insert(&mut self, slot: &Slot) {
         if !self.full && self.layers.last().is_none_or(|l| l.len >= l.capacity) {
-            let capacity = self.layers.last().map_or(FIRST_LAYER, |l| l.capacity * 2);
-            let error = FILTER_ERROR * 0.5f64.powi(self.layers.len() as i32 + 1);
+            let (capacity, error) = self
+                .layers
+                .last()
+                .map_or((FIRST_LAYER, FILTER_ERROR / 2.0), |l| {
+                    (l.capacity * 2, l.error / 2.0)
+                });
             let bytes = Layer::words(capacity, error) * 8;
             if self.layers.is_empty() || self.bytes + bytes <= self.max_bytes {
                 self.layers.push(Layer::new(capacity, error));
@@ -185,8 +203,26 @@ impl KeyFilter {
         self.layers.last_mut().expect("a layer").insert(slot);
     }
 
-    fn may_contain(&self, slot: &Slot) -> bool {
-        self.layers.iter().any(|l| l.may_contain(slot))
+    /// Take `lo..=hi` into the ranges of the layers from the `from`th: the
+    /// keys put in them since it was last.
+    fn cover(&mut self, from: usize, lo: &PkKey, hi: &PkKey) {
+        for layer in self.layers.iter_mut().skip(from) {
+            match &mut layer.range {
+                None => layer.range = Some((lo.clone(), hi.clone())),
+                Some((min, max)) => {
+                    if lo < min {
+                        *min = lo.clone();
+                    }
+                    if hi > max {
+                        *max = hi.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    fn may_contain(&self, slot: &Slot, key: &PkKey) -> bool {
+        self.layers.iter().any(|l| l.may_contain(slot, key))
     }
 
     fn bytes(&self) -> usize {
@@ -370,6 +406,13 @@ impl FileIndex {
             }
             // Room first: a key past its most would grow the map's table.
             if self.keys.len() >= self.max_keys && !self.keys.contains_key(&slot) {
+                // Its keys so far may leave for the filter, which takes
+                // their range from the file's.
+                if let Some((lo, hi)) = &range {
+                    let file = self.file_mut(id);
+                    file.widen(lo);
+                    file.widen(hi);
+                }
                 self.evict();
             }
             match self.keys.insert(slot, id) {
@@ -402,6 +445,51 @@ impl FileIndex {
             .is_some_and(|f| f.live == 0 && !f.evicted)
         {
             self.drop_file(id);
+        }
+    }
+
+    /// Take in `other`, an index of files of the same table holding keys
+    /// of their own — a snapshot's, of a range of keys read apart: its
+    /// files, standing after these, its keys, as the budget holds them,
+    /// and its filter of evicted keys.
+    pub fn absorb(&mut self, other: FileIndex) {
+        let FileIndex {
+            keys,
+            files,
+            evicted_keys,
+            added,
+            hashed,
+            ..
+        } = other;
+        let mut ids: Vec<Option<FileId>> = vec![None; files.len()];
+        for (old, file) in files.into_iter().enumerate() {
+            let Some(mut file) = file else { continue };
+            file.generation += self.added;
+            file.mapped = 0;
+            let evicted = file.evicted;
+            let id = self.place(file);
+            if evicted {
+                self.evicted += 1;
+                self.widen_evicted_range(id);
+            }
+            ids[old] = Some(id);
+        }
+        self.added += added;
+        self.hashed |= hashed;
+        let filter = &mut self.evicted_keys;
+        filter.bytes += evicted_keys.bytes;
+        filter.layers.extend(evicted_keys.layers);
+        filter.full |= filter.bytes >= filter.max_bytes;
+        for (slot, old) in keys {
+            let id = ids[old as usize].expect("a key's file is in its index");
+            if self.keys.len() >= self.max_keys && !self.keys.contains_key(&slot) {
+                self.evict();
+            }
+            if let Some(prev) = self.keys.insert(slot, id) {
+                // Of no file of this index: the ranges are apart.
+                debug_assert_eq!(prev, id, "a key in both indexes");
+            }
+            self.file_mut(id).mapped += 1;
         }
     }
 
@@ -489,7 +577,7 @@ impl FileIndex {
                 .evicted_range
                 .as_ref()
                 .is_some_and(|(lo, hi)| lo <= pk_key && pk_key <= hi)
-            && self.evicted_keys.may_contain(slot)
+            && self.evicted_keys.may_contain(slot, pk_key)
     }
 
     /// The evicted files that may hold `pk_key`'s current row, newest
@@ -684,7 +772,7 @@ impl FileIndex {
         generation: Option<u64>,
     ) -> FileId {
         let file = IndexedFile {
-            path: path.clone(),
+            path,
             partition_values,
             live: 0,
             mapped: 0,
@@ -694,6 +782,12 @@ impl FileIndex {
             unseen_deaths: 0,
         };
         self.added += 1;
+        self.place(file)
+    }
+
+    /// File `file` in a slot of its own.
+    fn place(&mut self, file: IndexedFile) -> FileId {
+        let path = file.path.clone();
         let id = match self.free.pop() {
             Some(id) => {
                 self.files[id as usize] = Some(file);
@@ -753,6 +847,8 @@ impl FileIndex {
             evicting[id as usize] = true;
             left -= self.file(id).mapped as usize;
         }
+        // The layers the keys go in: the last, and those they fill.
+        let layer = self.evicted_keys.layers.len().saturating_sub(1);
         // Into a table of its own: removed in place, the keys would leave
         // tombstones, which the inserts after would grow the table past.
         let mut kept = HashMap::with_capacity(self.max_keys);
@@ -767,6 +863,11 @@ impl FileIndex {
         for (id, evict) in evicting.into_iter().enumerate() {
             if evict {
                 let file = self.files[id].as_mut().expect("live file id");
+                let (lo, hi) = file
+                    .range
+                    .as_ref()
+                    .expect("a file holding keys has a range");
+                self.evicted_keys.cover(layer, lo, hi);
                 file.mapped = 0;
                 if !file.evicted {
                     file.evicted = true;
@@ -1277,5 +1378,32 @@ mod tests {
         assert!(partitions.contains(&us.as_slice()) && partitions.contains(&eu.as_slice()));
         assert_eq!(fi.partitions_for_pk(&n(6)), vec![eu.as_slice()]);
         assert!(fi.partitions_for_pk(&n(3)).is_empty(), "never in the table");
+    }
+
+    /// Two indexes of a table's key ranges, read apart, merge into what
+    /// one index of both would be: past its budget, erring only safely.
+    #[test]
+    fn absorbing_another_range_errs_only_safely() {
+        let mut exact = FileIndex::new();
+        let mut a = FileIndex::new();
+        a.max_keys = 30;
+        let mut b = FileIndex::new();
+        b.max_keys = 30;
+        for f in 0..10i64 {
+            let lo: Vec<PkKey> = (f * 20..f * 20 + 20).map(n).collect();
+            let hi: Vec<PkKey> = (1000 + f * 20..1000 + f * 20 + 20).map(n).collect();
+            a.add_file(format!("lo{f}"), lo.clone(), Vec::new());
+            b.add_file(format!("hi{f}"), hi.clone(), Vec::new());
+            exact.add_file(format!("lo{f}"), lo, Vec::new());
+            exact.add_file(format!("hi{f}"), hi, Vec::new());
+        }
+        a.max_keys = 40;
+        a.absorb(b);
+        assert_safe(&a, &exact);
+        assert!(a.keys.len() <= a.max_keys);
+        // A key of each, deleted after, leaves a count no higher than true.
+        a.remove_pks(&[n(5), n(1005)]);
+        exact.remove_pks(&[n(5), n(1005)]);
+        assert_safe(&a, &exact);
     }
 }

@@ -3632,6 +3632,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "futures",
  "http-body-util",
  "humantime",
  "hyper",

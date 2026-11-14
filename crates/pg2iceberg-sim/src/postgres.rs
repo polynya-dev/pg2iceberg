@@ -30,7 +30,7 @@ use pg2iceberg_core::{
 use pg2iceberg_pg::{
     DecodedMessage, PgClient, PgError, ReplicationStream, SlotMonitor, SnapshotId,
 };
-use pg2iceberg_snapshot::{SnapshotError, SnapshotSource};
+use pg2iceberg_snapshot::{KeyRange, SnapshotError, SnapshotSource};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -244,6 +244,23 @@ impl DbState {
                 .or_default()
                 .push((lsn, rows));
         }
+    }
+
+    /// `ident`'s rows as a snapshot reads them: as of an open snapshot's
+    /// LSN, like the REPEATABLE READ transaction production's snapshot
+    /// reads in, if one is open.
+    fn snapshot_rows(
+        &self,
+        ident: &TableIdent,
+    ) -> std::result::Result<std::borrow::Cow<'_, Rows>, SnapshotError> {
+        let table = self
+            .tables
+            .get(ident)
+            .ok_or_else(|| SnapshotError::Source(format!("unknown table: {ident}")))?;
+        Ok(match self.snapshot_at {
+            Some(lsn) => std::borrow::Cow::Owned(self.rows_at(ident, lsn)),
+            None => std::borrow::Cow::Borrowed(&table.rows),
+        })
     }
 
     /// `ident`'s rows as of `lsn`.
@@ -1924,35 +1941,57 @@ impl SnapshotSource for SimPostgres {
         chunk_size: usize,
         after_pk_key: Option<&str>,
     ) -> std::result::Result<Vec<Row>, SnapshotError> {
-        let s = self.state.lock().unwrap();
-        let table = s
-            .tables
-            .get(ident)
-            .ok_or_else(|| SnapshotError::Source(format!("unknown table: {ident}")))?;
+        self.read_range(ident, &KeyRange::default(), chunk_size, after_pk_key)
+            .await
+    }
 
-        // An open snapshot reads the table as of its LSN, like the
-        // REPEATABLE READ transaction production's snapshot reads in.
-        let at_snapshot;
-        let rows = match s.snapshot_at {
-            Some(lsn) => {
-                at_snapshot = s.rows_at(ident, lsn);
-                &at_snapshot
-            }
-            None => &table.rows,
-        };
+    /// Ranges of about as many rows, at the keys between them: keys are
+    /// the rows' canonical PK strings, in their order.
+    async fn split(
+        &self,
+        ident: &TableIdent,
+        parts: usize,
+        min_rows: usize,
+    ) -> std::result::Result<Vec<KeyRange>, SnapshotError> {
+        let s = self.state.lock().unwrap();
+        let keys: Vec<String> = s.snapshot_rows(ident)?.keys().cloned().collect();
+        let parts = parts.min(keys.len() / min_rows.max(1));
+        if parts < 2 {
+            return Ok(Vec::new());
+        }
+        let bounds: Vec<Option<String>> = std::iter::once(None)
+            .chain((1..parts).map(|p| Some(keys[keys.len() * p / parts].clone())))
+            .chain(std::iter::once(None))
+            .collect();
+        Ok(bounds
+            .windows(2)
+            .map(|w| KeyRange {
+                from: w[0].clone(),
+                to: w[1].clone(),
+            })
+            .collect())
+    }
+
+    async fn read_range(
+        &self,
+        ident: &TableIdent,
+        range: &KeyRange,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> std::result::Result<Vec<Row>, SnapshotError> {
+        let s = self.state.lock().unwrap();
         // SimPostgres stores rows keyed by canonical PK in a BTreeMap, so
         // iteration is already sorted ASC by PK. Filter strictly above the
-        // bound, then truncate.
-        let chunk: Vec<Row> = rows
+        // bound, within the range, then truncate.
+        let chunk: Vec<Row> = s
+            .snapshot_rows(ident)?
             .iter()
-            .filter(|(k, _)| match after_pk_key {
-                Some(after) => k.as_str() > after,
-                None => true,
-            })
+            .filter(|(k, _)| after_pk_key.is_none_or(|after| k.as_str() > after))
+            .filter(|(k, _)| range.from.as_deref().is_none_or(|from| k.as_str() >= from))
+            .take_while(|(k, _)| range.to.as_deref().is_none_or(|to| k.as_str() < to))
             .take(chunk_size)
             .map(|(_, v)| v.clone())
             .collect();
-
         Ok(chunk)
     }
 }

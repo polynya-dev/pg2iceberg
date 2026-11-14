@@ -6,20 +6,31 @@
 //! and serves chunked `read_chunk` calls by issuing
 //!
 //! ```sql
-//! SELECT col1, col2, ...
-//! FROM "schema"."table"
-//! [ WHERE (pk_cols) > (literals) ]   -- when after_pk_key is supplied
-//! ORDER BY pk_cols ASC
-//! LIMIT N;
+//! COPY (
+//!   SELECT col1::int8, col2::text, ...
+//!   FROM "schema"."table"
+//!   [ WHERE (pk_cols) > (literals) ]   -- when after_pk_key is supplied
+//!   ORDER BY pk_cols ASC
+//!   LIMIT N
+//! ) TO STDOUT (FORMAT binary);
 //! ```
 //!
 //! against the in-flight transaction. All chunks see a consistent view
-//! because the tx stays open for the lifetime of the source.
+//! because the tx stays open for the lifetime of the source. Values come
+//! in their binary form, each column cast to the type whose form its
+//! Iceberg type's decoder reads ([`crate::snapshot_copy`]).
 //!
 //! To read several tables at once, the source opens more connections:
 //! each imports the first's snapshot (`pg_export_snapshot()`, then `SET
 //! TRANSACTION SNAPSHOT`), so a chunk sees the same rows whichever reads
 //! it.
+//!
+//! A large table is split into ranges of its key's first column, in its
+//! index's order, read at once ([`SnapshotSource::split`]): at the bounds
+//! of the column's histogram in `pg_stats`, of rows about as many each —
+//! or, without one, of an integer column, evenly between its least and
+//! greatest values. A bound is the column's value as text, which
+//! Postgres takes as one of the column's type in `"c" >= '<bound>'`.
 //!
 //! `pk_cols` are in the primary key index's order, so the index serves
 //! each chunk; in another order Postgres scans and sorts the whole table
@@ -60,8 +71,10 @@
 //!   close the duplicate-event window completely.
 
 use crate::config::PostgresConfig;
+use crate::snapshot_copy;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use pg2iceberg_coord::prod::{connect_with as coord_connect_with, TlsMode as CoordTls};
 use pg2iceberg_core::value::{
     DaysSinceEpoch, Decimal as CoreDecimal, PgValue, TimeMicros, TimestampMicros,
@@ -69,7 +82,7 @@ use pg2iceberg_core::value::{
 use pg2iceberg_core::{ColumnName, ColumnSchema, Columns, Lsn, Row, TableIdent, TableSchema};
 use pg2iceberg_iceberg::pk_key;
 use pg2iceberg_pg::prod::value_decode::decode_text;
-use pg2iceberg_snapshot::{Result as SnapshotResult, SnapshotError, SnapshotSource};
+use pg2iceberg_snapshot::{KeyRange, Result as SnapshotResult, SnapshotError, SnapshotSource};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::sync::{Mutex, Semaphore};
@@ -93,6 +106,8 @@ struct CachedSchema {
     /// columns goes.
     row_columns: Columns,
     places: Vec<usize>,
+    /// The columns a chunk selects, each cast to be read in binary.
+    select: String,
 }
 
 /// The cursor of a table read in its index order: the last row's key, in
@@ -206,6 +221,20 @@ impl PgSnapshotSource {
             // PG identifier (the snapshotter passes `s.pg_ident()`),
             // and our SELECT issues against PG. The Iceberg-side
             // `s.ident` is irrelevant here.
+            let pg_types = column_types(&conn.client, &s.pg_ident())
+                .await
+                .with_context(|| format!("column types of {}", s.pg_ident()))?;
+            let select = s
+                .columns
+                .iter()
+                .map(|c| {
+                    let pg_type = pg_types
+                        .get(&c.name)
+                        .map(|(name, output)| (name.as_str(), output.as_str()));
+                    snapshot_copy::select(&c.name, c.ty, pg_type)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             by_ident.insert(
                 s.pg_ident(),
                 CachedSchema {
@@ -214,6 +243,7 @@ impl PgSnapshotSource {
                     index_order,
                     row_columns,
                     places,
+                    select,
                 },
             );
         }
@@ -257,39 +287,88 @@ impl PgSnapshotSource {
     pub fn snapshot_lsn(&self) -> Lsn {
         self.snapshot_lsn
     }
-}
 
-#[async_trait]
-impl SnapshotSource for PgSnapshotSource {
-    async fn snapshot_lsn(&self) -> SnapshotResult<Lsn> {
-        Ok(self.snapshot_lsn)
+    fn cached(&self, ident: &TableIdent) -> SnapshotResult<&CachedSchema> {
+        self.schemas
+            .get(ident)
+            .ok_or_else(|| SnapshotError::Source(format!("unknown table: {ident}")))
     }
 
-    async fn read_chunk(
+    /// What `copy`, a `COPY … TO STDOUT`, outputs, run on a client free, in
+    /// the snapshot.
+    async fn copy_out(&self, copy: &str) -> SnapshotResult<Vec<u8>> {
+        let _reader = self
+            .readers
+            .acquire()
+            .await
+            .map_err(|e| SnapshotError::Source(format!("snapshot readers: {e}")))?;
+        // Each reader holds at most one client, so one is free.
+        let client = self
+            .clients
+            .iter()
+            .find_map(|c| c.try_lock().ok())
+            .expect("a free client per reader");
+        let stream = client
+            .copy_out(copy)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("{copy:?}: {e}")))?;
+        futures::pin_mut!(stream);
+        let mut out = Vec::new();
+        while let Some(data) = stream.next().await {
+            out.extend_from_slice(
+                &data.map_err(|e| SnapshotError::Source(format!("{copy:?}: {e}")))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Run `q` on a client free, in the snapshot.
+    async fn query(&self, q: &str) -> SnapshotResult<Vec<SimpleQueryMessage>> {
+        let _reader = self
+            .readers
+            .acquire()
+            .await
+            .map_err(|e| SnapshotError::Source(format!("snapshot readers: {e}")))?;
+        // Each reader holds at most one client, so one is free.
+        let client = self
+            .clients
+            .iter()
+            .find_map(|c| c.try_lock().ok())
+            .expect("a free client per reader");
+        client
+            .simple_query(q)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("{q:?}: {e}")))
+    }
+
+    /// The first column of each row `q` returns.
+    async fn query_column(&self, q: &str) -> SnapshotResult<Vec<Option<String>>> {
+        let mut values = Vec::new();
+        for msg in self.query(q).await? {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let value: Option<&str> = row
+                    .try_get(0)
+                    .map_err(|e| SnapshotError::Source(format!("{q:?}: {e}")))?;
+                values.push(value.map(String::from));
+            }
+        }
+        Ok(values)
+    }
+
+    /// The rows of `ident` past `after_pk_key`, of `range` if given — a
+    /// chunk of up to `chunk_size`, in the cursor's order.
+    async fn read(
         &self,
         ident: &TableIdent,
+        range: Option<&KeyRange>,
         chunk_size: usize,
         after_pk_key: Option<&str>,
     ) -> SnapshotResult<Vec<Row>> {
-        let cached = self
-            .schemas
-            .get(ident)
-            .ok_or_else(|| SnapshotError::Source(format!("unknown table: {ident}")))?;
+        let cached = self.cached(ident)?;
 
-        // Build the SELECT.
-        let cols_sql: Vec<String> = cached
-            .schema
-            .columns
-            .iter()
-            .map(|c| quote_ident(&c.name))
-            .collect();
-        let cols_csv = cols_sql.join(", ");
         // Read on in the cursor's order; a first chunk in the index's.
         let (order, after) = match after_pk_key {
-            None => (
-                cached.index_order.clone().unwrap_or(cached.pk_cols.clone()),
-                None,
-            ),
+            None => (cached.read_order().to_vec(), None),
             Some(after) => {
                 let cursor = serde_json::from_str(after).map_err(|e| {
                     SnapshotError::Source(format!("decode after_pk_key {after:?}: {e}"))
@@ -318,67 +397,220 @@ impl SnapshotSource for PgSnapshotSource {
 
         let table_sql = qualified_table(ident);
 
-        let where_sql = match after {
-            Some(values) => {
-                let lits: Vec<String> = values
-                    .iter()
-                    .map(pg_value_to_sql_literal)
-                    .collect::<std::result::Result<_, _>>()
-                    .map_err(SnapshotError::Source)?;
-                format!(
-                    " WHERE ({pk}) > ({vals})",
-                    pk = pk_csv,
-                    vals = lits.join(", ")
-                )
+        let mut conditions = Vec::new();
+        if let Some(values) = after {
+            let lits: Vec<String> = values
+                .iter()
+                .map(pg_value_to_sql_literal)
+                .collect::<std::result::Result<_, _>>()
+                .map_err(SnapshotError::Source)?;
+            conditions.push(format!(
+                "({pk}) > ({vals})",
+                pk = pk_csv,
+                vals = lits.join(", ")
+            ));
+        }
+        if let Some(range) = range {
+            let lead = quote_ident(&cached.read_order()[0].0);
+            if let Some(from) = &range.from {
+                conditions.push(format!("{lead} >= {}", quote_lit(from)));
             }
-            None => String::new(),
+            if let Some(to) = &range.to {
+                conditions.push(format!("{lead} < {}", quote_lit(to)));
+            }
+        }
+        let where_sql = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
         };
 
         let q = format!(
-            "SELECT {cols} FROM {tbl}{where_clause} ORDER BY {pk} ASC LIMIT {limit}",
-            cols = cols_csv,
+            "COPY (SELECT {cols} FROM {tbl}{where_clause} ORDER BY {pk} ASC LIMIT {limit}) \
+             TO STDOUT (FORMAT binary)",
+            cols = cached.select,
             tbl = table_sql,
             where_clause = where_sql,
             pk = pk_csv,
             limit = chunk_size,
         );
 
-        let messages = {
-            let _reader = self
-                .readers
-                .acquire()
-                .await
-                .map_err(|e| SnapshotError::Source(format!("snapshot readers: {e}")))?;
-            // Each reader holds at most one client, so one is free.
-            let client = self
-                .clients
-                .iter()
-                .find_map(|c| c.try_lock().ok())
-                .expect("a free client per reader");
-            client
-                .simple_query(&q)
-                .await
-                .map_err(|e| SnapshotError::Source(format!("snapshot SELECT {ident}: {e}")))?
-        };
+        let copy = self
+            .copy_out(&q)
+            .await
+            .map_err(|e| SnapshotError::Source(format!("snapshot read of {ident}: {e}")))?;
 
+        let columns = &cached.schema.columns;
+        let malformed = |e: String| SnapshotError::Source(format!("snapshot read of {ident}: {e}"));
+        let mut tuples = snapshot_copy::Tuples::new(&copy, columns.len()).map_err(malformed)?;
+        let mut fields = Vec::with_capacity(columns.len());
         let mut out = Vec::with_capacity(chunk_size.min(64));
-        for msg in messages {
-            if let SimpleQueryMessage::Row(row) = msg {
-                let mut values = vec![PgValue::Null; cached.places.len()];
-                for ((idx, col), &place) in
-                    cached.schema.columns.iter().enumerate().zip(&cached.places)
-                {
-                    let raw: Option<&str> = row.try_get(idx).map_err(|e| {
-                        SnapshotError::Source(format!("row.try_get({}, {idx}): {e}", col.name))
+        while tuples.next_into(&mut fields).map_err(malformed)? {
+            let mut values = vec![PgValue::Null; cached.places.len()];
+            for ((col, &place), field) in columns.iter().zip(&cached.places).zip(&fields) {
+                if let Some(bytes) = field {
+                    values[place] = snapshot_copy::decode(col.ty, bytes).map_err(|e| {
+                        SnapshotError::Source(format!(
+                            "decode column {} ({:?}): {e}",
+                            col.name, col.ty
+                        ))
                     })?;
-                    if let Some(s) = raw {
-                        values[place] = decode_column(col, s)?;
-                    }
                 }
-                out.push(Row::with_columns(cached.row_columns.clone(), values));
             }
+            out.push(Row::with_columns(cached.row_columns.clone(), values));
         }
         Ok(out)
+    }
+
+    /// About how many rows `ident` holds, as of its last `ANALYZE`, its
+    /// partitions' included; none if never analyzed.
+    async fn estimated_rows(&self, ident: &TableIdent) -> SnapshotResult<f64> {
+        let q = format!(
+            "SELECT GREATEST(c.reltuples, 0) + COALESCE((                 SELECT sum(GREATEST(k.reltuples, 0)) FROM pg_inherits i                 JOIN pg_class k ON k.oid = i.inhrelid WHERE i.inhparent = c.oid), 0)              FROM pg_class c WHERE c.oid = {table}::regclass",
+            table = quote_lit(&qualified_table(ident)),
+        );
+        let rows = self.query_column(&q).await?;
+        Ok(rows
+            .into_iter()
+            .flatten()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0.0))
+    }
+
+    /// The bounds of `column`'s histogram in `pg_stats`, least first: of
+    /// as many rows between each two, about — but for its most common
+    /// values. Empty without one.
+    async fn histogram(&self, ident: &TableIdent, column: &str) -> SnapshotResult<Vec<String>> {
+        let q = format!(
+            "SELECT unnest(histogram_bounds::text::text[]) FROM (                 SELECT histogram_bounds FROM pg_stats                 WHERE schemaname = {schema} AND tablename = {table} AND attname = {column}                 ORDER BY inherited DESC LIMIT 1) s",
+            schema = quote_lit(&ident.namespace.0.join(".")),
+            table = quote_lit(&ident.name),
+            column = quote_lit(column),
+        );
+        Ok(self.query_column(&q).await?.into_iter().flatten().collect())
+    }
+
+    /// `parts - 1` integers evenly between `column`'s least and greatest
+    /// values, ascending, those that differ. Empty if it holds none.
+    async fn integer_bounds(
+        &self,
+        ident: &TableIdent,
+        column: &str,
+        parts: usize,
+    ) -> SnapshotResult<Vec<String>> {
+        let column = quote_ident(column);
+        let q = format!(
+            "SELECT min({column})::text FROM {table} UNION ALL SELECT max({column})::text FROM {table}",
+            table = qualified_table(ident),
+        );
+        let ends: Vec<i128> = self
+            .query_column(&q)
+            .await?
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.parse().ok())
+            .collect();
+        let [lo, hi] = ends[..] else {
+            return Ok(Vec::new());
+        };
+        let parts = parts as i128;
+        let mut bounds: Vec<String> = (1..parts)
+            .map(|p| lo + (hi - lo) * p / parts)
+            .filter(|&b| b > lo)
+            .map(|b| b.to_string())
+            .collect();
+        bounds.dedup();
+        Ok(bounds)
+    }
+}
+
+impl CachedSchema {
+    /// The order a table's first chunk is read in: its index's.
+    fn read_order(&self) -> &[ColumnName] {
+        self.index_order.as_deref().unwrap_or(&self.pk_cols)
+    }
+}
+
+#[async_trait]
+impl SnapshotSource for PgSnapshotSource {
+    async fn snapshot_lsn(&self) -> SnapshotResult<Lsn> {
+        Ok(self.snapshot_lsn)
+    }
+
+    async fn read_chunk(
+        &self,
+        ident: &TableIdent,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> SnapshotResult<Vec<Row>> {
+        self.read(ident, None, chunk_size, after_pk_key).await
+    }
+
+    async fn split(
+        &self,
+        ident: &TableIdent,
+        parts: usize,
+        min_rows: usize,
+    ) -> SnapshotResult<Vec<KeyRange>> {
+        let cached = self.cached(ident)?;
+        let rows = self.estimated_rows(ident).await?;
+        let parts = parts.min((rows / min_rows.max(1) as f64) as usize);
+        if parts < 2 {
+            return Ok(Vec::new());
+        }
+        let lead = &cached.read_order()[0].0;
+        let histogram = self.histogram(ident, lead).await?;
+        let mut bounds: Vec<String> = if histogram.len() > 2 {
+            // Every so many of its inner bounds, as many rows apart.
+            let buckets = histogram.len() - 1;
+            let parts = parts.min(buckets);
+            (1..parts)
+                .map(|p| histogram[p * buckets / parts].clone())
+                .collect()
+        } else {
+            let integer = cached
+                .schema
+                .columns
+                .iter()
+                .find(|c| c.name == *lead)
+                .is_some_and(|c| {
+                    matches!(
+                        c.ty,
+                        pg2iceberg_core::IcebergType::Int | pg2iceberg_core::IcebergType::Long
+                    )
+                });
+            if !integer {
+                return Ok(Vec::new());
+            }
+            self.integer_bounds(ident, lead, parts).await?
+        };
+        bounds.dedup();
+        if bounds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ends: Vec<Option<String>> = std::iter::once(None)
+            .chain(bounds.into_iter().map(Some))
+            .chain(std::iter::once(None))
+            .collect();
+        Ok(ends
+            .windows(2)
+            .map(|w| KeyRange {
+                from: w[0].clone(),
+                to: w[1].clone(),
+            })
+            .collect())
+    }
+
+    async fn read_range(
+        &self,
+        ident: &TableIdent,
+        range: &KeyRange,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> SnapshotResult<Vec<Row>> {
+        self.read(ident, Some(range), chunk_size, after_pk_key)
+            .await
     }
 
     fn cursor(
@@ -403,6 +635,37 @@ impl SnapshotSource for PgSnapshotSource {
             None => pk_key(last, pk_cols),
         }
     }
+}
+
+/// Each of `ident`'s columns' type's name and output function.
+async fn column_types(
+    client: &Client,
+    ident: &TableIdent,
+) -> Result<BTreeMap<String, (String, String)>> {
+    let q = format!(
+        "SELECT a.attname, t.typname, t.typoutput::regproc::text \
+         FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+         WHERE a.attrelid = {table}::regclass AND a.attnum > 0 AND NOT a.attisdropped",
+        table = quote_lit(&qualified_table(ident)),
+    );
+    let mut types = BTreeMap::new();
+    for msg in client
+        .simple_query(&q)
+        .await
+        .with_context(|| format!("simple_query {q:?}"))?
+    {
+        if let SimpleQueryMessage::Row(row) = msg {
+            let get = |i| -> Result<String> {
+                Ok(row
+                    .try_get(i)
+                    .context("pg_attribute")?
+                    .unwrap_or_default()
+                    .to_string())
+            };
+            types.insert(get(0)?, (get(1)?, get(2)?));
+        }
+    }
+    Ok(types)
 }
 
 /// The columns of `ident`'s primary key in its index's order, or `None`
@@ -430,7 +693,9 @@ async fn pk_index_order(client: &Client, ident: &TableIdent) -> Result<Option<Ve
     Ok((!cols.is_empty()).then_some(cols))
 }
 
-fn decode_column(col: &ColumnSchema, raw_text: &str) -> SnapshotResult<PgValue> {
+/// A value of `col` in its text form: what its binary form, which chunks
+/// are read in, decodes to as well.
+pub fn decode_column(col: &ColumnSchema, raw_text: &str) -> SnapshotResult<PgValue> {
     let pg_type = iceberg_to_pg_type_for_decode(col.ty);
     decode_text(pg_type, raw_text.as_bytes()).map_err(|e| {
         SnapshotError::Source(format!(

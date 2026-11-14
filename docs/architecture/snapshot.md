@@ -22,9 +22,21 @@ SELECT * FROM orders WHERE (o_w_id, o_d_id, o_id) > (3, 7, 2511)
 ORDER BY o_w_id, o_d_id, o_id LIMIT 10000
 ```
 
-The primary key's index serves each chunk. A chunk is written to the table's data files, and the next one is read from Postgres meanwhile, so up to two chunks of a table are in memory. The table is committed once, when all of it is read: readers see it empty, then complete, never part of it.
+The primary key's index serves each chunk. Its rows come in Postgres's binary form, as `COPY (SELECT …) TO STDOUT (FORMAT binary)` outputs them, each column cast to the type its Iceberg type is read from — decoding text took a third of a snapshot's CPU. A string column of a type other than `text` or `varchar`, such as `char(n)`, `inet` or an enum, comes as the text its type outputs. A chunk is written to the table's data files, and the next one is read from Postgres meanwhile, so up to two chunks of a table are in memory. The table is committed once, when all of it is read: readers see it empty, then complete, never part of it.
 
-Up to `source.logical.snapshot_concurrency` tables (default 4) are read at once, each on a task and a connection of its own. The first connection exports its snapshot (`pg_export_snapshot()`) and the others import it (`SET TRANSACTION SNAPSHOT`), so every table is read as of the same moment, whichever connection reads it. A table's rows are read in order by one connection, so the largest table bounds how long the snapshot takes.
+Up to `source.logical.snapshot_concurrency` tables (default 4) are read at once, each on a task and a connection of its own. The first connection exports its snapshot (`pg_export_snapshot()`) and the others import it (`SET TRANSACTION SNAPSHOT`), so every table is read as of the same moment, whichever connection reads it.
+
+## Large tables
+
+A table of more than ten chunks' rows is read in ranges of its key, up to 64, each on a task and connection of its own like a table, so one large table uses every task too. The ranges split the first column of the primary key's index, at the bounds of its histogram in `pg_stats`, so each holds about as many rows; a column without one — of few values, all common — is split evenly between its least and greatest values, if it's an integer. Postgres's statistics give the table's size, too, so a table never analyzed is read whole. Each range adds its condition to the chunk's:
+
+```sql
+SELECT * FROM orders WHERE (o_w_id, o_d_id, o_id) > (3, 7, 2511)
+  AND o_w_id >= '3' AND o_w_id < '5'
+ORDER BY o_w_id, o_d_id, o_id LIMIT 10000
+```
+
+A range writes its own data files, with its own share of the table's [file index](materializer.md#file-index) budget, and joins the table when it's read. The table is still committed once, when its last range joins; a range that fails fails the table, which a restart reads again, whole.
 
 ## Resumability
 

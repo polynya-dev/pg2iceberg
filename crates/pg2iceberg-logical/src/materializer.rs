@@ -473,6 +473,45 @@ struct Unit {
     remove_properties: BTreeSet<String>,
 }
 
+impl Unit {
+    /// Take in `other`'s steps, prepared: of another key range of the same
+    /// snapshot ([`Materializer::rejoin_range`]).
+    fn absorb(&mut self, other: Unit) {
+        debug_assert!(other.buf.is_empty(), "absorbed an unsealed unit");
+        self.steps.extend(other.steps);
+        self.folded += other.folded;
+        self.xids.extend(other.xids);
+        self.max_lsn = self.max_lsn.max(other.max_lsn);
+        self.max_source_ts_micros = self.max_source_ts_micros.max(other.max_source_ts_micros);
+    }
+}
+
+/// `steps` as the snapshots a commit adds: a step that only adds rows
+/// joins the one before it, and only one with equality deletes starts a
+/// snapshot of its own. An equality delete applies to the rows of lower
+/// sequence numbers — a snapshot's — so a step adding rows can take the
+/// number of the one before it: the deletes before that one still apply
+/// to its rows, those after still don't, and those of that one, of the
+/// same number, don't either, as they didn't when it came after. A
+/// snapshot for each step instead makes a commit's metadata grow with the
+/// square of its steps: each one's manifest list names every manifest
+/// before it. Steps without files are dropped.
+fn snapshot_steps(steps: Vec<PreparedCommit>) -> Vec<PreparedCommit> {
+    let mut snapshots: Vec<PreparedCommit> = Vec::new();
+    for step in steps {
+        if step.data_files.is_empty() && step.equality_deletes.is_empty() {
+            continue;
+        }
+        match snapshots.last_mut() {
+            Some(last) if step.equality_deletes.is_empty() => {
+                last.data_files.extend(step.data_files);
+            }
+            _ => snapshots.push(step),
+        }
+    }
+    snapshots
+}
+
 /// Table property prefix marking a column — `pg2iceberg.fill.<field id>`
 /// — added with a default Postgres stores for the rows that predate it,
 /// which carry no WAL for it: the value, as JSON, to fill into the rows
@@ -1888,7 +1927,78 @@ impl<C: Catalog> Materializer<C> {
     /// No meta tables or markers: their writers stay here.
     pub fn split_off(&mut self, ident: &TableIdent) -> Option<Self> {
         let entry = self.tables.remove(ident)?;
-        Some(Self {
+        Some(self.part(ident, entry))
+    }
+
+    /// A materializer for one of `ranges` key ranges of `ident`'s initial
+    /// snapshot, read apart from the others: of an empty table of its own,
+    /// with a FileIndex of its share of the budget, sharing this one's
+    /// stores, catalog cache, namer and metrics. What it applies
+    /// ([`Self::apply_snapshot_chunk`]) joins `ident`'s
+    /// ([`Self::rejoin_range`]), to commit with it. `None` unless the table
+    /// is empty and its snapshot not begun: rows it holds would need
+    /// folding against.
+    pub fn split_range(&self, ident: &TableIdent, ranges: usize) -> Option<Self> {
+        let entry = self.tables.get(ident)?;
+        if entry.file_index.holds_rows() || entry.snapshot.is_some() || !self.splits() {
+            return None;
+        }
+        let file_index = match self.pk_index_memory {
+            Some(bytes) => FileIndex::with_memory(bytes / ranges.max(1)),
+            None => FileIndex::new(),
+        };
+        let entry = TableEntry {
+            schema: entry.schema.clone(),
+            pk_cols: entry.pk_cols.clone(),
+            file_index,
+            index_at: entry.index_at,
+            writer: TableWriter::new(entry.schema.clone()),
+            gated_until_snapshot: false,
+            backfill: entry.backfill,
+            snapshot: None,
+        };
+        Some(self.part(ident, entry))
+    }
+
+    /// Make the rows applied to `ident`'s snapshot ready to commit: fold
+    /// and upload those still buffered ([`Self::apply_snapshot_chunk`]).
+    pub async fn seal_snapshot(&mut self, ident: &TableIdent) -> Result<()> {
+        let entry = self
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| MaterializerError::UnknownTable(ident.clone()))?;
+        let Some(mut unit) = entry.snapshot.take() else {
+            return Ok(());
+        };
+        let sealed = self.prepare_step(ident, &mut unit).await;
+        if let Some(entry) = self.tables.get_mut(ident) {
+            entry.snapshot = Some(unit);
+        }
+        sealed
+    }
+
+    /// Take back a range [`Self::split_range`] made, sealed: its rows join
+    /// `ident`'s snapshot, and its FileIndex the table's.
+    pub fn rejoin_range(&mut self, ident: &TableIdent, part: Self) {
+        let Some(entry) = self.tables.get_mut(ident) else {
+            return;
+        };
+        for (_, range) in part.tables {
+            entry.file_index.absorb(range.file_index);
+            if let Some(unit) = range.snapshot {
+                match &mut entry.snapshot {
+                    Some(mine) => mine.absorb(unit),
+                    None => entry.snapshot = Some(unit),
+                }
+            }
+        }
+    }
+
+    /// A materializer for `ident`, of `entry`, sharing this one's stores,
+    /// catalog cache, namer and metrics. No meta tables or markers: their
+    /// writers stay here.
+    fn part(&self, ident: &TableIdent, entry: TableEntry) -> Self {
+        Self {
             coord: self.coord.clone(),
             blob_store: self.blob_store.clone(),
             catalog: self.catalog.clone(),
@@ -1905,7 +2015,7 @@ impl<C: Catalog> Materializer<C> {
             maintenance: self.maintenance,
             table_concurrency: 1,
             pk_index_memory: self.pk_index_memory,
-        })
+        }
     }
 
     /// Take back a table [`Self::split_off`] moved out.
@@ -2743,7 +2853,8 @@ impl<C: Catalog> Materializer<C> {
 
     async fn commit(&mut self, ident: &TableIdent, unit: &mut Unit) -> Result<usize> {
         self.prepare_step(ident, unit).await?;
-        let unit = std::mem::take(unit);
+        let mut unit = std::mem::take(unit);
+        unit.steps = snapshot_steps(unit.steps);
         // How far it read the log: not at all, for rows read straight
         // from Postgres.
         let log_end = match unit.end_offset {
@@ -2770,7 +2881,7 @@ impl<C: Catalog> Materializer<C> {
         span.record("delete_files", delete_files_count);
         span.record("bytes", bytes_written);
 
-        // The commit adds one snapshot per step with files.
+        // The commit adds one snapshot per step: each has files.
         let snapshots = unit
             .steps
             .iter()
@@ -2832,7 +2943,7 @@ impl<C: Catalog> Materializer<C> {
                         .load_table(ident)
                         .await?
                         .and_then(|meta| meta.log_ends.get(&group).copied());
-                    if !applied.is_some_and(|end| end >= end_offset) {
+                    if applied.is_none_or(|end| end < end_offset) {
                         return Err(e.into());
                     }
                     tracing::warn!(error = %e, table = %ident, "commit reported failure but landed");

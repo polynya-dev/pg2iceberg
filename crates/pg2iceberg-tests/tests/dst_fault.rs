@@ -45,7 +45,7 @@ use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::fault::{ops, FaultPlan, FaultyBlobStore, FaultyCatalog, FaultyCoordinator};
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
-use pg2iceberg_snapshot::{run_snapshot_phase, SnapshotPhaseOutcome, Snapshotter};
+use pg2iceberg_snapshot::{run_snapshot_phase, KeyRange, SnapshotPhaseOutcome, Snapshotter};
 use pg2iceberg_validate::{
     run_logical_main_loop, run_materialize_tick, run_watcher_tick, InvariantWatcher, LogicalLoop,
 };
@@ -2365,6 +2365,14 @@ struct SnapshotReads {
 }
 
 impl SnapshotReads {
+    fn count(&self, chunk: Vec<Row>) -> Vec<Row> {
+        self.chunks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.rows
+            .fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+        chunk
+    }
+
     fn chunks(&self) -> usize {
         self.chunks.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -2387,13 +2395,30 @@ impl pg2iceberg_snapshot::SnapshotSource for CountingSource {
         after_pk_key: Option<&str>,
     ) -> pg2iceberg_snapshot::Result<Vec<Row>> {
         let chunk = self.db.read_chunk(ident, chunk_size, after_pk_key).await?;
-        self.reads
-            .chunks
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.reads
-            .rows
-            .fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
-        Ok(chunk)
+        Ok(self.reads.count(chunk))
+    }
+
+    async fn split(
+        &self,
+        ident: &TableIdent,
+        parts: usize,
+        min_rows: usize,
+    ) -> pg2iceberg_snapshot::Result<Vec<KeyRange>> {
+        self.db.split(ident, parts, min_rows).await
+    }
+
+    async fn read_range(
+        &self,
+        ident: &TableIdent,
+        range: &KeyRange,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> pg2iceberg_snapshot::Result<Vec<Row>> {
+        let chunk = self
+            .db
+            .read_range(ident, range, chunk_size, after_pk_key)
+            .await?;
+        Ok(self.reads.count(chunk))
     }
 }
 
@@ -2491,12 +2516,15 @@ fn thousand_row_db() -> SimPostgres {
     db
 }
 
-/// A lifecycle over `db` and `stores`, failing as `stores.plan` says. It
-/// snapshots `accounts`, then `orders`: each table's commit and record of
+/// A lifecycle over `db` and `stores`, failing as `stores.plan` says,
+/// reading `flush_rows` a chunk, `tasks` at once. It snapshots
+/// `accounts`, then `orders`: each table's commit and record of
 /// completion are its second.
-fn faulty_lifecycle(
+fn faulty_lifecycle_reading(
     db: &SimPostgres,
     stores: &SimStores,
+    flush_rows: usize,
+    tasks: usize,
 ) -> pg2iceberg_validate::LogicalLifecycle<FaultyCatalog> {
     let catalog = Arc::new(FaultyCatalog::new(
         stores.catalog.clone(),
@@ -2504,8 +2532,8 @@ fn faulty_lifecycle(
     ));
     let mut lifecycle = sim_lifecycle_with(db, stores, every_second(), catalog);
     lifecycle.schemas = vec![first_schema(), schema()];
-    lifecycle.snapshot_concurrency = 1;
-    lifecycle.flush_rows = 100;
+    lifecycle.snapshot_concurrency = tasks;
+    lifecycle.flush_rows = flush_rows;
     lifecycle.mat_batch_rows = 100;
     lifecycle
 }
@@ -2514,10 +2542,21 @@ fn faulty_lifecycle(
 /// one the first run read, one it removes, one it read later; then
 /// restart it. What the restart's snapshot read.
 async fn fail_change_and_restart(db: &SimPostgres, stores: &SimStores) -> Arc<SnapshotReads> {
+    fail_change_and_restart_reading(db, stores, 100, 1).await
+}
+
+/// [`fail_change_and_restart`], each run reading `flush_rows` a chunk,
+/// `tasks` at once.
+async fn fail_change_and_restart_reading(
+    db: &SimPostgres,
+    stores: &SimStores,
+    flush_rows: usize,
+    tasks: usize,
+) -> Arc<SnapshotReads> {
     use std::time::Duration;
 
     pg2iceberg_validate::run_logical_lifecycle(
-        faulty_lifecycle(db, stores),
+        faulty_lifecycle_reading(db, stores, flush_rows, tasks),
         Box::pin(tokio::time::sleep(Duration::from_secs(30))),
     )
     .await
@@ -2533,7 +2572,7 @@ async fn fail_change_and_restart(db: &SimPostgres, stores: &SimStores) -> Arc<Sn
     tx.commit(Timestamp(0)).unwrap();
 
     stores.plan.clear_failures();
-    let mut restarted = faulty_lifecycle(db, stores);
+    let mut restarted = faulty_lifecycle_reading(db, stores, flush_rows, tasks);
     // Names of its own: the store refuses to overwrite the first run's.
     restarted.blob_namer = Arc::new(CounterBlobNamer::new("s3://stage/restarted"));
     restarted.materializer_namer = Arc::new(CounterMaterializerNamer::new("s3://table/restarted"));
@@ -2665,6 +2704,332 @@ async fn a_snapshot_lands_every_table_it_reads_together() {
             .and_then(|r| r.get(&ColumnName("qty".into())));
         assert_eq!(first, Some(&PgValue::Int4(-1)), "{}", s.ident);
     }
+}
+
+/// `SimPostgres`'s snapshot a round trip away: how many reads of a
+/// table's ranges it serves at once, at most, and how many it fails.
+#[derive(Default)]
+struct RangeSource {
+    db: SimPostgres,
+    reading: std::sync::atomic::AtomicUsize,
+    most: std::sync::atomic::AtomicUsize,
+    /// Read of ranges, so far.
+    reads: std::sync::atomic::AtomicUsize,
+    /// The read of ranges, counting from 1, that fails.
+    failing: std::sync::Mutex<Option<usize>>,
+}
+
+impl RangeSource {
+    fn new(db: &SimPostgres) -> Self {
+        Self {
+            db: db.clone(),
+            ..Self::default()
+        }
+    }
+
+    fn most(&self) -> usize {
+        self.most.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl pg2iceberg_snapshot::SnapshotSource for RangeSource {
+    async fn snapshot_lsn(&self) -> pg2iceberg_snapshot::Result<pg2iceberg_core::Lsn> {
+        self.db.snapshot_lsn().await
+    }
+
+    async fn read_chunk(
+        &self,
+        ident: &TableIdent,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> pg2iceberg_snapshot::Result<Vec<Row>> {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        self.db.read_chunk(ident, chunk_size, after_pk_key).await
+    }
+
+    async fn split(
+        &self,
+        ident: &TableIdent,
+        parts: usize,
+        min_rows: usize,
+    ) -> pg2iceberg_snapshot::Result<Vec<KeyRange>> {
+        self.db.split(ident, parts, min_rows).await
+    }
+
+    async fn read_range(
+        &self,
+        ident: &TableIdent,
+        range: &KeyRange,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> pg2iceberg_snapshot::Result<Vec<Row>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let read = self.reads.fetch_add(1, SeqCst) + 1;
+        if *self.failing.lock().unwrap() == Some(read) {
+            return Err(pg2iceberg_snapshot::SnapshotError::Source(
+                "connection reset".into(),
+            ));
+        }
+        let reading = self.reading.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(reading, SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        self.reading.fetch_sub(1, SeqCst);
+        self.db
+            .read_range(ident, range, chunk_size, after_pk_key)
+            .await
+    }
+}
+
+/// A table of more rows than ten chunks is read in ranges of its keys,
+/// up to `snapshot_concurrency` at once, each into a part of the table's
+/// index — of a key or so each, here, evicting the rest. The table lands
+/// whole, and takes the changes after it, in each range.
+#[tokio::test(start_paused = true)]
+async fn a_large_table_is_read_in_ranges_at_once() {
+    use std::time::Duration;
+
+    const ROWS: i32 = 3000;
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let mut tx = db.begin_tx();
+    for i in 1..=ROWS {
+        tx.insert(&ident(), row(i, i * 10));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    let stores = SimStores::new();
+    let mut lifecycle = sim_lifecycle_on(&db, &stores, every_second());
+    lifecycle.flush_rows = 100;
+    // A range's last rows short of a step: written as it ends.
+    lifecycle.mat_batch_rows = 300;
+    lifecycle.snapshot_concurrency = 4;
+    lifecycle.pk_index_memory = 64;
+    let source = Arc::new(RangeSource::new(&db));
+    let factory_source = source.clone();
+    lifecycle.snapshot_source_factory = Box::new(move |_| {
+        let source = factory_source.clone();
+        Box::pin(async move {
+            Ok::<Box<dyn pg2iceberg_snapshot::SnapshotSource>, pg2iceberg_validate::LifecycleError>(
+                Box::new(SharedSource(source)),
+            )
+        })
+    });
+    let script = db.clone();
+    let shutdown = Box::pin(async move {
+        // Past the snapshot.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut tx = script.begin_tx();
+        tx.update(&ident(), row(1, -1));
+        tx.update(&ident(), row(1500, -1));
+        // Its `qty` TOASTed, unchanged: found in the row the snapshot
+        // wrote, through the index.
+        tx.update_with_unchanged(&ident(), row(2500, 0), vec![ColumnName("qty".into())]);
+        tx.delete(
+            &ident(),
+            Row::from([(ColumnName("id".into()), PgValue::Int4(2999))]),
+        );
+        tx.insert(&ident(), row(ROWS + 1, 0));
+        tx.commit(Timestamp(0)).unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    assert!(
+        source.most() > 1,
+        "its ranges read {} at once",
+        source.most()
+    );
+    let rows = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), ROWS as usize);
+    let qty = |id: i32| {
+        rows.iter()
+            .find(|r| r.get(&ColumnName("id".into())) == Some(&PgValue::Int4(id)))
+            .map(|r| r.get(&ColumnName("qty".into())).cloned())
+    };
+    assert_eq!(qty(1), Some(Some(PgValue::Int4(-1))));
+    assert_eq!(qty(1500), Some(Some(PgValue::Int4(-1))));
+    assert_eq!(qty(2000), Some(Some(PgValue::Int4(20_000))));
+    assert_eq!(qty(2500), Some(Some(PgValue::Int4(25_000))));
+    assert_eq!(qty(2999), None, "a row deleted after the snapshot");
+    assert_eq!(qty(ROWS + 1), Some(Some(PgValue::Int4(0))));
+}
+
+/// A table's snapshot is committed as one Iceberg snapshot, however many
+/// steps it's written in — here ten, over its ranges: a step that only
+/// adds rows needs no sequence number of its own, and a snapshot for
+/// each makes a commit's metadata grow with the square of its steps.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_commits_as_one_iceberg_snapshot() {
+    use std::time::Duration;
+
+    const ROWS: i32 = 3000;
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let mut tx = db.begin_tx();
+    for i in 1..=ROWS {
+        tx.insert(&ident(), row(i, i * 10));
+    }
+    tx.commit(Timestamp(0)).unwrap();
+    let stores = SimStores::new();
+    let mut lifecycle = sim_lifecycle_on(&db, &stores, every_second());
+    lifecycle.flush_rows = 100;
+    lifecycle.mat_batch_rows = 300;
+    lifecycle.snapshot_concurrency = 4;
+    let shutdown = Box::pin(tokio::time::sleep(Duration::from_secs(10)));
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let snapshots = pg2iceberg_iceberg::Catalog::snapshots(stores.catalog.as_ref(), &ident())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshots.len(),
+        1,
+        "the snapshot committed {} snapshots",
+        snapshots.len()
+    );
+    let rows = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), ROWS as usize);
+}
+
+/// A boxed [`RangeSource`] the test keeps a hold of.
+struct SharedSource(Arc<RangeSource>);
+
+#[async_trait::async_trait]
+impl pg2iceberg_snapshot::SnapshotSource for SharedSource {
+    async fn snapshot_lsn(&self) -> pg2iceberg_snapshot::Result<pg2iceberg_core::Lsn> {
+        self.0.snapshot_lsn().await
+    }
+
+    async fn read_chunk(
+        &self,
+        ident: &TableIdent,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> pg2iceberg_snapshot::Result<Vec<Row>> {
+        self.0.read_chunk(ident, chunk_size, after_pk_key).await
+    }
+
+    async fn split(
+        &self,
+        ident: &TableIdent,
+        parts: usize,
+        min_rows: usize,
+    ) -> pg2iceberg_snapshot::Result<Vec<KeyRange>> {
+        self.0.split(ident, parts, min_rows).await
+    }
+
+    async fn read_range(
+        &self,
+        ident: &TableIdent,
+        range: &KeyRange,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> pg2iceberg_snapshot::Result<Vec<Row>> {
+        self.0
+            .read_range(ident, range, chunk_size, after_pk_key)
+            .await
+    }
+}
+
+/// A read of one range fails while the others land: the table, not
+/// complete, is abandoned whole — the ranges landed with it — and read
+/// again, from the start, by the snapshot run next in the same process.
+#[tokio::test(start_paused = true)]
+async fn a_table_whose_range_fails_is_read_again_whole() {
+    const ROWS: i32 = 3000;
+    let seeds: Vec<(i32, i32)> = (1..=ROWS).map(|i| (i, i * 10)).collect();
+    let mut h = FaultHarness::boot_with_seeds(&seeds);
+    h.materializer.set_pk_index_memory(64);
+    let source = Arc::new(RangeSource::new(&h.db));
+    // A range's fifth chunk: the others have landed some by then.
+    *source.failing.lock().unwrap() = Some(15);
+    let tasks = pg2iceberg_snapshot::Concurrency {
+        tables: 4,
+        spawn: Arc::new(|task| {
+            tokio::spawn(task);
+        }),
+    };
+
+    for run in 0..2 {
+        let outcome = run_snapshot_phase(
+            source.clone(),
+            h.coord.clone() as Arc<dyn Coordinator>,
+            &[schema()],
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &mut h.materializer,
+            100,
+            Some(tasks.clone()),
+        )
+        .await;
+        match run {
+            0 => {
+                outcome.expect_err("a range's read failed");
+            }
+            _ => assert!(matches!(
+                outcome.unwrap(),
+                SnapshotPhaseOutcome::Completed { .. }
+            )),
+        }
+    }
+
+    assert!(
+        source.most() > 1,
+        "its ranges read {} at once",
+        source.most()
+    );
+    let materialized = read_materialized_state(
+        h.catalog_inner.as_ref(),
+        h.blob_inner.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(materialized.len(), ROWS as usize);
+    let deletes = pg2iceberg_stream::BlobStore::list(h.blob_inner.as_ref(), "s3://table")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|b| b.path.contains("eq-delete"))
+        .count();
+    assert_eq!(deletes, 0, "the retry deleted rows");
+}
+
+/// A table read in ranges whose commit fails is read again by the
+/// restart, whole.
+#[tokio::test(start_paused = true)]
+async fn a_table_read_in_ranges_failing_its_commit_reads_it_again() {
+    let db = thousand_row_db();
+    let stores = SimStores::new();
+    // `accounts`' commit, then `orders`'.
+    stores.plan.fail(ops::CAT_COMMIT_SNAPSHOT, [1]);
+
+    let reads = fail_change_and_restart_reading(&db, &stores, 50, 4).await;
+
+    assert_eq!(reads.rows(), 999, "the restart read {} rows", reads.rows());
+    assert_changes_landed(&stores).await;
 }
 
 /// `MemoryBlobStore`, but a compaction output takes `latency` to upload.

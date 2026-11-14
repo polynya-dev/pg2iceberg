@@ -13,6 +13,7 @@ pub mod init;
 pub mod realio;
 pub mod run;
 pub mod setup;
+pub mod snapshot_copy;
 pub mod snapshot_src;
 pub mod subscriber;
 pub mod tables;

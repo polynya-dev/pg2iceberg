@@ -103,8 +103,8 @@ where
     let snapshot_source_factory = Box::new(move |to_snapshot: &[TableSchema]| {
         let pg_cfg = pg_cfg.clone();
         let to_snapshot = to_snapshot.to_vec();
-        // A connection for each table read at once.
-        let connections = snapshot_concurrency.min(to_snapshot.len()).max(1);
+        // A connection for each table, or range of one, read at once.
+        let connections = snapshot_concurrency;
         Box::pin(async move {
             let source = PgSnapshotSource::open(&pg_cfg, &to_snapshot, connections)
                 .await
