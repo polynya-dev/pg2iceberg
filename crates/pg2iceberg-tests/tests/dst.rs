@@ -2043,6 +2043,24 @@ impl DstHarness {
         }
     }
 
+    /// The live data files that the pass held for
+    /// [`AuditedCatalog::land_before_next_commit`] removes, if one is.
+    fn racing_data_files(&self) -> Option<Vec<LiveFile>> {
+        let removed: BTreeSet<String> = match &*self.audited.land_before_next_commit.lock().unwrap()
+        {
+            None => return None,
+            Some(HeldPass::Job(pass) | HeldPass::Catalog(pass, _)) => {
+                pass.removed_paths.iter().cloned().collect()
+            }
+        };
+        let live = block_on(self.storage.live_files(&ident())).unwrap();
+        Some(
+            live.into_iter()
+                .filter(|f| f.equality_ids.is_none() && removed.contains(&f.path))
+                .collect(),
+        )
+    }
+
     /// A partial compaction pass must not change what readers see. The
     /// audited catalog checks the commit against transaction boundaries;
     /// this checks the stronger before == after.
@@ -2063,6 +2081,9 @@ impl DstHarness {
             rows
         };
         let before = state(self);
+        // The data files a pass another process holds (`*MidCommit`)
+        // removes, should it land just before this one's commit.
+        let racing = self.racing_data_files();
         // Compaction errors are non-fatal in the lifecycle; a pass whose
         // commit response was lost applied anyway, and one that lost to
         // another process's pass over the same files plans again next time.
@@ -2073,11 +2094,22 @@ impl DstHarness {
                 // 18. Delete files don't pile up: past a pass, none is
                 //     older than every data file — nothing is left for it
                 //     to apply to. Even where the catalog compacts, and
-                //     leaves them.
+                //     leaves them. The files another process's pass
+                //     removed while this one ran count still: this pass
+                //     planned with them, and what they held back is the
+                //     next one's to retire.
+                let landed = self
+                    .audited
+                    .land_before_next_commit
+                    .lock()
+                    .unwrap()
+                    .is_none();
+                let removed_meanwhile = racing.iter().flatten().filter(|_| landed);
                 let live = block_on(self.storage.live_files(&ident())).unwrap();
                 let oldest_data = live
                     .iter()
                     .filter(|f| f.equality_ids.is_none())
+                    .chain(removed_meanwhile)
                     .map(|f| f.seq)
                     .min();
                 let dangling: Vec<&str> = live
@@ -4414,6 +4446,41 @@ fn the_catalogs_compaction_racing_a_change(prod: bool) {
             managed_case(prod, &steps);
         }
     }
+}
+
+/// The catalog's compaction lands while pg2iceberg's pass retiring deletes
+/// commits, and drops the last data file a delete applies to — the pass
+/// planned to keep that delete, and leaves it to the next. Invariant 18
+/// holds the pass to the table it planned with.
+#[test]
+fn the_catalogs_compaction_landing_mid_pass_leaves_a_delete_to_the_next() {
+    managed_case(false, &the_catalogs_compaction_landing_mid_pass());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn the_catalogs_compaction_landing_mid_pass_leaves_a_delete_to_the_next_on_iceberg() {
+    managed_case(true, &the_catalogs_compaction_landing_mid_pass());
+}
+
+/// A dangling delete (the catalog rewrote the file it applied to), a
+/// truncate's delete over the one data file left, and a newer row. The
+/// pass retires the first delete, as the file it read is older; the
+/// catalog's pass, landing first, drops that file.
+fn the_catalogs_compaction_landing_mid_pass() -> Vec<Step> {
+    let cycle = |s: Step| [s, Step::DriveFlush, Step::MaterializerCycle];
+    let catalog_pass = Step::CatalogCompactPlan {
+        own_sequence_number: false,
+    };
+    [
+        &cycle(Step::Insert { id: 1, qty: 10 })[..],
+        &cycle(Step::Update { id: 1, qty: 11 }),
+        &[catalog_pass.clone(), Step::CatalogCompactCommit],
+        &cycle(Step::Truncate { reinsert: None }),
+        &cycle(Step::Insert { id: 2, qty: 20 }),
+        &[catalog_pass, Step::CatalogCompactMidCommit, Step::Compact],
+    ]
+    .concat()
 }
 
 /// As above, with a column dropped and re-added in what landed: applying
