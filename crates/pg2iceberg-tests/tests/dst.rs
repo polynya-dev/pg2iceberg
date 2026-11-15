@@ -2093,8 +2093,10 @@ impl DstHarness {
                 }
             }
             Err(e) if e.to_string().contains("response lost") => {}
+            // Production's catalog capitalizes it: "Rewrite removes ...".
             Err(e)
                 if e.to_string()
+                    .to_lowercase()
                     .contains("rewrite removes files no longer in the table") => {}
             Err(e) => panic!("compaction: {e}"),
         }
@@ -4294,6 +4296,42 @@ fn orphan_cleanup_leaves_the_catalogs_compaction_be() {
     ]
     .concat();
     managed_case(false, &steps);
+}
+
+/// A `compact` job's pass retires a delete file first, and pg2iceberg's
+/// own pass, which would retire it too, loses: its commit fails, and the
+/// next pass plans again. Production's catalog words the conflict its
+/// own way.
+#[test]
+fn a_pass_losing_to_a_jobs_pass_plans_again() {
+    managed_case(false, &pass_losing_to_a_jobs_pass());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_pass_losing_to_a_jobs_pass_plans_again_on_iceberg() {
+    managed_case(true, &pass_losing_to_a_jobs_pass());
+}
+
+fn pass_losing_to_a_jobs_pass() -> Vec<Step> {
+    [
+        &[
+            Step::BigTx { inserts: 2, qty: 0 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Compact,
+        ][..],
+        &catalog_compaction(),
+        &[
+            Step::ExternalCompactPlan,
+            Step::ExternalCompactMidCommit,
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Compact,
+        ],
+        &catalog_compaction(),
+    ]
+    .concat()
 }
 
 /// Where the catalog compacts the table, pg2iceberg leaves its data files
