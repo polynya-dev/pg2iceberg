@@ -160,6 +160,7 @@ fn unreferenced_blobs_outside_grace_window_get_deleted() {
         PREFIX,
         2500, // now
         500,  // grace
+        None,
     ))
     .unwrap();
     // The committed row's data file is referenced; the orphan at ms=1000
@@ -195,6 +196,7 @@ fn fresh_orphans_are_grace_protected() {
         PREFIX,
         1000, // now == orphan's mtime
         500,  // grace; cutoff = 500, orphan at 1000 > 500
+        None,
     ))
     .unwrap();
     assert_eq!(outcome.deleted, 0, "fresh orphans must be protected");
@@ -202,6 +204,40 @@ fn fresh_orphans_are_grace_protected() {
 
     // Both paths still present.
     assert_eq!(h.blob.paths().len(), 2);
+}
+
+/// With a write in flight, the files since it began — less the grace
+/// period — are kept however old; those before it are orphans as ever.
+#[test]
+fn a_write_in_flight_keeps_the_files_since_it_began() {
+    let h = Harness::new();
+    let s = schema();
+    ensure(&h, &s);
+    h.commit_row(&s, row(1, 10));
+    for (ms, name) in [(1000, "before"), (1450, "within-grace"), (1600, "since")] {
+        h.blob.set_clock_ms(ms);
+        h.write_orphan(&format!("{PREFIX}orphan-{name}.parquet"));
+    }
+
+    let outcome = block_on(cleanup_orphans(
+        &h.cat,
+        h.blob.as_ref(),
+        &ident(),
+        PREFIX,
+        5000,       // now: every orphan past the grace period
+        100,        // grace
+        Some(1500), // the write began: files from 1400 on stay
+    ))
+    .unwrap();
+    assert_eq!(outcome.deleted, 1);
+    assert_eq!(outcome.grace_protected, 0);
+    assert_eq!(outcome.in_flight_protected, 2);
+    let left: Vec<String> = h.blob.paths();
+    assert!(
+        !left.iter().any(|p| p.ends_with("orphan-before.parquet")),
+        "{left:?}"
+    );
+    assert_eq!(left.len(), 3, "{left:?}");
 }
 
 #[test]
@@ -219,6 +255,7 @@ fn referenced_blobs_are_never_deleted() {
         PREFIX,
         i64::MAX / 2,
         0,
+        None,
     ))
     .unwrap();
     assert_eq!(outcome.deleted, 0);
@@ -246,6 +283,7 @@ fn paths_outside_prefix_are_ignored() {
         PREFIX,
         i64::MAX / 2,
         0,
+        None,
     ))
     .unwrap();
     assert_eq!(outcome.deleted, 0);
@@ -300,6 +338,7 @@ fn compaction_replaced_files_become_orphans() {
         PREFIX,
         i64::MAX / 2,
         0,
+        None,
     ))
     .unwrap();
     assert_eq!(outcome.deleted, 3);
@@ -323,6 +362,7 @@ fn cleanup_with_no_orphans_is_a_noop() {
         PREFIX,
         i64::MAX / 2,
         0,
+        None,
     ))
     .unwrap();
     assert_eq!(outcome.deleted, 0);

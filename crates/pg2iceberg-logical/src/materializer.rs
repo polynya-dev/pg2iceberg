@@ -33,8 +33,8 @@ use pg2iceberg_coord::{Coordinator, LogEntry};
 use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::typemap::IcebergType;
 use pg2iceberg_core::{
-    is_snapshot_xid, ColumnName, ColumnSchema, IdGen, Lsn, Metrics, Namespace, NoopMetrics, Op,
-    PgValue, Row, TableIdent, TableSchema, Timestamp,
+    is_snapshot_xid, Clock, ColumnName, ColumnSchema, IdGen, Lsn, Metrics, Namespace, NoopMetrics,
+    Op, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
 use pg2iceberg_iceberg::meta::{
     self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
@@ -444,6 +444,22 @@ pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
 /// `Materializer`'s.
 pub const DEFAULT_PK_INDEX_MEMORY: usize = 512 << 20;
 
+/// The writers whose writes in flight a materializer records
+/// ([`Coordinator::begin_write`]): files it uploaded for a table and
+/// hasn't committed yet, which orphan cleanup keeps. One table has at most
+/// one write of each in flight: one process applies a table's changes,
+/// and the key ranges of its snapshot share theirs.
+pub mod writers {
+    /// The changes the materializer applies — staged backfill rows too.
+    pub const CHANGES: &str = "changes";
+    /// The initial snapshot, written to the table as it's read.
+    pub const SNAPSHOT: &str = "snapshot";
+    /// A compaction pass of the process that applies the changes.
+    pub const COMPACTION: &str = "compaction";
+    /// A compaction pass of `pg2iceberg compact`.
+    pub const COMPACT_COMMAND: &str = "compact command";
+}
+
 /// Steps read but not yet committed. Committed together, as one atomic
 /// `commit_snapshots`, so a transaction spanning several steps becomes
 /// visible at once.
@@ -471,6 +487,9 @@ struct Unit {
     filled: BTreeSet<i32>,
     /// Table properties the commit removes.
     remove_properties: BTreeSet<String>,
+    /// Whether its steps' uploads are recorded as a write in flight
+    /// ([`Materializer::unit_writer`]).
+    writing: bool,
 }
 
 impl Unit {
@@ -483,6 +502,7 @@ impl Unit {
         self.xids.extend(other.xids);
         self.max_lsn = self.max_lsn.max(other.max_lsn);
         self.max_source_ts_micros = self.max_source_ts_micros.max(other.max_source_ts_micros);
+        self.writing |= other.writing;
     }
 }
 
@@ -565,6 +585,11 @@ pub struct CompactionJob<C> {
     /// The FileIndex's [`FileIndex::unseen_deaths`] as the pass began.
     unseen_deaths: BTreeMap<String, u64>,
     config: pg2iceberg_iceberg::CompactionConfig,
+    /// Where the pass records its outputs, uploaded until it commits, as
+    /// a write in flight — as `writer`, by `clock`.
+    coord: Arc<dyn Coordinator>,
+    writer: &'static str,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl<C: Catalog> CompactionJob<C> {
@@ -572,16 +597,35 @@ impl<C: Catalog> CompactionJob<C> {
         &self.ident
     }
 
-    /// Prepare the pass: plan it, rewrite its inputs, upload its outputs.
+    /// Prepare the pass: plan it, rewrite its inputs, upload its outputs —
+    /// recorded as a write in flight until it commits
+    /// ([`Materializer::commit_compaction_pass`]).
     pub async fn run(self) -> CompactionPass {
         let started_micros = now_micros();
-        let pass = self.prepare().await;
+        let since_ms = now_ms(self.clock.as_deref());
+        let pass = match self
+            .coord
+            .begin_write(&self.ident, self.writer, since_ms)
+            .await
+        {
+            Ok(()) => self.prepare().await,
+            Err(e) => Err(pg2iceberg_iceberg::CompactError::Catalog(
+                pg2iceberg_iceberg::IcebergError::Other(format!(
+                    "record the pass as a write in flight: {e}"
+                )),
+            )),
+        };
+        // Nothing uploaded to commit: no write in flight.
+        if !matches!(pass, Ok(Some(_))) {
+            end_write(self.coord.as_ref(), &self.ident, self.writer).await;
+        }
         CompactionPass {
             ident: self.ident,
             started_micros,
             seconds: seconds_since(started_micros),
             unseen_deaths: self.unseen_deaths,
             pass,
+            writer: self.writer,
         }
     }
 
@@ -625,6 +669,8 @@ pub struct CompactionPass {
         Option<pg2iceberg_iceberg::PreparedPass>,
         pg2iceberg_iceberg::CompactError,
     >,
+    /// The write in flight its outputs are, if it uploaded any.
+    writer: &'static str,
 }
 
 impl CompactionPass {
@@ -687,6 +733,11 @@ pub struct Materializer<C: Catalog> {
     /// Most bytes a table's FileIndex holds ([`Self::with_pk_index_memory`]);
     /// `None`: every key.
     pk_index_memory: Option<usize>,
+    /// What times the writes in flight ([`Self::set_clock`]); `None`: the
+    /// system's clock.
+    clock: Option<Arc<dyn Clock>>,
+    /// The writer its compaction passes record ([`writers`]).
+    compaction_writer: &'static str,
 }
 
 /// Distributed-mode parameters. Built by
@@ -810,6 +861,8 @@ impl<C: Catalog> Materializer<C> {
             maintenance: Maintenance::default(),
             table_concurrency: DEFAULT_TABLE_CONCURRENCY,
             pk_index_memory: None,
+            clock: None,
+            compaction_writer: writers::COMPACTION,
         }
     }
 
@@ -2015,6 +2068,8 @@ impl<C: Catalog> Materializer<C> {
             maintenance: self.maintenance,
             table_concurrency: 1,
             pk_index_memory: self.pk_index_memory,
+            clock: self.clock.clone(),
+            compaction_writer: self.compaction_writer,
         }
     }
 
@@ -2101,6 +2156,18 @@ impl<C: Catalog> Materializer<C> {
             // Trailing `/`: `ns.orders/` must not match `ns.orders2/`.
             let table_prefix = format!("{}/", self.namer.table_dir(&ident).await);
             let started_micros = now_micros();
+            // Before the table: a write that ends after this reads it has
+            // committed its files by then.
+            let writes = self.coord.writes_in_flight(&ident).await?;
+            for w in &writes {
+                tracing::info!(
+                    table = %ident,
+                    writer = %w.writer,
+                    since_ms = w.since_ms,
+                    "a write in flight: keeping the table's files since it began"
+                );
+            }
+            let in_flight_since = writes.iter().map(|w| w.since_ms).min();
             // Uncached: it deletes what the table doesn't reference.
             let outcome = pg2iceberg_iceberg::cleanup_orphans(
                 self.catalog.uncached(),
@@ -2109,10 +2176,12 @@ impl<C: Catalog> Materializer<C> {
                 &table_prefix,
                 now_ms,
                 grace_period_ms,
+                in_flight_since,
             )
             .await
             .map_err(|e| MaterializerError::Cleanup(e.to_string()))?;
-            if outcome.deleted > 0 || outcome.grace_protected > 0 {
+            if outcome.deleted > 0 || outcome.grace_protected > 0 || outcome.in_flight_protected > 0
+            {
                 if self.meta_recorder.is_some() {
                     self.record_maintenance(MaintenanceStats {
                         ts_micros: started_micros,
@@ -2290,6 +2359,9 @@ impl<C: Catalog> Materializer<C> {
             live: LiveRows::new(&entry.file_index, Some(as_of)),
             unseen_deaths: entry.file_index.unseen_deaths(),
             config: config.clone(),
+            coord: self.coord.clone(),
+            writer: self.compaction_writer,
+            clock: self.clock.clone(),
         })
     }
 
@@ -2319,8 +2391,12 @@ impl<C: Catalog> Materializer<C> {
             mut seconds,
             unseen_deaths,
             pass,
+            writer,
         } = pass;
         if !self.tables.contains_key(&ident) {
+            if matches!(pass, Ok(Some(_))) {
+                end_write(self.coord.as_ref(), &ident, writer).await;
+            }
             return Ok(None);
         }
         let outcome = match pass {
@@ -2328,6 +2404,8 @@ impl<C: Catalog> Materializer<C> {
             Ok(Some(prepared)) => {
                 let committing = now_micros();
                 let committed = self.catalog.commit_compaction(prepared.commit).await;
+                // Its outputs are the table's now, or orphans.
+                end_write(self.coord.as_ref(), &ident, writer).await;
                 seconds += seconds_since(committing);
                 committed
                     .map(|meta| {
@@ -2512,6 +2590,29 @@ impl<C: Catalog> Materializer<C> {
     pub fn with_pk_index_memory(mut self, bytes: usize) -> Self {
         self.set_pk_index_memory(bytes);
         self
+    }
+
+    /// Time the writes in flight it records by `clock` — the object
+    /// store's, as near as it can be: orphan cleanup compares when a write
+    /// began with when its files were stored. Defaults to the system's.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = Some(clock);
+    }
+
+    /// Record its compaction passes as `writer`'s writes in flight
+    /// ([`writers`]): another process's than the one applying the
+    /// changes, as `pg2iceberg compact` is.
+    pub fn set_compaction_writer(&mut self, writer: &'static str) {
+        self.compaction_writer = writer;
+    }
+
+    /// The writer `unit`'s uploads are recorded as ([`writers`]).
+    fn unit_writer(unit: &Unit) -> &'static str {
+        if unit.direct {
+            writers::SNAPSHOT
+        } else {
+            writers::CHANGES
+        }
     }
 
     /// [`Self::with_pk_index_memory`], in place.
@@ -2806,6 +2907,14 @@ impl<C: Catalog> Materializer<C> {
             });
             deleted_pks.extend(chunk.pk_keys);
         }
+        // Its uploads stay unreferenced until the unit commits.
+        if !uploads.is_empty() && !unit.writing {
+            let since_ms = now_ms(self.clock.as_deref());
+            self.coord
+                .begin_write(ident, Self::unit_writer(unit), since_ms)
+                .await?;
+            unit.writing = true;
+        }
         let blob_store = &self.blob_store;
         stream::iter(uploads)
             .map(|(path, bytes)| {
@@ -2898,14 +3007,19 @@ impl<C: Catalog> Materializer<C> {
         // Commit catalog snapshots — durability gate.
         let started_micros = now_micros();
         let has_steps = !unit.steps.is_empty();
+        let writer = unit.writing.then(|| Self::unit_writer(&unit));
         let committed = if unit.steps.is_empty() {
             None
         } else {
-            match self
+            let committed = self
                 .catalog
                 .commit_snapshots(unit.steps, log_range, unit.remove_properties)
-                .await
-            {
+                .await;
+            // Its files are the table's now, or orphans.
+            if let Some(writer) = writer {
+                end_write(self.coord.as_ref(), ident, writer).await;
+            }
+            match committed {
                 Ok(meta) => {
                     // FileIndex holds the steps on top of `index_at`; their
                     // snapshots must follow it directly, or another process
@@ -3237,6 +3351,20 @@ impl<C: Catalog> Materializer<C> {
 /// Seconds since `started` ([`now_micros`]).
 fn seconds_since(started: i64) -> f64 {
     (now_micros() - started).max(0) as f64 / 1e6
+}
+
+/// Milliseconds since unix epoch by `clock`, or the system's.
+fn now_ms(clock: Option<&dyn Clock>) -> i64 {
+    clock.map_or_else(now_micros, |c| c.now().0) / 1000
+}
+
+/// End `writer`'s write in flight on `table` ([`Coordinator::end_write`]).
+/// Failing, the write stays recorded until the writer's next one ends:
+/// orphan cleanup keeps more meanwhile, never less.
+async fn end_write(coord: &dyn Coordinator, table: &TableIdent, writer: &str) {
+    if let Err(e) = coord.end_write(table, writer).await {
+        tracing::warn!(error = %e, table = %table, writer, "end the write in flight");
+    }
 }
 
 fn now_micros() -> i64 {

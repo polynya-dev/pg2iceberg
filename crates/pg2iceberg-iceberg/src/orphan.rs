@@ -20,6 +20,17 @@
 //!
 //! Paths are compared as object keys ([`object_key`]): the catalog
 //! records full `s3://bucket/...` URIs, while object stores list keys.
+//!
+//! ## Writes in flight
+//!
+//! A writer uploads its files before the commit that references them —
+//! moments before, for most commits; hours, for the initial snapshot of a
+//! large table, committed once whole. Until then they look like orphans.
+//! The grace period keeps the young ones; the caller keeps the rest by
+//! passing when the oldest write still in flight began (pg2iceberg's
+//! writers record theirs in the coordinator), and every file since then
+//! stays — less the grace period, which also covers the writers' clocks
+//! running ahead of the object store's.
 
 use crate::Snapshot;
 use pg2iceberg_core::TableIdent;
@@ -48,6 +59,9 @@ pub struct CleanupOutcome {
     /// Blobs that matched everything except the grace period — kept for
     /// now, eligible on the next pass once they age out.
     pub grace_protected: usize,
+    /// Blobs older than the grace period kept as a write in flight's:
+    /// written since the oldest began.
+    pub in_flight_protected: usize,
 }
 
 /// Find and delete unreferenced blobs under `prefix`. A blob is an
@@ -56,6 +70,11 @@ pub struct CleanupOutcome {
 /// 1. Its path lives under `prefix`.
 /// 2. No live snapshot references it (data file or delete file).
 /// 3. Its `last_modified_ms` is older than `now_ms - grace_period_ms`.
+/// 4. It's older than `in_flight_since - grace_period_ms`, with a write in
+///    flight: `in_flight_since` is when the oldest began.
+///
+/// Read when the writes in flight began before calling: a write that
+/// ends after this reads the table has committed its files by then.
 ///
 /// `now_ms` comes from the caller — production passes wall-clock millis;
 /// tests pass deterministic values. `grace_period_ms` of 0 means "delete
@@ -67,6 +86,7 @@ pub async fn cleanup_orphans(
     prefix: &str,
     now_ms: i64,
     grace_period_ms: i64,
+    in_flight_since: Option<i64>,
 ) -> Result<CleanupOutcome> {
     let snapshots = catalog
         .snapshots(ident)
@@ -76,10 +96,12 @@ pub async fn cleanup_orphans(
     let referenced = referenced_paths(&snapshots);
 
     let blobs = blob_store.list(prefix).await?;
-    let cutoff = now_ms - grace_period_ms;
+    let cutoff = now_ms.saturating_sub(grace_period_ms);
+    let in_flight_cutoff = in_flight_since.map(|s| s.saturating_sub(grace_period_ms));
 
     let mut to_delete: Vec<BlobInfo> = Vec::new();
     let mut grace_protected: usize = 0;
+    let mut in_flight_protected: usize = 0;
     for blob in blobs {
         // Compare object keys: the catalog holds full URIs and stores
         // list keys (normalizing the listed path too keeps a store that
@@ -89,6 +111,10 @@ pub async fn cleanup_orphans(
         }
         if blob.last_modified_ms > cutoff {
             grace_protected += 1;
+            continue;
+        }
+        if in_flight_cutoff.is_some_and(|c| blob.last_modified_ms >= c) {
+            in_flight_protected += 1;
             continue;
         }
         to_delete.push(blob);
@@ -103,6 +129,7 @@ pub async fn cleanup_orphans(
         deleted: to_delete.len(),
         bytes_freed,
         grace_protected,
+        in_flight_protected,
     })
 }
 

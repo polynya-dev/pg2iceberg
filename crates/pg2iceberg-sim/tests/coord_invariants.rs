@@ -327,3 +327,38 @@ fn replicated_lsn_tracks_replication_claims_only() {
     block_on(c.claim_offsets(&batch(vec![claim("a", 1, "s3://a/2")], 120, Some(120)))).unwrap();
     assert_eq!(block_on(c.replicated_lsn()).unwrap(), Lsn(150));
 }
+
+/// A write in flight keeps the earliest start it's recorded with — the key
+/// ranges of a snapshot each record theirs — until it ends; tables and
+/// writers apart. Mirrors the production coordinator's test.
+#[test]
+fn writes_in_flight_keep_their_earliest_start_until_they_end() {
+    let (c, _) = coord_at_t0();
+    let writes = |t: &str| {
+        block_on(c.writes_in_flight(&ident(t)))
+            .unwrap()
+            .into_iter()
+            .map(|w| (w.writer, w.since_ms))
+            .collect::<Vec<_>>()
+    };
+    assert!(writes("a").is_empty());
+    block_on(c.begin_write(&ident("a"), "snapshot", 200)).unwrap();
+    block_on(c.begin_write(&ident("a"), "snapshot", 100)).unwrap();
+    block_on(c.begin_write(&ident("a"), "snapshot", 300)).unwrap();
+    block_on(c.begin_write(&ident("a"), "compaction", 400)).unwrap();
+    block_on(c.begin_write(&ident("b"), "snapshot", 500)).unwrap();
+    assert_eq!(
+        writes("a"),
+        [("compaction".into(), 400), ("snapshot".into(), 100)]
+    );
+    block_on(c.end_write(&ident("a"), "snapshot")).unwrap();
+    block_on(c.end_write(&ident("a"), "snapshot")).unwrap();
+    assert_eq!(writes("a"), [("compaction".into(), 400)]);
+    assert_eq!(writes("b"), [("snapshot".into(), 500)]);
+    // Ended, a writer starts afresh.
+    block_on(c.begin_write(&ident("a"), "snapshot", 600)).unwrap();
+    assert_eq!(
+        writes("a"),
+        [("compaction".into(), 400), ("snapshot".into(), 600)]
+    );
+}

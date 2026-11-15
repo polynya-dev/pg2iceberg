@@ -190,6 +190,18 @@ pub struct TableSnapshotState {
     pub completed_at_micros: Option<i64>,
 }
 
+/// A process writing files to a table that it hasn't committed yet
+/// ([`Coordinator::begin_write`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteInFlight {
+    /// Which of the process's writers: one table has at most one of each
+    /// in flight.
+    pub writer: String,
+    /// Milliseconds since unix epoch, by the writer's clock, at or before
+    /// its first upload.
+    pub since_ms: i64,
+}
+
 /// One row in `log_index`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
@@ -328,6 +340,21 @@ pub trait Coordinator: Send + Sync {
         &self,
         tables: &[TableIdent],
     ) -> Result<std::collections::BTreeMap<TableIdent, i64>>;
+
+    // ── Writes in flight ────────────────────────────────────
+    /// Record that `writer` uploads files for `table` it commits later,
+    /// the first no earlier than `since_ms`: orphan cleanup keeps every
+    /// file of the table's from then on, and until [`Self::end_write`]. A
+    /// writer already recorded keeps its earlier `since_ms` — the key
+    /// ranges of a snapshot each record it as they start uploading.
+    async fn begin_write(&self, table: &TableIdent, writer: &str, since_ms: i64) -> Result<()>;
+
+    /// `writer` committed what it uploaded for `table`, or gave it up.
+    /// Idempotent.
+    async fn end_write(&self, table: &TableIdent, writer: &str) -> Result<()>;
+
+    /// The writes in flight on `table`, by writer.
+    async fn writes_in_flight(&self, table: &TableIdent) -> Result<Vec<WriteInFlight>>;
 
     // ── Per-table mid-snapshot resume cursor ────────────────
     /// Read the per-chunk resume cursor for a table. Returns the

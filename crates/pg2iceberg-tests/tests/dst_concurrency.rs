@@ -400,6 +400,24 @@ impl Coordinator for OneConnection {
     async fn table_epochs(&self, tables: &[TableIdent]) -> CoordResult<BTreeMap<TableIdent, i64>> {
         self.request(self.inner.table_epochs(tables)).await
     }
+    async fn begin_write(
+        &self,
+        table: &TableIdent,
+        writer: &str,
+        since_ms: i64,
+    ) -> CoordResult<()> {
+        self.request(self.inner.begin_write(table, writer, since_ms))
+            .await
+    }
+    async fn end_write(&self, table: &TableIdent, writer: &str) -> CoordResult<()> {
+        self.request(self.inner.end_write(table, writer)).await
+    }
+    async fn writes_in_flight(
+        &self,
+        table: &TableIdent,
+    ) -> CoordResult<Vec<pg2iceberg_coord::WriteInFlight>> {
+        self.request(self.inner.writes_in_flight(table)).await
+    }
     async fn snapshot_progress(&self, ident: &TableIdent) -> CoordResult<Option<String>> {
         self.request(self.inner.snapshot_progress(ident)).await
     }

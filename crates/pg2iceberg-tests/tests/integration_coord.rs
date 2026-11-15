@@ -328,6 +328,49 @@ async fn table_epochs_count_writes_per_table() {
     assert_eq!(epochs.get(&never), None);
 }
 
+/// A write in flight keeps the earliest start it's recorded with — the key
+/// ranges of a snapshot each record theirs — until it ends; tables and
+/// writers apart.
+#[tokio::test]
+async fn writes_in_flight_keep_their_earliest_start_until_they_end() {
+    let coord = fresh_coord().await;
+    let orders = ident("public", "orders");
+    let items = ident("public", "items");
+    let writes = |t: &TableIdent| {
+        let coord = &coord;
+        let t = t.clone();
+        async move {
+            coord
+                .writes_in_flight(&t)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|w| (w.writer, w.since_ms))
+                .collect::<Vec<_>>()
+        }
+    };
+    assert!(writes(&orders).await.is_empty());
+    coord.begin_write(&orders, "snapshot", 200).await.unwrap();
+    coord.begin_write(&orders, "snapshot", 100).await.unwrap();
+    coord.begin_write(&orders, "snapshot", 300).await.unwrap();
+    coord.begin_write(&orders, "compaction", 400).await.unwrap();
+    coord.begin_write(&items, "snapshot", 500).await.unwrap();
+    assert_eq!(
+        writes(&orders).await,
+        [("compaction".into(), 400), ("snapshot".into(), 100)]
+    );
+    coord.end_write(&orders, "snapshot").await.unwrap();
+    coord.end_write(&orders, "snapshot").await.unwrap();
+    assert_eq!(writes(&orders).await, [("compaction".into(), 400)]);
+    assert_eq!(writes(&items).await, [("snapshot".into(), 500)]);
+    // Ended, a writer starts afresh.
+    coord.begin_write(&orders, "snapshot", 600).await.unwrap();
+    assert_eq!(
+        writes(&orders).await,
+        [("compaction".into(), 400), ("snapshot".into(), 600)]
+    );
+}
+
 #[tokio::test]
 async fn cursor_round_trip() {
     let coord = fresh_coord().await;

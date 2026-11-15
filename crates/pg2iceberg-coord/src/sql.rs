@@ -193,6 +193,17 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
             )",
             schema.qualify("table_epoch")
         ),
+        // Files a process uploaded for a table and hasn't committed yet,
+        // which orphan cleanup must leave.
+        format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                table_name TEXT   NOT NULL,
+                writer     TEXT   NOT NULL,
+                since_ms   BIGINT NOT NULL,
+                PRIMARY KEY (table_name, writer)
+            )",
+            schema.qualify("writes_in_flight")
+        ),
     ]
 }
 
@@ -501,6 +512,35 @@ pub fn select_table_epochs(schema: &CoordSchema) -> String {
     )
 }
 
+// ── Writes in flight ──────────────────────────────────────────────────
+
+/// Record a write in flight, keeping an earlier `since_ms`. Args:
+/// `table_name`, `writer`, `since_ms`.
+pub fn begin_write(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {} AS w (table_name, writer, since_ms) VALUES ($1, $2, $3) \
+         ON CONFLICT (table_name, writer) DO UPDATE \
+         SET since_ms = LEAST(w.since_ms, EXCLUDED.since_ms)",
+        schema.qualify("writes_in_flight")
+    )
+}
+
+/// Drop a write in flight. Args: `table_name`, `writer`.
+pub fn end_write(schema: &CoordSchema) -> String {
+    format!(
+        "DELETE FROM {} WHERE table_name = $1 AND writer = $2",
+        schema.qualify("writes_in_flight")
+    )
+}
+
+/// A table's writes in flight. Arg: `table_name`.
+pub fn select_writes_in_flight(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT writer, since_ms FROM {} WHERE table_name = $1 ORDER BY writer",
+        schema.qualify("writes_in_flight")
+    )
+}
+
 // ── Per-table mid-snapshot resume ─────────────────────────────────────
 
 pub fn select_snapshot_progress(schema: &CoordSchema) -> String {
@@ -540,10 +580,10 @@ mod tests {
         // + 1 ALTER TABLE (log_index.flushable_lsn)
         // + 5 new per-concern tables (pipeline_meta, flushed_lsn,
         //   replicated_lsn, tables, snapshot_progress)
-        // + table_epoch
-        // = 14. Each statement is idempotent (CREATE TABLE IF NOT
+        // + table_epoch + writes_in_flight
+        // = 15. Each statement is idempotent (CREATE TABLE IF NOT
         // EXISTS or ADD COLUMN IF NOT EXISTS).
-        assert_eq!(stmts.len(), 14);
+        assert_eq!(stmts.len(), 15);
         for stmt in &stmts {
             assert!(
                 stmt.contains("IF NOT EXISTS"),
@@ -559,6 +599,7 @@ mod tests {
             "tables",
             "snapshot_progress",
             "table_epoch",
+            "writes_in_flight",
         ] {
             assert!(
                 stmts

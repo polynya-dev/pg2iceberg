@@ -116,6 +116,7 @@ All coordination state lives under the `_pg2iceberg` schema in the source (or a 
 | `pending_markers` | Pending blue-green replica-alignment markers |
 | `marker_emissions` | Per-(uuid, table) marker emission record (idempotent dedup) |
 | `table_epoch` | Per-table write epoch: tells processes caching a table's Iceberg metadata that another one wrote it |
+| `writes_in_flight` | Per-(table, writer) start of a write not yet committed: orphan cleanup keeps its files |
 
 Coordinator write amplification is negligible: a few small PG writes per flush regardless of batch size.
 

@@ -566,6 +566,8 @@ async fn compact(cfg: Config) -> Result<()> {
         );
     }
     let mut materializer = build_one_shot_materializer(cfg.clone(), Arc::new(NoopMetrics)).await?;
+    // Its passes' writes in flight aren't those of `run`'s passes.
+    materializer.set_compaction_writer(pg2iceberg_logical::materializer::writers::COMPACT_COMMAND);
     let cfg_compact = cfg.sink.compaction_config();
     let outcomes = materializer
         .compact_cycle(&cfg_compact)

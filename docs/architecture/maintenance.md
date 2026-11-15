@@ -16,6 +16,16 @@ The retention period defaults to 7 days (`168h`). Snapshots newer than the reten
 
 Orphan files are S3 objects that exist in the table's storage location but are not referenced by any current snapshot — typically left behind by interrupted writes. Maintenance deletes any file whose modification time is older than the orphan grace period (default: 30 minutes).
 
+A writer uploads its files before the commit that references them, so until it commits they look like orphans too. For most commits that's a moment, which the grace period covers. Some writes take far longer:
+
+- The initial snapshot writes a table's rows as it reads them and commits them once, whole — hours, for a large table.
+- A transaction too big to fold at once is uploaded in steps and committed once.
+- A compaction pass uploads its outputs as it rewrites, and commits at the end.
+
+So each pg2iceberg writer records the write in the coordinator (`_pg2iceberg.writes_in_flight`: table, writer, and when it began) before its first upload, and drops the record once it commits or gives up. Cleanup keeps every file of the table's written since the oldest write in flight began, less the grace period, which also covers the writers' clocks running ahead of the object store's. `maintain` logs each write that holds files back.
+
+A writer that dies mid-write leaves its record behind. Cleanup then keeps the table's newer files until that writer's next write ends: the next commit of the table's changes, the snapshot's retry, the next compaction pass of `run` or of `pg2iceberg compact`.
+
 ## When the catalog maintains the tables
 
 Managed catalogs maintain their tables themselves: S3 Tables compacts them, expires their snapshots and removes unreferenced files by default; R2 Data Catalog compacts and expires when you turn it on; so do Glue's table optimizers. They commit to the table as another engine would, and pg2iceberg's own maintenance would get in their way:

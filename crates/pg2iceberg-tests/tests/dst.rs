@@ -49,6 +49,11 @@
 //! process told — and pg2iceberg leaves that maintenance to it
 //! (invariant 17) but keeps delete files from piling up (18).
 //!
+//! Every writer records the files it uploads and hasn't committed as a
+//! write in flight, which orphan cleanup keeps — the DST runs it just
+//! before a commit (`CleanupOrphansMidCommit`) — and ends it once it
+//! commits or gives them up (19).
+//!
 //! Each case runs on the sims or — under the `integration` feature — on
 //! production's catalog and blob store (`IcebergRustCatalog` over
 //! iceberg-rust's memory catalog, `ObjectStoreBlobStore` over
@@ -65,7 +70,7 @@ use pg2iceberg_iceberg::CompactionConfig;
 use pg2iceberg_iceberg::{
     Catalog, LogRange, PreparedCommit, PreparedCompaction, SchemaChange, Snapshot, TableMetadata,
 };
-use pg2iceberg_logical::materializer::{MaterializerNamer, UuidMaterializerNamer};
+use pg2iceberg_logical::materializer::{writers, MaterializerNamer, UuidMaterializerNamer};
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{
     replication_start_lsn, CachingCatalog, Maintenance, Materializer, Pipeline,
@@ -495,6 +500,10 @@ enum Step {
     /// `maintain`'s second half: delete every blob in the table's
     /// directory that the table doesn't reference, with no grace period.
     CleanupOrphans,
+    /// `maintain`, a process of its own, cleans up orphans just before the
+    /// next commit — data or compaction: what that commit adds is uploaded
+    /// and not yet referenced.
+    CleanupOrphansMidCommit,
     /// A managed catalog's own compaction (`MANAGED` cases only) plans a
     /// pass and writes its output files next to pg2iceberg's, as the
     /// table's location holds both, but doesn't commit yet. As Iceberg's
@@ -547,6 +556,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => Just(Step::RestartMaterializer),
         2 => Just(Step::Compact),
         1 => Just(Step::Expire),
+        1 => Just(Step::CleanupOrphansMidCommit),
         1 => Just(Step::LoseCommitResponse),
         1 => Just(Step::CrashAfterCommit),
         2 => Just(Step::BackfillChunk),
@@ -734,6 +744,28 @@ impl Storage {
             catalog: catalog.clone(),
             blob: blob.clone(),
             backend: Backend::Sim { catalog, blob },
+        }
+    }
+
+    /// The blob store's clock — what its files' `last_modified_ms` are by —
+    /// for the processes to time their writes in flight by. `None`: the
+    /// system's, as an object store's is.
+    fn clock(&self) -> Option<Arc<dyn pg2iceberg_core::Clock>> {
+        match &self.backend {
+            Backend::Sim { blob, .. } => Some(Arc::new(BlobClock(blob.clone()))),
+            #[cfg(feature = "integration")]
+            Backend::Prod { .. } => None,
+        }
+    }
+
+    /// Now, by [`Self::clock`], in milliseconds since unix epoch.
+    fn now_ms(&self) -> i64 {
+        match self.clock() {
+            Some(clock) => clock.now().0 / 1000,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
         }
     }
 
@@ -1406,7 +1438,22 @@ fn worker(name: &str) -> pg2iceberg_core::WorkerId {
 /// Set `m` up as production does: it keeps its reads of the catalog
 /// until a pg2iceberg process writes the table, or a minute by `clock`;
 /// and where the catalog maintains the table, it's told so.
-fn like_production(m: &mut Materializer<AuditedCatalog>, clock: &TestClock) {
+/// The sim blob store's clock: a counter its `put`s stamp
+/// `last_modified_ms` with.
+struct BlobClock(Arc<MemoryBlobStore>);
+
+#[async_trait::async_trait]
+impl pg2iceberg_core::Clock for BlobClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(self.0.now_ms() * 1000)
+    }
+    async fn sleep(&self, _: std::time::Duration) {}
+}
+
+fn like_production(m: &mut Materializer<AuditedCatalog>, clock: &TestClock, storage: &Storage) {
+    if let Some(blob_clock) = storage.clock() {
+        m.set_clock(blob_clock);
+    }
     m.set_catalog_cache_ttl(
         Arc::new(clock.clone()),
         CachingCatalog::<AuditedCatalog>::DEFAULT_TTL,
@@ -1583,6 +1630,7 @@ impl DstHarness {
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
             land_before_next_commit: Default::default(),
+            cleanup_before_next_commit: Default::default(),
             coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
             managed: MANAGED.get(),
@@ -1596,7 +1644,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
-        like_production(&mut materializer, &clock);
+        like_production(&mut materializer, &clock, &storage);
         block_on(materializer.register_table(schema())).unwrap();
         register_other(&mut materializer);
         let other = DISTRIBUTED.get().then(|| {
@@ -1610,7 +1658,7 @@ impl DstHarness {
                 MAT_BATCH,
                 metrics(),
             );
-            like_production(&mut b, &clock);
+            like_production(&mut b, &clock, &storage);
             block_on(b.register_table(schema())).unwrap();
             register_other(&mut b);
             b.enable_distributed_mode(worker("b"), WORKER_TTL);
@@ -1720,6 +1768,7 @@ impl DstHarness {
             audit_paused: Default::default(),
             lose_next_response: Default::default(),
             land_before_next_commit: Default::default(),
+            cleanup_before_next_commit: Default::default(),
             coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
             managed: MANAGED.get(),
@@ -1733,7 +1782,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
-        like_production(&mut materializer, &clock);
+        like_production(&mut materializer, &clock, &storage);
         block_on(materializer.register_table(schema())).unwrap();
         register_other(&mut materializer);
         let other = DISTRIBUTED.get().then(|| {
@@ -1747,7 +1796,7 @@ impl DstHarness {
                 MAT_BATCH,
                 metrics(),
             );
-            like_production(&mut b, &clock);
+            like_production(&mut b, &clock, &storage);
             block_on(b.register_table(schema())).unwrap();
             register_other(&mut b);
             b.enable_distributed_mode(worker("b"), WORKER_TTL);
@@ -1925,7 +1974,8 @@ impl DstHarness {
         };
         let namer = mat_namer(&self.id_gen);
         if MANAGED.get() {
-            // As the materializer's own pass: the catalog rewrites.
+            // As the materializer's own pass: the catalog rewrites — and
+            // uploads nothing.
             block_on(pg2iceberg_iceberg::retire_deletes(
                 &held,
                 &ident(),
@@ -1934,6 +1984,14 @@ impl DstHarness {
             ))
             .unwrap();
         } else {
+            // As `pg2iceberg compact`'s pass, its outputs a write in flight
+            // until it commits.
+            block_on(self.coord.begin_write(
+                &ident(),
+                writers::COMPACT_COMMAND,
+                self.storage.now_ms(),
+            ))
+            .unwrap();
             block_on(pg2iceberg_iceberg::compact_table(
                 &held,
                 self.blob_store.as_ref(),
@@ -1951,6 +2009,9 @@ impl DstHarness {
             .unwrap();
         }
         self.pending_external = held.held.into_inner().unwrap();
+        if self.pending_external.is_none() {
+            block_on(self.coord.end_write(&ident(), writers::COMPACT_COMMAND)).unwrap();
+        }
     }
 
     /// Plan and write a pass as the catalog's own compaction does (see
@@ -2113,6 +2174,16 @@ impl DstHarness {
         }
     }
 
+    /// Run the snapshot phase as pg2iceberg does for a table it starts
+    /// with: written straight to the table ([`Materializer`] as the sink),
+    /// a few rows a chunk, uploaded as they're read and committed once
+    /// whole. Acks the slot to the snapshot LSN.
+    fn run_snapshot_to_the_table(&mut self) {
+        let s = Snapshotter::new(self.coord.clone() as Arc<dyn Coordinator>).with_chunk_size(2);
+        let snap_lsn = block_on(s.run(&self.db, &[schema()], &mut self.materializer)).unwrap();
+        self.stream.send_standby(snap_lsn);
+    }
+
     /// Run a Snapshotter-driven snapshot phase against the harness's source.
     /// Acks the slot to the snapshot LSN so live replication picks up
     /// strictly-later events.
@@ -2120,6 +2191,34 @@ impl DstHarness {
         let s = Snapshotter::new(self.coord.clone() as Arc<dyn Coordinator>);
         let snap_lsn = block_on(s.run(&self.db, &[schema()], &mut self.pipeline)).unwrap();
         self.stream.send_standby(snap_lsn);
+    }
+
+    /// Arm [`Step::CleanupOrphansMidCommit`]: a `maintain` process — a
+    /// materializer of its own over the same stores, as `pg2iceberg
+    /// maintain` builds — whose orphan cleanup, with no grace period, runs
+    /// just before the next commit. Not where the catalog maintains the
+    /// tables: `maintain` refuses to run there.
+    fn cleanup_orphans_mid_commit(&mut self) {
+        if MANAGED.get() {
+            return;
+        }
+        let mut maintain = Materializer::with_metrics(
+            self.coord.clone() as Arc<dyn Coordinator>,
+            self.blob_store.clone(),
+            self.audited.clone(),
+            mat_namer(&self.id_gen),
+            "default",
+            MAT_BATCH,
+            metrics(),
+        );
+        like_production(&mut maintain, &self.clock, &self.storage);
+        block_on(maintain.register_table(discovered_schema(&self.db))).unwrap();
+        register_other(&mut maintain);
+        *self.audited.cleanup_before_next_commit.lock().unwrap() = Some(Box::new(move || {
+            Box::pin(async move {
+                maintain.cleanup_orphans_cycle(i64::MAX, 0).await.unwrap();
+            })
+        }));
     }
 
     /// Pipeline-process crash. Slot, coord, and blob store survive (durable
@@ -2134,7 +2233,7 @@ impl DstHarness {
             MAT_BATCH,
             metrics(),
         );
-        like_production(&mut materializer, &self.clock);
+        like_production(&mut materializer, &self.clock, &self.storage);
         // As the lifecycle restarts: a table still backfilling is gated.
         if self.backfilling {
             block_on(materializer.register_table_pending(discovered_schema(&self.db))).unwrap();
@@ -2425,7 +2524,9 @@ impl DstHarness {
                         self.audited.clone(),
                         self.coord.clone() as Arc<dyn Coordinator>,
                     );
-                    match block_on(job.commit_compaction(pass)) {
+                    let committed = block_on(job.commit_compaction(pass));
+                    block_on(self.coord.end_write(&ident(), writers::COMPACT_COMMAND)).unwrap();
+                    match committed {
                         Ok(_) => {}
                         Err(e) if e.to_string().contains("response lost") => {}
                         // Another pass rewrote its files first; the job
@@ -2477,6 +2578,7 @@ impl DstHarness {
             Step::Expire => {
                 block_on(self.materializer.expire_cycle(0)).unwrap();
             }
+            Step::CleanupOrphansMidCommit => self.cleanup_orphans_mid_commit(),
             Step::CleanupOrphans => {
                 let cleaned =
                     block_on(self.materializer.cleanup_orphans_cycle(i64::MAX, 0)).unwrap();
@@ -2942,6 +3044,9 @@ struct AuditedCatalog {
     /// Another process's compaction pass, committed first when the next
     /// commit — data or compaction — is.
     land_before_next_commit: Mutex<Option<HeldPass>>,
+    /// `maintain`'s orphan cleanup, run first when the next commit — data
+    /// or compaction — is ([`Step::CleanupOrphansMidCommit`]).
+    cleanup_before_next_commit: Mutex<Option<CleanupHook>>,
     /// Where a pg2iceberg process records its writes, as every one does
     /// (see `CachingCatalog`).
     coord: Arc<dyn Coordinator>,
@@ -2951,6 +3056,11 @@ struct AuditedCatalog {
     /// Whether the catalog maintains the table itself (`MANAGED`).
     managed: bool,
 }
+
+/// A `maintain` process's orphan cleanup, held for
+/// [`AuditedCatalog::cleanup_before_next_commit`].
+type CleanupHook =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 
 /// A compaction pass held for [`AuditedCatalog::land_before_next_commit`].
 enum HeldPass {
@@ -2978,8 +3088,13 @@ impl AuditedCatalog {
 }
 
 impl AuditedCatalog {
-    /// Commit [`Self::land_before_next_commit`]'s pass, if one is held.
+    /// Commit [`Self::land_before_next_commit`]'s pass, if one is held —
+    /// after [`Self::cleanup_before_next_commit`]'s cleanup, if one is.
     async fn land_other_pass(&self) -> pg2iceberg_iceberg::Result<()> {
+        let cleanup = self.cleanup_before_next_commit.lock().unwrap().take();
+        if let Some(cleanup) = cleanup {
+            cleanup().await;
+        }
         let pass = self.land_before_next_commit.lock().unwrap().take();
         let result = match pass {
             None => return Ok(()),
@@ -2987,6 +3102,10 @@ impl AuditedCatalog {
                 let table = pass.ident.clone();
                 let result = self.inner.commit_compaction(pass).await.map(drop);
                 self.coord.bump_table_epoch(&table).await.unwrap();
+                self.coord
+                    .end_write(&table, writers::COMPACT_COMMAND)
+                    .await
+                    .unwrap();
                 result
             }
             // Another engine's: no pg2iceberg process hears of it.
@@ -3202,6 +3321,33 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     // 10, 16. Every commit along the way.
     if let Some(v) = h.audited.violations.lock().unwrap().first() {
         return Err(v.clone());
+    }
+
+    // 19. A write is recorded in flight only while it is: once its writer
+    //     commits what it uploaded, or gives it up, orphan cleanup may
+    //     delete what's left. A `compact` job yet to commit is one still.
+    let job_held = h.pending_external.is_some()
+        || matches!(
+            *h.audited.land_before_next_commit.lock().unwrap(),
+            Some(HeldPass::Job(_))
+        );
+    let mut tables = vec![ident()];
+    if SECOND_TABLE.get() > 0 {
+        tables.push(other_ident());
+    }
+    for table in &tables {
+        let stale: Vec<String> = block_on(h.coord.writes_in_flight(table))
+            .map_err(|e| format!("writes_in_flight failed: {e}"))?
+            .into_iter()
+            .filter(|w| !(job_held && *table == ident() && w.writer == writers::COMPACT_COMMAND))
+            .map(|w| w.writer)
+            .collect();
+        if !stale.is_empty() {
+            return Err(format!(
+                "invariant 19 (writes in flight end): at quiescence, {table} records writes in \
+                 flight by {stale:?}"
+            ));
+        }
     }
 
     // 6. No WAL retention at quiescence: the slot is acked up to the end
@@ -3668,6 +3814,120 @@ fn orphan_cleanup_keeps_live_files() {
     h.run_step(&Step::DriveFlush);
     h.run_step(&Step::MaterializerCycle);
     h.run_step(&Step::CleanupOrphans);
+    check_invariants(&mut h).unwrap();
+}
+
+/// `maintain` runs while a writer has uploaded files it hasn't committed:
+/// its orphan cleanup must leave them, or the commit references files
+/// that are gone. A `pg2iceberg compact` job's pass, held across it.
+#[test]
+fn orphan_cleanup_keeps_a_compact_jobs_outputs() {
+    orphan_case(false, &a_compact_job_across_cleanup());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn orphan_cleanup_keeps_a_compact_jobs_outputs_on_iceberg() {
+    orphan_case(true, &a_compact_job_across_cleanup());
+}
+
+fn a_compact_job_across_cleanup() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &[
+            Step::ExternalCompactPlan,
+            Step::CleanupOrphans,
+            Step::ExternalCompactCommit,
+        ],
+    ]
+    .concat()
+}
+
+/// As above, `maintain` running just before the materializer's own
+/// compaction pass commits.
+#[test]
+fn orphan_cleanup_keeps_a_compaction_passs_outputs() {
+    orphan_case(false, &a_pass_across_cleanup());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn orphan_cleanup_keeps_a_compaction_passs_outputs_on_iceberg() {
+    orphan_case(true, &a_pass_across_cleanup());
+}
+
+fn a_pass_across_cleanup() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &[Step::CleanupOrphansMidCommit, Step::Compact],
+    ]
+    .concat()
+}
+
+/// As above, just before a transaction folded in several steps — each
+/// uploaded as it's folded — commits.
+#[test]
+fn orphan_cleanup_keeps_a_big_transactions_steps() {
+    orphan_case(false, &a_big_transaction_across_cleanup());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn orphan_cleanup_keeps_a_big_transactions_steps_on_iceberg() {
+    orphan_case(true, &a_big_transaction_across_cleanup());
+}
+
+fn a_big_transaction_across_cleanup() -> Vec<Step> {
+    vec![
+        Step::BigTx { inserts: 6, qty: 0 },
+        Step::DriveFlush,
+        Step::CleanupOrphansMidCommit,
+        Step::MaterializerCycle,
+    ]
+}
+
+/// As above, just before the initial snapshot — written to the table as
+/// it's read, and committed once whole — commits.
+#[test]
+fn orphan_cleanup_keeps_a_snapshots_chunks() {
+    a_snapshot_across_cleanup(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn orphan_cleanup_keeps_a_snapshots_chunks_on_iceberg() {
+    a_snapshot_across_cleanup(true);
+}
+
+fn a_snapshot_across_cleanup(prod: bool) {
+    PROD_BACKEND.set(prod);
+    let seeds: Vec<(i32, i32)> = (1..=10).map(|i| (i, i * 10)).collect();
+    let mut h = DstHarness::boot_with_seeds(&seeds);
+    h.run_step(&Step::CleanupOrphansMidCommit);
+    h.run_snapshot_to_the_table();
+    for step in [
+        Step::Insert { id: 11, qty: 110 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// Run `steps`, checking the invariants after each and at quiescence.
+fn orphan_case(prod: bool, steps: &[Step]) {
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in steps {
+        h.run_step(step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
     check_invariants(&mut h).unwrap();
 }
 
