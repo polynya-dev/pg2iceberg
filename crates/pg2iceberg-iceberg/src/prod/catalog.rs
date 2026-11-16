@@ -522,8 +522,9 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 let manifest = match read.manifests.get(path).or(cached.manifests.get(path)) {
                     Some(manifest) => Arc::clone(manifest),
                     None => Arc::new(
-                        entry
-                            .load_manifest(table.file_io())
+                        table
+                            .manifest_reader()
+                            .read(entry)
                             .await
                             .map_err(map_iceberg_err)?,
                     ),
@@ -905,7 +906,7 @@ fn to_iceberg_type(ty: IcebergType) -> Type {
 fn from_iceberg_type(ty: &Type) -> Result<IcebergType> {
     let p = match ty {
         Type::Primitive(p) => p,
-        Type::Struct(_) | Type::List(_) | Type::Map(_) => {
+        Type::Struct(_) | Type::List(_) | Type::Map(_) | Type::Variant(_) => {
             return Err(IcebergError::Other(format!(
                 "non-primitive iceberg type encountered: {ty:?}"
             )));
@@ -2090,7 +2091,7 @@ mod tests {
             self.inner.write(bs).await
         }
 
-        async fn close(&mut self) -> iceberg::Result<()> {
+        async fn close(&mut self) -> iceberg::Result<iceberg::io::FileMetadata> {
             tokio::time::sleep(self.latency).await;
             self.inner.close().await
         }

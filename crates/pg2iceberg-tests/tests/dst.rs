@@ -973,8 +973,9 @@ mod prod_backend {
             .map_err(err)?;
         let mut held: HashMap<&str, u64> = HashMap::new();
         for manifest_file in list.entries() {
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
+            let manifest = table
+                .manifest_reader()
+                .read(manifest_file)
                 .await
                 .map_err(err)?;
             for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
@@ -1029,8 +1030,9 @@ mod prod_backend {
             .map_err(err)?;
         let mut out = Vec::new();
         for manifest_file in list.entries() {
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
+            let manifest = table
+                .manifest_reader()
+                .read(manifest_file)
                 .await
                 .map_err(err)?;
             for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
@@ -1213,7 +1215,7 @@ mod prod_backend {
             let mut totals = Totals::default();
             let list = table.manifest_list_reader(current).load().await?;
             for manifest_file in list.entries() {
-                let manifest = manifest_file.load_manifest(file_io).await?;
+                let manifest = table.manifest_reader().read(manifest_file).await?;
                 // A rewrite drops the entries earlier commits left `DELETED`.
                 let alive: Vec<_> = manifest.entries().iter().filter(|e| e.is_alive()).collect();
                 if let Some(read) = self.no_deletes_since {
@@ -1383,8 +1385,9 @@ mod prod_backend {
                 .await
                 .map_err(err)?;
             for manifest_file in list.entries() {
-                let manifest = manifest_file
-                    .load_manifest(table.file_io())
+                let manifest = table
+                    .manifest_reader()
+                    .read(manifest_file)
                     .await
                     .map_err(err)?;
                 out.extend(

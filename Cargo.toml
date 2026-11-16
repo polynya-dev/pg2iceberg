@@ -60,7 +60,7 @@ all = { level = "warn", priority = -1 }
 #    (Supabase's etl maintainer) rather than rolling our own to avoid the
 #    maintenance burden of two forks.
 [patch.crates-io]
-iceberg = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches-v0.10.1" }
+iceberg = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches-v0.11.0" }
 # `iceberg-catalog-rest` also has to come from the fork: the
 # polynya-patches branch threads the REST `loadTable` response's
 # `config` map through `Table::builder().properties(response_config)`,
@@ -68,7 +68,7 @@ iceberg = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polyn
 # servers (Polaris, Lakekeeper, ...) return per-table S3 STS tokens
 # in `config`, but our `extract_creds` sees an empty map because the
 # `Table::properties()` accessor surfaces nothing.
-iceberg-catalog-rest = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches-v0.10.1" }
-iceberg-storage-opendal = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches-v0.10.1" }
+iceberg-catalog-rest = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches-v0.11.0" }
+iceberg-storage-opendal = { git = "https://github.com/polynya-dev/iceberg-rust", branch = "polynya-patches-v0.11.0" }
 tokio-postgres = { git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }
 postgres-replication = { git = "https://github.com/iambriccardo/rust-postgres", rev = "31acf55c7e5c2244e5bb3a36e7afa2a01bf52c38" }

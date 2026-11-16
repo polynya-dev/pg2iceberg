@@ -975,11 +975,17 @@ impl Config {
             props.insert("warehouse".into(), self.sink.warehouse.clone());
         }
         let region = self.sink.resolved_region();
+        // Each with `rest.auth.type` set: iceberg-rust's REST client picks
+        // its auth manager by it, and only infers one — with a warning —
+        // when it's unset.
         match self.sink.resolved_catalog_auth() {
+            // A static token is OAuth2's, as in Iceberg Java.
             "bearer" if !self.sink.catalog_token.is_empty() => {
+                props.insert("rest.auth.type".into(), "oauth2".into());
                 props.insert("token".into(), self.sink.catalog_token.clone());
             }
             "oauth2" if !self.sink.catalog_client_id.is_empty() => {
+                props.insert("rest.auth.type".into(), "oauth2".into());
                 props.insert(
                     "oauth2-server-uri".into(),
                     format!(
@@ -999,6 +1005,7 @@ impl Config {
             // credentials, for the service the endpoint names (S3
             // Tables' `s3tables`, Glue's `glue`).
             "sigv4" => {
+                props.insert("rest.auth.type".into(), "sigv4".into());
                 props.insert("rest.sigv4-enabled".into(), "true".into());
                 props.insert("rest.signing-region".into(), region.clone());
                 if let Some((service, _)) = aws_endpoint(&self.sink.catalog_uri) {
@@ -1718,6 +1725,10 @@ sink:
         let props = cfg.rest_catalog_props();
         assert_eq!(props.get("token").map(String::as_str), Some("t0ken"));
         assert_eq!(
+            props.get("rest.auth.type").map(String::as_str),
+            Some("oauth2")
+        );
+        assert_eq!(
             props.get("s3.region").map(String::as_str),
             Some("eu-west-1")
         );
@@ -1836,6 +1847,10 @@ sink:
         };
         let props = cfg.rest_catalog_props();
         assert_eq!(
+            props.get("rest.auth.type").map(String::as_str),
+            Some("sigv4")
+        );
+        assert_eq!(
             props.get("rest.sigv4-enabled").map(String::as_str),
             Some("true")
         );
@@ -1863,6 +1878,19 @@ sink:
             ..SinkConfig::default()
         };
         assert_eq!(sink.resolved_catalog_auth(), "oauth2");
+        let props = Config {
+            sink,
+            ..Config::default()
+        }
+        .rest_catalog_props();
+        assert_eq!(
+            props.get("rest.auth.type").map(String::as_str),
+            Some("oauth2")
+        );
+        assert_eq!(
+            props.get("credential").map(String::as_str),
+            Some("id:secret")
+        );
     }
 
     #[test]
