@@ -15,7 +15,7 @@ use bytes::Bytes;
 use pg2iceberg_coord::schema::CoordSchema;
 use pg2iceberg_coord::{
     CommitBatch, CoordCommitReceipt, Coordinator, LogEntry, MarkerInfo, Result as CoordResult,
-    TableSnapshotState,
+    StagedLogSize, TableSnapshotState,
 };
 use pg2iceberg_core::partition::{PartitionField, Transform};
 use pg2iceberg_core::{
@@ -313,9 +313,13 @@ impl Coordinator for OneConnection {
         &self,
         table: &TableIdent,
         before_offset: u64,
+        limit: usize,
     ) -> CoordResult<Vec<String>> {
-        self.request(self.inner.truncate_log(table, before_offset))
+        self.request(self.inner.truncate_log(table, before_offset, limit))
             .await
+    }
+    async fn staged_log_size(&self, table: &TableIdent) -> CoordResult<StagedLogSize> {
+        self.request(self.inner.staged_log_size(table)).await
     }
     async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> CoordResult<()> {
         self.request(self.inner.ensure_cursor(group, table)).await
@@ -326,6 +330,9 @@ impl Coordinator for OneConnection {
     async fn set_cursor(&self, group: &str, table: &TableIdent, to_offset: i64) -> CoordResult<()> {
         self.request(self.inner.set_cursor(group, table, to_offset))
             .await
+    }
+    async fn table_cursors(&self, table: &TableIdent) -> CoordResult<Vec<(String, i64)>> {
+        self.request(self.inner.table_cursors(table)).await
     }
     async fn register_consumer(
         &self,

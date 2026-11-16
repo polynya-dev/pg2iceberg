@@ -14,7 +14,7 @@ use pg2iceberg_coord::{
     receipt, schema::CoordSchema, CommitBatch, CoordCommitReceipt, CoordError, Coordinator,
     LogEntry, MarkerInfo, OffsetGrant, Result,
 };
-use pg2iceberg_coord::{TableSnapshotState, WriteInFlight};
+use pg2iceberg_coord::{StagedLogSize, TableSnapshotState, WriteInFlight};
 use pg2iceberg_core::{Clock, Lsn, TableIdent, Timestamp, WorkerId};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -36,6 +36,13 @@ struct State {
     /// `log_index` rows in insert order. The `(table, end_offset)` PK is
     /// enforced on insert.
     log: Vec<LogEntry>,
+    /// Every `log_index` row ever claimed, in insert order, truncated
+    /// or not: what tests check staging against
+    /// ([`MemoryCoordinator::claimed_log`]).
+    claimed: Vec<LogEntry>,
+    /// Groups a cursor write to fails
+    /// ([`MemoryCoordinator::crash_on_cursor_write`]).
+    crash_groups: BTreeSet<String>,
     /// `mat_cursor.last_offset`. Default value when ensure_cursor inserts a
     /// row is `-1` (matches the prod DDL default).
     cursors: BTreeMap<(String, TableIdent), i64>,
@@ -91,6 +98,27 @@ impl MemoryCoordinator {
 
     pub fn schema(&self) -> &CoordSchema {
         &self.schema
+    }
+
+    /// Test hook: from now on, `set_cursor` for `groups` fails, writing
+    /// nothing — as for a process that dies before its cursor write
+    /// reaches the coordinator. An empty `groups` ends it.
+    pub fn crash_on_cursor_write(&self, groups: &[&str]) {
+        self.state.lock().unwrap().crash_groups = groups.iter().map(|g| g.to_string()).collect();
+    }
+
+    /// Test hook: every log entry ever claimed for `table`, by offset —
+    /// those [`Coordinator::truncate_log`] dropped too.
+    pub fn claimed_log(&self, table: &TableIdent) -> Vec<LogEntry> {
+        let state = self.state.lock().unwrap();
+        let mut out: Vec<LogEntry> = state
+            .claimed
+            .iter()
+            .filter(|e| &e.table == table)
+            .cloned()
+            .collect();
+        out.sort_by_key(|e| e.end_offset);
+        out
     }
 }
 
@@ -167,6 +195,7 @@ impl Coordinator for MemoryCoordinator {
                 });
             }
             state.log.push(entry.clone());
+            state.claimed.push(entry.clone());
             grants.push(OffsetGrant {
                 table: entry.table,
                 start_offset: entry.start_offset,
@@ -221,12 +250,34 @@ impl Coordinator for MemoryCoordinator {
         Ok(out)
     }
 
-    async fn truncate_log(&self, table: &TableIdent, before_offset: u64) -> Result<Vec<String>> {
+    async fn truncate_log(
+        &self,
+        table: &TableIdent,
+        before_offset: u64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        // As Postgres's bigint parameters bound them in prod.
+        if i64::try_from(before_offset).is_err() {
+            return Err(CoordError::Other("before_offset > i64".into()));
+        }
+        if i64::try_from(limit).is_err() {
+            return Err(CoordError::Other("limit > i64".into()));
+        }
         let mut state = self.state.lock().unwrap();
+        // The first `limit` by offset.
+        let mut doomed: Vec<u64> = state
+            .log
+            .iter()
+            .filter(|e| &e.table == table && e.end_offset <= before_offset)
+            .map(|e| e.end_offset)
+            .collect();
+        doomed.sort_unstable();
+        doomed.truncate(limit);
+        let doomed: BTreeSet<u64> = doomed.into_iter().collect();
         let mut paths = Vec::new();
         let mut keep = Vec::with_capacity(state.log.len());
         for entry in std::mem::take(&mut state.log) {
-            if &entry.table == table && entry.end_offset <= before_offset {
+            if &entry.table == table && doomed.contains(&entry.end_offset) {
                 paths.push(entry.s3_path);
             } else {
                 keep.push(entry);
@@ -234,6 +285,16 @@ impl Coordinator for MemoryCoordinator {
         }
         state.log = keep;
         Ok(paths)
+    }
+
+    async fn staged_log_size(&self, table: &TableIdent) -> Result<StagedLogSize> {
+        let state = self.state.lock().unwrap();
+        let mut size = StagedLogSize::default();
+        for e in state.log.iter().filter(|e| &e.table == table) {
+            size.files += 1;
+            size.bytes += e.byte_size;
+        }
+        Ok(size)
     }
 
     async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> Result<()> {
@@ -255,6 +316,11 @@ impl Coordinator for MemoryCoordinator {
 
     async fn set_cursor(&self, group: &str, table: &TableIdent, to_offset: i64) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+        if state.crash_groups.contains(group) {
+            return Err(CoordError::Other(format!(
+                "the process died before setting {group}'s cursor"
+            )));
+        }
         let key = (group.to_string(), table.clone());
         match state.cursors.get_mut(&key) {
             Some(slot) => {
@@ -263,6 +329,16 @@ impl Coordinator for MemoryCoordinator {
             }
             None => Err(CoordError::NotFound(format!("cursor for {group}/{table}"))),
         }
+    }
+
+    async fn table_cursors(&self, table: &TableIdent) -> Result<Vec<(String, i64)>> {
+        let state = self.state.lock().unwrap();
+        Ok(state
+            .cursors
+            .iter()
+            .filter(|((_, t), _)| t == table)
+            .map(|((group, _), offset)| (group.clone(), *offset))
+            .collect())
     }
 
     async fn register_consumer(&self, group: &str, worker: &WorkerId, ttl: Duration) -> Result<()> {

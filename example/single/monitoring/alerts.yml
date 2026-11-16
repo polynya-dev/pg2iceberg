@@ -45,6 +45,17 @@ groups:
         annotations:
           summary: "{{ $labels.table }} in Iceberg is {{ $value | humanizeDuration }} behind Postgres"
 
+      # A caught-up table's staged log holds one file, the last one
+      # materialized: more means the materializer isn't truncating it.
+      - alert: Pg2icebergStagedFilesPileUp
+        expr: >
+          pg2iceberg_staged_log_files > 1
+          and on (table) pg2iceberg_materializer_backlog_rows == 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.table }}'s staged log holds {{ $value }} files with nothing left to materialize"
+
       - alert: Pg2icebergInvariantViolation
         expr: increase(pg2iceberg_invariant_violations_total[10m]) > 0
         labels: {severity: critical}

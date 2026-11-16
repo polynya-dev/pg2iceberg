@@ -196,10 +196,18 @@ impl InvariantWatcher {
         }
 
         // 2. mat_cursor[t] ≤ max(log_index.end_offset[t]). Also gauges
-        //    the rows in between: the materializer's backlog. Reads only
-        //    the log past the cursor — nothing truncates the log, so all of
-        //    it grows without bound; the backlog doesn't.
+        //    the rows in between: the materializer's backlog — and how
+        //    much of the staged log the coordinator still holds. The
+        //    materializer truncates it behind the cursor, keeping the entry
+        //    the cursor sits at the end of, so the check has one to find.
         for table in &inputs.watched_tables {
+            if let Ok(size) = self.coord.staged_log_size(table).await {
+                let table = labels([("table", &table.to_string())]);
+                self.metrics
+                    .gauge(names::STAGED_LOG_FILES, &table, size.files as f64);
+                self.metrics
+                    .gauge(names::STAGED_LOG_BYTES, &table, size.bytes as f64);
+            }
             let cursor = match self.coord.get_cursor(&inputs.group, table).await {
                 Ok(c) => c.unwrap_or(-1),
                 Err(_) => continue, // Transient coord errors don't trip invariants.

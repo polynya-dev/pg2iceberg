@@ -133,6 +133,59 @@ impl BlobStore for MemoryBlobStore {
     }
 }
 
+/// A blob store that keeps a copy of everything put to it under `prefix`,
+/// deleted or not: what tests check staging against, once the
+/// materializer deletes the staged files it applied.
+pub struct Archive {
+    inner: std::sync::Arc<dyn BlobStore>,
+    prefix: String,
+    /// Object key → bytes.
+    archived: Mutex<BTreeMap<String, Bytes>>,
+}
+
+impl Archive {
+    pub fn new(inner: std::sync::Arc<dyn BlobStore>, prefix: &str) -> Self {
+        Self {
+            inner,
+            prefix: object_key(prefix).to_string(),
+            archived: Mutex::default(),
+        }
+    }
+
+    /// The bytes last put to `path`, deleted since or not.
+    pub fn archived(&self, path: &str) -> Option<Bytes> {
+        self.archived.lock().unwrap().get(object_key(path)).cloned()
+    }
+}
+
+#[async_trait]
+impl BlobStore for Archive {
+    async fn put(&self, path: &str, bytes: Bytes) -> Result<()> {
+        self.inner.put(path, bytes.clone()).await?;
+        let key = object_key(path);
+        if key.starts_with(&self.prefix) {
+            self.archived.lock().unwrap().insert(key.to_string(), bytes);
+        }
+        Ok(())
+    }
+
+    async fn get(&self, path: &str) -> Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<BlobInfo>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn register_table(&self, ident: &pg2iceberg_core::TableIdent) -> Result<()> {
+        self.inner.register_table(ident).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

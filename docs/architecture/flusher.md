@@ -56,13 +56,17 @@ The coordinator role is filled by the **source PostgreSQL database** itself. Thi
 1. Upload staged Parquet files to S3 in parallel (up to 8 at a time)
 2. In a single PostgreSQL transaction: increment `log_seq` by the batch size, insert per-claim rows into `log_index` with the assigned offset range, S3 path, and `flushable_lsn`, and persist any blue-green markers
 
-Step 2 is atomic — a flush is either fully registered or not registered at all. Orphaned S3 files from failed step 2s are collected by [table maintenance](maintenance.md).
+Step 2 is atomic — a flush is either fully registered or not registered at all. A failed step 2 leaves its uploaded files behind: nothing references them, and [orphan cleanup](maintenance.md#orphan-file-cleanup) only looks at tables' data files.
 
 While streaming, a flush — encoding its changes, both steps — runs on a task of its own, and the flusher goes on receiving the next changes meanwhile. One flush runs at a time, so batches register in commit order, and the slot is acked past a flush only once its step 2 commits. A flush that fails stops pg2iceberg, which resumes from the last registered batch on restart — or, if the replication stream dropped with it, the reconnected stream starts there — so none of its changes is skipped.
 
 **Read** (materializer ← log):
 
 The materializer reads `log_index` entries with offsets greater than its cursor, downloads the referenced files — up to eight ahead of the one it's applying — decodes them via the staging codec, and processes events in offset order. There is no in-memory cache optimization for the single-process case; profiling showed the S3-fetch overhead is amortized well below the materializer cycle interval.
+
+**Truncate** (materializer → log):
+
+Once a table's entries are applied, the materializer drops them from `log_index` and deletes their files — while its next cycle applies more, since the two touch different entries. It truncates before the lowest cursor reading the log: every consumer group that registered the table holds it, and so does a backfill until its rows are applied. The entry that cursor sits at the end of stays, so the log still shows how far it's applied. A log grown long under a release that didn't truncate it is worked off at most 1,000 entries a table a cycle; a file whose delete fails stays behind. `pg2iceberg_staged_log_files` and `pg2iceberg_staged_log_bytes` gauge what each table's log still holds.
 
 ## Restart record
 

@@ -49,6 +49,7 @@ use bytes::Bytes;
 use pg2iceberg_coord::TableSnapshotState;
 use pg2iceberg_coord::{
     CommitBatch, CoordCommitReceipt, CoordError, Coordinator, LogEntry, Result as CoordResult,
+    StagedLogSize,
 };
 use pg2iceberg_core::{Lsn, TableIdent, WorkerId};
 use pg2iceberg_iceberg::{
@@ -278,11 +279,16 @@ impl Coordinator for FaultyCoordinator {
         &self,
         table: &TableIdent,
         before_offset: u64,
+        limit: usize,
     ) -> CoordResult<Vec<String>> {
         if self.plan.tick(ops::COORD_TRUNCATE) {
             return Err(CoordError::Pg("injected fault: truncate_log".into()));
         }
-        self.inner.truncate_log(table, before_offset).await
+        self.inner.truncate_log(table, before_offset, limit).await
+    }
+
+    async fn staged_log_size(&self, table: &TableIdent) -> CoordResult<StagedLogSize> {
+        self.inner.staged_log_size(table).await
     }
 
     async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> CoordResult<()> {
@@ -298,6 +304,10 @@ impl Coordinator for FaultyCoordinator {
             return Err(CoordError::Pg("injected fault: set_cursor".into()));
         }
         self.inner.set_cursor(group, table, to_offset).await
+    }
+
+    async fn table_cursors(&self, table: &TableIdent) -> CoordResult<Vec<(String, i64)>> {
+        self.inner.table_cursors(table).await
     }
 
     async fn register_consumer(

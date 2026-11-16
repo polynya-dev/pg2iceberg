@@ -39,7 +39,7 @@ use pg2iceberg_iceberg::read_materialized_state;
 use pg2iceberg_iceberg::CompactionConfig;
 use pg2iceberg_logical::pipeline::CounterBlobNamer;
 use pg2iceberg_logical::{replication_start_lsn, CounterMaterializerNamer, Materializer, Pipeline};
-use pg2iceberg_sim::blob::MemoryBlobStore;
+use pg2iceberg_sim::blob::{Archive, MemoryBlobStore};
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
@@ -1269,7 +1269,8 @@ fn snapshot_cdc_fence_skips_pre_snapshot_wal_events_in_replication_stream() {
     // missing, replication would re-stage the 4 pre-seed inserts as log
     // entries (or worse, treat them as re-inserts triggering equality
     // deletes).
-    let entries = block_on(coord_inner.read_log(&ident(), 0, 1_000_000)).unwrap();
+    // Everything ever staged: the materializer truncates what it applied.
+    let entries = coord_inner.claimed_log(&ident());
     let total_records: u64 = entries.iter().map(|e| e.record_count).sum();
     assert_eq!(
         total_records, 0,
@@ -1818,12 +1819,16 @@ struct SimStores {
     coord: Arc<MemoryCoordinator>,
     catalog: Arc<MemoryCatalog>,
     blob: Arc<MemoryBlobStore>,
+    /// What the lifecycle writes through: `blob`, keeping a copy of every
+    /// file — the materializer deletes the staged ones it applied.
+    archive: Arc<Archive>,
     plan: FaultPlan,
 }
 
 impl SimStores {
     fn new() -> Self {
         let clock: Arc<dyn pg2iceberg_core::Clock> = Arc::new(TokioClock::new());
+        let blob = Arc::new(MemoryBlobStore::new());
         Self {
             coord: Arc::new(MemoryCoordinator::new(
                 CoordSchema::default_name(),
@@ -1831,7 +1836,8 @@ impl SimStores {
             )),
             clock,
             catalog: Arc::new(MemoryCatalog::new()),
-            blob: Arc::new(MemoryBlobStore::new()),
+            archive: Arc::new(Archive::new(blob.clone(), "")),
+            blob,
             plan: FaultPlan::new(),
         }
     }
@@ -1913,7 +1919,7 @@ fn sim_lifecycle_with<Cat: pg2iceberg_iceberg::Catalog + 'static>(
             stores.plan.clone(),
         )),
         catalog,
-        blob: stores.blob.clone() as Arc<dyn pg2iceberg_stream::BlobStore>,
+        blob: stores.archive.clone() as Arc<dyn pg2iceberg_stream::BlobStore>,
         clock: stores.clock.clone(),
         id_gen: Arc::new(ZeroIdGen),
         schemas: vec![schema()],
@@ -2468,7 +2474,8 @@ async fn the_snapshot_reads_flush_rows_a_chunk_straight_into_the_table() {
         .await
         .unwrap();
 
-    let staged = stores.coord.read_log(&ident(), 0, 1000).await.unwrap();
+    // Everything ever staged: the materializer truncates what it applied.
+    let staged = stores.coord.claimed_log(&ident());
     assert!(
         staged.is_empty(),
         "the snapshot staged {} chunks",
@@ -3593,7 +3600,13 @@ async fn lifecycle_reopens_a_dropped_replication_stream() {
         tx.insert(&ident(), row(i, i * 10));
     }
     tx.commit(Timestamp(0)).unwrap();
-    let (lifecycle, coord, catalog, blob) = sim_lifecycle(&db);
+    let stores = SimStores::new();
+    let lifecycle = sim_lifecycle_on(&db, &stores, pg2iceberg_logical::Schedule::default());
+    let (coord, catalog, blob) = (
+        stores.coord.clone(),
+        stores.catalog.clone(),
+        stores.blob.clone(),
+    );
 
     let script = db.clone();
     // Polled by the main loop from its first iteration on.
@@ -3648,11 +3661,10 @@ async fn lifecycle_reopens_a_dropped_replication_stream() {
     };
     assert_eq!(with_note(iceberg), with_note(pg));
 
+    // Everything ever staged: the materializer truncates what it applied.
     let mut staged = 0;
-    for entry in coord.read_log(&ident(), 0, 1_000_000).await.unwrap() {
-        let bytes = pg2iceberg_stream::BlobStore::get(blob.as_ref(), &entry.s3_path)
-            .await
-            .unwrap();
+    for entry in coord.claimed_log(&ident()) {
+        let bytes = stores.archive.archived(&entry.s3_path).unwrap();
         let events = pg2iceberg_stream::codec::decode_chunk(&bytes).unwrap();
         staged += events
             .iter()
