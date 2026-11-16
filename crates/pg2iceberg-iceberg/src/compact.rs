@@ -61,6 +61,10 @@
 //!   `t` is retired only when no dirty data file with seq `< t` remains
 //!   after this pass. Clean files don't hold it back: by definition no
 //!   live delete applies to any of their rows.
+//! - **Moved rows keep their lineage.** On a v3 table, every row has a
+//!   `_row_id` and a `_last_updated_sequence_number` — stored in its file,
+//!   or inherited from the file's first row id and data sequence number.
+//!   A rewritten row keeps both: the outputs store them for every row.
 //! - **No partial rewrites.** We rewrite a data file fully or not at all.
 //!   Partial rewrites would lose rows.
 //! - **Atomicity.** Either the entire `Replace` snapshot lands, or none
@@ -68,8 +72,11 @@
 
 use crate::reader::{value_at, ArrowBatches};
 use crate::writer::{StreamingDataFile, TableWriter, WriterError};
-use crate::{Catalog, DataFile, FileIndex, IcebergError, PkKey, PreparedCompaction, Snapshot};
-use arrow_array::{Array, BooleanArray, RecordBatch};
+use crate::{
+    Catalog, DataFile, FileIndex, IcebergError, PkKey, PreparedCompaction, Snapshot,
+    LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID, ROW_ID_FIELD_ID,
+};
+use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch};
 use arrow_select::filter::filter_record_batch;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -79,6 +86,7 @@ use pg2iceberg_stream::{BlobStore, StreamError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::{poll_fn, Future};
 use std::pin::pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use thiserror::Error;
 
@@ -243,6 +251,8 @@ struct LiveFile {
     /// its snapshot's — `snapshots()` lists a file under the snapshot that
     /// added it — or, for a compaction's output, the one its pass read.
     seq: i64,
+    /// A v3 data file's first row id ([`DataFile::first_row_id`]).
+    first_row_id: Option<i64>,
 }
 
 impl LiveFile {
@@ -252,8 +262,72 @@ impl LiveFile {
             record_count: df.record_count,
             partition_values: df.partition_values.clone(),
             seq,
+            first_row_id: df.first_row_id,
         }
     }
+}
+
+/// Row lineage's two columns, as a v3 table's data files store them.
+fn lineage_columns() -> [ColumnSchema; 2] {
+    let column = |name: &str, field_id| ColumnSchema {
+        name: name.into(),
+        field_id,
+        ty: pg2iceberg_core::IcebergType::Long,
+        nullable: true,
+        is_primary_key: false,
+    };
+    [
+        column("_row_id", ROW_ID_FIELD_ID),
+        column(
+            "_last_updated_sequence_number",
+            LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID,
+        ),
+    ]
+}
+
+/// `batch`, read from rows `offset..` of `input`, with its last two
+/// columns — row lineage's — filled in for each row the file doesn't
+/// store them for: `_row_id` as the file's first row id plus the row's
+/// position, `_last_updated_sequence_number` as the file's data sequence
+/// number. What a v3 reader reads for the rows, so the rewritten file
+/// stores what they had: the spec requires a commit that moves rows to
+/// keep both.
+fn with_lineage(batch: RecordBatch, input: &LiveFile, offset: u64) -> Result<RecordBatch> {
+    let width = batch.num_columns();
+    let stored = |i: usize| -> Result<Int64Array> {
+        batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .cloned()
+            .ok_or_else(|| {
+                WriterError::Encode(format!(
+                    "row lineage column {} isn't a long",
+                    batch.schema().field(i).name()
+                ))
+                .into()
+            })
+    };
+    let (row_ids, seqs) = (stored(width - 2)?, stored(width - 1)?);
+    let row_ids: Int64Array = (0..batch.num_rows())
+        .map(|i| match row_ids.is_null(i) {
+            false => Some(row_ids.value(i)),
+            true => input
+                .first_row_id
+                .map(|first| first + offset as i64 + i as i64),
+        })
+        .collect();
+    let seqs: Int64Array = (0..batch.num_rows())
+        .map(|i| match seqs.is_null(i) {
+            false => Some(seqs.value(i)),
+            true => input.first_row_id.map(|_| input.seq),
+        })
+        .collect();
+    let mut columns = batch.columns()[..width - 2].to_vec();
+    columns.push(Arc::new(row_ids));
+    columns.push(Arc::new(seqs));
+    RecordBatch::try_new(batch.schema(), columns)
+        .map_err(|e| WriterError::Encode(format!("row lineage: {e}")).into())
 }
 
 /// What one pass does: which data files it rewrites (in processing
@@ -399,7 +473,15 @@ where
         ))
         .await?;
 
-    let writer = TableWriter::new(schema.clone());
+    // A v3 table's rows have lineage — its data files take first row ids
+    // — which the outputs store for each row they move.
+    let lineage = live_data.values().any(|f| f.first_row_id.is_some());
+    let mut written = schema.clone();
+    if lineage {
+        written.columns.extend(lineage_columns());
+    }
+    let writer = TableWriter::new(written);
+    let read_cols = writer.schema().columns.clone();
     let mut out = OutputFiles::default();
     let mut rows_rewritten: u64 = 0;
     let mut rows_removed_by_deletes: u64 = 0;
@@ -419,9 +501,15 @@ where
     while let Some(((path, meta), bytes)) = io.next_input().await? {
         let source = sources[path.as_str()];
         bytes_before += meta.byte_size;
-        for batch in ArrowBatches::new(bytes, &schema.columns, DECODE_BATCH_ROWS)? {
-            let batch = batch?;
+        // The position in the input of the batch's first row.
+        let mut offset: u64 = 0;
+        for batch in ArrowBatches::new(bytes, &read_cols, DECODE_BATCH_ROWS)? {
+            let mut batch = batch?;
             let n = batch.num_rows();
+            if lineage {
+                batch = with_lineage(batch, meta, offset)?;
+            }
+            offset += n as u64;
             peak_rows = peak_rows.max(n as u64);
             rows_rewritten += n as u64;
             // A delete applies iff it is strictly newer than the row.
@@ -498,6 +586,7 @@ where
             removed_paths,
             // The table as the pass read it: the last snapshot.
             data_sequence_number: snapshots.last().map(|s| s.id),
+            stores_row_lineage: lineage,
         },
         outcome: CompactionOutcome {
             input_data_files: plan.inputs.len(),
@@ -552,6 +641,8 @@ where
             added_data_files: Vec::new(),
             removed_paths: retired.clone(),
             data_sequence_number: snapshots.last().map(|s| s.id),
+            // It moves no rows.
+            stores_row_lineage: true,
         })
         .await?;
     Ok(Some(CompactionOutcome {
@@ -639,6 +730,7 @@ impl OutputFiles {
             equality_field_ids: vec![],
             partition_values,
             sequence_number: None,
+            first_row_id: None,
         });
         self.added_pks.push(pks);
         self.added_sources.push(sources);
@@ -1144,6 +1236,7 @@ mod tests {
             equality_field_ids: vec![],
             partition_values: vec![],
             sequence_number: None,
+            first_row_id: None,
         }
     }
 
@@ -1226,6 +1319,7 @@ mod tests {
             record_count: 2,
             partition_values: Vec::new(),
             seq,
+            first_row_id: None,
         };
         let files = |entries: &[(&str, i64)]| -> BTreeMap<String, LiveFile> {
             entries

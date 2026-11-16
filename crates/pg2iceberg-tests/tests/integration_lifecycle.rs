@@ -257,6 +257,7 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             maintenance_retention: String::new(),
             maintenance_grace: "30m".into(),
             maintenance: String::new(),
+            format_version: 2,
             catalog_props: BTreeMap::new(),
             meta_namespace: String::new(),
         },
@@ -329,12 +330,87 @@ async fn iam_credentials_with_a_custom_endpoint_commit_snapshots() {
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: vec![],
         })
         .await
         .expect("commit, writing manifests to MinIO");
 }
+/// A REST catalog creates each table in the format version pg2iceberg is
+/// set to — its create request carries it only as a table property — and,
+/// for v3, takes a commit's row range: the next commit's rows get ids.
+#[tokio::test]
+async fn a_rest_catalog_creates_tables_in_the_configured_format_version() {
+    use iceberg::Catalog as _;
+    use pg2iceberg_core::{ColumnSchema, IcebergType, TableSchema};
+    use pg2iceberg_iceberg::{Catalog as _, DataFile, FormatVersion, PreparedCommit};
+
+    let stack = bring_up_stack().await;
+    let cfg = config_for_stack(&stack, "unused", "unused", "unused");
+    for (version, expected) in [
+        (FormatVersion::V2, iceberg::spec::FormatVersion::V2),
+        (FormatVersion::V3, iceberg::spec::FormatVersion::V3),
+    ] {
+        let rest = Arc::new(build_rest_catalog(&cfg).await.expect("rest catalog"));
+        let catalog = IcebergRustCatalog::new(rest.clone()).with_format_version(version);
+        let ident = TableIdent {
+            namespace: Namespace(vec!["public".into()]),
+            name: format!("v{}_{}", expected as u8, uniq()),
+        };
+        catalog
+            .ensure_namespace(&ident.namespace)
+            .await
+            .expect("namespace");
+        catalog
+            .create_table(&TableSchema {
+                ident: ident.clone(),
+                columns: vec![ColumnSchema {
+                    name: "id".into(),
+                    field_id: 1,
+                    ty: IcebergType::Int,
+                    nullable: false,
+                    is_primary_key: true,
+                }],
+                partition_spec: Vec::new(),
+                pg_schema: None,
+            })
+            .await
+            .expect("create table");
+        catalog
+            .commit_snapshot(PreparedCommit {
+                ident: ident.clone(),
+                data_files: vec![DataFile {
+                    path: format!("s3://{}/{}/data.parquet", stack.bucket, ident.name),
+                    record_count: 5,
+                    byte_size: 1,
+                    equality_field_ids: vec![],
+                    partition_values: Vec::new(),
+                    sequence_number: None,
+                    first_row_id: None,
+                }],
+                equality_deletes: vec![],
+            })
+            .await
+            .expect("commit");
+        let table = rest
+            .load_table(&iceberg::TableIdent::new(
+                iceberg::NamespaceIdent::new("public".into()),
+                ident.name.clone(),
+            ))
+            .await
+            .expect("load table");
+        assert_eq!(table.metadata().format_version(), expected, "{ident}");
+        if expected == iceberg::spec::FormatVersion::V3 {
+            assert_eq!(
+                table.metadata().next_row_id(),
+                5,
+                "{ident}: row ids given out"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_inserts_propagate_pg_to_iceberg() {
     // Surface lifecycle / pipeline / catalog tracing into test output

@@ -293,6 +293,7 @@ mod tests {
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values,
                 sequence_number: None,
+                first_row_id: None,
             });
         }
         for (i, chunk) in prepared.equality_deletes.into_iter().enumerate() {
@@ -309,6 +310,7 @@ mod tests {
                 equality_field_ids: prepared.pk_field_ids.clone(),
                 partition_values: chunk.partition_values,
                 sequence_number: None,
+                first_row_id: None,
             });
         }
         cat.snaps

@@ -179,6 +179,7 @@ mod tests {
             equality_field_ids: vec![],
             partition_values: vec![],
             sequence_number: None,
+            first_row_id: None,
         };
         Snapshot {
             id,

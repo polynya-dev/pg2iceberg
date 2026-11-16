@@ -49,6 +49,7 @@ sink:
 | `ICEBERG_NAMESPACE` | `sink.namespace` |
 | `ICEBERG_CREDENTIAL_MODE` | `sink.credential_mode` |
 | `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` |
+| `PG2ICEBERG_FORMAT_VERSION` | `sink.format_version` |
 | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` |
 | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` |
 | `PG2ICEBERG_LOG_FORMAT` | `text` (default) or `json` logs; no config field |
@@ -168,6 +169,10 @@ sink:
   # Data Catalog, Glue's table optimizers. See Table Maintenance.
   maintenance: pg2iceberg
 
+  # Iceberg format version of the tables pg2iceberg creates: 2, or 3 for
+  # row lineage. Tables that already exist keep theirs.
+  format_version: 2
+
   # `pg2iceberg maintain` (snapshot expiry + orphan cleanup)
   maintenance_retention: 168h    # 7 days. Snapshots older than this are dropped.
   maintenance_grace: 30m         # Orphan files younger than this are protected,
@@ -207,6 +212,7 @@ snapshot_only: false             # legacy field; prefer the `snapshot` subcomman
 - **`sink.materializer_batch_rows`** — the most change events the materializer folds into one step, which bounds its memory, along with the up to eight staged files it reads ahead (each at most `flush_rows` events). A transaction larger than this is written in several steps committed in one atomic catalog update, so readers of the table never see part of it; catching up, the materializer commits up to four steps at a time anyway. Steps only adding rows share a snapshot ([commit](../architecture/materializer.md)).
 - **`sink.materializer_concurrency`** — the most tables the materializer applies at once (default 4; 1 applies them one after another). A table's work is mostly waiting on the object store and catalog, so more at once catch up faster on many tables; each holds its own `materializer_batch_rows` events and staged files read ahead, and commits on its own, so memory and the catalog's request rate grow with it. With meta tables on (`meta_namespace`), tables go one at a time.
 - **`sink.pk_index_memory`** — the most memory, in bytes, the materializer holds of a table's primary keys: it maps each key to the data file holding its row ([file index](../architecture/materializer.md#file-index)). Within it — about 7 million keys at the default 512 MiB, leaving room for the map to grow and a quarter for the filter of evicted keys — nothing changes. Past it, the oldest files' keys are evicted, and changes to their rows cost more: an insert that may be of one writes an equality delete, and an update leaving TOAST columns out, a delete on a partitioned table, a `TRUNCATE` or a column added with a default reads the files that may hold them. Each table has its own budget.
+- **`sink.format_version`** — the [Iceberg format version](https://iceberg.apache.org/spec/#format-versioning) of the tables pg2iceberg creates: 2 (the default) or 3. A v3 table has row lineage: every row has a `_row_id`, and the sequence number of the commit that last changed it (`_last_updated_sequence_number`), which engines use to read a table incrementally. Compaction keeps both for the rows it moves ([compaction](../architecture/compaction.md#row-lineage)). An update gives the row a new `_row_id`: pg2iceberg writes it as an equality delete and an insert, which the spec allows to. Not every engine reads v3 tables yet: check the ones reading yours. Tables that already exist keep their version — pg2iceberg writes each as its own version says, including one another engine upgraded to v3 — and pg2iceberg never upgrades one.
 - **`sink.flush_interval` / `sink.materializer_interval`** — the micro-batch cadence: changes are staged every `flush_interval` (or sooner, once `flush_rows` are buffered) and committed to Iceberg every `materializer_interval` (or back to back, while catching up on a backlog). A change typically reaches Iceberg within about the two added together. Shorter intervals mean fresher tables, and more, smaller Iceberg snapshots and files for compaction to merge.
 - **`sink.compaction_delete_files` / `sink.compaction_delete_ratio`** — when compaction drops deleted rows. An update or delete leaves the old row in its data file, hidden by an equality delete that every reader applies; dropping it means rewriting the files holding such rows, and every older one, before the delete file can go. Under updates spread across a large table that's most of the table, so pg2iceberg waits until the deleted rows are `compaction_delete_ratio` of the rows those files hold (rewriting then reads at most 10 rows per row deleted, at 0.1), or until there are `compaction_delete_files` delete files for readers to open. Lower values keep reads cheaper; higher ones rewrite less.
 - **`sink.flush_bytes`** — not yet exposed; flush threshold is `flush_rows` + `flush_interval` only.

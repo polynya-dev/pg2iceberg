@@ -362,6 +362,7 @@ mod tests {
                 equality_field_ids: Vec::new(),
                 partition_values: Vec::new(),
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: Vec::new(),
         }

@@ -9,13 +9,21 @@
 //! state: files it added stay live until a later snapshot removes them.
 //! [`ReaderView`] is that state — what a query engine reading the current
 //! snapshot sees — independent of what [`Catalog::snapshots`] reports.
+//!
+//! Tables are created format v2 unless the catalog is told otherwise
+//! ([`MemoryCatalog::with_format_version`]), and can be upgraded
+//! ([`MemoryCatalog::upgrade_format_version`]). A v3 table has row
+//! lineage, as the spec requires: every commit gives each data file it
+//! adds the next `record_count` row ids, the first one recorded on the
+//! file ([`DataFile::first_row_id`]). A row's id is that plus its
+//! position in the file, unless the file stores the row's own.
 
 use async_trait::async_trait;
 use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
 use pg2iceberg_iceberg::PreparedCommit;
 use pg2iceberg_iceberg::{
     apply_schema_changes, log_ends_property, merge_log_ends, recorded_log_ends, Catalog, DataFile,
-    IcebergError, LogRange, Result, SchemaChange, Snapshot, TableMetadata,
+    FormatVersion, IcebergError, LogRange, Result, SchemaChange, Snapshot, TableMetadata,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -36,9 +44,34 @@ struct MemTable {
     /// Each snapshot's recorded log ends: those carried forward, and its
     /// own commit's (see [`LogRange`]).
     log_ends: BTreeMap<i64, BTreeMap<String, u64>>,
+    format_version: FormatVersion,
+    /// v3: the row id the next data file's first row takes.
+    next_row_id: i64,
 }
 
 impl MemTable {
+    /// Give rows their ids, as a v3 table's commit does: each data file
+    /// the table holds without any yet — one it had before its upgrade to
+    /// v3 — and then each of `files`, just committed, takes the next
+    /// `record_count` of them, in order. Every commit does: its manifest
+    /// list assigns ids to each manifest it names that has none. A v2
+    /// table has no row lineage.
+    fn assign_row_ids(&mut self, files: &mut [DataFile]) {
+        if self.format_version != FormatVersion::V3 {
+            return;
+        }
+        let live: BTreeSet<String> = self.live_paths().into_iter().map(str::to_string).collect();
+        let earlier = self
+            .snapshots
+            .iter_mut()
+            .flat_map(|s| s.data_files.iter_mut())
+            .filter(|f| f.first_row_id.is_none() && live.contains(&f.path));
+        for f in earlier.chain(files.iter_mut()) {
+            f.first_row_id = Some(self.next_row_id);
+            self.next_row_id += f.record_count as i64;
+        }
+    }
+
     /// Record snapshot `id`, just committed: it carries the table's log
     /// ends forward, with `range`'s.
     fn record_log_ends(&mut self, id: i64, range: Option<&LogRange>) {
@@ -89,6 +122,30 @@ impl MemTable {
         Ok(())
     }
 
+    /// Like the fork's `RewriteFilesAction::validate_no_row_ids`: a
+    /// rewrite whose outputs store no row lineage fails if a data file it
+    /// removes has row ids — its rows would take new ones.
+    fn check_row_lineage(&self, prepared: &pg2iceberg_iceberg::PreparedCompaction) -> Result<()> {
+        if prepared.stores_row_lineage {
+            return Ok(());
+        }
+        let removed: BTreeSet<&str> = prepared.removed_paths.iter().map(String::as_str).collect();
+        let with_ids: Vec<&str> = self
+            .snapshots
+            .iter()
+            .flat_map(|s| &s.data_files)
+            .filter(|f| f.first_row_id.is_some() && removed.contains(f.path.as_str()))
+            .map(|f| f.path.as_str())
+            .collect();
+        if !with_ids.is_empty() {
+            return Err(IcebergError::Conflict(format!(
+                "{}: {with_ids:?}",
+                pg2iceberg_iceberg::ROW_IDS_CONFLICT
+            )));
+        }
+        Ok(())
+    }
+
     /// Bring `metadata.log_ends` in line with the table's properties and
     /// its unexpired snapshots.
     fn refresh_log_ends(&mut self) {
@@ -106,11 +163,22 @@ impl MemTable {
 #[derive(Default, Clone)]
 pub struct MemoryCatalog {
     state: Arc<Mutex<State>>,
+    /// The format version of the tables it creates.
+    format_version: FormatVersion,
 }
 
 impl MemoryCatalog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create tables in format `version` (v2 by default), as
+    /// `IcebergRustCatalog::with_format_version` does.
+    pub fn with_format_version(self, version: FormatVersion) -> Self {
+        Self {
+            format_version: version,
+            ..self
+        }
     }
 
     /// Every snapshot ever committed to `ident`, expired or not: the
@@ -121,6 +189,44 @@ impl MemoryCatalog {
             .get(ident)
             .map(|t| t.snapshots.clone())
             .unwrap_or_default()
+    }
+
+    /// Test hook: upgrade `ident` to format `version`, as another engine
+    /// does (`ALTER TABLE … SET TBLPROPERTIES ('format-version' = '3')`).
+    /// Upgrading to v3 starts the table's row ids at 0; the rows it holds
+    /// get theirs at its next commit.
+    pub fn upgrade_format_version(&self, ident: &TableIdent, version: FormatVersion) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let table = s
+            .tables
+            .get_mut(ident)
+            .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
+        if (table.format_version, version) == (FormatVersion::V3, FormatVersion::V2) {
+            return Err(IcebergError::Other(format!(
+                "cannot downgrade {ident} from v3 to v2"
+            )));
+        }
+        if version == FormatVersion::V3 && table.format_version != FormatVersion::V3 {
+            table.next_row_id = 0;
+        }
+        table.format_version = version;
+        Ok(())
+    }
+
+    /// The table's format version.
+    pub fn format_version(&self, ident: &TableIdent) -> Option<FormatVersion> {
+        let s = self.state.lock().unwrap();
+        s.tables.get(ident).map(|t| t.format_version)
+    }
+
+    /// v3: the row id the table's next data file starts at — above every
+    /// id its rows have been given.
+    pub fn next_row_id(&self, ident: &TableIdent) -> Option<i64> {
+        let s = self.state.lock().unwrap();
+        s.tables
+            .get(ident)
+            .filter(|t| t.format_version == FormatVersion::V3)
+            .map(|t| t.next_row_id)
     }
 
     /// Test hook: stamp a config map onto a table's metadata. The
@@ -165,6 +271,7 @@ impl MemoryCatalog {
             .get_mut(&prepared.ident)
             .ok_or_else(|| IcebergError::NotFound(format!("table: {}", prepared.ident)))?;
         table.check_removable(&prepared.removed_paths)?;
+        table.check_row_lineage(&prepared)?;
         if own_sequence_number {
             let read = prepared.data_sequence_number.unwrap_or(0);
             let since = table
@@ -186,7 +293,7 @@ impl MemoryCatalog {
         } else {
             prepared.data_sequence_number
         };
-        let added = prepared
+        let mut added: Vec<DataFile> = prepared
             .added_data_files
             .into_iter()
             .map(|f| DataFile {
@@ -194,6 +301,7 @@ impl MemoryCatalog {
                 ..f
             })
             .collect();
+        table.assign_row_ids(&mut added);
         table.snapshots.push(Snapshot {
             id,
             data_files: added,
@@ -222,6 +330,7 @@ impl MemoryCatalog {
             .get_mut(ident)
             .ok_or_else(|| IcebergError::NotFound(format!("table: {ident}")))?;
         table.check_removable(&paths)?;
+        table.assign_row_ids(&mut []);
         let id = table.next_snapshot_id;
         table.next_snapshot_id += 1;
         table.snapshots.push(Snapshot {
@@ -287,6 +396,8 @@ impl Catalog for MemoryCatalog {
                 expired: BTreeSet::new(),
                 next_snapshot_id: 1,
                 log_ends: BTreeMap::new(),
+                format_version: self.format_version,
+                next_row_id: 0,
             },
         );
         Ok(metadata)
@@ -311,9 +422,11 @@ impl Catalog for MemoryCatalog {
         // snapshot id (multiplied by 1000 so retention-by-ms tests can
         // discriminate). Real catalogs surface iceberg's own
         // wall-clock millis here.
+        let mut data_files = prepared.data_files;
+        table.assign_row_ids(&mut data_files);
         table.snapshots.push(Snapshot {
             id,
-            data_files: prepared.data_files,
+            data_files,
             delete_files: prepared.equality_deletes,
             removed_paths: Vec::new(),
             timestamp_ms: id * 1000,
@@ -353,9 +466,11 @@ impl Catalog for MemoryCatalog {
             }
             let id = table.next_snapshot_id;
             table.next_snapshot_id += 1;
+            let mut data_files = step.data_files;
+            table.assign_row_ids(&mut data_files);
             table.snapshots.push(Snapshot {
                 id,
-                data_files: step.data_files,
+                data_files,
                 delete_files: step.equality_deletes,
                 removed_paths: Vec::new(),
                 timestamp_ms: id * 1000,
@@ -399,10 +514,11 @@ impl Catalog for MemoryCatalog {
             return Ok(table.metadata.clone());
         }
         table.check_removable(&prepared.removed_paths)?;
+        table.check_row_lineage(&prepared)?;
 
         let id = table.next_snapshot_id;
         table.next_snapshot_id += 1;
-        let added = prepared
+        let mut added: Vec<DataFile> = prepared
             .added_data_files
             .into_iter()
             .map(|f| DataFile {
@@ -410,6 +526,7 @@ impl Catalog for MemoryCatalog {
                 ..f
             })
             .collect();
+        table.assign_row_ids(&mut added);
         table.snapshots.push(Snapshot {
             id,
             data_files: added,
@@ -608,6 +725,7 @@ mod tests {
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
                 equality_deletes: vec![],
             }))
@@ -751,6 +869,7 @@ mod tests {
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
                 equality_deletes: vec![],
             }],

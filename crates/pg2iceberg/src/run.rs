@@ -192,7 +192,8 @@ fn data_path(location: &str, kind: &str, partition_segment: &str, id: &str) -> S
 pub async fn run(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     cfg.require_catalog()?;
     let catalog = build_rest_catalog(&cfg).await?;
-    let catalog = IcebergRustCatalog::new(Arc::new(catalog));
+    let catalog = IcebergRustCatalog::new(Arc::new(catalog))
+        .with_format_version(cfg.sink.resolved_format_version()?);
     let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
@@ -378,7 +379,8 @@ fn bucket_from_warehouse(warehouse: &str) -> Result<String> {
 pub async fn run_stream_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     cfg.require_catalog()?;
     let catalog = build_rest_catalog(&cfg).await?;
-    let catalog = IcebergRustCatalog::new(Arc::new(catalog));
+    let catalog = IcebergRustCatalog::new(Arc::new(catalog))
+        .with_format_version(cfg.sink.resolved_format_version()?);
     let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
@@ -720,7 +722,8 @@ async fn build_one_shot_materializer(
     metrics: Arc<dyn Metrics>,
 ) -> Result<Materializer<OneShotCatalog>> {
     cfg.require_catalog()?;
-    let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?));
+    let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?))
+        .with_format_version(cfg.sink.resolved_format_version()?);
     let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
@@ -823,7 +826,8 @@ async fn build_one_shot_materializer(
 pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
     cfg.require_catalog()?;
     let catalog: Arc<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> = Arc::new(
-        IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?)),
+        IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?))
+            .with_format_version(cfg.sink.resolved_format_version()?),
     );
     let blob = build_storage(&cfg, &catalog)
         .await
@@ -1027,7 +1031,8 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     use pg2iceberg_validate::LifecycleError;
 
     cfg.require_catalog()?;
-    let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?));
+    let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?))
+        .with_format_version(cfg.sink.resolved_format_version()?);
     // The snapshot is written straight to the tables: nothing to stage.
     let Storage {
         blob,

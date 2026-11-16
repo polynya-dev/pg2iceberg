@@ -119,6 +119,7 @@ impl Harness {
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values,
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: vec![],
         }))
@@ -323,9 +324,11 @@ fn compaction_replaced_files_become_orphans() {
             equality_field_ids: vec![],
             partition_values: vec![],
             sequence_number: None,
+            first_row_id: None,
         }],
         removed_paths: vec![p1.clone(), p2.clone(), p3.clone()],
         data_sequence_number: None,
+        stores_row_lineage: false,
     }))
     .unwrap();
 
@@ -445,6 +448,7 @@ fn cleanup_keeps_other_tables_files() {
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values,
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: vec![],
         }))
