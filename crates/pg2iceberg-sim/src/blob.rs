@@ -63,6 +63,12 @@ impl MemoryBlobStore {
             .sum()
     }
 
+    /// The clock's time: what the next `put` records as its
+    /// `last_modified_ms`.
+    pub fn now_ms(&self) -> i64 {
+        self.clock_ms.load(Ordering::SeqCst)
+    }
+
     /// Test-only: override the in-memory clock used for `last_modified_ms`
     /// stamping. Subsequent `put`s record this exact value (and the
     /// counter advances from there).

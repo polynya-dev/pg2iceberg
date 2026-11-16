@@ -614,6 +614,42 @@ impl Coordinator for PostgresCoordinator {
             .collect())
     }
 
+    async fn begin_write(&self, table: &TableIdent, writer: &str, since_ms: i64) -> Result<()> {
+        let key = table_key(table);
+        let client = self.client().await?;
+        client
+            .execute(&sql::begin_write(&self.schema), &[&key, &writer, &since_ms])
+            .await
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    async fn end_write(&self, table: &TableIdent, writer: &str) -> Result<()> {
+        let key = table_key(table);
+        let client = self.client().await?;
+        client
+            .execute(&sql::end_write(&self.schema), &[&key, &writer])
+            .await
+            .map_err(pg)?;
+        Ok(())
+    }
+
+    async fn writes_in_flight(&self, table: &TableIdent) -> Result<Vec<crate::WriteInFlight>> {
+        let key = table_key(table);
+        let client = self.client().await?;
+        let rows = client
+            .query(&sql::select_writes_in_flight(&self.schema), &[&key])
+            .await
+            .map_err(pg)?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::WriteInFlight {
+                writer: r.get(0),
+                since_ms: r.get(1),
+            })
+            .collect())
+    }
+
     async fn snapshot_progress(&self, ident: &TableIdent) -> Result<Option<String>> {
         let key = table_key(ident);
         let client = self.client().await?;

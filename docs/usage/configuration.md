@@ -170,7 +170,9 @@ sink:
 
   # `pg2iceberg maintain` (snapshot expiry + orphan cleanup)
   maintenance_retention: 168h    # 7 days. Snapshots older than this are dropped.
-  maintenance_grace: 30m         # Orphan files younger than this are protected.
+  maintenance_grace: 30m         # Orphan files younger than this are protected,
+                                 # and so are a write's still in flight — the initial
+                                 # snapshot's, a compaction pass's — however old.
                                  # Cleanup only scans each table's own directory,
                                  # <warehouse>/materialized/<namespace>.<table>/.
 

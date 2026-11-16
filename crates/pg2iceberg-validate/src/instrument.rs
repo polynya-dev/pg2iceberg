@@ -483,6 +483,32 @@ impl<C: Coordinator + ?Sized> Coordinator for Instrumented<C> {
             .await
     }
 
+    async fn begin_write(
+        &self,
+        table: &TableIdent,
+        writer: &str,
+        since_ms: i64,
+    ) -> pg2iceberg_coord::Result<()> {
+        self.coord(
+            "begin_write",
+            self.inner.begin_write(table, writer, since_ms),
+        )
+        .await
+    }
+
+    async fn end_write(&self, table: &TableIdent, writer: &str) -> pg2iceberg_coord::Result<()> {
+        self.coord("end_write", self.inner.end_write(table, writer))
+            .await
+    }
+
+    async fn writes_in_flight(
+        &self,
+        table: &TableIdent,
+    ) -> pg2iceberg_coord::Result<Vec<pg2iceberg_coord::WriteInFlight>> {
+        self.coord("writes_in_flight", self.inner.writes_in_flight(table))
+            .await
+    }
+
     async fn snapshot_progress(
         &self,
         ident: &TableIdent,

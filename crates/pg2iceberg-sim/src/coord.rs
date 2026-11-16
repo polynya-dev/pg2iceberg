@@ -10,11 +10,11 @@
 
 use crate::clock::{duration_to_micros, TestClock};
 use async_trait::async_trait;
-use pg2iceberg_coord::TableSnapshotState;
 use pg2iceberg_coord::{
     receipt, schema::CoordSchema, CommitBatch, CoordCommitReceipt, CoordError, Coordinator,
     LogEntry, MarkerInfo, OffsetGrant, Result,
 };
+use pg2iceberg_coord::{TableSnapshotState, WriteInFlight};
 use pg2iceberg_core::{Clock, Lsn, TableIdent, Timestamp, WorkerId};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -31,6 +31,8 @@ struct State {
     next_offset: BTreeMap<TableIdent, u64>,
     /// `table_epoch.epoch`. Bumped by `bump_table_epoch`.
     table_epochs: BTreeMap<TableIdent, i64>,
+    /// `writes_in_flight.since_ms` per `(table, writer)`.
+    writes_in_flight: BTreeMap<(TableIdent, String), i64>,
     /// `log_index` rows in insert order. The `(table, end_offset)` PK is
     /// enforced on insert.
     log: Vec<LogEntry>,
@@ -407,6 +409,37 @@ impl Coordinator for MemoryCoordinator {
         Ok(tables
             .iter()
             .filter_map(|t| s.table_epochs.get(t).map(|e| (t.clone(), *e)))
+            .collect())
+    }
+
+    async fn begin_write(&self, table: &TableIdent, writer: &str, since_ms: i64) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        let since = s
+            .writes_in_flight
+            .entry((table.clone(), writer.to_string()))
+            .or_insert(since_ms);
+        *since = (*since).min(since_ms);
+        Ok(())
+    }
+
+    async fn end_write(&self, table: &TableIdent, writer: &str) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .writes_in_flight
+            .remove(&(table.clone(), writer.to_string()));
+        Ok(())
+    }
+
+    async fn writes_in_flight(&self, table: &TableIdent) -> Result<Vec<WriteInFlight>> {
+        let s = self.state.lock().unwrap();
+        Ok(s.writes_in_flight
+            .iter()
+            .filter(|((t, _), _)| t == table)
+            .map(|((_, writer), since_ms)| WriteInFlight {
+                writer: writer.clone(),
+                since_ms: *since_ms,
+            })
             .collect())
     }
 
