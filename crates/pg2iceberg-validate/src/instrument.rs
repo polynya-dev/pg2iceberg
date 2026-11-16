@@ -389,35 +389,6 @@ impl<C: Coordinator + ?Sized> Coordinator for Instrumented<C> {
             .await
     }
 
-    async fn try_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> pg2iceberg_coord::Result<bool> {
-        self.coord("try_lock", self.inner.try_lock(table, worker, ttl))
-            .await
-    }
-
-    async fn renew_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> pg2iceberg_coord::Result<bool> {
-        self.coord("renew_lock", self.inner.renew_lock(table, worker, ttl))
-            .await
-    }
-
-    async fn release_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-    ) -> pg2iceberg_coord::Result<()> {
-        self.coord("release_lock", self.inner.release_lock(table, worker))
-            .await
-    }
-
     async fn pipeline_system_identifier(&self) -> pg2iceberg_coord::Result<u64> {
         self.coord(
             "pipeline_system_identifier",

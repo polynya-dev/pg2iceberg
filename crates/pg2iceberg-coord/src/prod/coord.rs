@@ -63,7 +63,7 @@ impl PostgresCoordinator {
     }
 
     /// Run the schema migration. Idempotent — every statement uses
-    /// `CREATE TABLE IF NOT EXISTS`. Caller is expected to invoke this
+    /// `IF NOT EXISTS` or `IF EXISTS`. Caller is expected to invoke this
     /// once at startup before any other coord method.
     pub async fn migrate(&self) -> Result<()> {
         let client = self.client().await?;
@@ -119,7 +119,7 @@ fn table_key(t: &TableIdent) -> String {
 
 /// Format a `Duration` as a Postgres `INTERVAL` text input. PG accepts
 /// the cast `'<n> seconds'::interval` cleanly down to microsecond
-/// resolution, which is enough for our consumer/lock TTLs.
+/// resolution, which is enough for our consumer TTLs.
 fn duration_as_interval(d: Duration) -> String {
     // `as_micros()` returns u128; cap at i64::MAX to keep the cast safe.
     let micros = d.as_micros().min(i64::MAX as u128);
@@ -401,52 +401,6 @@ impl Coordinator for PostgresCoordinator {
             .into_iter()
             .map(|r| WorkerId(r.get::<_, String>(0)))
             .collect())
-    }
-
-    async fn try_lock(&self, table: &TableIdent, worker: &WorkerId, ttl: Duration) -> Result<bool> {
-        let key = table_key(table);
-        // Sweep stale lock for this table first so a dead holder
-        // doesn't block a live worker.
-        let client = self.client().await?;
-        client
-            .execute(&sql::expire_locks(&self.schema), &[&key])
-            .await
-            .map_err(pg)?;
-        let interval = duration_as_interval(ttl);
-        let n = client
-            .execute(&sql::try_lock(&self.schema), &[&key, &worker.0, &interval])
-            .await
-            .map_err(pg)?;
-        Ok(n == 1)
-    }
-
-    async fn renew_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> Result<bool> {
-        let key = table_key(table);
-        let interval = duration_as_interval(ttl);
-        let client = self.client().await?;
-        let n = client
-            .execute(
-                &sql::renew_lock(&self.schema),
-                &[&key, &worker.0, &interval],
-            )
-            .await
-            .map_err(pg)?;
-        Ok(n == 1)
-    }
-
-    async fn release_lock(&self, table: &TableIdent, worker: &WorkerId) -> Result<()> {
-        let key = table_key(table);
-        let client = self.client().await?;
-        client
-            .execute(&sql::release_lock(&self.schema), &[&key, &worker.0])
-            .await
-            .map_err(pg)?;
-        Ok(())
     }
 
     async fn pipeline_system_identifier(&self) -> Result<u64> {

@@ -77,14 +77,10 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
             )",
             schema.qualify("mat_cursor")
         ),
-        format!(
-            "CREATE TABLE IF NOT EXISTS {} (
-                table_name TEXT PRIMARY KEY,
-                worker_id  TEXT NOT NULL,
-                expires_at TIMESTAMPTZ NOT NULL
-            )",
-            schema.qualify("lock")
-        ),
+        // Older releases created a per-table lease-lock table here
+        // that nothing ever read or wrote. Drop it from existing
+        // deployments; older binaries recreate it if rolled back to.
+        format!("DROP TABLE IF EXISTS {}", schema.qualify("lock")),
         format!(
             "CREATE TABLE IF NOT EXISTS {} (
                 group_name TEXT NOT NULL,
@@ -337,8 +333,7 @@ pub fn register_consumer(schema: &CoordSchema) -> String {
     // `$3::text::interval` forces PG to infer `$3` as text (via the
     // inner cast) rather than interval. tokio-postgres can serialize
     // `String` for a text parameter; serializing for an interval
-    // parameter has no built-in impl and panics at runtime. Mirror
-    // the same idiom in `try_lock` / `renew_lock`.
+    // parameter has no built-in impl and panics at runtime.
     format!(
         "INSERT INTO {} (group_name, worker_id, expires_at) \
          VALUES ($1, $2, now() + $3::text::interval) \
@@ -366,36 +361,6 @@ pub fn active_consumers(schema: &CoordSchema) -> String {
     format!(
         "SELECT worker_id FROM {} WHERE group_name = $1 ORDER BY worker_id",
         schema.qualify("consumer")
-    )
-}
-
-pub fn expire_locks(schema: &CoordSchema) -> String {
-    format!(
-        "DELETE FROM {} WHERE table_name = $1 AND expires_at < now()",
-        schema.qualify("lock")
-    )
-}
-
-pub fn try_lock(schema: &CoordSchema) -> String {
-    format!(
-        "INSERT INTO {} (table_name, worker_id, expires_at) \
-         VALUES ($1, $2, now() + $3::text::interval) ON CONFLICT DO NOTHING",
-        schema.qualify("lock")
-    )
-}
-
-pub fn renew_lock(schema: &CoordSchema) -> String {
-    format!(
-        "UPDATE {} SET expires_at = now() + $3::text::interval \
-         WHERE table_name = $1 AND worker_id = $2",
-        schema.qualify("lock")
-    )
-}
-
-pub fn release_lock(schema: &CoordSchema) -> String {
-    format!(
-        "DELETE FROM {} WHERE table_name = $1 AND worker_id = $2",
-        schema.qualify("lock")
     )
 }
 
@@ -575,18 +540,19 @@ mod tests {
     fn migrate_returns_idempotent_statements() {
         let s = CoordSchema::default_name();
         let stmts = migrate(&s);
-        // 6 base CREATE TABLEs (log_seq, log_index, mat_cursor, lock,
+        // 6 base CREATE TABLEs (log_seq, log_index, mat_cursor,
         // consumer, pending_markers, marker_emissions)
         // + 1 ALTER TABLE (log_index.flushable_lsn)
+        // + 1 DROP TABLE (the retired `lock` table)
         // + 5 new per-concern tables (pipeline_meta, flushed_lsn,
         //   replicated_lsn, tables, snapshot_progress)
         // + table_epoch + writes_in_flight
         // = 15. Each statement is idempotent (CREATE TABLE IF NOT
-        // EXISTS or ADD COLUMN IF NOT EXISTS).
+        // EXISTS, ADD COLUMN IF NOT EXISTS or DROP TABLE IF EXISTS).
         assert_eq!(stmts.len(), 15);
         for stmt in &stmts {
             assert!(
-                stmt.contains("IF NOT EXISTS"),
+                stmt.contains("IF NOT EXISTS") || stmt.contains("IF EXISTS"),
                 "stmt is not idempotent: {stmt}"
             );
             assert!(stmt.contains("_pg2iceberg."));
@@ -614,6 +580,16 @@ mod tests {
         // log_index has flushable_lsn either in the CREATE TABLE
         // body or via the idempotent ALTER TABLE.
         assert!(stmts.iter().any(|s| s.contains("flushable_lsn")));
+        // The retired `lock` table is dropped, never created.
+        assert!(stmts
+            .iter()
+            .any(|s| s == "DROP TABLE IF EXISTS _pg2iceberg.lock"));
+        assert!(
+            !stmts
+                .iter()
+                .any(|s| s.contains("CREATE TABLE IF NOT EXISTS _pg2iceberg.lock ")),
+            "lock table should no longer be created"
+        );
         // Old `checkpoints` table is gone — its concerns moved to
         // the four new tables.
         assert!(

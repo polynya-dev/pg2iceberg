@@ -1,7 +1,7 @@
 //! Phase A integration: `PostgresCoordinator` against a real Postgres
 //! container. Covers the durability-critical surfaces — migrate,
 //! claim_offsets (empty / claims / markers / mixed), read_log,
-//! truncate_log, cursor + consumer + lock CRUD, checkpoint round-trip,
+//! truncate_log, cursor + consumer CRUD, checkpoint round-trip,
 //! and the marker eligibility query that drives blue-green meta-marker
 //! emission.
 //!
@@ -155,9 +155,55 @@ async fn coordinator_reconnects_after_its_connection_is_dropped() {
 async fn migrate_is_idempotent_against_real_pg() {
     let coord = fresh_coord().await;
     // Second invocation must not error — every statement uses
-    // CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS.
+    // CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS /
+    // DROP TABLE IF EXISTS.
     coord.migrate().await.expect("migrate twice");
     coord.migrate().await.expect("migrate thrice");
+}
+
+/// Deployments migrated by older releases have a `lock` table that
+/// nothing uses any more; migrating drops it, rows and all.
+#[tokio::test]
+async fn migrate_drops_the_retired_lock_table() {
+    let pg = shared_pg().await;
+    let raw = format!("_pg2iceberg_test_{}", uuid::Uuid::new_v4().simple());
+    let admin = connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("admin connect");
+    admin
+        .client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {raw};
+             CREATE TABLE {raw}.lock (
+                 table_name TEXT PRIMARY KEY,
+                 worker_id  TEXT NOT NULL,
+                 expires_at TIMESTAMPTZ NOT NULL
+             );
+             INSERT INTO {raw}.lock VALUES ('public.orders', 'w1', now());"
+        ))
+        .await
+        .expect("create the old lock table");
+    let lock_exists = || async {
+        admin
+            .client
+            .query_one(
+                "SELECT to_regclass($1) IS NOT NULL",
+                &[&format!("{raw}.lock")],
+            )
+            .await
+            .expect("to_regclass")
+            .get::<_, bool>(0)
+    };
+    assert!(lock_exists().await);
+
+    let conn = connect_with(&pg.dsn, TlsMode::Disable)
+        .await
+        .expect("coord connect");
+    let coord = PostgresCoordinator::new(conn, CoordSchema::sanitize(&raw));
+    coord.migrate().await.expect("migrate");
+    assert!(!lock_exists().await);
+    coord.migrate().await.expect("migrate again");
+    assert!(!lock_exists().await);
 }
 
 /// `replicated_lsn` follows the highest `CommitBatch::replicated_lsn`
@@ -423,41 +469,6 @@ async fn consumer_lifecycle_and_expiry_sweep() {
     coord.unregister_consumer(group, &w1).await.unwrap();
     let active = coord.active_consumers(group).await.unwrap();
     assert!(active.is_empty());
-}
-
-#[tokio::test]
-async fn lock_try_renew_release_round_trip() {
-    let coord = fresh_coord().await;
-    let t = ident("public", "orders");
-    let w1 = WorkerId("w1".into());
-    let w2 = WorkerId("w2".into());
-
-    assert!(coord
-        .try_lock(&t, &w1, Duration::from_secs(60))
-        .await
-        .unwrap());
-    // w2 cannot grab a held lock.
-    assert!(!coord
-        .try_lock(&t, &w2, Duration::from_secs(60))
-        .await
-        .unwrap());
-    // w1 renews its own lock.
-    assert!(coord
-        .renew_lock(&t, &w1, Duration::from_secs(60))
-        .await
-        .unwrap());
-    // w2 cannot renew someone else's.
-    assert!(!coord
-        .renew_lock(&t, &w2, Duration::from_secs(60))
-        .await
-        .unwrap());
-
-    coord.release_lock(&t, &w1).await.unwrap();
-    // After release, w2 can acquire.
-    assert!(coord
-        .try_lock(&t, &w2, Duration::from_secs(60))
-        .await
-        .unwrap());
 }
 
 #[tokio::test]

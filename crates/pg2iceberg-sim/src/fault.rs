@@ -317,28 +317,6 @@ impl Coordinator for FaultyCoordinator {
         self.inner.active_consumers(group).await
     }
 
-    async fn try_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> CoordResult<bool> {
-        self.inner.try_lock(table, worker, ttl).await
-    }
-
-    async fn renew_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> CoordResult<bool> {
-        self.inner.renew_lock(table, worker, ttl).await
-    }
-
-    async fn release_lock(&self, table: &TableIdent, worker: &WorkerId) -> CoordResult<()> {
-        self.inner.release_lock(table, worker).await
-    }
-
     async fn pipeline_system_identifier(&self) -> CoordResult<u64> {
         self.inner.pipeline_system_identifier().await
     }

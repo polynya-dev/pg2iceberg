@@ -259,15 +259,6 @@ pub trait Coordinator: Send + Sync {
     /// explicit coordination.
     async fn active_consumers(&self, group: &str) -> Result<Vec<WorkerId>>;
 
-    async fn try_lock(&self, table: &TableIdent, worker: &WorkerId, ttl: Duration) -> Result<bool>;
-    async fn renew_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> Result<bool>;
-    async fn release_lock(&self, table: &TableIdent, worker: &WorkerId) -> Result<()>;
-
     // ── Pipeline meta (cluster fingerprint) ─────────────────
     /// Get the stored source-cluster `system_identifier`. Returns
     /// `Ok(0)` if no row has been written yet (fresh install).
