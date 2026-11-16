@@ -118,6 +118,7 @@ impl Harness {
             added_data_files,
             removed_paths: removed,
             data_sequence_number: planned_at,
+            stores_row_lineage: false,
         }))
         .unwrap();
         paths
@@ -141,6 +142,7 @@ impl Harness {
                     equality_field_ids: equality_field_ids.clone(),
                     partition_values: chunk.partition_values,
                     sequence_number: None,
+                    first_row_id: None,
                 }
             })
             .collect()

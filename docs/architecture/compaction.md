@@ -38,6 +38,12 @@ The ratio bounds the work: rewriting reads at most 1 / `compaction_delete_ratio`
 
 Each file is a round trip to the object store, so a pass overlaps them: the inputs are read ahead of the one being rewritten — up to eight files, and `target_file_size` bytes of them — starting while the deletes load, and an output uploads while the next is written, up to `target_file_size` bytes uploading. A pass holds those in memory as well as the file it's reading and the one it's writing: about four `target_file_size`s at most.
 
+## Row lineage
+
+A v3 table ([`sink.format_version`](../usage/configuration.md#notes-on-individual-fields)) gives every row a `_row_id` and the sequence number of the commit that last changed it, `_last_updated_sequence_number`. A data file doesn't store them unless it has to: the catalog gives each file it commits a range of row ids, and a row's id is the first plus its position in the file; its sequence number is the file's. Moved into a new file, a row would take the new file's — a new id, as if it were a new row, and a later sequence number, as if it had changed.
+
+So on a v3 table, compaction writes both into the files it writes, for every row: the ones the input stored, else the ones it gave. The row keeps them however many times it's moved, and engines that read the table incrementally see nothing changed.
+
 ## When the catalog compacts
 
 With `sink.maintenance: managed`, the catalog compacts the table and pg2iceberg rewrites no data files. Its pass keeps one job: retiring the delete files no data file is left for — the catalog's rewrites leave them behind. See [Table Maintenance](maintenance.md#when-the-catalog-maintains-the-tables).

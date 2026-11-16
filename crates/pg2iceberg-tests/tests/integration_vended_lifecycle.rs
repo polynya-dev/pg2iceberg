@@ -298,6 +298,7 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
             maintenance_retention: String::new(),
             maintenance_grace: "30m".into(),
             maintenance: String::new(),
+            format_version: 2,
             // The `header.x-iceberg-access-delegation: vended-credentials`
             // header is auto-added by `rest_catalog_props()` when
             // credential_mode=vended; no need to repeat it here.

@@ -169,6 +169,38 @@ pub struct PreparedCommit {
     pub equality_deletes: Vec<DataFile>,
 }
 
+/// The Iceberg format version of the tables pg2iceberg creates. Tables
+/// that already exist keep theirs: pg2iceberg writes each as its own
+/// format version says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FormatVersion {
+    /// What every engine reads.
+    #[default]
+    V2,
+    /// Adds row lineage: every row has a `_row_id`, and the sequence
+    /// number of the commit that last changed it.
+    V3,
+}
+
+impl FormatVersion {
+    /// The version numbered `n`: 2 or 3.
+    pub fn from_number(n: u8) -> Result<Self> {
+        match n {
+            2 => Ok(Self::V2),
+            3 => Ok(Self::V3),
+            other => Err(IcebergError::Other(format!(
+                "unsupported Iceberg format version {other}; expected 2 or 3"
+            ))),
+        }
+    }
+}
+
+/// The field id the spec reserves for row lineage's `_row_id`.
+pub const ROW_ID_FIELD_ID: i32 = 2147483540;
+/// The field id the spec reserves for row lineage's
+/// `_last_updated_sequence_number`.
+pub const LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID: i32 = 2147483539;
+
 /// Built by [`crate::compact::compact_table`] and consumed by
 /// [`Catalog::commit_compaction`]. Produces an `Operation::Replace`
 /// snapshot: drop everything in `removed_paths`, add everything in
@@ -190,7 +222,18 @@ pub struct PreparedCompaction {
     /// committed while the pass ran still apply to them. (With the new
     /// snapshot's, a row deleted meanwhile would come back.)
     pub data_sequence_number: Option<i64>,
+    /// Whether the added files store their rows' lineage (`_row_id`,
+    /// `_last_updated_sequence_number`), as a pass over a v3 table writes
+    /// them. A pass that read rows without ids writes none — and must not
+    /// commit if the rows it moves have since been given theirs (the table
+    /// upgraded to v3 meanwhile): the catalog refuses it, as a conflict.
+    pub stores_row_lineage: bool,
 }
+
+/// What a catalog's conflict error says when a compaction that stores no
+/// row lineage would move rows that have row ids (see
+/// [`PreparedCompaction::stores_row_lineage`]).
+pub const ROW_IDS_CONFLICT: &str = "rewrite moves rows that have row ids, without them";
 
 #[derive(Clone, Debug)]
 pub struct DataFile {
@@ -209,6 +252,12 @@ pub struct DataFile {
     /// deletes committed while the pass ran still apply to it. `None`: the
     /// snapshot's (see [`Self::sequence_number_in`]).
     pub sequence_number: Option<i64>,
+    /// A v3 data file's first row id, as the catalog assigned it when the
+    /// file was committed: the `_row_id` of each row the file doesn't
+    /// store one for is this plus the row's position in the file (row
+    /// lineage). `None` for a file about to be committed, a delete file,
+    /// and on a table without row lineage (v2).
+    pub first_row_id: Option<i64>,
 }
 
 impl DataFile {

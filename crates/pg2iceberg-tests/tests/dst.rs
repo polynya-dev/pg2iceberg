@@ -54,6 +54,16 @@
 //! before a commit (`CleanupOrphansMidCommit`) — and ends it once it
 //! commits or gives them up (19).
 //!
+//! In `FORMAT_V3` cases the tables are Iceberg v3 — created so, or
+//! upgraded by another engine — whose row lineage
+//! gives every row an id (`_row_id`) and the sequence number of the
+//! commit that last changed it (`_last_updated_sequence_number`). Every
+//! live row has both, and no two rows share an id (invariant 20); a
+//! commit that only moves rows — anyone's compaction, a removal of
+//! delete files — keeps each row's (21). An update through an equality
+//! delete may give the row a new id: the spec allows it, since the
+//! writer never read the old one.
+//!
 //! Each case runs on the sims or — under the `integration` feature — on
 //! production's catalog and blob store (`IcebergRustCatalog` over
 //! iceberg-rust's memory catalog, `ObjectStoreBlobStore` over
@@ -81,7 +91,7 @@ use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::id::SeqIdGen;
-use pg2iceberg_sim::oracle::{engine_read, live_files_from_history, LiveFile};
+use pg2iceberg_sim::oracle::{engine_read, engine_read_lineage, live_files_from_history, LiveFile};
 use pg2iceberg_sim::pgoutput::ReplicaIdentity;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pg2iceberg_snapshot::Snapshotter;
@@ -525,6 +535,9 @@ enum Step {
     /// The catalog drops the delete files no data file is left for them to
     /// apply to, in a `delete` snapshot.
     CatalogRemoveDanglingDeletes,
+    /// In `V3_UPGRADED` cases, another engine upgrades the tables to v3
+    /// now, whatever they hold, if it hasn't yet.
+    UpgradeToV3,
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
@@ -578,6 +591,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => Just(Step::CatalogCompactMidCommit),
         1 => Just(Step::CatalogExpire),
         1 => Just(Step::CatalogRemoveDanglingDeletes),
+        1 => Just(Step::UpgradeToV3),
     ]
 }
 
@@ -647,7 +661,29 @@ thread_local! {
     /// Whether this case's materializers hold a FileIndex of one key:
     /// past it, files are evicted, and keys found by reading them.
     static BOUNDED_INDEX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this case's tables are Iceberg v3, with row lineage:
+    /// pg2iceberg creates them v3 (`sink.format_version`), unless
+    /// `V3_UPGRADED`.
+    static FORMAT_V3: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// With `FORMAT_V3`: pg2iceberg creates the tables v2, and another
+    /// engine upgrades them to v3 while pg2iceberg runs, whatever they
+    /// hold (`Step::UpgradeToV3`, or at quiescence) — tables pg2iceberg
+    /// finds v3 whatever its setting.
+    static V3_UPGRADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// The format version pg2iceberg creates this case's tables in.
+fn created_format_version() -> pg2iceberg_iceberg::FormatVersion {
+    if FORMAT_V3.get() && !V3_UPGRADED.get() {
+        pg2iceberg_iceberg::FormatVersion::V3
+    } else {
+        pg2iceberg_iceberg::FormatVersion::V2
+    }
+}
+
+/// A v3 table's rows by primary key, each with its `_row_id` and
+/// `_last_updated_sequence_number`.
+type Lineage = BTreeMap<pg2iceberg_iceberg::PkKey, (Row, i64, i64)>;
 
 /// A FileIndex budget of one key (see `FileIndex::with_memory`): the
 /// workloads' keys are a handful.
@@ -738,7 +774,7 @@ impl Storage {
     }
 
     fn sim() -> Self {
-        let catalog = Arc::new(MemoryCatalog::new());
+        let catalog = Arc::new(MemoryCatalog::new().with_format_version(created_format_version()));
         let blob = Arc::new(MemoryBlobStore::new());
         Self {
             catalog: catalog.clone(),
@@ -795,6 +831,80 @@ impl Storage {
         }
     }
 
+    /// Upgrade `ident`, which has no snapshots yet, to format v3.
+    async fn upgrade_to_v3(&self, ident: &TableIdent) -> Result<(), String> {
+        match &self.backend {
+            Backend::Sim { catalog, .. } => catalog
+                .upgrade_format_version(ident, pg2iceberg_iceberg::FormatVersion::V3)
+                .map_err(|e| e.to_string()),
+            #[cfg(feature = "integration")]
+            Backend::Prod { iceberg } => prod_backend::upgrade_to_v3(iceberg, ident).await,
+        }
+    }
+
+    /// The table's row lineage, if it's a v3 table: its rows, by primary
+    /// key, each with its row id and last-updated sequence number.
+    ///
+    /// 20. Row lineage is whole: every live row of a v3 table has an id
+    ///     and a last-updated sequence number, no two rows share an id,
+    ///     and every id is below the table's next one — which the next
+    ///     commit's rows take theirs from. (A table upgraded from v2
+    ///     holds rows without, until its next commit gives them theirs.)
+    ///     Rows without are left out.
+    async fn lineage(&self, ident: &TableIdent) -> Result<Option<Lineage>, String> {
+        let next_row_id = match &self.backend {
+            Backend::Sim { catalog, .. } => catalog.next_row_id(ident),
+            #[cfg(feature = "integration")]
+            Backend::Prod { iceberg } => prod_backend::next_row_id(iceberg, ident).await?,
+        };
+        let Some(next_row_id) = next_row_id else {
+            return Ok(None);
+        };
+        let files = self.live_files(ident).await?;
+        let schema = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(|e| format!("load_table: {e}"))?
+            .ok_or_else(|| format!("no table {ident}"))?
+            .schema;
+        let rows = engine_read_lineage(self.blob.as_ref(), &schema, &files).await?;
+        let pk = [ColumnName("id".into())];
+        let mut lineage = Lineage::new();
+        let mut ids = BTreeMap::new();
+        for r in rows {
+            // A table upgraded from v2 gives its rows ids at its next
+            // commit; until then, it has given out none.
+            if (r.row_id, r.last_updated, next_row_id) == (None, None, 0) {
+                continue;
+            }
+            let (Some(row_id), Some(last_updated)) = (r.row_id, r.last_updated) else {
+                return Err(format!(
+                    "invariant 20 (row lineage): {ident}'s row {:?} has row id {:?} and \
+                     last-updated sequence number {:?}",
+                    r.row, r.row_id, r.last_updated
+                ));
+            };
+            if row_id >= next_row_id {
+                return Err(format!(
+                    "invariant 20 (row lineage): {ident}'s row {:?} has row id {row_id}, but the \
+                     table's next row id is {next_row_id}",
+                    r.row
+                ));
+            }
+            if let Some(other) = ids.insert(row_id, r.row.clone()) {
+                return Err(format!(
+                    "invariant 20 (row lineage): {ident}'s rows {other:?} and {:?} share row id \
+                     {row_id}",
+                    r.row
+                ));
+            }
+            let key = pg2iceberg_iceberg::PkKey::from_row(&r.row, &pk);
+            lineage.insert(key, (r.row, row_id, last_updated));
+        }
+        Ok(Some(lineage))
+    }
+
     /// The current snapshot's summary counts the files it holds. (The sim
     /// catalog writes no summaries.)
     #[cfg_attr(not(feature = "integration"), allow(unused_variables))]
@@ -842,6 +952,7 @@ impl Storage {
                     if own_sequence_number { None } else { read },
                     pass.removed_paths.into_iter().collect(),
                     if own_sequence_number { read } else { None },
+                    !pass.stores_row_lineage,
                 )
                 .await
             }
@@ -867,6 +978,7 @@ impl Storage {
                     None,
                     paths.into_iter().collect(),
                     None,
+                    false,
                 )
                 .await
             }
@@ -922,7 +1034,7 @@ impl Storage {
 mod prod_backend {
     use super::*;
     use iceberg::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
-    use iceberg::spec::DataContentType;
+    use iceberg::spec::{DataContentType, FormatVersion};
     use iceberg::{CatalogBuilder, NamespaceIdent};
     use pg2iceberg_iceberg::prod::IcebergRustCatalog;
     use pg2iceberg_stream::ObjectStoreBlobStore;
@@ -943,7 +1055,10 @@ mod prod_backend {
             object_store::memory::InMemory::new(),
         ))));
         Storage {
-            catalog: Arc::new(IcebergRustCatalog::new(iceberg.clone())),
+            catalog: Arc::new(
+                IcebergRustCatalog::new(iceberg.clone())
+                    .with_format_version(created_format_version()),
+            ),
             blob,
             backend: Backend::Prod { iceberg },
         }
@@ -1037,9 +1152,13 @@ mod prod_backend {
                 .map_err(err)?;
             for entry in manifest.entries().iter().filter(|e| e.is_alive()) {
                 let df = entry.data_file();
-                let equality_ids = match df.content_type() {
-                    DataContentType::Data => None,
-                    DataContentType::EqualityDeletes => Some(df.equality_ids().unwrap_or_default()),
+                // A v3 data file's first row id: iceberg-rust inherits it on
+                // load, as Java's `ManifestReader` does.
+                let (equality_ids, first_row_id) = match df.content_type() {
+                    DataContentType::Data => (None, df.first_row_id()),
+                    DataContentType::EqualityDeletes => {
+                        (Some(df.equality_ids().unwrap_or_default()), None)
+                    }
                     DataContentType::PositionDeletes => {
                         return Err(format!("unexpected position delete {}", df.file_path()))
                     }
@@ -1055,10 +1174,52 @@ mod prod_backend {
                         .map(partition_literal)
                         .collect::<Result<_, _>>()?,
                     equality_ids,
+                    first_row_id,
                 });
             }
         }
         Ok(out)
+    }
+
+    async fn load(
+        iceberg: &iceberg::memory::MemoryCatalog,
+        ident: &TableIdent,
+    ) -> Result<iceberg::table::Table, String> {
+        use iceberg::Catalog as _;
+        let err = |e: iceberg::Error| e.to_string();
+        let ns = NamespaceIdent::from_strs(&ident.namespace.0).map_err(err)?;
+        iceberg
+            .load_table(&iceberg::TableIdent::new(ns, ident.name.clone()))
+            .await
+            .map_err(err)
+    }
+
+    /// Upgrade `ident` to format v3, as another engine does.
+    pub async fn upgrade_to_v3(
+        iceberg: &Arc<iceberg::memory::MemoryCatalog>,
+        ident: &TableIdent,
+    ) -> Result<(), String> {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        let table = load(iceberg, ident).await?;
+        let tx = Transaction::new(&table);
+        tx.upgrade_table_version()
+            .set_format_version(FormatVersion::V3)
+            .apply(tx)
+            .map_err(|e| e.to_string())?
+            .commit(iceberg.as_ref())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// v3: the table's next row id. `None` without row lineage.
+    pub async fn next_row_id(
+        iceberg: &iceberg::memory::MemoryCatalog,
+        ident: &TableIdent,
+    ) -> Result<Option<i64>, String> {
+        let table = load(iceberg, ident).await?;
+        let meta = table.metadata();
+        Ok((meta.format_version() == FormatVersion::V3).then(|| meta.next_row_id() as i64))
     }
 
     /// The harness partitions by `truncate(qty)`: an int, or null.
@@ -1079,10 +1240,18 @@ mod prod_backend {
     /// `removed` is rewritten with that file as a `DELETED` entry and the
     /// rest as `EXISTING`; `added` goes in a manifest of its own, at data
     /// sequence number `added_seq` (`None`: the commit's own); the summary
-    /// counts the table and holds nothing of pg2iceberg's. With
+    /// counts the table and holds nothing of pg2iceberg's. On a v3 table,
+    /// an `EXISTING` data file records the first row id it had (loaded
+    /// with it), so its rows keep their ids, and the snapshot takes a row
+    /// range for the rows of the manifests that record none. (`added`'s rows would keep
+    /// theirs as Java's rewrite keeps them — stored in the files — only if
+    /// the files store them: they're pg2iceberg's compaction's.) With
     /// `no_deletes_since`, the commit fails if a live delete file is newer
     /// than that sequence number, as Java's rewrite validates when its
-    /// outputs take the commit's own number.
+    /// outputs take the commit's own number. With `no_row_ids` — `added`
+    /// stores no row lineage — it fails if a removed data file's rows
+    /// have ids, as the sim's rewrites and pg2iceberg's do.
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit_foreign(
         iceberg: &Arc<iceberg::memory::MemoryCatalog>,
         ident: &TableIdent,
@@ -1091,6 +1260,7 @@ mod prod_backend {
         added_seq: Option<i64>,
         removed: BTreeSet<String>,
         no_deletes_since: Option<i64>,
+        no_row_ids: bool,
     ) -> pg2iceberg_iceberg::Result<()> {
         use iceberg::transaction::{ApplyTransactionAction, Transaction};
         use iceberg::Catalog as _;
@@ -1111,6 +1281,7 @@ mod prod_backend {
             added_seq,
             removed,
             no_deletes_since,
+            no_row_ids,
         };
         action
             .apply(Transaction::new(&table))
@@ -1127,6 +1298,7 @@ mod prod_backend {
         added_seq: Option<i64>,
         removed: BTreeSet<String>,
         no_deletes_since: Option<i64>,
+        no_row_ids: bool,
     }
 
     /// The `total-*` summary properties of a table holding the files
@@ -1191,6 +1363,7 @@ mod prod_backend {
             let file_io = table.file_io();
             let schema = meta.current_schema().clone();
             let spec = meta.default_partition_spec().as_ref().clone();
+            let v3 = meta.format_version() == FormatVersion::V3;
             let mut written = 0;
             let mut new_manifest = |content| -> iceberg::Result<ManifestWriter> {
                 written += 1;
@@ -1204,9 +1377,11 @@ mod prod_backend {
                     schema.clone(),
                     spec.clone(),
                 );
-                Ok(match content {
-                    ManifestContentType::Data => builder.build_v2_data(),
-                    ManifestContentType::Deletes => builder.build_v2_deletes(),
+                Ok(match (content, v3) {
+                    (ManifestContentType::Data, false) => builder.build_v2_data(),
+                    (ManifestContentType::Deletes, false) => builder.build_v2_deletes(),
+                    (ManifestContentType::Data, true) => builder.build_v3_data(),
+                    (ManifestContentType::Deletes, true) => builder.build_v3_deletes(),
                 })
             };
 
@@ -1238,8 +1413,20 @@ mod prod_backend {
                 }
                 let mut writer = new_manifest(manifest_file.content)?;
                 for e in alive {
+                    // On v3, with the first row id it was loaded with.
                     let df = e.data_file().clone();
                     let entry_seq = e.sequence_number().expect("inherited on load");
+                    if self.removed.contains(df.file_path())
+                        && self.no_row_ids
+                        && df.content_type() == DataContentType::Data
+                        && df.first_row_id().is_some()
+                    {
+                        return Err(conflict(format!(
+                            "{}: {}",
+                            pg2iceberg_iceberg::ROW_IDS_CONFLICT,
+                            df.file_path()
+                        )));
+                    }
                     if self.removed.contains(df.file_path()) {
                         found.insert(df.file_path().to_string());
                         writer.add_delete_file(df, entry_seq, e.file_sequence_number)?;
@@ -1276,13 +1463,18 @@ mod prod_backend {
                 "{}/metadata/snap-foreign-{snapshot_id}.avro",
                 meta.location()
             );
-            let mut list_writer = ManifestListWriter::v2(
-                file_io.new_output(&list_path)?.writer().await?,
-                snapshot_id,
-                Some(current.snapshot_id()),
-                seq,
-            );
+            let list_out = file_io.new_output(&list_path)?.writer().await?;
+            let parent = Some(current.snapshot_id());
+            let first_row_id = meta.next_row_id();
+            let mut list_writer = if v3 {
+                ManifestListWriter::v3(list_out, snapshot_id, parent, seq, Some(first_row_id))
+            } else {
+                ManifestListWriter::v2(list_out, snapshot_id, parent, seq)
+            };
             list_writer.add_manifests(manifests.into_iter())?;
+            let row_range = list_writer
+                .next_row_id()
+                .map(|next| (first_row_id, next - first_row_id));
             list_writer.close().await?;
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1291,15 +1483,18 @@ mod prod_backend {
             let snapshot = iceberg::spec::Snapshot::builder()
                 .with_manifest_list(list_path)
                 .with_snapshot_id(snapshot_id)
-                .with_parent_snapshot_id(Some(current.snapshot_id()))
+                .with_parent_snapshot_id(parent)
                 .with_sequence_number(seq)
                 .with_summary(Summary {
                     operation: self.operation.clone(),
                     additional_properties: totals.properties(),
                 })
                 .with_schema_id(meta.current_schema_id())
-                .with_timestamp_ms(now_ms)
-                .build();
+                .with_timestamp_ms(now_ms);
+            let snapshot = match row_range {
+                Some((first, added)) => snapshot.with_row_range(first, added).build(),
+                None => snapshot.build(),
+            };
             Ok(iceberg::transaction::ActionCommit::new(
                 vec![
                     iceberg::TableUpdate::AddSnapshot { snapshot },
@@ -1558,6 +1753,9 @@ struct DstHarness {
     /// yet committed, and whether its outputs take the commit's sequence
     /// number (see [`Step::CatalogCompactPlan`]).
     pending_catalog: Option<(PreparedCompaction, bool)>,
+    /// Whether another engine has upgraded the tables to v3
+    /// (`V3_UPGRADED`).
+    upgraded: bool,
     /// The tokio runtime prod-backend cases run iceberg-rust on (see
     /// [`tokio_runtime`]), entered for the case. Dropped last.
     #[cfg(feature = "integration")]
@@ -1694,6 +1892,7 @@ impl DstHarness {
             id_gen,
             pending_external: None,
             pending_catalog: None,
+            upgraded: false,
             #[cfg(feature = "integration")]
             _tokio: tokio,
             backfilling: false,
@@ -1832,6 +2031,7 @@ impl DstHarness {
             id_gen,
             pending_external: None,
             pending_catalog: None,
+            upgraded: false,
             #[cfg(feature = "integration")]
             _tokio: tokio,
             backfilling: false,
@@ -2081,6 +2281,23 @@ impl DstHarness {
         }
     }
 
+    /// In `V3_UPGRADED` cases, another engine upgrades the tables to v3,
+    /// once: pg2iceberg finds them v3 from its next read on.
+    fn upgrade_to_v3(&mut self) {
+        if !V3_UPGRADED.get() || self.upgraded {
+            return;
+        }
+        self.upgraded = true;
+        for table in [ident(), other_ident()] {
+            if block_on(self.storage.catalog.load_table(&table))
+                .unwrap()
+                .is_some()
+            {
+                block_on(self.storage.upgrade_to_v3(&table)).unwrap();
+            }
+        }
+    }
+
     /// The catalog drops each delete file older than every data file:
     /// none is left for it to apply to.
     fn catalog_remove_dangling_deletes(&mut self) {
@@ -2101,7 +2318,11 @@ impl DstHarness {
         if dangling.is_empty() {
             return;
         }
-        match block_on(self.storage.commit_catalog_removal(&ident(), dangling)) {
+        match block_on(self.audited.keeping_lineage(
+            &ident(),
+            "the catalog's removal of delete files",
+            self.storage.commit_catalog_removal(&ident(), dangling),
+        )) {
             Ok(()) | Err(pg2iceberg_iceberg::IcebergError::Conflict(_)) => {}
             Err(e) => panic!("catalog removal commit: {e}"),
         }
@@ -2194,6 +2415,12 @@ impl DstHarness {
                 if e.to_string()
                     .to_lowercase()
                     .contains("rewrite removes files no longer in the table") => {}
+            // A pass that read rows before they had ids, which they've had
+            // since (the table upgraded to v3): it plans again.
+            Err(e)
+                if e.to_string()
+                    .to_lowercase()
+                    .contains(pg2iceberg_iceberg::ROW_IDS_CONFLICT) => {}
             Err(e) => panic!("compaction: {e}"),
         }
         // The materializer updates its FileIndex from what the pass
@@ -2584,9 +2811,14 @@ impl DstHarness {
             } => self.catalog_compact_plan(*own_sequence_number),
             Step::CatalogCompactCommit => {
                 if let Some((pass, own_sequence_number)) = self.pending_catalog.take() {
+                    let table = pass.ident.clone();
                     match block_on(
-                        self.storage
-                            .commit_catalog_rewrite(pass, own_sequence_number),
+                        self.audited.keeping_lineage(
+                            &table,
+                            "the catalog's compaction",
+                            self.storage
+                                .commit_catalog_rewrite(pass, own_sequence_number),
+                        ),
                     ) {
                         // Lost to another rewrite of its files, or to a
                         // delete: the catalog plans again next time.
@@ -2607,6 +2839,7 @@ impl DstHarness {
                 }
             }
             Step::CatalogRemoveDanglingDeletes => self.catalog_remove_dangling_deletes(),
+            Step::UpgradeToV3 => self.upgrade_to_v3(),
             Step::LoseCommitResponse => self
                 .audited
                 .lose_next_response
@@ -3137,7 +3370,14 @@ impl AuditedCatalog {
             None => return Ok(()),
             Some(HeldPass::Job(pass)) => {
                 let table = pass.ident.clone();
-                let result = self.inner.commit_compaction(pass).await.map(drop);
+                let result = self
+                    .keeping_lineage(
+                        &table,
+                        "a compaction job",
+                        self.inner.commit_compaction(pass),
+                    )
+                    .await
+                    .map(drop);
                 self.coord.bump_table_epoch(&table).await.unwrap();
                 self.coord
                     .end_write(&table, writers::COMPACT_COMMAND)
@@ -3147,9 +3387,14 @@ impl AuditedCatalog {
             }
             // Another engine's: no pg2iceberg process hears of it.
             Some(HeldPass::Catalog(pass, own_sequence_number)) => {
-                self.storage
-                    .commit_catalog_rewrite(pass, own_sequence_number)
-                    .await
+                let table = pass.ident.clone();
+                self.keeping_lineage(
+                    &table,
+                    "the catalog's compaction",
+                    self.storage
+                        .commit_catalog_rewrite(pass, own_sequence_number),
+                )
+                .await
             }
         };
         match result {
@@ -3203,7 +3448,62 @@ impl AuditedCatalog {
                 .unwrap()
                 .push(format!("after a commit: {e}"));
         }
+        if let Err(e) = self.storage.lineage(&ident()).await {
+            self.violations
+                .lock()
+                .unwrap()
+                .push(format!("after a commit: {e}"));
+        }
     }
+
+    /// Run `commit`, `who`'s, which only moves rows: a compaction's, or a
+    /// removal of delete files.
+    ///
+    /// 21. A commit that only moves rows keeps their lineage: on a v3
+    ///     table, each row it leaves live has the row id and last-updated
+    ///     sequence number it had before. Engines that read the table
+    ///     incrementally tell rows apart by id, and tell what changed by
+    ///     the sequence number.
+    async fn keeping_lineage<T>(
+        &self,
+        ident: &TableIdent,
+        who: &str,
+        commit: impl std::future::Future<Output = pg2iceberg_iceberg::Result<T>>,
+    ) -> pg2iceberg_iceberg::Result<T> {
+        let before = self.storage.lineage(ident).await;
+        let result = commit.await;
+        // Whether or not it says it applied: a lost response applied.
+        let after = self.storage.lineage(ident).await;
+        let violation = match (before, after) {
+            (Ok(Some(before)), Ok(Some(after))) => lineage_kept(&before, &after)
+                .err()
+                .map(|e| format!("invariant 21 (row lineage): {who} on {ident}: {e}")),
+            (Ok(_), Ok(_)) => None,
+            (Err(e), _) => Some(format!("before {who} on {ident}: {e}")),
+            (_, Err(e)) => Some(format!("after {who} on {ident}: {e}")),
+        };
+        if let Some(v) = violation {
+            self.violations.lock().unwrap().push(v);
+        }
+        result
+    }
+}
+
+/// Every row live both `before` and `after` keeps its row id and
+/// last-updated sequence number.
+fn lineage_kept(before: &Lineage, after: &Lineage) -> Result<(), String> {
+    for (key, (row, id, seq)) in after {
+        let Some((_, was_id, was_seq)) = before.get(key) else {
+            continue;
+        };
+        if (id, seq) != (was_id, was_seq) {
+            return Err(format!(
+                "row {row:?} had row id {was_id} and last-updated sequence number {was_seq}, \
+                 now {id} and {seq}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -3279,7 +3579,14 @@ impl Catalog for AuditedCatalog {
         self.land_other_pass().await?;
         self.check_leaves_maintenance_to_the_catalog(&prepared)
             .await;
-        let meta = self.inner.commit_compaction(prepared).await?;
+        let table = prepared.ident.clone();
+        let meta = self
+            .keeping_lineage(
+                &table,
+                "pg2iceberg's compaction",
+                self.inner.commit_compaction(prepared),
+            )
+            .await?;
         self.audit().await;
         let meta = self.respond(meta)?;
         Ok(meta)
@@ -3337,6 +3644,8 @@ fn write_after_schema_change(h: &DstHarness) {
 }
 
 fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
+    // The upgrade comes, if the workload didn't bring it.
+    h.upgrade_to_v3();
     while h.backfilling {
         h.backfill_chunk();
     }
@@ -3645,6 +3954,20 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     block_on(h.storage.summary_counts_live_files(&ident()))
         .map_err(|e| format!("invariant 15: {e}"))?;
 
+    // 20. Row lineage is whole (see `Storage::lineage`), at quiescence as
+    //     after every commit.
+    let lineage = block_on(h.storage.lineage(&ident()))?;
+    if FORMAT_V3.get() != lineage.is_some() {
+        return Err(format!(
+            "FORMAT_V3 is {}, but the table has row lineage: {}",
+            FORMAT_V3.get(),
+            lineage.is_some()
+        ));
+    }
+    if let Some(v) = h.audited.violations.lock().unwrap().first() {
+        return Err(v.clone());
+    }
+
     Ok(())
 }
 
@@ -3748,7 +4071,10 @@ proptest! {
         second_table in 0u8..3,
         managed in any::<bool>(),
         bounded_index in any::<bool>(),
+        format in 0u8..3,
     ) {
+        FORMAT_V3.set(format > 0);
+        V3_UPGRADED.set(format == 2);
         MANAGED.set(managed);
         BOUNDED_INDEX.set(bounded_index);
         SECOND_TABLE.set(second_table);
@@ -6074,4 +6400,312 @@ fn pipeline_crash_then_materializer_catches_up() {
     h.run_step(&Step::DriveFlush);
     h.run_step(&Step::MaterializerCycle);
     check_invariants(&mut h).unwrap();
+}
+
+// ---------- Iceberg v3: row lineage ----------
+
+/// Run `steps` on v3 tables (`FORMAT_V3`), checking the invariants after
+/// each step and at quiescence.
+fn v3_case(prod: bool, managed: bool, steps: &[Step]) {
+    FORMAT_V3.set(true);
+    MANAGED.set(managed);
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in steps {
+        h.run_step(step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    if let Err(e) = check_invariants(&mut h) {
+        panic!("at quiescence: {e}");
+    }
+}
+
+/// Rounds of random steps, each ending in a commit and a compaction —
+/// the catalog's too, where it maintains the table: the random workload
+/// compacts too rarely to move many rows (invariant 21).
+fn compacting_rounds(managed: bool) -> impl Strategy<Value = Vec<Step>> {
+    prop::collection::vec(prop::collection::vec(step_strategy(), 1..=6), 1..=6).prop_map(
+        move |rounds| {
+            let mut steps = Vec::new();
+            for round in rounds {
+                steps.extend(round);
+                steps.extend([Step::DriveFlush, Step::MaterializerCycle, Step::Compact]);
+                if managed {
+                    steps.extend(catalog_compaction());
+                }
+            }
+            steps
+        },
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// A v3 table keeps its row lineage under random workloads that
+    /// compact after every round.
+    #[test]
+    fn row_lineage_survives_random_workloads_that_compact(
+        (managed, steps) in any::<bool>()
+            .prop_flat_map(|managed| (Just(managed), compacting_rounds(managed))),
+        prod_backend in integration_only(),
+        partitioned in any::<bool>(),
+        upgraded in any::<bool>(),
+    ) {
+        PARTITIONED.set(partitioned);
+        FORMAT_V3.set(true);
+        V3_UPGRADED.set(upgraded);
+        MANAGED.set(managed);
+        PROD_BACKEND.set(prod_backend);
+        let mut h = DstHarness::boot();
+        for (i, step) in steps.iter().enumerate() {
+            h.run_step(step);
+            if let Err(e) = check_step_invariants(&h) {
+                panic!("workload {steps:?}\nfailed after step {i}: {e}");
+            }
+        }
+        if let Err(e) = check_invariants(&mut h) {
+            panic!("workload {steps:?}\nfailed: {e}");
+        }
+    }
+}
+
+/// Inserts, updates and deletes over several commits, without compaction.
+fn writes() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &[
+            Step::Insert { id: 3, qty: 30 },
+            Step::Delete { id: 2 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+/// Every row pg2iceberg writes to a v3 table has its lineage: the
+/// commits give its file a row range.
+#[test]
+fn rows_written_to_a_v3_table_have_row_lineage() {
+    v3_case(false, false, &writes());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn rows_written_to_a_v3_table_have_row_lineage_on_iceberg() {
+    v3_case(true, false, &writes());
+}
+
+/// pg2iceberg's compaction moves the rows of a dirty file into a new
+/// one: they keep their ids and sequence numbers.
+#[test]
+fn compaction_keeps_row_lineage() {
+    v3_case(
+        false,
+        false,
+        &[&dirty_file()[..], &[Step::Compact]].concat(),
+    );
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn compaction_keeps_row_lineage_on_iceberg() {
+    v3_case(true, false, &[&dirty_file()[..], &[Step::Compact]].concat());
+}
+
+/// So does the catalog's — as Java's rewrite does, writing the rows' ids
+/// into the files it writes, and recording the first row id of each file
+/// it carries into a manifest it rewrites.
+#[test]
+fn the_catalogs_compaction_keeps_row_lineage() {
+    v3_case(
+        false,
+        true,
+        &[&dirty_file()[..], &catalog_compaction()].concat(),
+    );
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn the_catalogs_compaction_keeps_row_lineage_on_iceberg() {
+    v3_case(
+        true,
+        true,
+        &[&dirty_file()[..], &catalog_compaction()].concat(),
+    );
+}
+
+/// The catalog's compaction, which counts every file older than a delete
+/// as dirty, rewrites its own output: the rows it moves again keep the
+/// lineage that output stores.
+#[test]
+fn the_catalogs_compaction_of_its_own_output_keeps_row_lineage() {
+    v3_case(false, true, &catalog_compacted_repeatedly());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn the_catalogs_compaction_of_its_own_output_keeps_row_lineage_on_iceberg() {
+    v3_case(true, true, &catalog_compacted_repeatedly());
+}
+
+/// Rounds of changes, each ending in pg2iceberg's compaction and then the
+/// catalog's, whose passes merge their earlier outputs with new files
+/// (the shrunk case of `row_lineage_survives_random_workloads_that_compact`).
+fn catalog_compacted_repeatedly() -> Vec<Step> {
+    let rounds = [
+        vec![Step::BigTx { inserts: 3, qty: 0 }],
+        vec![Step::DrivePartial { n: 1 }],
+        vec![Step::Insert { id: 2, qty: 0 }],
+        vec![Step::Update { id: 2, qty: 0 }],
+        vec![Step::DrivePartial { n: 1 }],
+    ];
+    rounds
+        .into_iter()
+        .flat_map(|round| {
+            round
+                .into_iter()
+                .chain([Step::DriveFlush, Step::MaterializerCycle, Step::Compact])
+                .chain(catalog_compaction())
+        })
+        .collect()
+}
+
+/// Compaction rewrites the manifest that lists the file it rewrites, and
+/// carries the files it leaves into the new one. Each must record the
+/// first row id it had, or the manifest list gives the new manifest's
+/// files fresh ones: the rows of a file nothing touched (row 1, alone in
+/// its partition) would change ids. Manifests are production's alone.
+#[cfg(feature = "integration")]
+#[test]
+fn compaction_keeps_the_lineage_of_the_files_it_leaves_on_iceberg() {
+    PARTITIONED.set(true);
+    v3_case(
+        true,
+        false,
+        &[
+            Step::Insert { id: 1, qty: 10 },
+            Step::Insert { id: 2, qty: 100 },
+            Step::Insert { id: 3, qty: 110 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Update { id: 3, qty: 111 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Compact,
+        ],
+    );
+}
+
+/// The harness's model of another engine's commit (`commit_foreign`)
+/// carries a file it leaves into the manifest it rewrites with the file's
+/// first row id, as Java does: the file's rows keep their ids.
+#[cfg(feature = "integration")]
+#[test]
+fn the_catalogs_commit_keeps_the_lineage_of_the_files_it_leaves_on_iceberg() {
+    PARTITIONED.set(true);
+    FORMAT_V3.set(true);
+    MANAGED.set(true);
+    PROD_BACKEND.set(true);
+    let mut h = DstHarness::boot();
+    // One commit, so one manifest: a file per partition.
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 100 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+    }
+    let files = block_on(h.storage.live_files(&ident())).unwrap();
+    assert_eq!(files.len(), 2, "a file per partition: {files:?}");
+    let second = files
+        .iter()
+        .find(|f| f.partition == [pg2iceberg_core::partition::PartitionLiteral::Int(100)])
+        .expect("row 2's file")
+        .path
+        .clone();
+    let before = block_on(h.storage.lineage(&ident())).unwrap().unwrap();
+    // The catalog drops row 2's file, keeping row 1's.
+    block_on(h.storage.commit_catalog_removal(&ident(), vec![second])).unwrap();
+    let after = block_on(h.storage.lineage(&ident())).unwrap().unwrap();
+    assert_eq!(after.len(), 1, "row 1 is left: {after:?}");
+    lineage_kept(&before, &after).unwrap();
+}
+
+/// A compaction pass planned while the table is still v2 stores no row
+/// lineage; another engine upgrades the table, and its next commit gives
+/// the rows ids. The pass, committed after, would move them to new ones:
+/// the catalog refuses it, and it plans again.
+#[test]
+fn a_pass_planned_before_an_upgrade_keeps_row_lineage() {
+    upgraded_while_a_pass_is_in_flight(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_pass_planned_before_an_upgrade_keeps_row_lineage_on_iceberg() {
+    upgraded_while_a_pass_is_in_flight(true);
+}
+
+fn upgraded_while_a_pass_is_in_flight(prod: bool) {
+    PARTITIONED.set(true);
+    V3_UPGRADED.set(true);
+    let round = |first: Step| {
+        [
+            first,
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Compact,
+        ]
+    };
+    let steps = [
+        &round(Step::Insert { id: 1, qty: 0 })[..],
+        &catalog_compaction(),
+        &round(Step::BigTx { inserts: 1, qty: 0 }),
+        &catalog_compaction(),
+        &[
+            Step::CatalogCompactPlan {
+                own_sequence_number: false,
+            },
+            Step::UpgradeToV3,
+        ],
+        &round(Step::DriveFlush),
+        &catalog_compaction(),
+    ]
+    .concat();
+    v3_case(prod, true, &steps);
+}
+
+/// So does a `compact` job's pass, planned before the upgrade and
+/// committed after pg2iceberg's next commit gave the rows ids.
+#[test]
+fn a_jobs_pass_planned_before_an_upgrade_keeps_row_lineage() {
+    a_jobs_pass_across_an_upgrade(false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_jobs_pass_planned_before_an_upgrade_keeps_row_lineage_on_iceberg() {
+    a_jobs_pass_across_an_upgrade(true);
+}
+
+fn a_jobs_pass_across_an_upgrade(prod: bool) {
+    V3_UPGRADED.set(true);
+    let steps = [
+        &dirty_file()[..],
+        &[
+            Step::ExternalCompactPlan,
+            Step::UpgradeToV3,
+            Step::Insert { id: 3, qty: 30 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::ExternalCompactCommit,
+        ],
+    ]
+    .concat();
+    v3_case(prod, false, &steps);
 }

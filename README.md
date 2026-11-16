@@ -273,6 +273,7 @@ Settings come from environment variables and an optional YAML file: `--config`, 
 | `PG2ICEBERG_LOG_FORMAT` | — | `text` (default) or `json` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Export traces over OTLP/HTTP to this collector. Default: none |
 | `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` | `pg2iceberg` / `managed` (the catalog compacts, expires and cleans the tables). Default: `pg2iceberg` |
+| `PG2ICEBERG_FORMAT_VERSION` | `sink.format_version` | Iceberg format version of the tables pg2iceberg creates: `2` or `3` (row lineage). Default: `2` |
 | `AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, ... | `sink.s3_*` | Read as AWS tools read them; the file's `sink.s3_*` take precedence |
 
 ### Inferred settings

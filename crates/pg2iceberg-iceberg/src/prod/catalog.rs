@@ -58,6 +58,8 @@ use crate::{
 pub struct IcebergRustCatalog<C: IcebergCatalogTrait> {
     inner: Arc<C>,
     manifests: Arc<ManifestCache>,
+    /// The format version of the tables it creates.
+    format_version: crate::FormatVersion,
 }
 
 impl<C: IcebergCatalogTrait> IcebergRustCatalog<C> {
@@ -65,6 +67,15 @@ impl<C: IcebergCatalogTrait> IcebergRustCatalog<C> {
         Self {
             inner,
             manifests: Arc::default(),
+            format_version: crate::FormatVersion::default(),
+        }
+    }
+
+    /// Create tables in format `version` (v2 by default).
+    pub fn with_format_version(self, version: crate::FormatVersion) -> Self {
+        Self {
+            format_version: version,
+            ..self
         }
     }
 }
@@ -74,6 +85,7 @@ impl<C: IcebergCatalogTrait> Clone for IcebergRustCatalog<C> {
         Self {
             inner: Arc::clone(&self.inner),
             manifests: Arc::clone(&self.manifests),
+            format_version: self.format_version,
         }
     }
 }
@@ -93,7 +105,11 @@ struct ManifestCache {
 #[derive(Clone, Default)]
 struct TableManifests {
     lists: HashMap<String, Arc<iceberg::spec::ManifestList>>,
-    manifests: HashMap<String, Arc<iceberg::spec::Manifest>>,
+    /// By path and the first row id the list naming the manifest gives
+    /// it, which its data files inherit theirs from on load: a manifest a
+    /// table wrote before its upgrade to v3 has none until the next
+    /// commit's list assigns one.
+    manifests: HashMap<(String, Option<u64>), Arc<iceberg::spec::Manifest>>,
 }
 
 impl ManifestCache {
@@ -173,14 +189,19 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         // build. The `clone()` on `ice_schema` is the cost of avoiding
         // a more elaborate dynamic-build dance.
         //
-        // Format v2, explicitly: what pg2iceberg writes and is tested
-        // against, and what every engine reads (v3 isn't yet — ClickHouse,
-        // open-source Trino).
+        // The format version explicitly, never the catalog's default: v2
+        // unless configured — what every engine reads (v3 isn't yet —
+        // ClickHouse, open-source Trino). (A REST catalog takes it as the
+        // `format-version` property, which the fork's client sends.)
+        let format_version = match self.format_version {
+            crate::FormatVersion::V2 => FormatVersion::V2,
+            crate::FormatVersion::V3 => FormatVersion::V3,
+        };
         let creation = if schema.partition_spec.is_empty() {
             TableCreation::builder()
                 .name(schema.ident.name.clone())
                 .schema(ice_schema)
-                .format_version(FormatVersion::V2)
+                .format_version(format_version)
                 .build()
         } else {
             let unbound = to_iceberg_unbound_partition_spec(schema)?;
@@ -188,7 +209,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 .name(schema.ident.name.clone())
                 .schema(ice_schema)
                 .partition_spec(unbound)
-                .format_version(FormatVersion::V2)
+                .format_version(format_version)
                 .build()
         };
         let table = self
@@ -335,6 +356,9 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             .remove_paths(prepared.removed_paths.iter().cloned());
         if let Some(seq) = prepared.data_sequence_number {
             action = action.set_data_sequence_number(seq);
+        }
+        if !prepared.stores_row_lineage {
+            action = action.validate_no_row_ids();
         }
         let action = action
             // iceberg-rust refuses a snapshot that adds no files and sets
@@ -485,6 +509,11 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let mut expired_adds: BTreeMap<String, (i64, DataFile, DataContentType)> = BTreeMap::new();
         let cached = self.manifests.get(ident);
         let mut read = TableManifests::default();
+        // Each data file's first row id, as the latest snapshot listing it
+        // gives it — what a reader of the table reads. One the table had
+        // before its upgrade to v3 gets one only in a later snapshot than
+        // the one that added it.
+        let mut first_row_ids: HashMap<String, i64> = HashMap::new();
         for snap in snaps {
             // Use the iceberg snapshot_id for manifest filtering (matches the
             // `added_snapshot_id` field stored in manifest entries), but report
@@ -518,8 +547,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 std::collections::BTreeSet::new();
             for entry in manifest_list.entries() {
                 // Each manifest list names every manifest before it.
-                let path = &entry.manifest_path;
-                let manifest = match read.manifests.get(path).or(cached.manifests.get(path)) {
+                let key = (entry.manifest_path.clone(), entry.first_row_id);
+                let manifest = match read.manifests.get(&key).or(cached.manifests.get(&key)) {
                     Some(manifest) => Arc::clone(manifest),
                     None => Arc::new(
                         table
@@ -529,13 +558,16 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                             .map_err(map_iceberg_err)?,
                     ),
                 };
-                read.manifests.insert(path.clone(), Arc::clone(&manifest));
+                read.manifests.insert(key, Arc::clone(&manifest));
                 // A `DELETED` entry records a file its snapshot removed (other
                 // engines write them; our rewrite omits removed files): no
                 // file the snapshot holds.
                 for me in manifest.entries().iter().filter(|me| me.is_alive()) {
                     let df = me.data_file();
                     all_paths_this_snap.insert(df.file_path().to_string());
+                    if let Some(id) = df.first_row_id() {
+                        first_row_ids.insert(df.file_path().to_string(), id);
+                    }
 
                     let partition_values = iceberg_struct_to_partition_literals(df.partition());
                     let mut our = DataFile {
@@ -545,6 +577,11 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                         equality_field_ids: df.equality_ids().unwrap_or_default(),
                         partition_values,
                         sequence_number: None,
+                        // Inherited on load, as a v3 reader assigns it.
+                        first_row_id: match df.content_type() {
+                            DataContentType::Data => df.first_row_id(),
+                            _ => None,
+                        },
                     };
                     // Match the sim's "files added in this commit"
                     // semantics: only surface entries first introduced
@@ -631,6 +668,11 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         }
         out.extend(stand_ins.into_values());
         out.sort_by_key(|s| s.id);
+        for df in out.iter_mut().flat_map(|s| &mut s.data_files) {
+            if let Some(&id) = first_row_ids.get(&df.path) {
+                df.first_row_id = Some(id);
+            }
+        }
         self.manifests.put(ident, read);
         Ok(out)
     }
@@ -1403,6 +1445,7 @@ mod tests {
                         equality_field_ids: vec![],
                         partition_values: vec![PartitionLiteral::Long(1)],
                         sequence_number: None,
+                        first_row_id: None,
                     },
                     DataFile {
                         path: "memory:///warehouse/public/orders/data-qty-2.parquet".into(),
@@ -1411,6 +1454,7 @@ mod tests {
                         equality_field_ids: vec![],
                         partition_values: vec![PartitionLiteral::Long(2)],
                         sequence_number: None,
+                        first_row_id: None,
                     },
                 ],
                 equality_deletes: vec![],
@@ -1511,6 +1555,7 @@ mod tests {
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values,
                 sequence_number: None,
+                first_row_id: None,
             });
         }
         c.commit_snapshot(PreparedCommit {
@@ -1566,6 +1611,7 @@ mod tests {
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
                 equality_deletes: vec![],
             })
@@ -1632,6 +1678,7 @@ mod tests {
                         equality_field_ids: vec![],
                         partition_values: Vec::new(),
                         sequence_number: None,
+                        first_row_id: None,
                     }],
                     equality_deletes: vec![],
                 })
@@ -1681,6 +1728,7 @@ mod tests {
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
                 equality_deletes: vec![],
             })
@@ -1699,9 +1747,11 @@ mod tests {
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
                 sequence_number: None,
+                first_row_id: None,
             }],
             removed_paths: original_paths.clone(),
             data_sequence_number: None,
+            stores_row_lineage: false,
         })
         .await
         .unwrap();
@@ -1744,6 +1794,7 @@ mod tests {
                 added_data_files: vec![],
                 removed_paths: vec![],
                 data_sequence_number: None,
+                stores_row_lineage: false,
             })
             .await
             .unwrap();
@@ -1768,6 +1819,7 @@ mod tests {
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: vec![],
         })
@@ -1779,6 +1831,7 @@ mod tests {
             added_data_files: vec![],
             removed_paths: vec![path.into()],
             data_sequence_number: None,
+            stores_row_lineage: false,
         })
         .await
         .unwrap();
@@ -1815,6 +1868,7 @@ mod tests {
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
                 equality_deletes: vec![],
             })
@@ -1876,6 +1930,7 @@ mod tests {
             equality_field_ids: eq_ids,
             partition_values: Vec::new(),
             sequence_number: None,
+            first_row_id: None,
         };
         let tick = || tokio::time::sleep(std::time::Duration::from_millis(2));
         let append = |data: Vec<DataFile>, deletes: Vec<DataFile>| {
@@ -1898,6 +1953,7 @@ mod tests {
             added_data_files: vec![file("c0", vec![])],
             removed_paths: vec![file("d0", vec![]).path],
             data_sequence_number: None,
+            stores_row_lineage: false,
         })
         .await
         .unwrap();
@@ -1935,6 +1991,7 @@ mod tests {
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: vec![],
         })
@@ -1981,6 +2038,7 @@ mod tests {
                     equality_field_ids: vec![1],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
             })
             .await
@@ -2009,6 +2067,7 @@ mod tests {
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
                 equality_deletes: vec![DataFile {
                     path: "memory:///warehouse/public/orders/eq-deletes-0.parquet".into(),
@@ -2017,6 +2076,7 @@ mod tests {
                     equality_field_ids: vec![1],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
             })
             .await
@@ -2051,6 +2111,7 @@ mod tests {
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
             })
             .await
@@ -2227,6 +2288,7 @@ mod tests {
                     equality_field_ids: vec![],
                     partition_values: Vec::new(),
                     sequence_number: None,
+                    first_row_id: None,
                 }],
                 equality_deletes: vec![],
             }],
@@ -2284,6 +2346,7 @@ mod tests {
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: vec![],
         })
@@ -2342,6 +2405,7 @@ mod tests {
             equality_field_ids,
             partition_values: Vec::new(),
             sequence_number: None,
+            first_row_id: None,
         };
         PreparedCommit {
             ident: ident(),
@@ -2539,6 +2603,7 @@ mod tests {
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: vec![],
         })
@@ -2583,6 +2648,7 @@ mod tests {
                 equality_field_ids: vec![],
                 partition_values: Vec::new(),
                 sequence_number: None,
+                first_row_id: None,
             }],
             equality_deletes: vec![],
         };

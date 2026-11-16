@@ -407,6 +407,14 @@ pub struct SinkConfig {
     #[serde(default)]
     pub maintenance: String,
 
+    /// The Iceberg format version of the tables pg2iceberg creates: 2
+    /// (the default), or 3, whose rows carry row lineage (`_row_id`,
+    /// `_last_updated_sequence_number`) — but which fewer engines read.
+    /// Tables that already exist keep theirs. See
+    /// [`Self::resolved_format_version`].
+    #[serde(default = "default_format_version")]
+    pub format_version: u8,
+
     /// Free-form REST-catalog props passthrough. Useful for
     /// vendor-specific settings (Polaris OAuth2
     /// server URI, etc.) without us having to enumerate every quirk.
@@ -459,6 +467,7 @@ impl Default for SinkConfig {
             maintenance_retention: String::new(),
             maintenance_grace: default_maintenance_grace(),
             maintenance: String::new(),
+            format_version: default_format_version(),
             catalog_props: BTreeMap::new(),
             meta_namespace: String::new(),
         }
@@ -518,6 +527,16 @@ impl SinkConfig {
                 "unknown sink.maintenance {other:?}; expected \"pg2iceberg\" or \"managed\""
             ),
         }
+    }
+
+    /// `format_version`, checked.
+    pub fn resolved_format_version(&self) -> Result<pg2iceberg_iceberg::FormatVersion> {
+        pg2iceberg_iceberg::FormatVersion::from_number(self.format_version).map_err(|_| {
+            anyhow::anyhow!(
+                "unsupported sink.format_version {}; expected 2 or 3",
+                self.format_version
+            )
+        })
     }
 
     /// `compaction_delete_ratio` is a share: 0 rewrites a file for any row
@@ -642,6 +661,10 @@ fn default_target_file_size() -> u64 {
     128 * 1024 * 1024
 }
 
+fn default_format_version() -> u8 {
+    2
+}
+
 fn default_maintenance_grace() -> String {
     "30m".into()
 }
@@ -733,6 +756,7 @@ impl Config {
         self.metrics_addr()?;
         self.liveness_timeout()?;
         self.sink.resolved_maintenance()?;
+        self.sink.resolved_format_version()?;
         Ok(self)
     }
 
@@ -810,6 +834,7 @@ impl Config {
     /// | `PG2ICEBERG_METRICS_ADDR` | `metrics_addr` |
     /// | `PG2ICEBERG_LIVENESS_TIMEOUT` | `liveness_timeout` |
     /// | `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` |
+    /// | `PG2ICEBERG_FORMAT_VERSION` | `sink.format_version` |
     ///
     /// AWS's own variables fill in only what the file leaves out:
     /// `AWS_REGION` / `AWS_DEFAULT_REGION` for `sink.s3_region`, and
@@ -846,6 +871,14 @@ impl Config {
         set(&mut self.metrics_addr, "PG2ICEBERG_METRICS_ADDR");
         set(&mut self.liveness_timeout, "PG2ICEBERG_LIVENESS_TIMEOUT");
         set(&mut self.sink.maintenance, "PG2ICEBERG_MAINTENANCE");
+        if let Some(version) = env("PG2ICEBERG_FORMAT_VERSION") {
+            self.sink.format_version = version.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "PG2ICEBERG_FORMAT_VERSION={version:?}: expected an Iceberg format \
+                     version, 2 or 3"
+                )
+            })?;
+        }
         if let Some(tables) = env("PG2ICEBERG_TABLES") {
             self.tables = tables
                 .split(|c: char| c == ',' || c.is_whitespace())
@@ -1664,6 +1697,30 @@ sink:
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name: &str| map.get(name).cloned()
+    }
+
+    /// Tables are created v2 unless told v3, from the file or the
+    /// environment; another version fails the config load.
+    #[test]
+    fn tables_are_created_v2_unless_told_v3() {
+        use pg2iceberg_iceberg::FormatVersion;
+        let version = |cfg: Config| cfg.sink.resolved_format_version().unwrap();
+        assert_eq!(
+            version(Config::from_env(&vars(&[])).unwrap()),
+            FormatVersion::V2
+        );
+        let env = vars(&[("PG2ICEBERG_FORMAT_VERSION", "3")]);
+        assert_eq!(version(Config::from_env(&env).unwrap()), FormatVersion::V3);
+        let yaml = format!("{INTERVALS}  format_version: 3\n");
+        let env = vars(&[]);
+        let cfg = Config::parse(&yaml, &env).unwrap().finish(&env).unwrap();
+        assert_eq!(version(cfg), FormatVersion::V3);
+        for bad in ["4", "v3"] {
+            let err = Config::from_env(&vars(&[("PG2ICEBERG_FORMAT_VERSION", bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("format"), "{bad}: {err}");
+        }
     }
 
     /// pg2iceberg maintains the tables unless told the catalog does; a

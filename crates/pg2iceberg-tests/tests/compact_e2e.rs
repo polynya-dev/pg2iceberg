@@ -147,6 +147,7 @@ impl Harness {
                 equality_field_ids: vec![],
                 partition_values: chunk.partition_values,
                 sequence_number: None,
+                first_row_id: None,
             });
         }
         let mut delete_files = Vec::new();
@@ -161,6 +162,7 @@ impl Harness {
                 equality_field_ids: prepared.pk_field_ids.clone(),
                 partition_values: chunk.partition_values,
                 sequence_number: None,
+                first_row_id: None,
             });
         }
         block_on(self.cat.commit_snapshot(PreparedCommit {
@@ -1113,4 +1115,61 @@ fn deletes_wait_until_they_kill_enough_rows_to_rewrite_for() {
     assert_eq!(out.rows_removed_by_deletes, 110);
     assert_eq!(out.input_delete_files, 6);
     assert_eq!(visible_id_qty(&h, &s).len(), 890);
+}
+
+/// Each row of `s`, by id, with its `_row_id` and
+/// `_last_updated_sequence_number` as a v3 engine reads them.
+fn lineage(h: &Harness, s: &TableSchema) -> BTreeMap<i32, (i64, i64)> {
+    use pg2iceberg_sim::oracle::{engine_read_lineage, live_files_from_history};
+    let files = live_files_from_history(&h.cat.history(&s.ident));
+    block_on(engine_read_lineage(h.blob.as_ref(), s, &files))
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let Some(PgValue::Int4(id)) = r.row.get(&ColumnName("id".into())) else {
+                panic!("no id in {:?}", r.row);
+            };
+            let lineage = (r.row_id.expect("row id"), r.last_updated.expect("seq"));
+            (*id, lineage)
+        })
+        .collect()
+}
+
+/// On a v3 table, a pass keeps the lineage of each row it moves, however
+/// many record batches it reads them in: a row's position runs on across
+/// them.
+#[test]
+fn compaction_keeps_row_lineage_across_record_batches() {
+    let h = Harness {
+        cat: MemoryCatalog::new().with_format_version(pg2iceberg_iceberg::FormatVersion::V3),
+        ..Harness::new()
+    };
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    let n = 3 * pg2iceberg_iceberg::compact::DECODE_BATCH_ROWS as i32 + 7;
+    let files = h.commit(
+        &s,
+        (1..=n)
+            .map(|i| MaterializedRow {
+                op: Op::Insert,
+                row: row_id_qty(i, i),
+                unchanged_cols: vec![],
+                unchanged_from: None,
+            })
+            .collect(),
+    );
+    assert_eq!(files.len(), 1, "one input file");
+    delete(&h, &s, pk_only(1));
+    let before = lineage(&h, &s);
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let out = h.run_compaction(&s, &cfg).expect("compaction should run");
+    assert_eq!(out.rows_rewritten, n as u64);
+    let after = lineage(&h, &s);
+    assert_eq!(after.len(), n as usize - 1);
+    assert_eq!(before, after);
 }

@@ -140,6 +140,7 @@ fn table_with_history(
                     equality_field_ids: vec![],
                     partition_values: c.partition_values.clone(),
                     sequence_number: None,
+                    first_row_id: None,
                 })
                 .collect();
             let equality_deletes = prepared
@@ -152,6 +153,7 @@ fn table_with_history(
                     equality_field_ids: prepared.pk_field_ids.clone(),
                     partition_values: c.partition_values.clone(),
                     sequence_number: None,
+                    first_row_id: None,
                 })
                 .collect();
             block_on(cat.commit_snapshot(PreparedCommit {
