@@ -33,7 +33,7 @@ tokio-postgres = { version = "0.7", optional = true, default-features = false, f
 object_store = { version = "0.11", optional = true, default-features = false, features = ["aws"] }
 # The DST's production backend reads a table's manifests directly, as
 # ground truth independent of pg2iceberg's own `snapshots()`.
-iceberg = { version = "0.10", optional = true }
+iceberg = { version = "0.11", optional = true }
 # Parses pgoutput in the sim-vs-Postgres conformance suite.
 postgres-replication = { version = "0.6", optional = true, default-features = false }
 async-trait = { workspace = true, optional = true }

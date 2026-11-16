@@ -203,8 +203,9 @@ async fn fast_append_round_trip_creates_snapshot_with_data_file() {
 
     let manifest_list = table.manifest_list_reader(snap).load().await.unwrap();
     assert_eq!(manifest_list.entries().len(), 1);
-    let manifest = manifest_list.entries()[0]
-        .load_manifest(table.file_io())
+    let manifest = table
+        .manifest_reader()
+        .read(&manifest_list.entries()[0])
         .await
         .unwrap();
     assert_eq!(manifest.entries().len(), 1);
