@@ -263,50 +263,6 @@ fn active_consumers_sorted_by_id() {
     assert_eq!(ids, vec!["a", "b", "c"]);
 }
 
-// ---------- locks ----------
-
-#[test]
-fn try_lock_returns_true_then_false_until_release() {
-    let (c, _) = coord_at_t0();
-    let w1 = WorkerId("w1".into());
-    let w2 = WorkerId("w2".into());
-    assert!(block_on(c.try_lock(&ident("a"), &w1, Duration::from_secs(30))).unwrap());
-    assert!(!block_on(c.try_lock(&ident("a"), &w2, Duration::from_secs(30))).unwrap());
-    block_on(c.release_lock(&ident("a"), &w1)).unwrap();
-    assert!(block_on(c.try_lock(&ident("a"), &w2, Duration::from_secs(30))).unwrap());
-}
-
-#[test]
-fn expired_lock_can_be_reclaimed() {
-    let (c, clock) = coord_at_t0();
-    let w1 = WorkerId("w1".into());
-    let w2 = WorkerId("w2".into());
-    assert!(block_on(c.try_lock(&ident("a"), &w1, Duration::from_secs(10))).unwrap());
-    clock.advance(Duration::from_secs(11));
-    assert!(block_on(c.try_lock(&ident("a"), &w2, Duration::from_secs(10))).unwrap());
-}
-
-#[test]
-fn renew_lock_only_succeeds_for_holder() {
-    let (c, _) = coord_at_t0();
-    let w1 = WorkerId("w1".into());
-    let w2 = WorkerId("w2".into());
-    block_on(c.try_lock(&ident("a"), &w1, Duration::from_secs(10))).unwrap();
-    assert!(block_on(c.renew_lock(&ident("a"), &w1, Duration::from_secs(20))).unwrap());
-    assert!(!block_on(c.renew_lock(&ident("a"), &w2, Duration::from_secs(20))).unwrap());
-}
-
-#[test]
-fn release_lock_by_non_holder_is_noop() {
-    let (c, _) = coord_at_t0();
-    let w1 = WorkerId("w1".into());
-    let w2 = WorkerId("w2".into());
-    block_on(c.try_lock(&ident("a"), &w1, Duration::from_secs(10))).unwrap();
-    block_on(c.release_lock(&ident("a"), &w2)).unwrap();
-    // Lock still held by w1.
-    assert!(!block_on(c.try_lock(&ident("a"), &w2, Duration::from_secs(10))).unwrap());
-}
-
 /// `replicated_lsn` follows the highest `CommitBatch::replicated_lsn`
 /// claimed — with claims or without — and ignores batches that carry
 /// none (a backfill's). Mirrors the production coordinator's test.

@@ -5,7 +5,7 @@
 //! for free — the lock is held across the multi-step `claim_offsets`
 //! algorithm.
 //!
-//! Time-dependent ops (consumer heartbeats, locks) consult an injected
+//! Time-dependent ops (consumer heartbeats) consult an injected
 //! [`Clock`] so tests advance time explicitly. No real `Instant::now()`.
 
 use crate::clock::{duration_to_micros, TestClock};
@@ -41,8 +41,6 @@ struct State {
     cursors: BTreeMap<(String, TableIdent), i64>,
     /// `consumer.expires_at` per `(group, worker)`.
     consumers: BTreeMap<(String, WorkerId), Timestamp>,
-    /// `lock` per table: holder + expiry.
-    locks: BTreeMap<TableIdent, (WorkerId, Timestamp)>,
     /// `pipeline_meta.system_identifier` (zero = unset).
     system_identifier: u64,
     /// `flushed_lsn.lsn` — highest LSN we've ever acked. Compared to
@@ -295,53 +293,6 @@ impl Coordinator for MemoryCoordinator {
             .collect();
         out.sort();
         Ok(out)
-    }
-
-    async fn try_lock(&self, table: &TableIdent, worker: &WorkerId, ttl: Duration) -> Result<bool> {
-        let now = self.clock.now();
-        let expiry = ttl_expiry(now, ttl);
-        let mut state = self.state.lock().unwrap();
-
-        // Expire stale lock for this table first.
-        if let Some((_, exp)) = state.locks.get(table) {
-            if *exp < now {
-                state.locks.remove(table);
-            }
-        }
-
-        if state.locks.contains_key(table) {
-            return Ok(false);
-        }
-        state.locks.insert(table.clone(), (worker.clone(), expiry));
-        Ok(true)
-    }
-
-    async fn renew_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> Result<bool> {
-        let now = self.clock.now();
-        let expiry = ttl_expiry(now, ttl);
-        let mut state = self.state.lock().unwrap();
-        match state.locks.get_mut(table) {
-            Some((holder, exp)) if holder == worker => {
-                *exp = expiry;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn release_lock(&self, table: &TableIdent, worker: &WorkerId) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if let Some((holder, _)) = state.locks.get(table) {
-            if holder == worker {
-                state.locks.remove(table);
-            }
-        }
-        Ok(())
     }
 
     async fn pipeline_system_identifier(&self) -> Result<u64> {

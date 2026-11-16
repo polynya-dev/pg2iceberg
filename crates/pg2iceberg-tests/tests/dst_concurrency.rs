@@ -343,26 +343,6 @@ impl Coordinator for OneConnection {
     async fn active_consumers(&self, group: &str) -> CoordResult<Vec<WorkerId>> {
         self.request(self.inner.active_consumers(group)).await
     }
-    async fn try_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> CoordResult<bool> {
-        self.request(self.inner.try_lock(table, worker, ttl)).await
-    }
-    async fn renew_lock(
-        &self,
-        table: &TableIdent,
-        worker: &WorkerId,
-        ttl: Duration,
-    ) -> CoordResult<bool> {
-        self.request(self.inner.renew_lock(table, worker, ttl))
-            .await
-    }
-    async fn release_lock(&self, table: &TableIdent, worker: &WorkerId) -> CoordResult<()> {
-        self.request(self.inner.release_lock(table, worker)).await
-    }
     async fn pipeline_system_identifier(&self) -> CoordResult<u64> {
         self.request(self.inner.pipeline_system_identifier()).await
     }
