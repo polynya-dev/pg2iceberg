@@ -2413,7 +2413,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2461,7 +2461,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=rebase-v0.11.0#a5b550ddd444e0416bba7e265039808ce56d65dd"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#429f3a0aa236eec59850679c025c068d2ac29d41"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2520,7 +2520,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=rebase-v0.11.0#a5b550ddd444e0416bba7e265039808ce56d65dd"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#429f3a0aa236eec59850679c025c068d2ac29d41"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2544,7 +2544,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=rebase-v0.11.0#a5b550ddd444e0416bba7e265039808ce56d65dd"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#429f3a0aa236eec59850679c025c068d2ac29d41"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2554,7 +2554,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=rebase-v0.11.0#a5b550ddd444e0416bba7e265039808ce56d65dd"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#429f3a0aa236eec59850679c025c068d2ac29d41"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4270,7 +4270,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -4308,7 +4308,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.52.0",
 ]
