@@ -801,7 +801,7 @@ mod reader_tests {
             stop: stop.clone(),
             wal_end: 0,
         };
-        let (events_tx, _events_rx) =
+        let (events_tx, events_rx) =
             mpsc::channel::<Result<DecodedMessage>>(EVENTS_CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(CMD_CHANNEL_CAPACITY);
         let reader = tokio::spawn(reader_task(wire, HashMap::new(), events_tx, cmd_rx));
@@ -823,6 +823,10 @@ mod reader_tests {
 
         // Stop the flood so the reader exits cleanly regardless of outcome
         // (it polls `next()` every iteration even when stream-biased).
+        // Drop the receiver first: nothing drains it, so the flood fills
+        // it once it runs long enough, and the reader would park forever
+        // delivering its "stream closed" error into the full channel.
+        drop(events_rx);
         stop.store(true, Ordering::Relaxed);
         let _ = reader.await;
 
