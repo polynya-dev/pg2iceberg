@@ -335,6 +335,10 @@ impl Coordinator for FaultyCoordinator {
         self.inner.set_pipeline_system_identifier(sysid).await
     }
 
+    async fn claim_group(&self, group: &str) -> CoordResult<()> {
+        self.inner.claim_group(group).await
+    }
+
     async fn flushed_lsn(&self) -> CoordResult<Lsn> {
         self.inner.flushed_lsn().await
     }

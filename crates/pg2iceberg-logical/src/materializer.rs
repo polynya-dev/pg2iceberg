@@ -119,6 +119,17 @@ pub enum MaterializerError {
     /// update never happened. Handled within a cycle, never returned.
     #[error("log already applied up to offset {end}")]
     AlreadyApplied { end: u64 },
+    /// The table's log starts past its cursor: entries it hasn't applied
+    /// are gone ([`Materializer::log_continues`]).
+    #[error(
+        "{table}'s staged log starts at offset {start}, past its cursor at {cursor}: \
+         changes it hasn't applied are gone, and the table needs a new snapshot"
+    )]
+    LogGap {
+        table: TableIdent,
+        cursor: i64,
+        start: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MaterializerError>;
@@ -1575,8 +1586,13 @@ impl<C: Catalog> Materializer<C> {
             snapshot: true,
             ..Unit::default()
         };
+        let group = self.snapshot_group();
         let mut log = self.staged_log(ident, from.max(0) as u64);
+        let mut first = true;
         while let Some((e, bytes)) = log.next().await? {
+            if std::mem::take(&mut first) && !self.log_continues(ident, &group, from, &e).await? {
+                return Ok(0);
+            }
             let rows: Vec<MatEvent> = decode_chunk(&bytes)?
                 .into_iter()
                 .filter(|evt| is_snapshot_xid(evt.xid))
@@ -2762,6 +2778,40 @@ impl<C: Catalog> Materializer<C> {
         Ok(folded)
     }
 
+    /// Whether `first`, the first entry read past `cursor` of `group`,
+    /// starts where the cursor sits, as entries follow one another. If
+    /// not, those in between are gone: fine if the cursor has moved past
+    /// them since it was read — another process applied and truncated
+    /// them, a worker that owned the table too for a moment — and this
+    /// cycle has nothing to do (`false`); otherwise they're lost, and
+    /// it's a [`MaterializerError::LogGap`].
+    async fn log_continues(
+        &self,
+        ident: &TableIdent,
+        group: &str,
+        cursor: i64,
+        first: &LogEntry,
+    ) -> Result<bool> {
+        if first.start_offset == cursor.max(0) as u64 {
+            return Ok(true);
+        }
+        let now = self.coord.get_cursor(group, ident).await?.unwrap_or(-1);
+        if now > cursor {
+            tracing::info!(
+                table = %ident,
+                cursor,
+                now,
+                "another process applied the log meanwhile"
+            );
+            return Ok(false);
+        }
+        Err(MaterializerError::LogGap {
+            table: ident.clone(),
+            cursor,
+            start: first.start_offset,
+        })
+    }
+
     /// Truncating the table's log ([`truncate_log`]): once this process
     /// starts, then whenever it has applied the log past where it's
     /// truncated to. Not before the table's backfill is looked up: that
@@ -2777,7 +2827,10 @@ impl<C: Catalog> Materializer<C> {
         let coord = self.coord.clone();
         let blob_store = self.blob_store.clone();
         let ident = ident.clone();
-        async move { truncate_log(coord.as_ref(), blob_store.as_ref(), &ident, due?).await }
+        // The group's cursors over the log: its changes', and its
+        // backfill's while one applies.
+        let groups = [self.group.clone(), self.snapshot_group()];
+        async move { truncate_log(coord.as_ref(), blob_store.as_ref(), &ident, &groups, due?).await }
     }
 
     /// Fold and commit the table's changes past its cursor, in units.
@@ -2796,6 +2849,9 @@ impl<C: Catalog> Materializer<C> {
         let mut read_any = false;
         let mut log = self.staged_log(ident, cursor.max(0) as u64);
         while let Some((e, bytes)) = log.next().await? {
+            if !read_any && !self.log_continues(ident, &self.group, cursor, &e).await? {
+                return Ok(0);
+            }
             read_any = true;
             let events = decode_chunk(&bytes)?;
             // A schema change starts its entry (the pipeline stages it
@@ -3459,11 +3515,11 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-/// Drop `ident`'s log before the lowest cursor reading it, and delete the
-/// files those entries staged: every reader has applied them, and none
-/// reads them again. Every group that registered the table holds its log —
-/// its changes' cursor, and its backfill's while one applies. The entry at
-/// the cursor stays, so the log still shows where it's applied to. At most
+/// Drop `ident`'s log before the lowest of `groups`' cursors — the consumer
+/// group's, which the schema serves alone ([`Coordinator::claim_group`]) —
+/// and delete the files those entries staged: they're applied, and nothing
+/// reads them again. The entry at the cursor stays, so the log still shows
+/// where it's applied to. At most
 /// [`TRUNCATE_BATCH`] entries at once, past `log_start`, where it was
 /// truncated to before. Returns where it's truncated to now, unless it
 /// left some for next time. Best effort: what this leaves the next one
@@ -3472,6 +3528,7 @@ async fn truncate_log(
     coord: &dyn Coordinator,
     blob_store: &dyn BlobStore,
     ident: &TableIdent,
+    groups: &[String],
     log_start: i64,
 ) -> Option<i64> {
     let cursors = match coord.table_cursors(ident).await {
@@ -3483,7 +3540,7 @@ async fn truncate_log(
     };
     let keep_from = cursors
         .into_iter()
-        .filter(|(group, _)| !group.ends_with(SNAPSHOT_LSN_SUFFIX))
+        .filter(|(group, _)| groups.contains(group))
         .map(|(_, cursor)| cursor)
         .min()?;
     if keep_from <= log_start.max(0) {

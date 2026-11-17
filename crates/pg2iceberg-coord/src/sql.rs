@@ -101,6 +101,12 @@ pub fn migrate(schema: &CoordSchema) -> Vec<String> {
             )",
             schema.qualify("pipeline_meta")
         ),
+        // The consumer group the schema serves (`claim_group`); NULL
+        // until a process claims it.
+        format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS consumer_group TEXT",
+            schema.qualify("pipeline_meta")
+        ),
         // Single-row record of the highest LSN we've ever told the
         // replication slot to flush past. Updated *before* every
         // `send_standby`, so on a crash between the two writes the
@@ -409,6 +415,39 @@ pub fn upsert_pipeline_meta(schema: &CoordSchema) -> String {
     )
 }
 
+/// Ensure the pipeline-meta row, so `claim_group` can lock it.
+pub fn ensure_pipeline_meta(schema: &CoordSchema) -> String {
+    format!(
+        "INSERT INTO {} (id) VALUES (1) ON CONFLICT (id) DO NOTHING",
+        schema.qualify("pipeline_meta")
+    )
+}
+
+/// The claimed consumer group, the row locked until the transaction ends.
+pub fn select_pipeline_group(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT consumer_group FROM {} WHERE id = 1 FOR UPDATE",
+        schema.qualify("pipeline_meta")
+    )
+}
+
+/// Groups other than `$1` with cursors: a group's own cursors are named
+/// `group` and `group#…`.
+pub fn other_cursor_groups(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT DISTINCT split_part(group_name, '#', 1) AS g FROM {} \
+         WHERE split_part(group_name, '#', 1) <> $1 ORDER BY g",
+        schema.qualify("mat_cursor")
+    )
+}
+
+pub fn set_pipeline_group(schema: &CoordSchema) -> String {
+    format!(
+        "UPDATE {} SET consumer_group = $1, updated_at = now() WHERE id = 1",
+        schema.qualify("pipeline_meta")
+    )
+}
+
 // ── Last-acked LSN (single-row tamper detection) ──────────────────────
 
 pub fn select_flushed_lsn(schema: &CoordSchema) -> String {
@@ -562,14 +601,15 @@ mod tests {
         let stmts = migrate(&s);
         // 6 base CREATE TABLEs (log_seq, log_index, mat_cursor,
         // consumer, pending_markers, marker_emissions)
-        // + 1 ALTER TABLE (log_index.flushable_lsn)
+        // + 2 ALTER TABLEs (log_index.flushable_lsn,
+        //   pipeline_meta.consumer_group)
         // + 1 DROP TABLE (the retired `lock` table)
         // + 5 new per-concern tables (pipeline_meta, flushed_lsn,
         //   replicated_lsn, tables, snapshot_progress)
         // + table_epoch + writes_in_flight
-        // = 15. Each statement is idempotent (CREATE TABLE IF NOT
+        // = 16. Each statement is idempotent (CREATE TABLE IF NOT
         // EXISTS, ADD COLUMN IF NOT EXISTS or DROP TABLE IF EXISTS).
-        assert_eq!(stmts.len(), 15);
+        assert_eq!(stmts.len(), 16);
         for stmt in &stmts {
             assert!(
                 stmt.contains("IF NOT EXISTS") || stmt.contains("IF EXISTS"),

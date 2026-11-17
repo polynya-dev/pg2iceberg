@@ -28,7 +28,7 @@ use std::time::Duration;
 use pg2iceberg_coord::{
     prod::{connect_with, PostgresCoordinator, TlsMode},
     schema::CoordSchema,
-    CommitBatch, Coordinator, MarkerInfo, OffsetClaim, StagedLogSize,
+    CommitBatch, CoordError, Coordinator, MarkerInfo, OffsetClaim, StagedLogSize,
 };
 use pg2iceberg_core::{Lsn, Namespace, TableIdent, WorkerId};
 use testcontainers_modules::postgres::Postgres;
@@ -467,6 +467,36 @@ async fn cursor_round_trip() {
     let other = ident("public", "missing");
     let err = coord.set_cursor(group, &other, 0).await.unwrap_err();
     assert!(matches!(err, pg2iceberg_coord::CoordError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn claim_group_binds_the_schema_to_one_group() {
+    let coord = fresh_coord().await;
+    coord.claim_group("a").await.unwrap();
+    coord.claim_group("a").await.unwrap();
+    let refused = coord.claim_group("b").await.unwrap_err();
+    assert!(
+        matches!(&refused, CoordError::GroupMismatch { holder, configured } if holder == "a" && configured == "b"),
+        "{refused}"
+    );
+    // The refusal changed nothing.
+    coord.claim_group("a").await.unwrap();
+}
+
+#[tokio::test]
+async fn claim_group_refuses_a_schema_holding_another_groups_cursors() {
+    let coord = fresh_coord().await;
+    let t = ident("public", "orders");
+    // Cursors from before the schema recorded its group.
+    coord.ensure_cursor("old#snapshot", &t).await.unwrap();
+    coord.ensure_cursor("old", &t).await.unwrap();
+    let refused = coord.claim_group("new").await.unwrap_err();
+    assert!(
+        matches!(&refused, CoordError::GroupMismatch { holder, .. } if holder == "old"),
+        "{refused}"
+    );
+    // Its own, `#…` ones too, are no obstacle.
+    coord.claim_group("old").await.unwrap();
 }
 
 #[tokio::test]

@@ -67,7 +67,7 @@ pg2iceberg materializer-only --config config.yaml --worker-id worker-b
 Each worker registers a heartbeat in `_pg2iceberg.consumer` keyed by `state.group` and `--worker-id`. On every cycle, every worker reads the active-worker list and computes the same deterministic assignment (sorted tables → sorted workers → `[i % N]`). Adding or removing a worker rebalances on the next cycle automatically; no leader election.
 
 !!! note
-    All workers must share the same `state.group` (default `default`) and the same configured table list. Different `--worker-id` per process is mandatory — duplicates trample each other's heartbeat row and produce undefined assignment.
+    All workers must share the same `state.group` (default `default`) and the same configured table list. A coordinator schema serves one group: a process configured with another refuses to start. Different `--worker-id` per process is mandatory — duplicates trample each other's heartbeat row and produce undefined assignment.
 
 ## `snapshot` — one-shot initial snapshot
 

@@ -357,6 +357,9 @@ impl Coordinator for OneConnection {
         self.request(self.inner.set_pipeline_system_identifier(sysid))
             .await
     }
+    async fn claim_group(&self, group: &str) -> CoordResult<()> {
+        self.request(self.inner.claim_group(group)).await
+    }
     async fn flushed_lsn(&self) -> CoordResult<Lsn> {
         self.request(self.inner.flushed_lsn()).await
     }

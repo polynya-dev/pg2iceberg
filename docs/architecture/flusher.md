@@ -43,7 +43,7 @@ The coordinator role is filled by the **source PostgreSQL database** itself. Thi
 | `log_index` | Sparse index: maps offset ranges to staged-Parquet S3 paths + LSNs |
 | `mat_cursor` | Per-`(group, table)` cursor tracking the last materialized offset |
 | `consumer` | Heartbeat registry for distributed materializer workers |
-| `pipeline_meta` | Singleton: source-cluster `system_identifier` |
+| `pipeline_meta` | Singleton: source-cluster `system_identifier`, and the consumer group the schema serves |
 | `flushed_lsn` | Singleton: highest LSN we've acked the slot to |
 | `tables` | Per-table snapshot status + `pg_class.oid` |
 | `snapshot_progress` | Per-table mid-snapshot resume cursor |
@@ -66,7 +66,7 @@ The materializer reads `log_index` entries with offsets greater than its cursor,
 
 **Truncate** (materializer → log):
 
-Once a table's entries are applied, the materializer drops them from `log_index` and deletes their files — while its next cycle applies more, since the two touch different entries. It truncates before the lowest cursor reading the log: every consumer group that registered the table holds it, and so does a backfill until its rows are applied. The entry that cursor sits at the end of stays, so the log still shows how far it's applied. A log grown long under a release that didn't truncate it is worked off at most 1,000 entries a table a cycle; a file whose delete fails stays behind. `pg2iceberg_staged_log_files` and `pg2iceberg_staged_log_bytes` gauge what each table's log still holds.
+Once a table's entries are applied, the materializer drops them from `log_index` and deletes their files — while its next cycle applies more, since the two touch different entries. It truncates before the table's cursor — or its backfill's, until a backfill's rows are applied. The entry that cursor sits at the end of stays, so the log still shows how far it's applied, and a materializer that finds its log starting past its cursor stops with an error rather than read on: what's missing can't be applied, and the table needs a new snapshot. A log grown long under a release that didn't truncate it is worked off at most 1,000 entries a table a cycle; a file whose delete fails stays behind. `pg2iceberg_staged_log_files` and `pg2iceberg_staged_log_bytes` gauge what each table's log still holds.
 
 ## Restart record
 

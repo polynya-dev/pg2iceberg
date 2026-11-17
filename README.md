@@ -108,7 +108,7 @@ All coordination state lives under the `_pg2iceberg` schema in the source (or a 
 | `log_index` | Sparse index of staged Parquet files with offset ranges + LSN |
 | `mat_cursor` | Materializer progress (last committed offset per table) |
 | `consumer` | Heartbeat registry for distributed materializer workers |
-| `pipeline_meta` | Singleton: source-cluster `system_identifier` (DSN-swap detection) |
+| `pipeline_meta` | Singleton: source-cluster `system_identifier` (DSN-swap detection), and the consumer group the schema serves |
 | `flushed_lsn` | Singleton: highest LSN we've acked the slot to (slot-tamper detection) |
 | `tables` | Per-table snapshot status + `pg_class.oid` (drop-recreate detection) |
 | `snapshot_progress` | Per-table mid-snapshot resume cursor |

@@ -197,7 +197,7 @@ state:
   # When empty, the source PG hosts it.
   # postgres_url: postgres://coord_user:secret@coord-db.example.com/coord?sslmode=require
   coordinator_schema: _pg2iceberg
-  group: default                 # consumer group name (distributed mode)
+  group: default                 # consumer group name (distributed mode); one per coordinator_schema
 
 metrics_addr: ":9090"            # /metrics, /healthz, /readyz; `off` serves nothing
 liveness_timeout: 5m             # /healthz fails once nothing completes for this long

@@ -485,6 +485,12 @@ async fn start<Cat: Catalog + 'static>(
             .await
             .map_err(|e| LifecycleError::Coord(e.to_string()))?;
     }
+    // One schema serves one consumer group: refuse another before it
+    // reads or moves a cursor.
+    lc.coord
+        .claim_group(&lc.group)
+        .await
+        .map_err(|e| LifecycleError::Coord(e.to_string()))?;
 
     // 2. Startup validation. Refuses to start on any of the
     //    invariants `pipeline/validate.go` enforces. Cluster
