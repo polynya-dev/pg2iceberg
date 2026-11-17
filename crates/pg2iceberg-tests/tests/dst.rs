@@ -6892,6 +6892,53 @@ fn upgraded_while_a_pass_is_in_flight(prod: bool) {
     v3_case(prod, true, &steps);
 }
 
+/// A transaction too big for one step — every row updated, more added —
+/// commits its steps as one update, written together: on a v3 table, each
+/// step's rows take the row ids after the last's (invariant 20).
+#[test]
+fn a_commit_of_several_steps_gives_each_row_an_id() {
+    several_steps_on_v3(false, false);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_commit_of_several_steps_gives_each_row_an_id_on_iceberg() {
+    several_steps_on_v3(true, false);
+}
+
+/// So does the first such commit since the table was upgraded to v3,
+/// whose first step gives the files from before the upgrade ids too.
+#[test]
+fn a_commit_of_several_steps_after_an_upgrade_gives_each_row_an_id() {
+    several_steps_on_v3(false, true);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_commit_of_several_steps_after_an_upgrade_gives_each_row_an_id_on_iceberg() {
+    several_steps_on_v3(true, true);
+}
+
+fn several_steps_on_v3(prod: bool, upgraded: bool) {
+    V3_UPGRADED.set(upgraded);
+    let mut steps = vec![
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::Insert { id: 3, qty: 30 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ];
+    if upgraded {
+        steps.push(Step::UpgradeToV3);
+    }
+    steps.extend([
+        Step::BigTx { inserts: 5, qty: 1 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]);
+    v3_case(prod, false, &steps);
+}
+
 /// So does a `compact` job's pass, planned before the upgrade and
 /// committed after pg2iceberg's next commit gave the rows ids.
 #[test]

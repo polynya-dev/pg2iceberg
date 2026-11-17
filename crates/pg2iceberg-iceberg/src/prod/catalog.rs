@@ -32,8 +32,8 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use iceberg::spec::{
     DataContentType, DataFile as IcebergDataFile, DataFileBuilder, DataFileFormat, FormatVersion,
-    Literal, ManifestFile, NestedField, PrimitiveLiteral, PrimitiveType, Schema as IcebergSchema,
-    Struct, Type,
+    Literal, ManifestContentType, ManifestFile, NestedField, PrimitiveLiteral, PrimitiveType,
+    Schema as IcebergSchema, Struct, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{
@@ -756,11 +756,9 @@ impl TransactionAction for ChainedAppendAction {
     /// together: every step's manifests at once, then every step's manifest
     /// list, each naming its parent's manifests and its own. Written one
     /// step at a time, each took four round trips to object storage — its
-    /// manifests, its list, and reading that list back for the next.
+    /// manifests, its list, and reading that list back for the next. On a
+    /// v3 table, each step's rows take the row ids after the last's.
     async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
-        if table.metadata().format_version() == FormatVersion::V3 {
-            return self.commit_one_by_one(table).await;
-        }
         // The manifests the first step's list carries forward: as a fast
         // append keeps them.
         let mut parent: Vec<ManifestFile> = match table.metadata().current_snapshot() {
@@ -775,6 +773,16 @@ impl TransactionAction for ChainedAppendAction {
                 .collect(),
             None => Vec::new(),
         };
+        // A v3 table's files from before it was upgraded have no row ids
+        // until its next commit gives them some, in the first step's list:
+        // a range a staged step, which counts its own rows, can't record.
+        let unassigned = table.metadata().format_version() == FormatVersion::V3
+            && parent
+                .iter()
+                .any(|m| m.content == ManifestContentType::Data && m.first_row_id.is_none());
+        if unassigned {
+            return self.commit_one_by_one(table).await;
+        }
         let mut local = table.clone();
         let mut updates = Vec::new();
         let mut requirements = None;
@@ -814,9 +822,9 @@ impl TransactionAction for ChainedAppendAction {
 }
 
 impl ChainedAppendAction {
-    /// One step after another, each a fast append on the last: for v3
-    /// tables, whose snapshots take their row range from their written
-    /// manifest list.
+    /// One step after another, each a fast append on the last: for a v3
+    /// table's first commit since its upgrade, whose first step's list
+    /// gives the files before it row ids.
     async fn commit_one_by_one(&self, table: &Table) -> iceberg::Result<ActionCommit> {
         let mut local = table.clone();
         let mut updates = Vec::new();
@@ -2400,7 +2408,7 @@ mod tests {
     fn step(i: usize) -> PreparedCommit {
         let file = |kind: &str, equality_field_ids: Vec<i32>| DataFile {
             path: format!("memory:///warehouse/public/orders/step-{kind}-{i}.parquet"),
-            record_count: 1,
+            record_count: if equality_field_ids.is_empty() { 2 } else { 1 },
             byte_size: 100,
             equality_field_ids,
             partition_values: Vec::new(),
@@ -2421,13 +2429,25 @@ mod tests {
     /// snapshot on the last.
     #[tokio::test(start_paused = true)]
     async fn a_commit_of_several_steps_writes_them_together() {
+        several_steps_written_together(crate::FormatVersion::V2).await;
+    }
+
+    /// As above, on a v3 table — each step's rows taking the row ids after
+    /// the last's, and a manifest carried into a later step's list keeping
+    /// the ones it took.
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_of_several_steps_writes_them_together_on_v3() {
+        several_steps_written_together(crate::FormatVersion::V3).await;
+    }
+
+    async fn several_steps_written_together(version: crate::FormatVersion) {
         const LATENCY: std::time::Duration = std::time::Duration::from_millis(100);
         const STEPS: usize = 4;
         let storage = CountingStorage {
             latency: LATENCY,
             ..Default::default()
         };
-        let c = fresh_on(storage.clone()).await;
+        let c = fresh_on(storage.clone()).await.with_format_version(version);
         c.ensure_namespace(&ident().namespace).await.unwrap();
         c.create_table(&schema()).await.unwrap();
         append(&c, 0).await;
@@ -2456,6 +2476,30 @@ mod tests {
             .collect();
         assert_eq!(deletes.len(), STEPS);
         assert!(deletes.windows(2).all(|w| w[0] < w[1]), "{deletes:?}");
+
+        if version == crate::FormatVersion::V3 {
+            // Every data file's rows have ids of their own: one run from 0,
+            // in commit order, up to the table's next row id.
+            let mut ranges: Vec<(i64, i64)> = snapshots
+                .iter()
+                .flat_map(|s| &s.data_files)
+                .map(|f| {
+                    let first = f
+                        .first_row_id
+                        .expect("a data file of a v3 table has row ids");
+                    (first, first + f.record_count as i64)
+                })
+                .collect();
+            ranges.sort();
+            let it = to_iceberg_table_ident(&ident()).unwrap();
+            let table = c.inner.load_table(&it).await.unwrap();
+            let next_row_id = table.metadata().next_row_id() as i64;
+            let expected: Vec<(i64, i64)> = std::iter::once((0, 1))
+                .chain((0..STEPS as i64).map(|i| (1 + 2 * i, 3 + 2 * i)))
+                .collect();
+            assert_eq!(ranges, expected);
+            assert_eq!(next_row_id, 1 + 2 * STEPS as i64);
+        }
     }
 
     #[tokio::test]
