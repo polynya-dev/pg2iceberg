@@ -6455,62 +6455,70 @@ fn materializer_idempotent_when_run_extra_times() {
     check_invariants(&mut h).unwrap();
 }
 
-/// Two consumer groups materialize one staged log, each into a catalog of
-/// its own. The one ahead truncates the log only as far as the one behind
-/// has read it: a group that registered the table holds its log.
+/// Entries a table hasn't applied, gone from its log — however that came
+/// about — fail its cycle, loudly: what they held is lost, and the table
+/// needs a new snapshot. Reading on from what's left would lose them
+/// silently.
 #[test]
-fn a_group_behind_holds_the_log() {
+fn a_gap_in_the_log_fails_the_cycle() {
     let mut h = DstHarness::boot();
-    let catalog = Arc::new(MemoryCatalog::new());
-    let mut behind = Materializer::new(
-        h.coord.clone() as Arc<dyn Coordinator>,
-        h.blob_store.clone(),
-        catalog.clone(),
-        mat_namer(&h.id_gen),
-        "behind",
-        MAT_BATCH,
-    );
-    block_on(behind.register_table(schema())).unwrap();
-
     for step in [
         Step::Insert { id: 1, qty: 10 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
         Step::Insert { id: 2, qty: 20 },
         Step::DriveFlush,
-        Step::MaterializerCycle,
         Step::Insert { id: 3, qty: 30 },
         Step::DriveFlush,
-        Step::MaterializerCycle,
-        Step::Update { id: 1, qty: 11 },
-        Step::Insert { id: 4, qty: 40 },
-        Step::DriveFlush,
-        Step::MaterializerCycle,
     ] {
         h.run_step(&step);
     }
-    // Ahead and caught up, the group still finds the log the other hasn't
-    // read: all of it.
-    assert_eq!(
-        block_on(h.coord.read_log(&ident(), 0, 1_000_000)).unwrap(),
-        h.coord.claimed_log(&ident()),
-        "the group ahead truncated what the group behind hasn't read"
-    );
-    while block_on(behind.cycle()).unwrap() > 0 {}
-
-    let files = live_files_from_history(&catalog.history(&ident()));
-    let schema = block_on(catalog.load_table(&ident()))
+    let cursor = block_on(h.coord.get_cursor("default", &ident()))
         .unwrap()
-        .expect("table exists")
-        .schema;
-    let mut behinds = block_on(engine_read(h.blob_store.as_ref(), &schema, &files)).unwrap();
-    sort_by_pk(&mut behinds);
-    let mut pg = h.db.read_table(&ident()).map(stored_rows).unwrap();
-    sort_by_pk(&mut pg);
-    assert_eq!(
-        on_source_columns(&h.db, behinds),
-        on_source_columns(&h.db, pg),
-        "the group behind lost changes the group ahead truncated"
+        .unwrap();
+    let unapplied = block_on(h.coord.read_log(&ident(), cursor as u64, 1_000_000)).unwrap();
+    assert!(unapplied.len() > 1, "{unapplied:?}");
+    // The first entry past the cursor goes (with the applied one before).
+    block_on(
+        h.coord
+            .truncate_log(&ident(), unapplied[0].end_offset, 1_000),
+    )
+    .unwrap();
+
+    let failed = block_on(h.materializer.cycle()).expect_err("the cycle read past the gap");
+    assert!(
+        failed
+            .to_string()
+            .contains("the table needs a new snapshot"),
+        "{failed}"
     );
-    check_invariants(&mut h).unwrap();
+}
+
+/// Another process — a worker that owned the table too, for a moment —
+/// applies the table's log and truncates it between this one reading the
+/// cursor and reading the log. The gap that leaves is no loss: the cycle
+/// finds nothing to do, rather than failing for a new snapshot.
+#[test]
+fn a_gap_another_process_left_is_no_loss() {
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::Insert { id: 3, qty: 30 },
+        Step::DriveFlush,
+    ] {
+        h.run_step(&step);
+    }
+    let end = h.coord.claimed_log(&ident()).last().unwrap().end_offset;
+    let coord = h.coord.clone();
+    h.coord.before_next_read_log(move || {
+        block_on(coord.set_cursor("default", &ident(), end as i64)).unwrap();
+        block_on(coord.truncate_log(&ident(), end - 1, 1_000)).unwrap();
+    });
+    assert_eq!(block_on(h.materializer.cycle()).unwrap(), 0);
 }
 
 /// A cycle that stops at its row budget leaves a backlog: truncating the

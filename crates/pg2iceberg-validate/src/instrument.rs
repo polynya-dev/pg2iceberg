@@ -422,6 +422,11 @@ impl<C: Coordinator + ?Sized> Coordinator for Instrumented<C> {
         .await
     }
 
+    async fn claim_group(&self, group: &str) -> pg2iceberg_coord::Result<()> {
+        self.coord("claim_group", self.inner.claim_group(group))
+            .await
+    }
+
     async fn flushed_lsn(&self) -> pg2iceberg_coord::Result<Lsn> {
         self.coord("flushed_lsn", self.inner.flushed_lsn()).await
     }

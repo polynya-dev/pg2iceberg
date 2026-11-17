@@ -492,6 +492,44 @@ impl Coordinator for PostgresCoordinator {
         Ok(())
     }
 
+    async fn claim_group(&self, group: &str) -> Result<()> {
+        // One transaction, the pipeline-meta row locked: concurrent
+        // claims of different groups can't both win.
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(pg)?;
+        tx.execute(&sql::ensure_pipeline_meta(&self.schema), &[])
+            .await
+            .map_err(pg)?;
+        let holder: Option<String> = tx
+            .query_one(&sql::select_pipeline_group(&self.schema), &[])
+            .await
+            .map_err(pg)?
+            .get(0);
+        let holder = match holder {
+            Some(holder) => Some(holder),
+            // Claimed by none yet: another group's cursors hold it anyway.
+            None => tx
+                .query(&sql::other_cursor_groups(&self.schema), &[&group])
+                .await
+                .map_err(pg)?
+                .first()
+                .map(|r| r.get::<_, String>(0)),
+        };
+        match holder {
+            Some(holder) if holder != group => Err(CoordError::GroupMismatch {
+                holder,
+                configured: group.to_string(),
+            }),
+            _ => {
+                tx.execute(&sql::set_pipeline_group(&self.schema), &[&group])
+                    .await
+                    .map_err(pg)?;
+                tx.commit().await.map_err(pg)?;
+                Ok(())
+            }
+        }
+    }
+
     async fn flushed_lsn(&self) -> Result<Lsn> {
         let client = self.client().await?;
         let rows = client

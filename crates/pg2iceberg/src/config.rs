@@ -681,7 +681,9 @@ pub struct StateConfig {
     pub postgres_url: String,
     #[serde(default = "default_coord_schema")]
     pub coordinator_schema: String,
-    /// Materialization group name (consumer / mat_cursor key).
+    /// Materialization group name (consumer / mat_cursor key): the
+    /// distributed workers of one pipeline. A coordinator schema serves
+    /// one group ([`pg2iceberg_coord::Coordinator::claim_group`]).
     /// Defaults to `"default"`.
     #[serde(default = "default_group")]
     pub group: String,
@@ -695,6 +697,20 @@ impl Default for StateConfig {
             coordinator_schema: default_coord_schema(),
             group: default_group(),
         }
+    }
+}
+
+impl StateConfig {
+    /// A group names its cursors `group` and `group#…`: `#` would make one
+    /// group's cursors look like another's.
+    pub fn validate_group(&self) -> Result<()> {
+        if self.group.is_empty() || self.group.contains('#') {
+            anyhow::bail!(
+                "state.group must be a non-empty name without '#', not {:?}",
+                self.group
+            );
+        }
+        Ok(())
     }
 }
 
@@ -753,6 +769,7 @@ impl Config {
         self.sink.validate_compaction()?;
         self.sink.validate_materializer()?;
         self.source.logical.validate_snapshot()?;
+        self.state.validate_group()?;
         self.metrics_addr()?;
         self.liveness_timeout()?;
         self.sink.resolved_maintenance()?;
@@ -1373,6 +1390,17 @@ state:
             .unwrap_err()
             .to_string();
         assert!(err.contains("snapshot_concurrency"), "{err}");
+    }
+
+    #[test]
+    fn group_is_a_name_without_hashes() {
+        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
+        cfg.state.validate_group().unwrap();
+        for bad in ["", "a#b"] {
+            cfg.state.group = bad.into();
+            let err = cfg.state.validate_group().unwrap_err().to_string();
+            assert!(err.contains("state.group"), "{err}");
+        }
     }
 
     #[test]

@@ -4,7 +4,9 @@
 //! — the future PG impl will be tested against the same suite via a shared
 //! `coord_conformance` test crate.
 
-use pg2iceberg_coord::{schema::CoordSchema, CommitBatch, Coordinator, OffsetClaim, StagedLogSize};
+use pg2iceberg_coord::{
+    schema::CoordSchema, CommitBatch, CoordError, Coordinator, OffsetClaim, StagedLogSize,
+};
 use pg2iceberg_core::{Lsn, Namespace, TableIdent, WorkerId};
 use pg2iceberg_sim::{clock::TestClock, coord::MemoryCoordinator};
 use pollster::block_on;
@@ -222,6 +224,33 @@ fn staged_log_size_counts_what_the_log_holds() {
 }
 
 // ---------- cursor semantics ----------
+
+#[test]
+fn claim_group_binds_the_schema_to_one_group() {
+    let (c, _) = coord_at_t0();
+    block_on(c.claim_group("a")).unwrap();
+    block_on(c.claim_group("a")).unwrap();
+    let refused = block_on(c.claim_group("b")).unwrap_err();
+    assert!(
+        matches!(&refused, CoordError::GroupMismatch { holder, configured } if holder == "a" && configured == "b"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn claim_group_refuses_a_schema_holding_another_groups_cursors() {
+    let (c, _) = coord_at_t0();
+    // Cursors from before the schema recorded its group.
+    block_on(c.ensure_cursor("old#snapshot", &ident("t"))).unwrap();
+    block_on(c.ensure_cursor("old", &ident("t"))).unwrap();
+    let refused = block_on(c.claim_group("new")).unwrap_err();
+    assert!(
+        matches!(&refused, CoordError::GroupMismatch { holder, .. } if holder == "old"),
+        "{refused}"
+    );
+    // Its own, `#…` ones too, are no obstacle.
+    block_on(c.claim_group("old")).unwrap();
+}
 
 #[test]
 fn table_cursors_lists_every_groups_cursor_of_the_table() {

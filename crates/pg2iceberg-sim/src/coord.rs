@@ -50,6 +50,8 @@ struct State {
     consumers: BTreeMap<(String, WorkerId), Timestamp>,
     /// `pipeline_meta.system_identifier` (zero = unset).
     system_identifier: u64,
+    /// `pipeline_meta.consumer_group` (`None` = unclaimed).
+    consumer_group: Option<String>,
     /// `flushed_lsn.lsn` — highest LSN we've ever acked. Compared to
     /// `slot.confirmed_flush_lsn` at startup to catch external slot
     /// advancement.
@@ -73,11 +75,15 @@ struct State {
     marker_emissions: BTreeSet<(String, TableIdent)>,
 }
 
+/// Work [`MemoryCoordinator::before_next_read_log`] runs.
+type Interlude = Box<dyn FnOnce() + Send>;
+
 #[derive(Clone)]
 pub struct MemoryCoordinator {
     schema: CoordSchema,
     clock: Arc<dyn Clock>,
     state: Arc<Mutex<State>>,
+    before_read_log: Arc<Mutex<Option<Interlude>>>,
 }
 
 impl MemoryCoordinator {
@@ -86,6 +92,7 @@ impl MemoryCoordinator {
             schema,
             clock,
             state: Arc::new(Mutex::new(State::default())),
+            before_read_log: Arc::default(),
         }
     }
 
@@ -98,6 +105,13 @@ impl MemoryCoordinator {
 
     pub fn schema(&self) -> &CoordSchema {
         &self.schema
+    }
+
+    /// Test hook: run `f` just before the next `read_log` reads — as
+    /// another process's work landing between a read of the cursor and of
+    /// the log. `f` may call this coordinator.
+    pub fn before_next_read_log(&self, f: impl FnOnce() + Send + 'static) {
+        *self.before_read_log.lock().unwrap() = Some(Box::new(f));
     }
 
     /// Test hook: from now on, `set_cursor` for `groups` fails, writing
@@ -237,6 +251,10 @@ impl Coordinator for MemoryCoordinator {
         }
         if i64::try_from(limit).is_err() {
             return Err(CoordError::Other("limit > i64".into()));
+        }
+        let interlude = self.before_read_log.lock().unwrap().take();
+        if let Some(f) = interlude {
+            f();
         }
         let state = self.state.lock().unwrap();
         let mut out: Vec<LogEntry> = state
@@ -385,6 +403,29 @@ impl Coordinator for MemoryCoordinator {
         }
         state.system_identifier = sysid;
         Ok(())
+    }
+
+    async fn claim_group(&self, group: &str) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        // Claimed by none yet: another group's cursors hold it anyway.
+        let holder = state.consumer_group.clone().or_else(|| {
+            state
+                .cursors
+                .keys()
+                .map(|(g, _)| g.split('#').next().unwrap_or_default().to_string())
+                .filter(|g| g != group)
+                .min()
+        });
+        match holder {
+            Some(holder) if holder != group => Err(CoordError::GroupMismatch {
+                holder,
+                configured: group.to_string(),
+            }),
+            _ => {
+                state.consumer_group = Some(group.to_string());
+                Ok(())
+            }
+        }
     }
 
     async fn flushed_lsn(&self) -> Result<Lsn> {

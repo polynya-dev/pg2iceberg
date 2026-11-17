@@ -1964,6 +1964,40 @@ fn seeded_db() -> SimPostgres {
     db
 }
 
+/// A process of another consumer group than the one the coordinator
+/// schema serves refuses to start, before it reads or moves a cursor: the
+/// schema's log, snapshot status and truncation assume one group.
+#[tokio::test(start_paused = true)]
+async fn another_consumer_group_is_refused() {
+    let db = seeded_db();
+    let stores = SimStores::new();
+    pg2iceberg_validate::run_logical_lifecycle(
+        sim_lifecycle_on(&db, &stores, every_second()),
+        Box::pin(std::future::ready(())),
+    )
+    .await
+    .expect("the first start");
+
+    let mut other = sim_lifecycle_on(&db, &stores, every_second());
+    other.group = "other".into();
+    let refused =
+        pg2iceberg_validate::run_logical_lifecycle(other, Box::pin(std::future::ready(())))
+            .await
+            .expect_err("another group started");
+    assert!(
+        refused
+            .to_string()
+            .contains("serves consumer group \"default\", not \"other\""),
+        "{refused}"
+    );
+    pg2iceberg_validate::run_logical_lifecycle(
+        sim_lifecycle_on(&db, &stores, every_second()),
+        Box::pin(std::future::ready(())),
+    )
+    .await
+    .expect("the group's own next start");
+}
+
 /// The coordinator can't take the LSN the standby tick would ack. The
 /// slot must not be acked past what's recorded: the next start would find
 /// it ahead, and refuse to start as if it had been tampered with.

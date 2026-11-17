@@ -46,6 +46,16 @@ pub enum CoordError {
          `pg2iceberg cleanup` first; otherwise verify the source DSN."
     )]
     SystemIdMismatch { stored: u64, connected: u64 },
+    /// The coordinator schema serves another consumer group. One schema
+    /// serves one group: the staged log, its snapshot status and its
+    /// truncation all assume a single reader.
+    #[error(
+        "this coordinator schema serves consumer group {holder:?}, not {configured:?}: \
+         one schema serves one group. To materialize the same tables into another \
+         sink, run another pipeline, with a replication slot and \
+         state.coordinator_schema of its own. A group can't be renamed."
+    )]
+    GroupMismatch { holder: String, configured: String },
     #[error("other: {0}")]
     Other(String),
 }
@@ -293,6 +303,13 @@ pub trait Coordinator: Send + Sync {
     /// [`CoordError::SystemIdMismatch`]. Caller stamps once at
     /// startup right after `IDENTIFY_SYSTEM`.
     async fn set_pipeline_system_identifier(&self, sysid: u64) -> Result<()>;
+
+    /// Bind the schema to consumer group `group`, as every process that
+    /// reads or moves cursors does at startup: the first records it; any
+    /// other group is refused with [`CoordError::GroupMismatch`] — as is
+    /// one starting on a schema that predates the record and holds cursors
+    /// of another (a group's own `#…` cursors are its).
+    async fn claim_group(&self, group: &str) -> Result<()>;
 
     // ── Last-acked LSN (tamper detection) ───────────────────
     /// Read the highest LSN we've ever told the replication slot to

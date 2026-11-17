@@ -421,7 +421,7 @@ pub async fn run_materializer_only(
     }
     let mut materializer = traced(
         pg2iceberg_logical::work_span!("startup"),
-        build_one_shot_materializer(cfg.clone(), metrics.clone()),
+        build_one_shot_materializer(cfg.clone(), metrics.clone(), Cursors::Claim),
     )
     .await?;
     materializer.set_catalog_cache_ttl(
@@ -567,7 +567,8 @@ async fn compact(cfg: Config) -> Result<()> {
              Set a non-zero value (e.g. 134217728 for 128 MiB) to enable."
         );
     }
-    let mut materializer = build_one_shot_materializer(cfg.clone(), Arc::new(NoopMetrics)).await?;
+    let mut materializer =
+        build_one_shot_materializer(cfg.clone(), Arc::new(NoopMetrics), Cursors::Untouched).await?;
     // Its passes' writes in flight aren't those of `run`'s passes.
     materializer.set_compaction_writer(pg2iceberg_logical::materializer::writers::COMPACT_COMMAND);
     let cfg_compact = cfg.sink.compaction_config();
@@ -631,7 +632,8 @@ async fn maintain(cfg: Config, retention_override: Option<String>) -> Result<()>
         );
     }
 
-    let mut materializer = build_one_shot_materializer(cfg.clone(), Arc::new(NoopMetrics)).await?;
+    let mut materializer =
+        build_one_shot_materializer(cfg.clone(), Arc::new(NoopMetrics), Cursors::Untouched).await?;
 
     // Step 1: snapshot expiry.
     if !retention_str.is_empty() {
@@ -717,9 +719,20 @@ fn instrument(
 /// opening the replication slot or installing signal handlers — for
 /// one-shot subcommands (`compact`, `maintain`) and `materializer-only`,
 /// recording into `metrics`.
+/// Whether a one-shot materializer reads and moves the tables' cursors.
+#[derive(Clone, Copy, PartialEq)]
+enum Cursors {
+    /// It does (`materializer-only`): the schema must serve its consumer
+    /// group, which it claims ([`Coordinator::claim_group`]).
+    Claim,
+    /// It doesn't (`compact`, `maintain`).
+    Untouched,
+}
+
 async fn build_one_shot_materializer(
     cfg: Config,
     metrics: Arc<dyn Metrics>,
+    cursors: Cursors,
 ) -> Result<Materializer<OneShotCatalog>> {
     cfg.require_catalog()?;
     let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?))
@@ -737,7 +750,17 @@ async fn build_one_shot_materializer(
         .await
         .context("coord connect")?;
     let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
-    let coord: Arc<dyn Coordinator> = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
+    let concrete = PostgresCoordinator::new(coord_conn, coord_schema);
+    if cursors == Cursors::Claim {
+        // Started before the process that replicates, it migrates the
+        // schema itself: the claim needs its newest columns.
+        concrete.migrate().await.context("coord migrate")?;
+        concrete
+            .claim_group(&cfg.state.group)
+            .await
+            .context("claim the consumer group")?;
+    }
+    let coord: Arc<dyn Coordinator> = Arc::new(concrete);
     let (catalog, blob, coord) = instrument(catalog, storage.blob, coord, &metrics);
 
     // Resolve schemas. Discovery requires PG; tables with explicit
@@ -1054,6 +1077,10 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
     let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
     coord_concrete.migrate().await.context("coord migrate")?;
+    coord_concrete
+        .claim_group(&cfg.state.group)
+        .await
+        .context("claim the consumer group")?;
     let (catalog, blob, coord) = instrument(catalog, blob, coord_concrete, &metrics);
 
     // ── pg + slot ──────────────────────────────────────────────────
