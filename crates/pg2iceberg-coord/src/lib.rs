@@ -221,6 +221,16 @@ pub struct LogEntry {
     pub flushable_lsn: Lsn,
 }
 
+/// How much of a table's staged log the coordinator holds
+/// ([`Coordinator::staged_log_size`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StagedLogSize {
+    /// Log entries: one staged file each.
+    pub files: u64,
+    /// Bytes of those files.
+    pub bytes: u64,
+}
+
 #[async_trait]
 pub trait Coordinator: Send + Sync {
     /// Atomic in PG: ensure-row → bump `log_seq` → insert per-claim
@@ -239,9 +249,19 @@ pub trait Coordinator: Send + Sync {
         limit: usize,
     ) -> Result<Vec<LogEntry>>;
 
-    /// Delete log_index rows with `end_offset <= before_offset`, returning
-    /// their `s3_path`s so the caller can GC the staged objects.
-    async fn truncate_log(&self, table: &TableIdent, before_offset: u64) -> Result<Vec<String>>;
+    /// Delete the first `limit` of `table`'s log_index rows with
+    /// `end_offset <= before_offset`, by offset, returning their
+    /// `s3_path`s so the caller can delete the staged objects.
+    async fn truncate_log(
+        &self,
+        table: &TableIdent,
+        before_offset: u64,
+        limit: usize,
+    ) -> Result<Vec<String>>;
+
+    /// How much of `table`'s staged log log_index holds: its entries, and
+    /// the bytes of the files they staged.
+    async fn staged_log_size(&self, table: &TableIdent) -> Result<StagedLogSize>;
 
     async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> Result<()>;
     /// Returns `None` if the cursor row doesn't exist; some callers treat that
@@ -249,6 +269,8 @@ pub trait Coordinator: Send + Sync {
     /// cases; we surface the difference.
     async fn get_cursor(&self, group: &str, table: &TableIdent) -> Result<Option<i64>>;
     async fn set_cursor(&self, group: &str, table: &TableIdent, to_offset: i64) -> Result<()>;
+    /// Every group's cursor of `table`, as `(group, value)`, by group.
+    async fn table_cursors(&self, table: &TableIdent) -> Result<Vec<(String, i64)>>;
 
     async fn register_consumer(&self, group: &str, worker: &WorkerId, ttl: Duration) -> Result<()>;
     async fn unregister_consumer(&self, group: &str, worker: &WorkerId) -> Result<()>;

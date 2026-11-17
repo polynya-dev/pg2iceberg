@@ -49,6 +49,7 @@ use pg2iceberg_iceberg::{
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::field::Empty;
@@ -400,6 +401,13 @@ struct TableEntry {
     /// not yet committed ([`Materializer::apply_snapshot_chunk`]); `None`
     /// with no snapshot being applied.
     snapshot: Option<Unit>,
+    /// The table's cursor as this process last read or set it: its log
+    /// is applied through this offset (`-1`: none of it, or not known).
+    cursor: i64,
+    /// No entry of the table's log ends before this offset: the log is
+    /// truncated to here ([`truncate_log`]); `-1` until this
+    /// process truncates it.
+    log_start: i64,
 }
 
 /// A table backfilled mid-stream ([`Materializer::register_table_pending`])
@@ -427,6 +435,9 @@ enum Backfill {
 
 /// The snapshot cursor's value once a backfill's rows are all applied.
 const SNAPSHOT_APPLIED: i64 = i64::MAX;
+/// What names a group's [`Materializer::snapshot_lsn_group`]: its
+/// cursors hold LSNs, not log offsets.
+const SNAPSHOT_LSN_SUFFIX: &str = "#snapshot-lsn";
 
 /// Default `cycle_rows`, in multiples of `batch_rows`.
 const DEFAULT_STEPS_PER_CYCLE: usize = 8;
@@ -439,6 +450,11 @@ pub const STEPS_PER_COMMIT: usize = 4;
 const STEP_UPLOADS: usize = 8;
 /// Default most tables a cycle applies at once.
 pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
+/// Most log entries a cycle truncates of a table: a long log — of a
+/// release that never truncated it — is worked off a batch a cycle.
+const TRUNCATE_BATCH: usize = 1000;
+/// Most staged files deleted at once.
+const STAGED_DELETES: usize = 8;
 /// Default most bytes a table's FileIndex holds
 /// ([`Materializer::with_pk_index_memory`]): pg2iceberg's, not a bare
 /// `Materializer`'s.
@@ -1164,6 +1180,8 @@ impl<C: Catalog> Materializer<C> {
                 gated_until_snapshot: false,
                 backfill: Backfill::Unknown,
                 snapshot: None,
+                cursor: -1,
+                log_start: -1,
             },
         );
         Ok(())
@@ -1445,14 +1463,15 @@ impl<C: Catalog> Materializer<C> {
         format!("{}#snapshot", self.group)
     }
 
-    /// The `mat_cursor` group recording, for each table, the LSN of the
-    /// initial snapshot applied straight to it
-    /// ([`Self::apply_snapshot_chunk`]) — an LSN, not a log offset. The
-    /// backfill that resumes a snapshot that failed, or never got marked
-    /// complete, applies the changes since: rows the snapshot committed
-    /// may predate them.
+    /// The `mat_cursor` group recording, for each table, the LSN of its
+    /// earliest snapshot ([`Self::first_snapshot_lsn`]) — an LSN, not a log
+    /// offset: of the initial snapshot applied straight to it
+    /// ([`Self::apply_snapshot_chunk`]), as it begins, or else of a
+    /// backfill's first staged row, once found. The backfill that resumes
+    /// a snapshot that failed, or never got marked complete, applies the
+    /// changes since: rows the snapshot committed may predate them.
     fn snapshot_lsn_group(&self) -> String {
-        format!("{}#snapshot-lsn", self.group)
+        format!("{}{SNAPSHOT_LSN_SUFFIX}", self.group)
     }
 
     /// The `mat_cursor` group `unit` advances.
@@ -1496,6 +1515,19 @@ impl<C: Catalog> Materializer<C> {
         if let Some(lsn) = direct {
             return Ok(Some(Lsn(lsn as u64)));
         }
+        let Some(lsn) = self.first_staged_snapshot_lsn(ident).await? else {
+            return Ok(None);
+        };
+        // Recorded: the log is truncated as it's applied, and this row with it.
+        let group = self.snapshot_lsn_group();
+        self.coord.ensure_cursor(&group, ident).await?;
+        self.coord.set_cursor(&group, ident, lsn.0 as i64).await?;
+        Ok(Some(lsn))
+    }
+
+    /// The LSN of the table's first staged snapshot row, if its log holds
+    /// one.
+    async fn first_staged_snapshot_lsn(&self, ident: &TableIdent) -> Result<Option<Lsn>> {
         let mut after = 0;
         loop {
             let entries = self.coord.read_log(ident, after, LOG_PAGE_ENTRIES).await?;
@@ -1528,10 +1560,10 @@ impl<C: Catalog> Materializer<C> {
             Err(MaterializerError::AlreadyApplied { .. }) => 0,
             result => result?,
         };
+        let since = self.first_snapshot_lsn(ident).await?;
         self.coord
             .set_cursor(&self.snapshot_group(), ident, SNAPSHOT_APPLIED)
             .await?;
-        let since = self.first_snapshot_lsn(ident).await?;
         if let Some(entry) = self.tables.get_mut(ident) {
             entry.backfill = Backfill::Applied { since };
         }
@@ -2010,6 +2042,8 @@ impl<C: Catalog> Materializer<C> {
             gated_until_snapshot: false,
             backfill: entry.backfill,
             snapshot: None,
+            cursor: entry.cursor,
+            log_start: entry.log_start,
         };
         Some(self.part(ident, entry))
     }
@@ -2676,6 +2710,23 @@ impl<C: Catalog> Materializer<C> {
         if !self.tables.contains_key(ident) {
             return Err(MaterializerError::UnknownTable(ident.clone()));
         }
+        // Looked up before truncating: it may read the log from its start
+        // (`first_snapshot_lsn`).
+        self.backfill(ident).await?;
+        // What's applied is truncated while this cycle applies more:
+        // truncating takes the entries behind the cursors, applying those
+        // past them.
+        let truncation = self.truncation(ident);
+        let (applied, truncated) = futures::join!(self.apply_table(ident), truncation);
+        if let (Some(start), Some(entry)) = (truncated, self.tables.get_mut(ident)) {
+            entry.log_start = entry.log_start.max(start);
+        }
+        applied
+    }
+
+    /// Apply the table's log past its cursors: a backfill's rows, once
+    /// it's complete, then its changes.
+    async fn apply_table(&mut self, ident: &TableIdent) -> Result<usize> {
         if let Backfill::Applying(from) = self.backfill(ident).await? {
             // Only once the backfill has staged every row — its rows are
             // done at the log's end — whatever the gate says.
@@ -2694,17 +2745,39 @@ impl<C: Catalog> Materializer<C> {
                 return Ok(folded);
             }
         }
-        loop {
+        let folded = loop {
             match self.apply_changes(ident).await {
                 // Skip what landed, and apply what's past it.
                 Err(MaterializerError::AlreadyApplied { end }) => {
                     self.coord
                         .set_cursor(&self.group, ident, end as i64)
                         .await?;
+                    if let Some(entry) = self.tables.get_mut(ident) {
+                        entry.cursor = end as i64;
+                    }
                 }
-                result => return result,
+                result => break result?,
             }
-        }
+        };
+        Ok(folded)
+    }
+
+    /// Truncating the table's log ([`truncate_log`]): once this process
+    /// starts, then whenever it has applied the log past where it's
+    /// truncated to. Not before the table's backfill is looked up: that
+    /// may read the log from its start ([`Self::first_snapshot_lsn`]).
+    fn truncation(&self, ident: &TableIdent) -> impl Future<Output = Option<i64>> + Send + 'static {
+        let due = self
+            .tables
+            .get(ident)
+            .filter(|e| {
+                e.backfill != Backfill::Unknown && (e.log_start < 0 || e.cursor > e.log_start)
+            })
+            .map(|e| e.log_start);
+        let coord = self.coord.clone();
+        let blob_store = self.blob_store.clone();
+        let ident = ident.clone();
+        async move { truncate_log(coord.as_ref(), blob_store.as_ref(), &ident, due?).await }
     }
 
     /// Fold and commit the table's changes past its cursor, in units.
@@ -2714,6 +2787,9 @@ impl<C: Catalog> Materializer<C> {
             .get_cursor(&self.group, ident)
             .await?
             .unwrap_or(-1);
+        if let Some(entry) = self.tables.get_mut(ident) {
+            entry.cursor = cursor;
+        }
         let mut unit = Unit::default();
         let mut events_read = 0usize;
         let mut folded = 0usize;
@@ -3076,6 +3152,11 @@ impl<C: Catalog> Materializer<C> {
             self.coord
                 .set_cursor(&group, ident, end_offset as i64)
                 .await?;
+            if !unit.snapshot {
+                if let Some(entry) = self.tables.get_mut(ident) {
+                    entry.cursor = end_offset as i64;
+                }
+            }
         }
 
         // Blue-green meta-marker emission. After cursor + FileIndex are
@@ -3376,6 +3457,64 @@ fn now_micros() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0)
+}
+
+/// Drop `ident`'s log before the lowest cursor reading it, and delete the
+/// files those entries staged: every reader has applied them, and none
+/// reads them again. Every group that registered the table holds its log —
+/// its changes' cursor, and its backfill's while one applies. The entry at
+/// the cursor stays, so the log still shows where it's applied to. At most
+/// [`TRUNCATE_BATCH`] entries at once, past `log_start`, where it was
+/// truncated to before. Returns where it's truncated to now, unless it
+/// left some for next time. Best effort: what this leaves the next one
+/// drops — but for files whose delete failed, which stay behind.
+async fn truncate_log(
+    coord: &dyn Coordinator,
+    blob_store: &dyn BlobStore,
+    ident: &TableIdent,
+    log_start: i64,
+) -> Option<i64> {
+    let cursors = match coord.table_cursors(ident).await {
+        Ok(cursors) => cursors,
+        Err(e) => {
+            tracing::warn!(table = %ident, error = %e, "can't truncate the staged log");
+            return None;
+        }
+    };
+    let keep_from = cursors
+        .into_iter()
+        .filter(|(group, _)| !group.ends_with(SNAPSHOT_LSN_SUFFIX))
+        .map(|(_, cursor)| cursor)
+        .min()?;
+    if keep_from <= log_start.max(0) {
+        // None to drop.
+        return Some(log_start.max(0));
+    }
+    // Entries ending before `keep_from`.
+    let before = (keep_from - 1) as u64;
+    let paths = match coord.truncate_log(ident, before, TRUNCATE_BATCH).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::warn!(table = %ident, error = %e, "can't truncate the staged log");
+            return None;
+        }
+    };
+    let all = paths.len() < TRUNCATE_BATCH;
+    let deleted: Vec<std::result::Result<(), StreamError>> = stream::iter(paths)
+        .map(|path| async move { blob_store.delete(&path).await })
+        .buffer_unordered(STAGED_DELETES)
+        .collect()
+        .await;
+    let failed: Vec<StreamError> = deleted.into_iter().filter_map(|d| d.err()).collect();
+    if let Some(e) = failed.first() {
+        tracing::warn!(
+            table = %ident,
+            failed = failed.len(),
+            error = %e,
+            "can't delete staged files the log no longer holds; they stay behind"
+        );
+    }
+    all.then_some(keep_from)
 }
 
 /// Expand `Op::Truncate` events into per-PK `Op::Delete` events of

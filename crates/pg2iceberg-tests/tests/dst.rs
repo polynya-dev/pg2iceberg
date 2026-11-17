@@ -64,6 +64,14 @@
 //! delete may give the row a new id: the spec allows it, since the
 //! writer never read the old one.
 //!
+//! The staged log keeps only what's left to apply, and the entry each
+//! table's cursor sits at the end of: the materializer drops the rest from
+//! `log_index`, and deletes their files (22) — never an entry Iceberg
+//! hasn't committed past, checked after every step (23). Staging is
+//! checked against every entry ever claimed
+//! (`MemoryCoordinator::claimed_log`) and every file ever staged
+//! (`Archive`), truncated or not.
+//!
 //! Each case runs on the sims or — under the `integration` feature — on
 //! production's catalog and blob store (`IcebergRustCatalog` over
 //! iceberg-rust's memory catalog, `ObjectStoreBlobStore` over
@@ -86,7 +94,7 @@ use pg2iceberg_logical::{
     replication_start_lsn, CachingCatalog, Maintenance, Materializer, Pipeline,
 };
 use pg2iceberg_pg::DecodedMessage;
-use pg2iceberg_sim::blob::MemoryBlobStore;
+use pg2iceberg_sim::blob::{Archive, MemoryBlobStore};
 use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
@@ -1710,6 +1718,8 @@ struct DstHarness {
     db: SimPostgres,
     coord: Arc<MemoryCoordinator>,
     blob_store: Arc<dyn BlobStore>,
+    /// Every staged file `blob_store` was given, deleted since or not.
+    archive: Arc<Archive>,
     /// The backend behind `blob_store` and the catalog, and the oracle
     /// that reads it as a query engine would.
     storage: Storage,
@@ -1814,7 +1824,8 @@ impl DstHarness {
         #[cfg(feature = "integration")]
         let tokio = PROD_BACKEND.get().then(|| tokio_runtime().enter());
         let storage = Storage::for_case();
-        let blob_store = storage.blob.clone();
+        let archive = Arc::new(Archive::new(storage.blob.clone(), STAGE_PREFIX));
+        let blob_store: Arc<dyn BlobStore> = archive.clone();
         let catalog = storage.catalog.clone();
         let namer = Arc::new(CounterBlobNamer::new(STAGE_PREFIX));
         let pipeline = new_pipeline(&coord, &blob_store, &namer, &db);
@@ -1878,6 +1889,7 @@ impl DstHarness {
             db,
             coord,
             blob_store,
+            archive,
             storage,
             namer,
             pipeline,
@@ -1953,7 +1965,8 @@ impl DstHarness {
         #[cfg(feature = "integration")]
         let tokio = PROD_BACKEND.get().then(|| tokio_runtime().enter());
         let storage = Storage::for_case();
-        let blob_store = storage.blob.clone();
+        let archive = Arc::new(Archive::new(storage.blob.clone(), STAGE_PREFIX));
+        let blob_store: Arc<dyn BlobStore> = archive.clone();
         let catalog = storage.catalog.clone();
         let namer = Arc::new(CounterBlobNamer::new(STAGE_PREFIX));
         let pipeline = new_pipeline(&coord, &blob_store, &namer, &db);
@@ -2017,6 +2030,7 @@ impl DstHarness {
             db,
             coord,
             blob_store,
+            archive,
             storage,
             namer,
             pipeline,
@@ -2514,26 +2528,13 @@ impl DstHarness {
     /// A cycle whose commits land but whose cursor updates don't: the
     /// process dies after committing, before recording how far it got.
     fn crash_after_commit(&mut self) {
-        let mut tables = vec![ident()];
-        if SECOND_TABLE.get() > 0 {
-            tables.push(other_ident());
-        }
-        let cursors: Vec<_> = tables
-            .iter()
-            .flat_map(|t| ["default", "default#snapshot"].map(|g| (t.clone(), g)))
-            .map(|(t, g)| {
-                let cursor = block_on(self.coord.get_cursor(g, &t)).unwrap();
-                (t, g, cursor)
-            })
-            .collect();
-        self.materialize();
-        for (t, g, cursor) in cursors {
-            let now = block_on(self.coord.get_cursor(g, &t)).unwrap();
-            if now != cursor {
-                // No cursor reads as -1: from the log's start.
-                block_on(self.coord.set_cursor(g, &t, cursor.unwrap_or(-1))).unwrap();
-            }
-        }
+        // It dies at its first cursor write, a commit having landed —
+        // before it, and before anything after it, such as truncating the
+        // log behind the cursor.
+        self.coord
+            .crash_on_cursor_write(&["default", "default#snapshot"]);
+        let _died = block_on(self.materializer.cycle());
+        self.coord.crash_on_cursor_write(&[]);
         self.restart_materializer();
     }
 
@@ -2869,6 +2870,19 @@ impl DstHarness {
 // ---------- invariant checks ----------
 
 /// Invariants that must hold after *every* step, not just at quiescence.
+/// The events `entry` staged, read from the archive: the materializer
+/// deletes staged files once it has applied them.
+fn staged_events_of(
+    h: &DstHarness,
+    entry: &pg2iceberg_coord::LogEntry,
+) -> Result<Vec<pg2iceberg_stream::MatEvent>, String> {
+    let bytes = h
+        .archive
+        .archived(&entry.s3_path)
+        .ok_or_else(|| format!("{} was never staged", entry.s3_path))?;
+    decode_chunk(&bytes).map_err(|e| format!("decode_chunk({}): {e}", entry.s3_path))
+}
+
 fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     // 7. Bounded memory: no transaction, however large, makes the
     //    pipeline hold more than MAX_BUFFERED_ROWS change events.
@@ -2879,8 +2893,7 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
         ));
     }
 
-    let entries = block_on(h.coord.read_log(&ident(), 0, 1_000_000))
-        .map_err(|e| format!("read_log failed: {e}"))?;
+    let entries = h.coord.claimed_log(&ident());
 
     // 8. Bounded staged objects, so the materializer never has to load
     //    one huge file either.
@@ -2899,11 +2912,7 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     //    only claims are visible to the materializer.
     let mut staged = BTreeSet::new();
     for entry in &entries {
-        let bytes = block_on(h.blob_store.get(&entry.s3_path))
-            .map_err(|e| format!("blob_store.get({}): {e}", entry.s3_path))?;
-        let chunk =
-            decode_chunk(&bytes).map_err(|e| format!("decode_chunk({}): {e}", entry.s3_path))?;
-        staged.extend(chunk.into_iter().map(|m| m.lsn));
+        staged.extend(staged_events_of(h, entry)?.into_iter().map(|m| m.lsn));
     }
     let mut by_xid: BTreeMap<u32, Vec<_>> = BTreeMap::new();
     for c in
@@ -2921,6 +2930,50 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
                 "invariant 9 (torn transaction): xid {xid} has {claimed} of {} events claimed",
                 lsns.len()
             ));
+        }
+    }
+
+    // 23. Truncation never outruns materialization: every entry not yet
+    //     materialized is still in the log, and its file in the object
+    //     store — or its rows never reach the table. Materialized is
+    //     through the table's log end as its commits record it, or its
+    //     cursor if that's further: entries with nothing to commit (a
+    //     TRUNCATE of an empty table) move the cursor alone. (A cursor
+    //     moved before its commit lands is invariant 5's and 16's.)
+    let blob_keys = block_on(h.storage.blob_keys())?;
+    let mut tables = vec![ident()];
+    if SECOND_TABLE.get() > 0 {
+        tables.push(other_ident());
+    }
+    for table in &tables {
+        let logged = block_on(h.audited.load_table(table))
+            .map_err(|e| format!("invariant 23: load_table: {e}"))?
+            .and_then(|meta| meta.log_ends.get("default").copied())
+            .map_or(-1, |end| end as i64);
+        let cursor = block_on(h.coord.get_cursor("default", table))
+            .map_err(|e| format!("get_cursor failed: {e}"))?
+            .unwrap_or(-1);
+        let committed = logged.max(cursor);
+        let live = block_on(h.coord.read_log(table, 0, 1_000_000))
+            .map_err(|e| format!("read_log failed: {e}"))?;
+        for entry in h.coord.claimed_log(table) {
+            if (entry.end_offset as i64) <= committed {
+                continue;
+            }
+            if !live.contains(&entry) {
+                return Err(format!(
+                    "invariant 23 (no truncation before materialization): {table} is materialized \
+                     through {committed}, and log_index lost [{}, {})",
+                    entry.start_offset, entry.end_offset
+                ));
+            }
+            if !blob_keys.contains(object_key(&entry.s3_path)) {
+                return Err(format!(
+                    "invariant 23 (no truncation before materialization): {table} is materialized \
+                     through {committed}, and the object store lost {}, of [{}, {})",
+                    entry.s3_path, entry.start_offset, entry.end_offset
+                ));
+            }
         }
     }
 
@@ -3663,6 +3716,10 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
             break;
         }
     }
+    // A cycle truncates what the ones before it applied, as it applies
+    // more; the last may have moved a cursor with nothing to commit.
+    h.materialize();
+    h.materialize_other();
 
     // 10, 16. Every commit along the way.
     if let Some(v) = h.audited.violations.lock().unwrap().first() {
@@ -3710,12 +3767,13 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
         ));
     }
 
-    let entries = block_on(h.coord.read_log(&ident(), 0, 1_000_000))
+    let live = block_on(h.coord.read_log(&ident(), 0, 1_000_000))
         .map_err(|e| format!("read_log failed: {e}"))?;
+    let entries = h.coord.claimed_log(&ident());
 
     // 1. Every log_index s3_path resolves in blob_store.
     let blob_keys = block_on(h.storage.blob_keys())?;
-    for entry in &entries {
+    for entry in &live {
         if !blob_keys.contains(object_key(&entry.s3_path)) {
             return Err(format!(
                 "invariant 1 (blob completeness) violated: log_index references {} but blob_store doesn't have it",
@@ -3724,7 +3782,57 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
         }
     }
 
-    // 2. Contiguous offsets per table.
+    // 22. The staged log keeps what's left to apply, and the entry the
+    //     table's cursor sits at the end of — nothing before it: by the
+    //     cycle after the one that applied them, those entries are gone
+    //     from log_index, and their files from the object store.
+    //     Otherwise both grow with every flush, forever.
+    let mut tables = vec![ident()];
+    if SECOND_TABLE.get() > 0 {
+        tables.push(other_ident());
+    }
+    for table in &tables {
+        let cursor = block_on(h.coord.get_cursor("default", table))
+            .map_err(|e| format!("get_cursor failed: {e}"))?
+            .unwrap_or(-1);
+        let live = block_on(h.coord.read_log(table, 0, 1_000_000))
+            .map_err(|e| format!("read_log failed: {e}"))?;
+        // The watcher finds where the log is applied to by it.
+        if cursor > 0 && !live.iter().any(|e| e.end_offset as i64 >= cursor) {
+            return Err(format!(
+                "invariant 22 (bounded staged log): {table}'s cursor is at {cursor}, and no \
+                 entry of its log ends there: {live:?}"
+            ));
+        }
+        for entry in h.coord.claimed_log(table) {
+            if (entry.end_offset as i64) >= cursor {
+                continue;
+            }
+            if live.contains(&entry) {
+                return Err(format!(
+                    "invariant 22 (bounded staged log): {table}'s cursor is at {cursor}, \
+                     and log_index still holds [{}, {})",
+                    entry.start_offset, entry.end_offset
+                ));
+            }
+            if blob_keys.contains(object_key(&entry.s3_path)) {
+                return Err(format!(
+                    "invariant 22 (bounded staged log): {table}'s cursor is at {cursor}, \
+                     and the object store still holds {}, of [{}, {})",
+                    entry.s3_path, entry.start_offset, entry.end_offset
+                ));
+            }
+        }
+    }
+
+    // 2. Contiguous offsets per table, from 0 for all ever claimed; the
+    //    log still held is the end of them.
+    if !entries.ends_with(&live) {
+        return Err(format!(
+            "invariant 2 (contiguous offsets): log_index holds {live:?}, not the end of the \
+             claimed {entries:?}"
+        ));
+    }
     let mut prev_end = 0u64;
     for entry in &entries {
         if entry.start_offset != prev_end {
@@ -3760,11 +3868,7 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     //    in this harness, but this keeps the check robust to future expansion.)
     let mut staged_events = Vec::new();
     for entry in &entries {
-        let bytes = block_on(h.blob_store.get(&entry.s3_path))
-            .map_err(|e| format!("blob_store.get({}): {e}", entry.s3_path))?;
-        let mut chunk =
-            decode_chunk(&bytes).map_err(|e| format!("decode_chunk({}): {e}", entry.s3_path))?;
-        staged_events.append(&mut chunk);
+        staged_events.append(&mut staged_events_of(h, entry)?);
     }
     // Staging is at-least-once: a crash between a claim and the slot ack
     // replays the transaction, staging it again, and the fold absorbs the
@@ -3997,10 +4101,11 @@ fn check_invariants_with_snapshot(h: &mut DstHarness) -> Result<(), String> {
         }
     }
 
-    let entries = block_on(h.coord.read_log(&ident(), 0, 1_000_000))
+    let live = block_on(h.coord.read_log(&ident(), 0, 1_000_000))
         .map_err(|e| format!("read_log failed: {e}"))?;
+    let entries = h.coord.claimed_log(&ident());
     let blob_keys = block_on(h.storage.blob_keys())?;
-    for entry in &entries {
+    for entry in &live {
         if !blob_keys.contains(object_key(&entry.s3_path)) {
             return Err(format!(
                 "invariant 1: log_index references {} but blob_store doesn't have it",
@@ -4009,6 +4114,11 @@ fn check_invariants_with_snapshot(h: &mut DstHarness) -> Result<(), String> {
         }
     }
 
+    if !entries.ends_with(&live) {
+        return Err(format!(
+            "invariant 2: log_index holds {live:?}, not the end of the claimed {entries:?}"
+        ));
+    }
     let mut prev_end = 0u64;
     for entry in &entries {
         if entry.start_offset != prev_end {
@@ -6288,10 +6398,10 @@ fn crash_after_some_inserts_then_more_inserts() {
 
 /// Row changes staged for the main table (schema events aside).
 fn staged_changes(h: &DstHarness) -> usize {
-    block_on(h.coord.read_log(&ident(), 0, 1_000_000))
-        .unwrap()
+    h.coord
+        .claimed_log(&ident())
         .iter()
-        .flat_map(|e| decode_chunk(&block_on(h.blob_store.get(&e.s3_path)).unwrap()).unwrap())
+        .flat_map(|e| staged_events_of(h, e).unwrap())
         .filter(|e| e.op != Op::Relation)
         .count()
 }
@@ -6343,6 +6453,108 @@ fn materializer_idempotent_when_run_extra_times() {
     h.run_step(&Step::MaterializerCycle);
     h.run_step(&Step::MaterializerCycle);
     check_invariants(&mut h).unwrap();
+}
+
+/// Two consumer groups materialize one staged log, each into a catalog of
+/// its own. The one ahead truncates the log only as far as the one behind
+/// has read it: a group that registered the table holds its log.
+#[test]
+fn a_group_behind_holds_the_log() {
+    let mut h = DstHarness::boot();
+    let catalog = Arc::new(MemoryCatalog::new());
+    let mut behind = Materializer::new(
+        h.coord.clone() as Arc<dyn Coordinator>,
+        h.blob_store.clone(),
+        catalog.clone(),
+        mat_namer(&h.id_gen),
+        "behind",
+        MAT_BATCH,
+    );
+    block_on(behind.register_table(schema())).unwrap();
+
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Insert { id: 3, qty: 30 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Update { id: 1, qty: 11 },
+        Step::Insert { id: 4, qty: 40 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ] {
+        h.run_step(&step);
+    }
+    // Ahead and caught up, the group still finds the log the other hasn't
+    // read: all of it.
+    assert_eq!(
+        block_on(h.coord.read_log(&ident(), 0, 1_000_000)).unwrap(),
+        h.coord.claimed_log(&ident()),
+        "the group ahead truncated what the group behind hasn't read"
+    );
+    while block_on(behind.cycle()).unwrap() > 0 {}
+
+    let files = live_files_from_history(&catalog.history(&ident()));
+    let schema = block_on(catalog.load_table(&ident()))
+        .unwrap()
+        .expect("table exists")
+        .schema;
+    let mut behinds = block_on(engine_read(h.blob_store.as_ref(), &schema, &files)).unwrap();
+    sort_by_pk(&mut behinds);
+    let mut pg = h.db.read_table(&ident()).map(stored_rows).unwrap();
+    sort_by_pk(&mut pg);
+    assert_eq!(
+        on_source_columns(&h.db, behinds),
+        on_source_columns(&h.db, pg),
+        "the group behind lost changes the group ahead truncated"
+    );
+    check_invariants(&mut h).unwrap();
+}
+
+/// A cycle that stops at its row budget leaves a backlog: truncating the
+/// log behind its cursor leaves every entry it hasn't applied.
+#[test]
+fn a_backlog_survives_truncation() {
+    let mut h = DstHarness::boot();
+    // Transactions of their own: a cycle can stop between any two.
+    for id in 1..=20 {
+        h.run_step(&Step::Insert { id, qty: id });
+    }
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    assert!(
+        h.materializer.backlogged(),
+        "the cycle applied the whole log"
+    );
+    check_step_invariants(&h).unwrap();
+    check_invariants(&mut h).unwrap();
+}
+
+/// Once a backfill's rows are applied, the LSN of its snapshot — changes
+/// before it are skipped — is recorded: truncating the log drops the rows
+/// it's read from, and a restarted materializer would find none.
+#[test]
+fn an_applied_backfill_records_its_snapshot_lsn() {
+    BACKFILL.set(true);
+    let mut h = DstHarness::boot();
+    check_invariants(&mut h).unwrap();
+    let first = h
+        .coord
+        .claimed_log(&ident())
+        .iter()
+        .flat_map(|e| staged_events_of(&h, e).unwrap())
+        .find(|e| {
+            e.xid
+                .is_some_and(|x| x >= pg2iceberg_snapshot::SNAPSHOT_XID_BASE)
+        })
+        .expect("the backfill staged its rows")
+        .lsn;
+    assert_eq!(
+        block_on(h.coord.get_cursor("default#snapshot-lsn", &ident())).unwrap(),
+        Some(first.0 as i64)
+    );
 }
 
 // ---------- snapshot integration ----------

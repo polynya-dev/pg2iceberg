@@ -17,11 +17,11 @@
 use crate::prod::connect::PgConn;
 use crate::schema::CoordSchema;
 use crate::sql;
-use crate::TableSnapshotState;
 use crate::{
     receipt, CommitBatch, CoordCommitReceipt, CoordError, Coordinator, LogEntry, MarkerInfo,
     OffsetGrant, Result,
 };
+use crate::{StagedLogSize, TableSnapshotState};
 use async_trait::async_trait;
 use pg2iceberg_core::{Lsn, TableIdent, WorkerId};
 use std::collections::BTreeMap;
@@ -315,16 +315,39 @@ impl Coordinator for PostgresCoordinator {
         Ok(out)
     }
 
-    async fn truncate_log(&self, table: &TableIdent, before_offset: u64) -> Result<Vec<String>> {
+    async fn truncate_log(
+        &self,
+        table: &TableIdent,
+        before_offset: u64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         let key = table_key(table);
         let before_i64 = i64::try_from(before_offset)
             .map_err(|_| CoordError::Other("before_offset > i64".into()))?;
+        let limit_i64 =
+            i64::try_from(limit).map_err(|_| CoordError::Other("limit > i64".into()))?;
         let client = self.client().await?;
         let rows = client
-            .query(&sql::truncate_log(&self.schema), &[&key, &before_i64])
+            .query(
+                &sql::truncate_log(&self.schema),
+                &[&key, &before_i64, &limit_i64],
+            )
             .await
             .map_err(pg)?;
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    async fn staged_log_size(&self, table: &TableIdent) -> Result<StagedLogSize> {
+        let key = table_key(table);
+        let client = self.client().await?;
+        let row = client
+            .query_one(&sql::staged_log_size(&self.schema), &[&key])
+            .await
+            .map_err(pg)?;
+        Ok(StagedLogSize {
+            files: row.get::<_, i64>(0).max(0) as u64,
+            bytes: row.get::<_, i64>(1).max(0) as u64,
+        })
     }
 
     async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> Result<()> {
@@ -358,6 +381,19 @@ impl Coordinator for PostgresCoordinator {
             return Err(CoordError::NotFound(format!("cursor for {group}/{table}")));
         }
         Ok(())
+    }
+
+    async fn table_cursors(&self, table: &TableIdent) -> Result<Vec<(String, i64)>> {
+        let key = table_key(table);
+        let client = self.client().await?;
+        let rows = client
+            .query(&sql::table_cursors(&self.schema), &[&key])
+            .await
+            .map_err(pg)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect())
     }
 
     async fn register_consumer(&self, group: &str, worker: &WorkerId, ttl: Duration) -> Result<()> {

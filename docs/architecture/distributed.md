@@ -59,6 +59,8 @@ A worker leaving (crash or graceful shutdown) is detected within one heartbeat T
 
 `mat_cursor` is keyed by `(group_name, table_name)` — workers within the same group share cursors per table because the deterministic round-robin assignment guarantees only one worker materializes any given table per cycle. There's no `worker_id` in the cursor key; ownership is recomputed at each cycle's start, not persisted.
 
+The log is truncated behind the lowest cursor of any group that registered the table, so a group holds the log it hasn't read yet — from when it registers the table: a group added later starts where the log starts then.
+
 ## Commit isolation
 
 Two workers shouldn't ever process the same table on the same cycle (the assignment is deterministic), but transient races during rebalance are possible if one worker hasn't yet noticed a peer dropped out. In that window:

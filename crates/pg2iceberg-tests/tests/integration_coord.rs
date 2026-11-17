@@ -28,7 +28,7 @@ use std::time::Duration;
 use pg2iceberg_coord::{
     prod::{connect_with, PostgresCoordinator, TlsMode},
     schema::CoordSchema,
-    CommitBatch, Coordinator, MarkerInfo, OffsetClaim,
+    CommitBatch, Coordinator, MarkerInfo, OffsetClaim, StagedLogSize,
 };
 use pg2iceberg_core::{Lsn, Namespace, TableIdent, WorkerId};
 use testcontainers_modules::postgres::Postgres;
@@ -347,12 +347,45 @@ async fn truncate_log_returns_paths_and_drops_rows() {
         .await
         .unwrap();
 
-    let dropped = coord.truncate_log(&t, 2).await.expect("truncate_log");
+    coord
+        .claim_offsets(&CommitBatch::without_markers(
+            vec![claim(&t, 1, "s3://b/c.parquet")],
+            Lsn(3),
+        ))
+        .await
+        .unwrap();
+    let size = coord.staged_log_size(&t).await.expect("staged_log_size");
+    assert_eq!(
+        size,
+        StagedLogSize {
+            files: 3,
+            bytes: 700
+        }
+    );
+
+    // At most `limit`, the first by offset: [0, 2), not [2, 6).
+    let dropped = coord.truncate_log(&t, 6, 1).await.expect("truncate_log");
     assert_eq!(dropped, vec!["s3://b/a.parquet".to_string()]);
+    let dropped = coord.truncate_log(&t, 6, 16).await.expect("truncate_log");
+    assert_eq!(dropped, vec!["s3://b/b.parquet".to_string()]);
 
     let remaining = coord.read_log(&t, 0, 16).await.unwrap();
     assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].s3_path, "s3://b/b.parquet");
+    assert_eq!(remaining[0].s3_path, "s3://b/c.parquet");
+    let size = coord.staged_log_size(&t).await.expect("staged_log_size");
+    assert_eq!(
+        size,
+        StagedLogSize {
+            files: 1,
+            bytes: 100
+        }
+    );
+    let other = ident("public", "other");
+    let none = coord
+        .staged_log_size(&other)
+        .await
+        .expect("staged_log_size");
+    assert_eq!(none, StagedLogSize::default());
 }
 
 #[tokio::test]
@@ -434,6 +467,25 @@ async fn cursor_round_trip() {
     let other = ident("public", "missing");
     let err = coord.set_cursor(group, &other, 0).await.unwrap_err();
     assert!(matches!(err, pg2iceberg_coord::CoordError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn table_cursors_lists_every_groups_cursor_of_the_table() {
+    let coord = fresh_coord().await;
+    let t = ident("public", "orders");
+    coord.ensure_cursor("b", &t).await.unwrap();
+    coord.ensure_cursor("a", &t).await.unwrap();
+    coord
+        .ensure_cursor("a", &ident("public", "other"))
+        .await
+        .unwrap();
+    coord.set_cursor("b", &t, 7).await.unwrap();
+    assert_eq!(
+        coord.table_cursors(&t).await.unwrap(),
+        vec![("a".to_string(), -1), ("b".to_string(), 7)]
+    );
+    let none = ident("public", "none");
+    assert!(coord.table_cursors(&none).await.unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -98,6 +98,8 @@ Read from `pg_replication_slots` every watcher tick (30 s).
 | `pg2iceberg_pipeline_rows_staged_total` | counter | `table` | Rows staged as Parquet, snapshot rows included. |
 | `pg2iceberg_pipeline_staged_bytes_total` | counter | `table` | Bytes of staged Parquet. |
 | `pg2iceberg_pipeline_flushed_lsn` | gauge | | Highest source LSN staged and recorded. |
+| `pg2iceberg_staged_log_files` | gauge | `table` | Staged files the table's log holds: those not yet materialized, and the last one that was. The materializer deletes the rest. Gauged by the watcher, so in distributed mode by `stream-only`. |
+| `pg2iceberg_staged_log_bytes` | gauge | `table` | Bytes of those files in the object store. |
 
 ### Materializing
 
@@ -160,6 +162,9 @@ The materializer reads staged files ahead of the one it's applying, up to eight 
 | About to lose WAL | `pg2iceberg_slot_wal_status{status=~"unreserved\|lost"} == 1` |
 | A table is stale | `time() - pg2iceberg_materializer_source_commit_timestamp_seconds > 900 and on (table) pg2iceberg_materializer_backlog_rows > 0` |
 | An invariant broke | `increase(pg2iceberg_invariant_violations_total[10m]) > 0` |
+| Staged files pile up | `pg2iceberg_staged_log_files > 1 and on (table) pg2iceberg_materializer_backlog_rows == 0` for 30 minutes |
+
+A caught-up table's log holds one staged file, the last one materialized. More, with no backlog, means the materializer isn't truncating it: check its logs for `can't truncate the staged log`.
 
 How stale a table is only means something while it has a backlog. A table nobody writes to keeps its last source commit time but is fully up to date, which is why the stale-table alert also checks the backlog.
 

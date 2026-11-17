@@ -4,7 +4,7 @@
 //! — the future PG impl will be tested against the same suite via a shared
 //! `coord_conformance` test crate.
 
-use pg2iceberg_coord::{schema::CoordSchema, CommitBatch, Coordinator, OffsetClaim};
+use pg2iceberg_coord::{schema::CoordSchema, CommitBatch, Coordinator, OffsetClaim, StagedLogSize};
 use pg2iceberg_core::{Lsn, Namespace, TableIdent, WorkerId};
 use pg2iceberg_sim::{clock::TestClock, coord::MemoryCoordinator};
 use pollster::block_on;
@@ -184,14 +184,58 @@ fn truncate_log_returns_paths_and_drops_rows() {
         markers: vec![],
     }))
     .unwrap();
-    let dropped = block_on(c.truncate_log(&ident("a"), 6)).unwrap();
-    assert_eq!(dropped, vec!["p0".to_string(), "p1".to_string()]);
+    // At most `limit`, the first by offset.
+    let dropped = block_on(c.truncate_log(&ident("a"), 6, 1)).unwrap();
+    assert_eq!(dropped, vec!["p0".to_string()]);
+    let dropped = block_on(c.truncate_log(&ident("a"), 6, 100)).unwrap();
+    assert_eq!(dropped, vec!["p1".to_string()]);
     let remaining = block_on(c.read_log(&ident("a"), 0, 100)).unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].s3_path, "p2");
 }
 
+#[test]
+fn staged_log_size_counts_what_the_log_holds() {
+    let (c, _) = coord_at_t0();
+    assert_eq!(
+        block_on(c.staged_log_size(&ident("a"))).unwrap(),
+        StagedLogSize::default()
+    );
+    block_on(c.claim_offsets(&CommitBatch {
+        claims: vec![
+            claim("a", 3, "p0"),
+            claim("a", 2, "p1"),
+            claim("b", 1, "q0"),
+        ],
+        flushable_lsn: Lsn(1),
+        replicated_lsn: None,
+        markers: vec![],
+    }))
+    .unwrap();
+    let a = block_on(c.staged_log_size(&ident("a"))).unwrap();
+    assert_eq!(a.files, 2);
+    block_on(c.truncate_log(&ident("a"), 3, 100)).unwrap();
+    let after = block_on(c.staged_log_size(&ident("a"))).unwrap();
+    assert_eq!(after.files, 1);
+    assert!(after.bytes < a.bytes);
+    assert_eq!(block_on(c.staged_log_size(&ident("b"))).unwrap().files, 1);
+}
+
 // ---------- cursor semantics ----------
+
+#[test]
+fn table_cursors_lists_every_groups_cursor_of_the_table() {
+    let (c, _) = coord_at_t0();
+    block_on(c.ensure_cursor("b", &ident("t"))).unwrap();
+    block_on(c.ensure_cursor("a", &ident("t"))).unwrap();
+    block_on(c.ensure_cursor("a", &ident("u"))).unwrap();
+    block_on(c.set_cursor("b", &ident("t"), 7)).unwrap();
+    assert_eq!(
+        block_on(c.table_cursors(&ident("t"))).unwrap(),
+        vec![("a".to_string(), -1), ("b".to_string(), 7)]
+    );
+    assert!(block_on(c.table_cursors(&ident("v"))).unwrap().is_empty());
+}
 
 #[test]
 fn ensure_cursor_creates_at_minus_one_and_get_returns_some() {

@@ -201,6 +201,10 @@ catalog! {
         "Bytes of staged Parquet uploaded.";
     PIPELINE_FLUSHED_LSN: Gauge "pg2iceberg_pipeline_flushed_lsn" []
         "Highest source LSN staged and recorded in the coordinator.";
+    STAGED_LOG_FILES: Gauge "pg2iceberg_staged_log_files" ["table"]
+        "Staged files the table's log still holds: those not yet materialized, and the last one that was.";
+    STAGED_LOG_BYTES: Gauge "pg2iceberg_staged_log_bytes" ["table"]
+        "Bytes of the staged files the table's log still holds.";
 
     // ── Materializing ────────────────────────────────────────────────
     MATERIALIZER_CYCLE_TOTAL: Counter "pg2iceberg_materializer_cycle_total" ["table"]

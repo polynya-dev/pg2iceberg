@@ -327,12 +327,21 @@ impl<C: Coordinator + ?Sized> Coordinator for Instrumented<C> {
         &self,
         table: &TableIdent,
         before_offset: u64,
+        limit: usize,
     ) -> pg2iceberg_coord::Result<Vec<String>> {
         self.coord(
             "truncate_log",
-            self.inner.truncate_log(table, before_offset),
+            self.inner.truncate_log(table, before_offset, limit),
         )
         .await
+    }
+
+    async fn staged_log_size(
+        &self,
+        table: &TableIdent,
+    ) -> pg2iceberg_coord::Result<pg2iceberg_coord::StagedLogSize> {
+        self.coord("staged_log_size", self.inner.staged_log_size(table))
+            .await
     }
 
     async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> pg2iceberg_coord::Result<()> {
@@ -356,6 +365,14 @@ impl<C: Coordinator + ?Sized> Coordinator for Instrumented<C> {
         to_offset: i64,
     ) -> pg2iceberg_coord::Result<()> {
         self.coord("set_cursor", self.inner.set_cursor(group, table, to_offset))
+            .await
+    }
+
+    async fn table_cursors(
+        &self,
+        table: &TableIdent,
+    ) -> pg2iceberg_coord::Result<Vec<(String, i64)>> {
+        self.coord("table_cursors", self.inner.table_cursors(table))
             .await
     }
 

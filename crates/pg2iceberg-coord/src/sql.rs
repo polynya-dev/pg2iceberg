@@ -299,9 +299,22 @@ pub fn insert_marker_emission(schema: &CoordSchema) -> String {
     )
 }
 
+/// Delete the first `$3` of table `$1`'s entries ending at or before
+/// `$2`, by offset, returning their paths.
 pub fn truncate_log(schema: &CoordSchema) -> String {
     format!(
-        "DELETE FROM {} WHERE table_name = $1 AND end_offset <= $2 RETURNING s3_path",
+        "DELETE FROM {li} WHERE table_name = $1 AND end_offset IN ( \
+             SELECT end_offset FROM {li} WHERE table_name = $1 AND end_offset <= $2 \
+             ORDER BY end_offset LIMIT $3 \
+         ) RETURNING s3_path",
+        li = schema.qualify("log_index")
+    )
+}
+
+/// Table `$1`'s log entries, and the bytes they staged.
+pub fn staged_log_size(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT count(*), COALESCE(sum(byte_size), 0)::bigint FROM {} WHERE table_name = $1",
         schema.qualify("log_index")
     )
 }
@@ -325,6 +338,13 @@ pub fn set_cursor(schema: &CoordSchema) -> String {
     format!(
         "UPDATE {} SET last_offset = $3, last_committed = now() \
          WHERE group_name = $1 AND table_name = $2",
+        schema.qualify("mat_cursor")
+    )
+}
+
+pub fn table_cursors(schema: &CoordSchema) -> String {
+    format!(
+        "SELECT group_name, last_offset FROM {} WHERE table_name = $1 ORDER BY group_name",
         schema.qualify("mat_cursor")
     )
 }
