@@ -89,6 +89,8 @@ impl Harness {
             ident: schema.ident.clone(),
             data_files,
             equality_deletes,
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         }))
         .unwrap();
         paths
@@ -119,6 +121,8 @@ impl Harness {
             removed_paths: removed,
             data_sequence_number: planned_at,
             stores_row_lineage: false,
+            removed_deletion_vectors: Vec::new(),
+            deletion_vectors: Vec::new(),
         }))
         .unwrap();
         paths

@@ -171,6 +171,25 @@ impl TableWriter {
         rows: &[MaterializedRow],
         file_index: &FileIndex,
     ) -> Result<PreparedFiles> {
+        self.prepare_with(rows, file_index, true)
+    }
+
+    /// [`Self::prepare`] for a v3 table, whose deletes are deletion
+    /// vectors, which the caller writes: only the data files.
+    pub fn prepare_data(
+        &self,
+        rows: &[MaterializedRow],
+        file_index: &FileIndex,
+    ) -> Result<PreparedFiles> {
+        self.prepare_with(rows, file_index, false)
+    }
+
+    fn prepare_with(
+        &self,
+        rows: &[MaterializedRow],
+        file_index: &FileIndex,
+        equality_deletes: bool,
+    ) -> Result<PreparedFiles> {
         if rows.is_empty() {
             return Ok(PreparedFiles {
                 data: Vec::new(),
@@ -187,9 +206,12 @@ impl TableWriter {
                 Op::Insert => data_rows.push(r),
                 Op::Update => {
                     data_rows.push(r);
-                    delete_rows.push(r);
+                    if equality_deletes {
+                        delete_rows.push(r);
+                    }
                 }
-                Op::Delete => delete_rows.push(r),
+                Op::Delete if equality_deletes => delete_rows.push(r),
+                Op::Delete => {}
                 Op::Relation | Op::Truncate => {
                     return Err(WriterError::Encode(format!(
                         "unexpected op in folded rows: {:?}",

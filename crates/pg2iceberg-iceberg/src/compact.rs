@@ -21,14 +21,18 @@
 //!    until `max_input_bytes_per_pass`; the rest wait for a later pass.
 //! 4. Retire every delete file no remaining dirty file could still need.
 //! 5. Load deleted PKs (`PK → max delete seq`) from the delete files that
-//!    can apply to an input.
+//!    can apply to an input, and the inputs' deletion vectors.
 //! 6. Stream the inputs one record batch at a time: drop rows a delete
-//!    applies to (`delete_seq > row_seq`), encode survivors straight into
+//!    applies to (`delete_seq > row_seq`) and those at their vector's
+//!    positions, encode survivors straight into
 //!    the open output file, and upload it once it reaches the target size.
 //!    The inputs are read ahead of the one being rewritten, and an output
 //!    uploads while the next is encoded ([`PassIo`]).
 //! 7. `Catalog::commit_compaction` issues one `Operation::Replace`
-//!    snapshot removing the inputs + retired deletes and adding outputs.
+//!    snapshot removing the inputs, their vectors and retired deletes, and
+//!    adding outputs. Rows deleted from the inputs by vectors since the
+//!    pass read them are carried over to the outputs, as vectors of their
+//!    own, by whoever commits it ([`PreparedPass::read_vectors`]).
 //!
 //! ## Memory
 //!
@@ -70,11 +74,12 @@
 //! - **Atomicity.** Either the entire `Replace` snapshot lands, or none
 //!   of it. The catalog's commit path is the gate.
 
+use crate::deletion_vector::{read_deletion_vectors, Positions};
 use crate::reader::{value_at, ArrowBatches};
 use crate::writer::{StreamingDataFile, TableWriter, WriterError};
 use crate::{
-    Catalog, DataFile, FileIndex, IcebergError, PkKey, PreparedCompaction, Snapshot,
-    LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID, ROW_ID_FIELD_ID,
+    Catalog, DataFile, DeletionVector, FileIndex, IcebergError, PkKey, PreparedCompaction,
+    Snapshot, LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID, ROW_ID_FIELD_ID,
 };
 use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch};
 use arrow_select::filter::filter_record_batch;
@@ -179,6 +184,9 @@ pub struct CompactionOutcome {
     /// update its `FileIndex` without replaying the table. Bounded by the
     /// pass budget, like the rest of the pass.
     pub added_files: Vec<CompactedFile>,
+    /// Deletion vectors its commit added to `added_files`: the rows
+    /// deleted from its inputs after it read them.
+    pub vectors: Vec<DeletionVector>,
     /// The table's current snapshot after the pass's commit.
     pub snapshot_id: Option<i64>,
 }
@@ -191,6 +199,9 @@ pub struct CompactedFile {
     /// Which of [`CompactionOutcome::rewritten_files`] each key's row came
     /// from, parallel to `pk_keys`.
     pub pk_sources: Vec<u32>,
+    /// Each row's position in the file it came from, parallel to
+    /// `pk_keys`.
+    pub pk_positions: Vec<u32>,
     pub partition_values: Vec<PartitionLiteral>,
 }
 
@@ -225,6 +236,12 @@ impl LiveRows {
 pub struct PreparedPass {
     /// Its commit, for [`Catalog::commit_compaction`].
     pub commit: PreparedCompaction,
+    /// The deletion vector of each input that had one, as the pass read
+    /// it — and applied it. A vector an input has by the commit that
+    /// isn't this one holds rows deleted since, still in the outputs: the
+    /// commit has to carry them over ([`PreparedCompaction::deletion_vectors`])
+    /// or fail.
+    pub read_vectors: BTreeMap<String, DeletionVector>,
     /// What it did; `snapshot_id` is its commit's, once made.
     pub outcome: CompactionOutcome,
 }
@@ -253,6 +270,8 @@ struct LiveFile {
     seq: i64,
     /// A v3 data file's first row id ([`DataFile::first_row_id`]).
     first_row_id: Option<i64>,
+    /// A data file's live deletion vector, if it has one.
+    vector: Option<DeletionVector>,
 }
 
 impl LiveFile {
@@ -263,6 +282,7 @@ impl LiveFile {
             partition_values: df.partition_values.clone(),
             seq,
             first_row_id: df.first_row_id,
+            vector: None,
         }
     }
 }
@@ -472,6 +492,21 @@ where
             &mut peak_rows,
         ))
         .await?;
+    // Each input's vector: its rows at those positions are dead.
+    let read_vectors: BTreeMap<String, DeletionVector> = plan
+        .inputs
+        .iter()
+        .filter_map(|(path, f)| f.vector.clone().map(|dv| (path.clone(), dv)))
+        .collect();
+    let vectors: Vec<&DeletionVector> = read_vectors.values().collect();
+    let dead: HashMap<&str, Positions> = read_vectors
+        .keys()
+        .map(String::as_str)
+        .zip(
+            io.alongside(read_deletion_vectors(blob_store, &vectors))
+                .await?,
+        )
+        .collect();
 
     // A v3 table's rows have lineage — its data files take first row ids
     // — which the outputs store for each row they move.
@@ -501,6 +536,7 @@ where
     while let Some(((path, meta), bytes)) = io.next_input().await? {
         let source = sources[path.as_str()];
         bytes_before += meta.byte_size;
+        let dead = dead.get(path.as_str());
         // The position in the input of the batch's first row.
         let mut offset: u64 = 0;
         for batch in ArrowBatches::new(bytes, &read_cols, DECODE_BATCH_ROWS)? {
@@ -509,6 +545,7 @@ where
             if lineage {
                 batch = with_lineage(batch, meta, offset)?;
             }
+            let first = offset;
             offset += n as u64;
             peak_rows = peak_rows.max(n as u64);
             rows_rewritten += n as u64;
@@ -520,12 +557,14 @@ where
             let mut survivor_keys = Vec::with_capacity(n);
             for i in 0..n {
                 let key = keys.at(i)?;
+                let at = first + i as u64;
                 let kept = delete_pks
                     .get(&key)
-                    .is_none_or(|del_seq| *del_seq <= meta.seq);
+                    .is_none_or(|del_seq| *del_seq <= meta.seq)
+                    && !dead.is_some_and(|d| d.contains(at));
                 live.push(kept);
                 if kept {
-                    survivor_keys.push(key);
+                    survivor_keys.push((key, crate::file_index::position_of(at)));
                 }
             }
             let survivors = filter_record_batch(&batch, &BooleanArray::from(live))
@@ -560,6 +599,7 @@ where
         bytes_before += live_deletes[path].byte_size;
     }
 
+    let removed_deletion_vectors = read_vectors.values().map(DeletionVector::key).collect();
     let mut removed_paths: Vec<String> = plan.inputs.iter().map(|(p, _)| p.clone()).collect();
     removed_paths.extend(plan.retired_deletes.iter().cloned());
     removed_paths.sort();
@@ -572,11 +612,15 @@ where
         .iter()
         .zip(std::mem::take(&mut out.added_pks))
         .zip(std::mem::take(&mut out.added_sources))
-        .map(|((f, pk_keys), pk_sources)| CompactedFile {
-            path: f.path.clone(),
-            pk_keys,
-            pk_sources,
-            partition_values: f.partition_values.clone(),
+        .map(|((f, rows), pk_sources)| {
+            let (pk_keys, pk_positions) = rows.into_iter().unzip();
+            CompactedFile {
+                path: f.path.clone(),
+                pk_keys,
+                pk_sources,
+                pk_positions,
+                partition_values: f.partition_values.clone(),
+            }
         })
         .collect();
     Ok(Some(PreparedPass {
@@ -587,7 +631,10 @@ where
             // The table as the pass read it: the last snapshot.
             data_sequence_number: snapshots.last().map(|s| s.id),
             stores_row_lineage: lineage,
+            removed_deletion_vectors,
+            deletion_vectors: Vec::new(),
         },
+        read_vectors,
         outcome: CompactionOutcome {
             input_data_files: plan.inputs.len(),
             input_delete_files: plan.retired_deletes.len(),
@@ -600,6 +647,7 @@ where
             pending_files: plan.pending_files,
             rewritten_files: plan.inputs.into_iter().map(|(p, _)| p).collect(),
             added_files,
+            vectors: Vec::new(),
             snapshot_id: None,
         },
     }))
@@ -643,6 +691,8 @@ where
             data_sequence_number: snapshots.last().map(|s| s.id),
             // It moves no rows.
             stores_row_lineage: true,
+            removed_deletion_vectors: Vec::new(),
+            deletion_vectors: Vec::new(),
         })
         .await?;
     Ok(Some(CompactionOutcome {
@@ -658,13 +708,15 @@ where
 #[derive(Default)]
 struct OutputFiles {
     open: Option<(Vec<PartitionLiteral>, StreamingDataFile)>,
-    /// PK keys of the rows in the open file.
-    open_pks: Vec<PkKey>,
+    /// PK keys of the rows in the open file, each with its position in
+    /// its input.
+    open_pks: Vec<(PkKey, u32)>,
     /// The input each of `open_pks` came from.
     open_sources: Vec<u32>,
     added: Vec<DataFile>,
-    /// PK keys of each added file, parallel to `added`.
-    added_pks: Vec<Vec<PkKey>>,
+    /// PK keys of each added file, with their positions in their inputs,
+    /// parallel to `added`.
+    added_pks: Vec<Vec<(PkKey, u32)>>,
     /// Their inputs, parallel to `added_pks`.
     added_sources: Vec<Vec<u32>>,
 }
@@ -677,7 +729,7 @@ impl OutputFiles {
         writer: &TableWriter,
         tuple: &[PartitionLiteral],
         rows: &RecordBatch,
-        keys: impl Iterator<Item = PkKey>,
+        keys: impl Iterator<Item = (PkKey, u32)>,
         source: u32,
     ) -> Result<()> {
         if self.open.is_none() {
@@ -738,13 +790,16 @@ impl OutputFiles {
     }
 }
 
-/// What a table's equality deletes hide: a data file's row is deleted iff
-/// a delete of its key is newer than the file — the rule a pass applies.
+/// What a table's deletes hide: a data file's row is deleted iff an
+/// equality delete of its key is newer than the file, or the file's
+/// deletion vector holds its position — the rules a pass applies.
 pub struct Deletes {
     /// Each live data file's sequence number.
     data_seqs: BTreeMap<String, i64>,
     /// Each key a live delete names → the newest such delete's.
     newest: HashMap<PkKey, i64>,
+    /// Each data file's deleted positions, of those with a vector.
+    vectors: HashMap<String, Positions>,
 }
 
 impl Deletes {
@@ -770,16 +825,30 @@ impl Deletes {
             &mut peak_rows,
         )
         .await?;
+        let with_vectors: Vec<(&String, &DeletionVector)> = data
+            .iter()
+            .filter_map(|(path, f)| f.vector.as_ref().map(|dv| (path, dv)))
+            .collect();
+        let read: Vec<&DeletionVector> = with_vectors.iter().map(|(_, dv)| *dv).collect();
+        let positions = read_deletion_vectors(blob_store, &read).await?;
+        let vectors = with_vectors
+            .iter()
+            .map(|(path, _)| (*path).clone())
+            .zip(positions)
+            .collect();
         Ok(Self {
             data_seqs: data.into_iter().map(|(path, f)| (path, f.seq)).collect(),
             newest,
+            vectors,
         })
     }
 
-    /// Whether the row of `key` in data file `path` is deleted.
-    pub fn hides(&self, path: &str, key: &PkKey) -> bool {
+    /// Whether the row of `key` at `position` in data file `path` is
+    /// deleted.
+    pub fn hides(&self, path: &str, position: u64, key: &PkKey) -> bool {
         let seq = self.data_seqs.get(path).copied().unwrap_or(i64::MAX);
         self.newest.get(key).is_some_and(|deleted| *deleted > seq)
+            || self.vectors.get(path).is_some_and(|p| p.contains(position))
     }
 }
 
@@ -963,18 +1032,20 @@ impl<'a> PassIo<'a> {
     }
 }
 
-/// Whether some live delete may have killed one of a data file's rows.
-/// Only a delete newer than the file can; past that, trust the index's
-/// count of live rows when there is one.
+/// Whether some live delete may have killed one of a data file's rows:
+/// its deletion vector did. Only an equality delete newer than the file
+/// can; past that, trust the index's count of live rows when there is
+/// one.
 fn dirty_check<'a>(
     live_deletes: &BTreeMap<String, LiveFile>,
     live_rows: Option<&'a BTreeMap<String, u64>>,
 ) -> impl Fn(&str, &LiveFile) -> bool + 'a {
     let newest_delete = live_deletes.values().map(|d| d.seq).max();
     move |path: &str, f: &LiveFile| {
-        newest_delete.is_some_and(|d| d > f.seq)
-            && live_rows
-                .is_none_or(|counts| counts.get(path).copied().unwrap_or(0) < f.record_count)
+        f.vector.is_some()
+            || (newest_delete.is_some_and(|d| d > f.seq)
+                && live_rows
+                    .is_none_or(|counts| counts.get(path).copied().unwrap_or(0) < f.record_count))
     }
 }
 
@@ -1018,9 +1089,12 @@ fn purge_due(
     is_dirty: &impl Fn(&str, &LiveFile) -> bool,
     config: &CompactionConfig,
 ) -> bool {
-    if live_deletes.is_empty() {
+    let vectors = live_data.values().filter_map(|f| f.vector.as_ref());
+    if live_deletes.is_empty() && vectors.clone().next().is_none() {
         return false;
     }
+    // A backstop on equality-delete files: each costs every reader. A
+    // deletion vector costs one only its data file's.
     if live_deletes.len() >= config.delete_file_threshold {
         return true;
     }
@@ -1034,7 +1108,8 @@ fn purge_due(
         }
     }
     if live_rows.is_none() {
-        dead = live_deletes.values().map(|d| d.record_count).sum();
+        dead = live_deletes.values().map(|d| d.record_count).sum::<u64>()
+            + vectors.map(|v| v.cardinality).sum::<u64>();
     }
     held > 0 && dead as f64 >= config.delete_ratio * held as f64
 }
@@ -1217,6 +1292,11 @@ fn compute_live_files(
             );
         }
     }
+    for (file, (dv, _)) in crate::live_deletion_vectors(snapshots) {
+        if let Some(f) = data.get_mut(file) {
+            f.vector = Some(dv.clone());
+        }
+    }
     (data, deletes)
 }
 
@@ -1249,6 +1329,8 @@ mod tests {
             timestamp_ms: id * 1000,
             expired: false,
             log_range: None,
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         }
     }
 
@@ -1320,6 +1402,7 @@ mod tests {
             partition_values: Vec::new(),
             seq,
             first_row_id: None,
+            vector: None,
         };
         let files = |entries: &[(&str, i64)]| -> BTreeMap<String, LiveFile> {
             entries

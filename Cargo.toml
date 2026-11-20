@@ -45,12 +45,14 @@ all = { level = "warn", priority = -1 }
 # `[patch.crates-io]` and matching git overrides for the two ecosystem
 # forks pg2iceberg-rust depends on:
 #
-# 1. `iceberg` → `polynya-dev/iceberg-rust@polynya-patches-v0.10.1`:
-#    upstream v0.10.1 plus `TransactionAction` visibility, a whole-schema
+# 1. `iceberg` → `polynya-dev/iceberg-rust@polynya-patches-v0.11.0`:
+#    upstream v0.11.0 plus `TransactionAction` visibility, a whole-schema
 #    `ReplaceSchemaAction`, a `FastAppendAction` that accepts delete files
 #    as well as data files, a compaction `RewriteFilesAction` (explicit
-#    data sequence number, removed-file check, summary totals),
-#    `Table::properties()` for vended credentials, and SigV4 signing.
+#    data sequence number, removed-file check, summary totals, removes
+#    its inputs' deletion vectors), a `RowDeltaAction` (deletion vectors
+#    on v3), `Table::properties()` for vended credentials, and SigV4
+#    signing.
 #    See `crates/pg2iceberg-iceberg/src/prod/gap_audit.rs` for context.
 #
 # 2. `tokio-postgres` + `postgres-replication` → `iambriccardo/rust-postgres`

@@ -50,7 +50,8 @@ use pg2iceberg_core::{
 
 use crate::{
     apply_schema_changes, log_ends_property, merge_log_ends, recorded_log_ends, Catalog, DataFile,
-    IcebergError, LogRange, PreparedCommit, Result, SchemaChange, Snapshot, TableMetadata,
+    DeletionVector, DeletionVectorKey, IcebergError, LogRange, PreparedCommit, Result,
+    SchemaChange, Snapshot, TableMetadata,
 };
 
 /// Wraps an `iceberg::Catalog` (e.g. `MemoryCatalog`, `RestCatalog`,
@@ -240,13 +241,27 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 "commit_snapshots: steps span several tables".into(),
             ));
         }
+        let steps: Vec<PreparedCommit> = steps.into_iter().filter(|s| !s.is_empty()).collect();
+        // A v3 table's commit is one snapshot: its deletion vectors apply
+        // to the rows of their own snapshot.
+        let vectors: Vec<(String, i64)> = steps
+            .iter()
+            .flat_map(|s| &s.removed_deletion_vectors)
+            .map(|key| Ok((key.path.clone(), vector_offset(key.offset)?)))
+            .collect::<Result<_>>()?;
+        let delta = !vectors.is_empty() || steps.iter().any(|s| !s.deletion_vectors.is_empty());
+        if delta && steps.len() > 1 {
+            return Err(IcebergError::Other(format!(
+                "commit_snapshots: deletion vectors in a commit of {} snapshots",
+                steps.len()
+            )));
+        }
+        let equality_deletes = steps.iter().any(|s| !s.equality_deletes.is_empty());
         let it = to_iceberg_table_ident(&ident)?;
         let table = self.inner.load_table(&it).await.map_err(map_iceberg_err)?;
         let mut files: Vec<Vec<IcebergDataFile>> = Vec::with_capacity(steps.len());
         for step in &steps {
-            if !step.data_files.is_empty() || !step.equality_deletes.is_empty() {
-                files.push(to_iceberg_files(step, &table)?);
-            }
+            files.push(to_iceberg_files(step, &table)?);
         }
 
         // Recorded on the last snapshot, with every group's end so far.
@@ -262,12 +277,32 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let appends = !files.is_empty();
         // Loaded just above: no reload before the first attempt.
         let tx = Transaction::new(&table).with_fresh_base();
+        // A table upgraded to v3 since the commit was prepared takes
+        // deletion vectors: checked on the table each attempt lands on.
+        let tx = if equality_deletes {
+            RefuseEqualityDeletesOnV3 {
+                ident: ident.clone(),
+            }
+            .apply(tx)
+            .map_err(map_iceberg_err)?
+        } else {
+            tx
+        };
         let tx = match files.len() {
             // No work — match the sim-catalog noop semantics so the
             // materializer can flush "no data, no deletes" without a
             // snapshot bump.
             0 if remove_properties.is_empty() => return metadata_from_table(&ident, &table),
             0 => Ok(tx),
+            // The forked row delta removes the vectors those it adds
+            // replace, checking each attempt that they're still the
+            // table's, and that its vectors' data files are live.
+            1 if delta => tx
+                .row_delta()
+                .add_data_files(files.remove(0))
+                .remove_deletion_vectors(vectors)
+                .set_snapshot_properties(properties)
+                .apply(tx),
             1 => tx
                 .fast_append()
                 // The materializer guarantees unique file paths; skip
@@ -314,7 +349,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         &self,
         prepared: crate::PreparedCompaction,
     ) -> Result<TableMetadata> {
-        if prepared.added_data_files.is_empty() && prepared.removed_paths.is_empty() {
+        if prepared.is_empty() {
             // Pure no-op: hand back current metadata without bumping a
             // snapshot.
             let it = to_iceberg_table_ident(&prepared.ident)?;
@@ -348,12 +383,24 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             );
         }
 
-        // Loaded just above: no reload before the first attempt.
+        for dv in &prepared.deletion_vectors {
+            iceberg_added.push(to_iceberg_vector(dv, &table)?);
+        }
+        let vectors: Vec<(String, i64)> = prepared
+            .removed_deletion_vectors
+            .iter()
+            .map(|key| Ok((key.path.clone(), vector_offset(key.offset)?)))
+            .collect::<Result<_>>()?;
+
+        // Loaded just above: no reload before the first attempt. The
+        // forked rewrite fails if a data file it removes has a vector it
+        // doesn't: rows deleted since the pass read them.
         let tx = Transaction::new(&table).with_fresh_base();
         let mut action = tx
             .rewrite_files()
             .add_data_files(iceberg_added)
-            .remove_paths(prepared.removed_paths.iter().cloned());
+            .remove_paths(prepared.removed_paths.iter().cloned())
+            .remove_deletion_vectors(vectors);
         if let Some(seq) = prepared.data_sequence_number {
             action = action.set_data_sequence_number(seq);
         }
@@ -499,7 +546,7 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         // manifest list. We need the previous snapshot's full path set to
         // compute `removed_paths` — diffing parent_paths - current_paths
         // gives the set of files the snapshot dropped.
-        let mut paths_per_snap: BTreeMap<i64, std::collections::BTreeSet<String>> = BTreeMap::new();
+        let mut paths_per_snap: BTreeMap<i64, Held> = BTreeMap::new();
         // Live files added by expired snapshots, by path. Expiry drops a
         // snapshot from the metadata but not the files it added: they stay
         // in the retained snapshots' manifests, as entries naming a
@@ -507,6 +554,8 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         let retained: std::collections::BTreeSet<i64> =
             snaps.iter().map(|s| s.snapshot_id()).collect();
         let mut expired_adds: BTreeMap<String, (i64, DataFile, DataContentType)> = BTreeMap::new();
+        let mut expired_vectors: BTreeMap<DeletionVectorKey, (i64, DeletionVector)> =
+            BTreeMap::new();
         let cached = self.manifests.get(ident);
         let mut read = TableManifests::default();
         // Each data file's first row id, as the latest snapshot listing it
@@ -539,12 +588,12 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 .insert(list_path.to_string(), Arc::clone(&manifest_list));
             let mut data_files: Vec<DataFile> = Vec::new();
             let mut delete_files: Vec<DataFile> = Vec::new();
-            // All live file paths in this snapshot's manifest list,
-            // regardless of which snapshot first added them. Used both as
-            // the cache for the next snapshot's diff and as the "current"
-            // side of this snapshot's.
-            let mut all_paths_this_snap: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
+            let mut deletion_vectors: Vec<DeletionVector> = Vec::new();
+            // All live files in this snapshot's manifest list, regardless
+            // of which snapshot first added them. Used both as the cache
+            // for the next snapshot's diff and as the "current" side of
+            // this snapshot's.
+            let mut held = Held::default();
             for entry in manifest_list.entries() {
                 // Each manifest list names every manifest before it.
                 let key = (entry.manifest_path.clone(), entry.first_row_id);
@@ -564,7 +613,23 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 // file the snapshot holds.
                 for me in manifest.entries().iter().filter(|me| me.is_alive()) {
                     let df = me.data_file();
-                    all_paths_this_snap.insert(df.file_path().to_string());
+                    if let Some(mut dv) = deletion_vector_of(df)? {
+                        held.vectors.insert(dv.key());
+                        // As for a data file, below.
+                        if me.snapshot_id() != Some(snap_id) {
+                            let added_by_expired =
+                                me.snapshot_id().is_none_or(|id| !retained.contains(&id));
+                            if added_by_expired {
+                                let seq = me.sequence_number().unwrap_or(seq_num);
+                                expired_vectors.entry(dv.key()).or_insert((seq, dv));
+                            }
+                            continue;
+                        }
+                        dv.sequence_number = me.sequence_number().filter(|&seq| seq != seq_num);
+                        deletion_vectors.push(dv);
+                        continue;
+                    }
+                    held.paths.insert(df.file_path().to_string());
                     if let Some(id) = df.first_row_id() {
                         first_row_ids.insert(df.file_path().to_string(), id);
                     }
@@ -624,17 +689,15 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
             // doesn't. A rewrite's inputs, but not only: another engine
             // may drop files in a `delete` or `overwrite` (dangling delete
             // files, say). An expired parent's files are gone with it.
-            let removed_paths: Vec<String> = parent_id
-                .and_then(|pid| paths_per_snap.get(&pid))
-                .map(|parent_paths| {
-                    parent_paths
-                        .difference(&all_paths_this_snap)
-                        .cloned()
-                        .collect()
-                })
+            let parent = parent_id.and_then(|pid| paths_per_snap.get(&pid));
+            let removed_paths: Vec<String> = parent
+                .map(|parent| parent.paths.difference(&held.paths).cloned().collect())
+                .unwrap_or_default();
+            let removed_deletion_vectors: Vec<DeletionVectorKey> = parent
+                .map(|parent| parent.vectors.difference(&held.vectors).cloned().collect())
                 .unwrap_or_default();
 
-            paths_per_snap.insert(snap_id, all_paths_this_snap);
+            paths_per_snap.insert(snap_id, held);
 
             out.push(Snapshot {
                 id: seq_num,
@@ -644,27 +707,36 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
                 timestamp_ms: snap.timestamp_ms(),
                 expired: false,
                 log_range: log_range_of(&snap),
+                deletion_vectors,
+                removed_deletion_vectors,
             });
         }
         // One stand-in snapshot per sequence number: MoR ordering only
         // needs the files' sequence numbers, which the manifests keep.
         let mut stand_ins: BTreeMap<i64, Snapshot> = BTreeMap::new();
+        let stand_in = |seq| Snapshot {
+            id: seq,
+            data_files: Vec::new(),
+            delete_files: Vec::new(),
+            removed_paths: Vec::new(),
+            timestamp_ms: 0,
+            expired: true,
+            log_range: None,
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
+        };
         for (seq, df, content) in expired_adds.into_values() {
-            let snap = stand_ins.entry(seq).or_insert_with(|| Snapshot {
-                id: seq,
-                data_files: Vec::new(),
-                delete_files: Vec::new(),
-                removed_paths: Vec::new(),
-                timestamp_ms: 0,
-                expired: true,
-                log_range: None,
-            });
+            let snap = stand_ins.entry(seq).or_insert_with(|| stand_in(seq));
             match content {
                 DataContentType::Data => snap.data_files.push(df),
                 DataContentType::EqualityDeletes | DataContentType::PositionDeletes => {
                     snap.delete_files.push(df)
                 }
             }
+        }
+        for (seq, dv) in expired_vectors.into_values() {
+            let snap = stand_ins.entry(seq).or_insert_with(|| stand_in(seq));
+            snap.deletion_vectors.push(dv);
         }
         out.extend(stand_ins.into_values());
         out.sort_by_key(|s| s.id);
@@ -678,10 +750,80 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     }
 }
 
+/// What one snapshot holds, for diffing it against its children.
+#[derive(Default)]
+struct Held {
+    /// Data and equality-delete files.
+    paths: BTreeSet<String>,
+    vectors: BTreeSet<DeletionVectorKey>,
+}
+
+/// `df` as a deletion vector, if it is one: a position-delete entry
+/// naming a blob in a Puffin file.
+fn deletion_vector_of(df: &IcebergDataFile) -> Result<Option<DeletionVector>> {
+    if df.content_type() != DataContentType::PositionDeletes
+        || df.file_format() != DataFileFormat::Puffin
+    {
+        return Ok(None);
+    }
+    let (Some(referenced), Some(offset), Some(length)) = (
+        df.referenced_data_file(),
+        df.content_offset(),
+        df.content_size_in_bytes(),
+    ) else {
+        return Err(IcebergError::Other(format!(
+            "deletion vector {} without its data file, offset or size",
+            df.file_path()
+        )));
+    };
+    let unsigned = |n: i64| {
+        u64::try_from(n)
+            .map_err(|_| IcebergError::Other(format!("deletion vector {}: {n}", df.file_path())))
+    };
+    Ok(Some(DeletionVector {
+        path: df.file_path().to_string(),
+        byte_size: df.file_size_in_bytes(),
+        offset: unsigned(offset)?,
+        length: unsigned(length)?,
+        referenced_data_file: referenced,
+        cardinality: df.record_count(),
+        partition_values: iceberg_struct_to_partition_literals(df.partition()),
+        sequence_number: None,
+    }))
+}
+
 // ───── inline transaction actions ────────────────────────────────────────
 
-/// Translate one prepared step's data + equality-delete files into
-/// iceberg `DataFile`s against `table`'s default partition spec.
+/// A deletion vector's offset, as a manifest records it.
+fn vector_offset(offset: u64) -> Result<i64> {
+    i64::try_from(offset)
+        .map_err(|_| IcebergError::Other(format!("deletion vector offset {offset}")))
+}
+
+/// `dv` as the manifest entry naming it, against `table`'s default
+/// partition spec.
+fn to_iceberg_vector(dv: &DeletionVector, table: &Table) -> Result<IcebergDataFile> {
+    let spec_id = table.metadata().default_partition_spec_id();
+    let part_field_count = table.metadata().default_partition_spec().fields().len();
+    let partition = build_partition_struct(&dv.partition_values, part_field_count, &dv.path)?;
+    DataFileBuilder::default()
+        .content(DataContentType::PositionDeletes)
+        .file_path(dv.path.clone())
+        .file_format(DataFileFormat::Puffin)
+        .file_size_in_bytes(dv.byte_size)
+        .record_count(dv.cardinality)
+        .referenced_data_file(Some(dv.referenced_data_file.clone()))
+        .content_offset(Some(vector_offset(dv.offset)?))
+        .content_size_in_bytes(Some(vector_offset(dv.length)?))
+        .partition(partition)
+        .partition_spec_id(spec_id)
+        .build()
+        .map_err(|e| IcebergError::Other(format!("deletion vector build: {e}")))
+}
+
+/// Translate one prepared step's data files, equality-delete files and
+/// deletion vectors into iceberg `DataFile`s against `table`'s default
+/// partition spec.
 fn to_iceberg_files(prepared: &PreparedCommit, table: &Table) -> Result<Vec<IcebergDataFile>> {
     let spec_id = table.metadata().default_partition_spec_id();
     let part_field_count = table.metadata().default_partition_spec().fields().len();
@@ -725,7 +867,31 @@ fn to_iceberg_files(prepared: &PreparedCommit, table: &Table) -> Result<Vec<Iceb
                 .map_err(|e| IcebergError::Other(format!("delete file build: {e}")))?,
         );
     }
+    for dv in &prepared.deletion_vectors {
+        all_files.push(to_iceberg_vector(dv, table)?);
+    }
     Ok(all_files)
+}
+
+/// Fails the commit if the table it lands on is v3 — upgraded since the
+/// commit, which holds equality deletes, was prepared: pg2iceberg writes
+/// a v3 table's deletes as deletion vectors. A conflict: the materializer
+/// prepares the commit again, for the table as it is.
+struct RefuseEqualityDeletesOnV3 {
+    ident: TableIdent,
+}
+
+#[async_trait]
+impl TransactionAction for RefuseEqualityDeletesOnV3 {
+    async fn commit(self: Arc<Self>, table: &Table) -> iceberg::Result<ActionCommit> {
+        if table.metadata().format_version() == FormatVersion::V3 {
+            return Err(iceberg::Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!("{}: {}", crate::EQUALITY_DELETES_ON_V3_CONFLICT, self.ident),
+            ));
+        }
+        Ok(ActionCommit::new(vec![], vec![]))
+    }
 }
 
 /// Several fast-appends committed as one table update. Each step becomes
@@ -1267,6 +1433,10 @@ fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Res
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        format_version: match table.metadata().format_version() {
+            FormatVersion::V3 => crate::FormatVersion::V3,
+            FormatVersion::V1 | FormatVersion::V2 => crate::FormatVersion::V2,
+        },
     })
 }
 
@@ -1466,6 +1636,8 @@ mod tests {
                     },
                 ],
                 equality_deletes: vec![],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .unwrap();
@@ -1570,6 +1742,8 @@ mod tests {
             ident: ident(),
             data_files,
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         })
         .await
         .unwrap();
@@ -1622,6 +1796,8 @@ mod tests {
                     first_row_id: None,
                 }],
                 equality_deletes: vec![],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .unwrap_err();
@@ -1689,6 +1865,8 @@ mod tests {
                         first_row_id: None,
                     }],
                     equality_deletes: vec![],
+                    deletion_vectors: Vec::new(),
+                    removed_deletion_vectors: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1739,6 +1917,8 @@ mod tests {
                     first_row_id: None,
                 }],
                 equality_deletes: vec![],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .unwrap();
@@ -1760,6 +1940,8 @@ mod tests {
             removed_paths: original_paths.clone(),
             data_sequence_number: None,
             stores_row_lineage: false,
+            removed_deletion_vectors: Vec::new(),
+            deletion_vectors: Vec::new(),
         })
         .await
         .unwrap();
@@ -1803,6 +1985,8 @@ mod tests {
                 removed_paths: vec![],
                 data_sequence_number: None,
                 stores_row_lineage: false,
+                removed_deletion_vectors: Vec::new(),
+                deletion_vectors: Vec::new(),
             })
             .await
             .unwrap();
@@ -1830,6 +2014,8 @@ mod tests {
                 first_row_id: None,
             }],
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         })
         .await
         .unwrap();
@@ -1840,6 +2026,8 @@ mod tests {
             removed_paths: vec![path.into()],
             data_sequence_number: None,
             stores_row_lineage: false,
+            removed_deletion_vectors: Vec::new(),
+            deletion_vectors: Vec::new(),
         })
         .await
         .unwrap();
@@ -1879,6 +2067,8 @@ mod tests {
                     first_row_id: None,
                 }],
                 equality_deletes: vec![],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .unwrap();
@@ -1946,6 +2136,8 @@ mod tests {
                 ident: ident(),
                 data_files: data,
                 equality_deletes: deletes,
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
         };
         append(vec![file("d0", vec![])], vec![]).await.unwrap();
@@ -1962,6 +2154,8 @@ mod tests {
             removed_paths: vec![file("d0", vec![]).path],
             data_sequence_number: None,
             stores_row_lineage: false,
+            removed_deletion_vectors: Vec::new(),
+            deletion_vectors: Vec::new(),
         })
         .await
         .unwrap();
@@ -2002,6 +2196,8 @@ mod tests {
                 first_row_id: None,
             }],
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         })
         .await
         .unwrap();
@@ -2020,6 +2216,8 @@ mod tests {
                 ident: ident(),
                 data_files: vec![],
                 equality_deletes: vec![],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .unwrap();
@@ -2048,6 +2246,8 @@ mod tests {
                     sequence_number: None,
                     first_row_id: None,
                 }],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .unwrap();
@@ -2086,6 +2286,8 @@ mod tests {
                     sequence_number: None,
                     first_row_id: None,
                 }],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .unwrap();
@@ -2121,6 +2323,8 @@ mod tests {
                     sequence_number: None,
                     first_row_id: None,
                 }],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .unwrap_err();
@@ -2299,6 +2503,8 @@ mod tests {
                     first_row_id: None,
                 }],
                 equality_deletes: vec![],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             }],
             Some(range),
             BTreeSet::new(),
@@ -2357,6 +2563,8 @@ mod tests {
                 first_row_id: None,
             }],
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         })
         .await
         .unwrap();
@@ -2405,7 +2613,9 @@ mod tests {
     }
 
     /// Step `i` of a commit: a data file and an equality-delete file.
-    fn step(i: usize) -> PreparedCommit {
+    /// Step `i` of a commit: a data file, and — for a v2 table, whose
+    /// deletes they are — an equality-delete file.
+    fn step(i: usize, version: crate::FormatVersion) -> PreparedCommit {
         let file = |kind: &str, equality_field_ids: Vec<i32>| DataFile {
             path: format!("memory:///warehouse/public/orders/step-{kind}-{i}.parquet"),
             record_count: if equality_field_ids.is_empty() { 2 } else { 1 },
@@ -2418,7 +2628,12 @@ mod tests {
         PreparedCommit {
             ident: ident(),
             data_files: vec![file("data", vec![])],
-            equality_deletes: vec![file("eq-delete", vec![1])],
+            equality_deletes: match version {
+                crate::FormatVersion::V2 => vec![file("eq-delete", vec![1])],
+                crate::FormatVersion::V3 => Vec::new(),
+            },
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         }
     }
 
@@ -2454,9 +2669,13 @@ mod tests {
         storage.take_reads();
 
         let start = tokio::time::Instant::now();
-        c.commit_snapshots((0..STEPS).map(step).collect(), None, BTreeSet::new())
-            .await
-            .unwrap();
+        c.commit_snapshots(
+            (0..STEPS).map(|i| step(i, version)).collect(),
+            None,
+            BTreeSet::new(),
+        )
+        .await
+        .unwrap();
         let took = start.elapsed();
 
         let reads = storage.take_reads();
@@ -2469,12 +2688,14 @@ mod tests {
         let snapshots = c.snapshots(&ident()).await.unwrap();
         assert_eq!(snapshots.len(), 1 + STEPS);
         // The first commit's file, and each step's data and delete files.
-        assert_eq!(live_files(&snapshots).len(), 1 + 2 * STEPS);
+        let v2 = version == crate::FormatVersion::V2;
+        let per_step = if v2 { 2 } else { 1 };
+        assert_eq!(live_files(&snapshots).len(), 1 + per_step * STEPS);
         let deletes: Vec<i64> = snapshots
             .iter()
             .flat_map(|s| s.delete_files.iter().map(move |_| s.id))
             .collect();
-        assert_eq!(deletes.len(), STEPS);
+        assert_eq!(deletes.len(), if v2 { STEPS } else { 0 });
         assert!(deletes.windows(2).all(|w| w[0] < w[1]), "{deletes:?}");
 
         if version == crate::FormatVersion::V3 {
@@ -2650,6 +2871,8 @@ mod tests {
                 first_row_id: None,
             }],
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         })
         .await
         .unwrap();
@@ -2695,6 +2918,8 @@ mod tests {
                 first_row_id: None,
             }],
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         };
         // On a single-step commit, and a chained one.
         let meta = c
@@ -2751,6 +2976,233 @@ mod tests {
         ] {
             let back = from_iceberg_type(&to_iceberg_type(ty)).unwrap();
             assert_eq!(back, ty);
+        }
+    }
+
+    // ── deletion vectors ─────────────────────────────────────────────
+
+    fn data(name: &str) -> DataFile {
+        DataFile {
+            path: format!("memory:///warehouse/public/orders/data/{name}"),
+            record_count: 10,
+            byte_size: 1024,
+            equality_field_ids: vec![],
+            partition_values: Vec::new(),
+            sequence_number: None,
+            first_row_id: None,
+        }
+    }
+
+    fn dv(puffin: &str, offset: u64, of: &str) -> DeletionVector {
+        DeletionVector {
+            path: format!("memory:///warehouse/public/orders/data/{puffin}"),
+            byte_size: 4096,
+            offset,
+            length: 40,
+            referenced_data_file: data(of).path,
+            cardinality: 1,
+            partition_values: Vec::new(),
+            sequence_number: None,
+        }
+    }
+
+    async fn v3() -> IcebergRustCatalog<iceberg::memory::MemoryCatalog> {
+        let c = fresh().await.with_format_version(crate::FormatVersion::V3);
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        c
+    }
+
+    async fn commit(
+        c: &IcebergRustCatalog<iceberg::memory::MemoryCatalog>,
+        data_files: Vec<DataFile>,
+        vectors: Vec<DeletionVector>,
+        removed: Vec<&DeletionVector>,
+    ) -> Result<TableMetadata> {
+        c.commit_snapshot(PreparedCommit {
+            data_files,
+            deletion_vectors: vectors,
+            removed_deletion_vectors: removed.into_iter().map(|v| v.key()).collect(),
+            ..PreparedCommit::empty(ident())
+        })
+        .await
+    }
+
+    /// The table's live vectors, as `snapshots` replays them.
+    async fn live_vectors(
+        c: &IcebergRustCatalog<iceberg::memory::MemoryCatalog>,
+    ) -> Vec<(String, DeletionVectorKey)> {
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        crate::live_deletion_vectors(&snaps)
+            .into_iter()
+            .map(|(file, (dv, _))| (file.to_string(), dv.key()))
+            .collect()
+    }
+
+    fn conflict(r: Result<TableMetadata>) {
+        assert!(matches!(r, Err(IcebergError::Conflict(_))), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn deletion_vectors_round_trip_and_replace_each_other() {
+        let c = v3().await;
+        let first = dv("p1.puffin", 4, "a.parquet");
+        let of_b = dv("p1.puffin", 44, "b.parquet");
+        commit(
+            &c,
+            vec![data("a.parquet"), data("b.parquet")],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+        commit(&c, vec![], vec![first.clone(), of_b.clone()], vec![])
+            .await
+            .unwrap();
+        let second = dv("p2.puffin", 4, "a.parquet");
+        commit(
+            &c,
+            vec![data("c.parquet")],
+            vec![second.clone()],
+            vec![&first],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            live_vectors(&c).await,
+            vec![
+                (data("a.parquet").path, second.key()),
+                (data("b.parquet").path, of_b.key()),
+            ]
+        );
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        let last = snaps.last().unwrap();
+        assert_eq!(last.removed_deletion_vectors, vec![first.key()]);
+        assert!(last.removed_paths.is_empty(), "{:?}", last.removed_paths);
+        let read = &snaps[1].deletion_vectors[0];
+        assert_eq!(
+            read,
+            &DeletionVector {
+                sequence_number: None,
+                ..first.clone()
+            }
+        );
+
+        // Without replacing, or replacing one gone, or naming a file gone.
+        conflict(commit(&c, vec![], vec![dv("p3.puffin", 4, "a.parquet")], vec![]).await);
+        conflict(
+            commit(
+                &c,
+                vec![],
+                vec![dv("p3.puffin", 4, "a.parquet")],
+                vec![&first],
+            )
+            .await,
+        );
+        conflict(commit(&c, vec![], vec![dv("p3.puffin", 4, "gone.parquet")], vec![]).await);
+        // Nor in a commit of several snapshots.
+        let err = c
+            .commit_snapshots(
+                vec![
+                    PreparedCommit {
+                        data_files: vec![data("d.parquet")],
+                        ..PreparedCommit::empty(ident())
+                    },
+                    PreparedCommit {
+                        deletion_vectors: vec![dv("p3.puffin", 4, "d.parquet")],
+                        ..PreparedCommit::empty(ident())
+                    },
+                ],
+                None,
+                BTreeSet::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, IcebergError::Other(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_compaction_takes_its_inputs_vectors_with_them() {
+        let c = v3().await;
+        let first = dv("p1.puffin", 4, "a.parquet");
+        commit(&c, vec![data("a.parquet")], vec![first.clone()], vec![])
+            .await
+            .unwrap();
+        let pass = |removed: Vec<DeletionVectorKey>, carried: Vec<DeletionVector>| {
+            crate::PreparedCompaction {
+                ident: ident(),
+                added_data_files: vec![data("out.parquet")],
+                removed_paths: vec![data("a.parquet").path],
+                data_sequence_number: Some(1),
+                stores_row_lineage: true,
+                removed_deletion_vectors: removed,
+                deletion_vectors: carried,
+            }
+        };
+        conflict(c.commit_compaction(pass(vec![], vec![])).await);
+        // A vector landed after the pass read the table: carried over.
+        let second = dv("p2.puffin", 4, "a.parquet");
+        commit(&c, vec![], vec![second.clone()], vec![&first])
+            .await
+            .unwrap();
+        conflict(c.commit_compaction(pass(vec![first.key()], vec![])).await);
+        let carried = dv("p3.puffin", 4, "out.parquet");
+        c.commit_compaction(pass(vec![second.key()], vec![carried.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            live_vectors(&c).await,
+            vec![(data("out.parquet").path, carried.key())]
+        );
+        let snaps = c.snapshots(&ident()).await.unwrap();
+        assert_eq!(
+            snaps.last().unwrap().removed_paths,
+            vec![data("a.parquet").path]
+        );
+    }
+
+    /// A commit prepared for a v2 table holds equality deletes; the table
+    /// upgraded to v3 meanwhile takes deletion vectors instead.
+    #[tokio::test]
+    async fn equality_deletes_prepared_before_an_upgrade_conflict() {
+        let c = fresh().await;
+        c.ensure_namespace(&ident().namespace).await.unwrap();
+        c.create_table(&schema()).await.unwrap();
+        let deletes = PreparedCommit {
+            equality_deletes: vec![DataFile {
+                equality_field_ids: vec![1],
+                ..data("deletes.parquet")
+            }],
+            ..PreparedCommit::empty(ident())
+        };
+        c.commit_snapshot(deletes.clone()).await.unwrap();
+        let it = to_iceberg_table_ident(&ident()).unwrap();
+        let table = c.inner.load_table(&it).await.unwrap();
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .upgrade_table_version()
+            .set_format_version(FormatVersion::V3)
+            .apply(tx)
+            .unwrap();
+        tx.commit(c.inner.as_ref()).await.unwrap();
+        let err = c
+            .commit_snapshot(PreparedCommit {
+                equality_deletes: vec![DataFile {
+                    equality_field_ids: vec![1],
+                    ..data("deletes-2.parquet")
+                }],
+                ..PreparedCommit::empty(ident())
+            })
+            .await
+            .unwrap_err();
+        match err {
+            IcebergError::Conflict(msg) => {
+                assert!(
+                    msg.contains(crate::EQUALITY_DELETES_ON_V3_CONFLICT),
+                    "{msg}"
+                )
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

@@ -40,7 +40,7 @@ One row per materialization, per table. Partitioned by `day(ts)`.
 | `bytes` | `bigint` | Bytes flushed |
 | `duration_ms` | `bigint` | Commit duration |
 | `data_files` | `int` | Data files written |
-| `delete_files` | `int` | Equality delete files written |
+| `delete_files` | `int` | Delete files written: equality delete files, or on a v3 table deletion vectors (one per data file) |
 | `max_source_ts` | `timestamptz` | Latest source-side event timestamp |
 | `schema_id` | `int` | Iceberg schema ID at commit time |
 | `tx_count` | `int` | Distinct PostgreSQL transaction IDs (logical mode) |

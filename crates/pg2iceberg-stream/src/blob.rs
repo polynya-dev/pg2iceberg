@@ -39,6 +39,20 @@ pub trait BlobStore: Send + Sync {
     /// `path` may be a full URI or an object key; see [`object_key`].
     async fn put(&self, path: &str, bytes: Bytes) -> Result<()>;
     async fn get(&self, path: &str) -> Result<Bytes>;
+    /// Bytes `range` of the blob at `path`: a deletion vector, one blob
+    /// of the Puffin file holding it. Object stores read just those; the
+    /// default reads the whole blob.
+    async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let bytes = self.get(path).await?;
+        let (start, end) = (range.start as usize, range.end as usize);
+        if start > end || end > bytes.len() {
+            return Err(crate::StreamError::Io(format!(
+                "get_range {path:?}: {range:?} of {} bytes",
+                bytes.len()
+            )));
+        }
+        Ok(bytes.slice(start..end))
+    }
     /// Enumerate every blob whose object key starts with `prefix`'s.
     /// Returns info for each (path, size, last-modified-ms), where
     /// `path` is the object key — not the form it was written in, so

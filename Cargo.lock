@@ -2461,7 +2461,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.11.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#fae9f8fe687d85f38ada75426313902efc53d19e"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#2638583a5eae3ff57218a280d042be41a769f1ee"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2520,7 +2520,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.11.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#fae9f8fe687d85f38ada75426313902efc53d19e"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#2638583a5eae3ff57218a280d042be41a769f1ee"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2544,7 +2544,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.11.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#fae9f8fe687d85f38ada75426313902efc53d19e"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#2638583a5eae3ff57218a280d042be41a769f1ee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2554,7 +2554,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.11.0"
-source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#fae9f8fe687d85f38ada75426313902efc53d19e"
+source = "git+https://github.com/polynya-dev/iceberg-rust?branch=polynya-patches-v0.11.0#2638583a5eae3ff57218a280d042be41a769f1ee"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3745,6 +3745,7 @@ dependencies = [
  "arrow-select 54.3.1",
  "async-trait",
  "bytes",
+ "crc32fast",
  "futures",
  "iceberg",
  "object_store",
@@ -3752,6 +3753,7 @@ dependencies = [
  "pg2iceberg-core",
  "pg2iceberg-stream",
  "pollster",
+ "roaring",
  "serde",
  "serde_json",
  "thiserror",
