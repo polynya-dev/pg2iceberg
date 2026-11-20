@@ -5,7 +5,8 @@
 //! files at snapshots strictly less than `N`. Data and deletes from the same
 //! commit (the materializer always writes them together for an Update) stay
 //! mutually consistent: the new data row is visible, the prior data row is
-//! invalidated.
+//! invalidated. A deletion vector deletes the rows at its positions of its
+//! data file, of a sequence number no higher than its own.
 //!
 //! This is the read path used by the `verify` subcommand and the
 //! materializer's end-to-end correctness tests.
@@ -93,6 +94,7 @@ pub async fn read_materialized_state(
         }
     }
 
+    let vectors = crate::live_deletion_vectors(&snapshots);
     let mut visible: Vec<Row> = Vec::new();
     for snap in &snapshots {
         for df in &snap.data_files {
@@ -104,7 +106,16 @@ pub async fn read_materialized_state(
             let bytes = blob_store.get(&df.path).await?;
             let rows = read_data_file(&bytes, &schema.columns)?;
             let seq = df.sequence_number_in(snap);
-            for row in rows {
+            let dead = match vectors.get(df.path.as_str()) {
+                Some((dv, dv_seq)) if *dv_seq >= seq => {
+                    crate::deletion_vector::read_deletion_vector(blob_store, dv).await?
+                }
+                _ => crate::deletion_vector::Positions::new(),
+            };
+            for (position, row) in rows.into_iter().enumerate() {
+                if dead.contains(position as u64) {
+                    continue;
+                }
                 let key = pk_key(&row, pk_cols);
                 let deleted_later = deletes
                     .iter()
@@ -326,6 +337,8 @@ mod tests {
                 timestamp_ms: snap_id * 1000,
                 expired: false,
                 log_range: None,
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             });
     }
 

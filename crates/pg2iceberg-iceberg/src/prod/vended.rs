@@ -571,6 +571,15 @@ impl BlobStore for VendedBlobStoreRouter {
         Ok(bytes)
     }
 
+    async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> StreamResult<Bytes> {
+        let store = self.store_for(path).await?;
+        let p = parse_path(path)?;
+        store
+            .get_range(&p, range.start as usize..range.end as usize)
+            .await
+            .map_err(|e| StreamError::Io(format!("vended get_range {path:?}: {e}")))
+    }
+
     async fn list(&self, prefix: &str) -> StreamResult<Vec<BlobInfo>> {
         let store = self.store_for(prefix).await?;
         let prefix_path = if prefix.is_empty() {
@@ -715,6 +724,7 @@ mod tests {
             location: location.into(),
             log_ends: BTreeMap::new(),
             properties: BTreeMap::new(),
+            format_version: Default::default(),
         }
     }
 

@@ -9,6 +9,7 @@
 //! create_table              → iceberg::Catalog::create_table                   ✅ wired
 //! commit_snapshot (append)  → iceberg::transaction::Transaction::fast_append   ✅ wired
 //! commit_snapshot (deletes) → fork-patched FastAppendAction routes by type     ✅ wired (via fork)
+//! commit_snapshot (v3 DVs)  → fork's Transaction::row_delta                   ✅ wired (via fork)
 //! evolve_schema             → iceberg::transaction::Transaction::replace_schema ✅ wired (via fork)
 //! commit_compaction         → fork's Transaction::rewrite_files                ✅ wired (via fork)
 //! snapshots                 → table.metadata().snapshots() + manifest walk     ✅ wired
@@ -20,8 +21,8 @@
 //! ## We're on a patched fork of iceberg-rust
 //!
 //! The workspace `Cargo.toml` pins `iceberg` to
-//! `polynya-dev/iceberg-rust` (branch `polynya-patches-v0.10.1`), based on
-//! upstream `v0.10.1`. The fork's patches:
+//! `polynya-dev/iceberg-rust` (branch `polynya-patches-v0.11.0`), based on
+//! upstream `v0.11.0`. The fork's patches:
 //!
 //! 1. **`TransactionAction` visibility.** The trait (and
 //!    `BoxedTransactionAction`) flipped from `pub(crate)` to `pub`. Lets
@@ -40,10 +41,15 @@
 //! 4. **`RewriteFilesAction`** for compaction: one `Replace` snapshot that
 //!    removes files by path and adds outputs at an explicit data sequence
 //!    number, fails if a removed file is already gone, and keeps the
-//!    summary's running totals.
-//! 5. **`Table::properties()`**: the REST `loadTable` response's `config`
+//!    summary's running totals. It removes its inputs' deletion vectors,
+//!    and fails if one landed since it read them.
+//! 5. **`RowDeltaAction`**: adds data files and deletion vectors and
+//!    removes the vectors they replace, in one snapshot. Fails if a
+//!    removed vector is gone, or an added one names a data file that is
+//!    gone or has another vector.
+//! 6. **`Table::properties()`**: the REST `loadTable` response's `config`
 //!    (vended credentials).
-//! 6. **SigV4 request signing** for the REST catalog.
+//! 7. **SigV4 request signing** for the REST catalog.
 //!
 //! All are intended to be upstreamed as separate PRs; once they
 //! land we drop the fork and pin to a fresh crates.io release.
@@ -81,12 +87,11 @@
 //! match either no rows or every row depending on reader and silently
 //! corrupt the table either way.
 //!
-//! Position deletes: not used yet. Our `TableWriter` only emits equality
-//! deletes today. RisingWave's `DeltaWriter` shows the optimization path
-//! (in-batch self-cancellation via position deletes), but it's a separate
-//! optimization — read-side correctness already works with equality
-//! deletes only. Revisit if profiling shows in-batch insert/delete churn
-//! is hot.
+//! That's format v2. A v3 table gets deletion vectors instead, never new
+//! equality deletes: the materializer finds each deleted row's file and
+//! position, writes the unit's vectors to one Puffin file, and commits
+//! them with its data files through the fork's `RowDeltaAction`, which
+//! removes the vectors they replace.
 //!
 //! ## Snapshot ID semantics
 //!
@@ -128,7 +133,5 @@
 //!    real BlobStore + catalog interop, not just per-method translation).
 //! 2. Wire `IcebergRustCatalog` into the binary, replacing the sim
 //!    catalog as the default at runtime.
-//! 3. (Optional optimization) Adopt RisingWave-style position deletes
-//!    for in-batch self-cancellation. Equality deletes alone are correct.
 
 #![allow(clippy::doc_markdown)]

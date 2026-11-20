@@ -9,6 +9,7 @@ pub mod blob;
 pub mod catalog;
 pub mod clock;
 pub mod coord;
+pub mod deletion_vector;
 pub mod fault;
 pub mod id;
 pub mod oracle;

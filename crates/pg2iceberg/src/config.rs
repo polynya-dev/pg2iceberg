@@ -1665,7 +1665,7 @@ sink:
         assert_eq!(cfg.sink.flush_rows, 10_000);
         assert_eq!(cfg.sink.materializer_batch_rows, 50_000);
         assert_eq!(cfg.sink.materializer_concurrency, 4);
-        assert_eq!(cfg.sink.pk_index_memory, 512 << 20);
+        assert_eq!(cfg.sink.pk_index_memory, 576 << 20);
         assert_eq!(cfg.source.logical.snapshot_concurrency, 4);
         assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
         assert_eq!(cfg.state.group, "default");

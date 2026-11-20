@@ -134,9 +134,10 @@ pub async fn cleanup_orphans(
 }
 
 /// Compute the object keys (see [`object_key`]) of every file still
-/// referenced by *any* live snapshot's data or delete files. A file is
-/// unreferenced iff it appears in some snapshot's `removed_paths`
-/// (compaction-replaced) or no snapshot ever wrote it.
+/// referenced by *any* live snapshot's data or delete files — and the
+/// Puffin files of its live deletion vectors. A file is unreferenced iff
+/// it appears in some snapshot's `removed_paths` (compaction-replaced), or
+/// every vector in it is removed, or no snapshot ever wrote it.
 ///
 /// We don't include manifest-list / manifest / metadata.json paths —
 /// those live in iceberg's metadata directory under the table location,
@@ -161,6 +162,9 @@ fn referenced_paths(snapshots: &[Snapshot]) -> BTreeSet<String> {
             }
             out.insert(object_key(&df.path).to_string());
         }
+    }
+    for (dv, _) in crate::live_deletion_vectors(snapshots).values() {
+        out.insert(object_key(&dv.path).to_string());
     }
     out
 }
@@ -189,6 +193,8 @@ mod tests {
             timestamp_ms: id * 1000,
             expired: false,
             log_range: None,
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         }
     }
 

@@ -59,7 +59,7 @@ Limitations. The catalog has no history, and pgoutput reports a schema change on
 - **`reason="column_gone"`, the column dropped or renamed before pg2iceberg reads the value:** the drop clears it. The rows keep NULL under the dropped column's name.
 - **False warnings:** a default set after the column was added (`ALTER COLUMN … SET DEFAULT`) also counts as `not_stored`, but there the rows really are NULL in PostgreSQL too. A column added without a default and dropped before pg2iceberg read it counts as `column_gone`.
 - **Workaround:** while the column exists, touching the rows in PostgreSQL (`UPDATE t SET c = c`) writes their values to the WAL and brings them over.
-- **Cost:** a fill rewrites every row of the table, as equality deletes plus new data files, so on a large table it is one large commit. Compaction folds it back down.
+- **Cost:** a fill rewrites every row of the table, as deletes (equality deletes, or deletion vectors on v3) plus new data files, so on a large table it is one large commit. Compaction folds it back down.
 
 ## Type changes
 

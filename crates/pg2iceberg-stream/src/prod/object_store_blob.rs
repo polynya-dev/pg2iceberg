@@ -72,6 +72,14 @@ impl BlobStore for ObjectStoreBlobStore {
         Ok(bytes)
     }
 
+    async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let p = parse_path(path)?;
+        self.inner
+            .get_range(&p, range.start as usize..range.end as usize)
+            .await
+            .map_err(|e| StreamError::Io(format!("object_store get_range {path:?}: {e}")))
+    }
+
     async fn list(&self, prefix: &str) -> Result<Vec<BlobInfo>> {
         let prefix_path = if prefix.is_empty() {
             None

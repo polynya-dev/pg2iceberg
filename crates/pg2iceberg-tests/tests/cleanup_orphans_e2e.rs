@@ -122,6 +122,8 @@ impl Harness {
                 first_row_id: None,
             }],
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         }))
         .unwrap();
         path
@@ -329,6 +331,8 @@ fn compaction_replaced_files_become_orphans() {
         removed_paths: vec![p1.clone(), p2.clone(), p3.clone()],
         data_sequence_number: None,
         stores_row_lineage: false,
+        removed_deletion_vectors: Vec::new(),
+        deletion_vectors: Vec::new(),
     }))
     .unwrap();
 
@@ -451,6 +455,8 @@ fn cleanup_keeps_other_tables_files() {
                 first_row_id: None,
             }],
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         }))
         .unwrap();
     }

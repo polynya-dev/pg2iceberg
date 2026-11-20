@@ -160,6 +160,8 @@ fn table_with_history(
                 ident: ident(),
                 data_files,
                 equality_deletes,
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             }))
             .unwrap();
         }

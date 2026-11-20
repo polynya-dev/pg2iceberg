@@ -169,6 +169,8 @@ impl Harness {
             ident: schema.ident.clone(),
             data_files: data_files.clone(),
             equality_deletes: delete_files,
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         }))
         .unwrap();
         data_files
@@ -226,6 +228,44 @@ fn insert(h: &Harness, s: &TableSchema, row: Row) {
             unchanged_from: None,
         }],
     );
+}
+
+/// Delete the rows at `positions` of `file`, a data file of a v3 table:
+/// a deletion vector, replacing the one it has, if any.
+fn delete_at(h: &Harness, s: &TableSchema, file: &DataFile, positions: &[u64]) {
+    use pg2iceberg_iceberg::deletion_vector::{read_deletion_vector, Positions, PuffinWriter};
+    let history = h.cat.history(&s.ident);
+    let old = pg2iceberg_iceberg::live_deletion_vectors(&history)
+        .get(file.path.as_str())
+        .map(|(dv, _)| (*dv).clone());
+    let mut deleted: Positions = positions.iter().copied().collect();
+    if let Some(old) = &old {
+        deleted.union_with(&block_on(read_deletion_vector(h.blob.as_ref(), old)).unwrap());
+    }
+    let mut puffin = PuffinWriter::new();
+    let (offset, length) = puffin.add(&file.path, &deleted);
+    let bytes = puffin.finish();
+    let path = format!(
+        "test/dv-{}.puffin",
+        h.counter.fetch_add(1, Ordering::SeqCst)
+    );
+    let byte_size = bytes.len() as u64;
+    block_on(h.blob.put(&path, bytes)).unwrap();
+    block_on(h.cat.commit_snapshot(PreparedCommit {
+        deletion_vectors: vec![pg2iceberg_iceberg::DeletionVector {
+            path,
+            byte_size,
+            offset,
+            length,
+            referenced_data_file: file.path.clone(),
+            cardinality: deleted.len(),
+            partition_values: file.partition_values.clone(),
+            sequence_number: None,
+        }],
+        removed_deletion_vectors: old.iter().map(|dv| dv.key()).collect(),
+        ..PreparedCommit::empty(s.ident.clone())
+    }))
+    .unwrap();
 }
 
 fn delete(h: &Harness, s: &TableSchema, row: Row) {
@@ -1159,7 +1199,8 @@ fn compaction_keeps_row_lineage_across_record_batches() {
             .collect(),
     );
     assert_eq!(files.len(), 1, "one input file");
-    delete(&h, &s, pk_only(1));
+    // PK 1's row: the file's first. A v3 table's delete is a vector.
+    delete_at(&h, &s, &files[0], &[0]);
     let before = lineage(&h, &s);
     let cfg = CompactionConfig {
         data_file_threshold: 1,
@@ -1172,4 +1213,164 @@ fn compaction_keeps_row_lineage_across_record_batches() {
     let after = lineage(&h, &s);
     assert_eq!(after.len(), n as usize - 1);
     assert_eq!(before, after);
+}
+
+/// A pass over a v3 table drops the rows its inputs' deletion vectors
+/// delete, and removes the vectors with their files.
+#[test]
+fn compaction_applies_and_removes_its_inputs_deletion_vectors() {
+    let h = Harness {
+        cat: MemoryCatalog::new().with_format_version(pg2iceberg_iceberg::FormatVersion::V3),
+        ..Harness::new()
+    };
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    let rows = |ids: std::ops::RangeInclusive<i32>| {
+        ids.map(|i| MaterializedRow {
+            op: Op::Insert,
+            row: row_id_qty(i, i),
+            unchanged_cols: vec![],
+            unchanged_from: None,
+        })
+        .collect()
+    };
+    let a = h.commit(&s, rows(1..=10)).remove(0);
+    let b = h.commit(&s, rows(11..=20)).remove(0);
+    delete_at(&h, &s, &a, &[0, 3]);
+    delete_at(&h, &s, &a, &[9]);
+    delete_at(&h, &s, &b, &[5]);
+    let before = block_on(read_materialized_state(
+        &h.cat,
+        h.blob.as_ref(),
+        &s.ident,
+        &s,
+        &pk_cols(),
+    ))
+    .unwrap();
+    assert_eq!(before.len(), 16);
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    let out = h.run_compaction(&s, &cfg).expect("compaction should run");
+    assert_eq!(out.input_data_files, 2);
+    assert_eq!(out.rows_removed_by_deletes, 4);
+    let snaps = block_on(h.cat.snapshots(&s.ident)).unwrap();
+    assert!(pg2iceberg_iceberg::live_deletion_vectors(&snaps).is_empty());
+    let mut after = block_on(read_materialized_state(
+        &h.cat,
+        h.blob.as_ref(),
+        &s.ident,
+        &s,
+        &pk_cols(),
+    ))
+    .unwrap();
+    let mut before = before;
+    let id = |r: &Row| format!("{:?}", r.get(&ColumnName("id".into())));
+    before.sort_by_key(id);
+    after.sort_by_key(id);
+    assert_eq!(before, after);
+    // Nothing left to drop: no pass is due.
+    assert!(h
+        .run_compaction(
+            &s,
+            &CompactionConfig {
+                data_file_threshold: 8,
+                ..cfg
+            }
+        )
+        .is_none());
+}
+
+/// Rows `ids`, inserted.
+fn inserts(ids: std::ops::RangeInclusive<i32>) -> Vec<MaterializedRow> {
+    ids.map(|i| MaterializedRow {
+        op: Op::Insert,
+        row: row_id_qty(i, i),
+        unchanged_cols: vec![],
+        unchanged_from: None,
+    })
+    .collect()
+}
+
+fn v3_harness() -> Harness {
+    Harness {
+        cat: MemoryCatalog::new().with_format_version(pg2iceberg_iceberg::FormatVersion::V3),
+        ..Harness::new()
+    }
+}
+
+/// Rows deleting through vectors make the files holding them worth a
+/// pass, as equality deletes do: past `delete_ratio` of their rows.
+#[test]
+fn rows_deletion_vectors_delete_make_a_pass_due() {
+    let h = v3_harness();
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    let a = h.commit(&s, inserts(1..=10)).remove(0);
+    h.commit(&s, inserts(11..=20));
+    let cfg = CompactionConfig {
+        // No small files to merge: only the deletes can make it due.
+        data_file_threshold: 8,
+        delete_file_threshold: 32,
+        delete_ratio: 0.2,
+        target_size_bytes: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
+    delete_at(&h, &s, &a, &[1]);
+    assert!(h.run_compaction(&s, &cfg).is_none(), "one row in ten");
+    delete_at(&h, &s, &a, &[4, 6]);
+    let out = h.run_compaction(&s, &cfg).expect("three rows in ten");
+    // With the small files it can merge in.
+    assert!(out.rewritten_files.contains(&a.path), "{out:?}");
+    assert_eq!(out.rows_removed_by_deletes, 3);
+    let snaps = block_on(h.cat.snapshots(&s.ident)).unwrap();
+    assert!(pg2iceberg_iceberg::live_deletion_vectors(&snaps).is_empty());
+}
+
+/// An index catching up with commits it didn't make learns the rows
+/// another process's vectors deleted — as a rebuild finds them.
+#[test]
+fn an_index_catching_up_learns_another_processs_deletion_vectors() {
+    let h = v3_harness();
+    let s = schema_id_qty();
+    ensure_table(&h, &s);
+    let a = h.commit(&s, inserts(1..=10)).remove(0);
+    let mut index = h.file_index(&s);
+    let at = block_on(h.cat.load_table(&s.ident))
+        .unwrap()
+        .unwrap()
+        .current_snapshot_id;
+    let catch_up = |index: &mut FileIndex, at: Option<i64>| {
+        block_on(pg2iceberg_iceberg::catch_up_from_catalog(
+            index,
+            at,
+            &h.cat,
+            h.blob.as_ref(),
+            &s.ident,
+            &s,
+            &pk_cols(),
+        ))
+        .unwrap()
+    };
+    // Another process's: rows 3 and 5 (positions 2 and 4).
+    delete_at(&h, &s, &a, &[2, 4]);
+    let at = catch_up(&mut index, at);
+    assert_eq!(index, h.file_index(&s));
+    // Then 8 too: a vector replacing the one the index learned.
+    delete_at(&h, &s, &a, &[7]);
+    h.commit(&s, inserts(11..=12));
+    catch_up(&mut index, at);
+    assert_eq!(index, h.file_index(&s));
+    let key = |id: i32| pg2iceberg_iceberg::PkKey::from_row(&pk_only(id), &pk_cols());
+    for id in [3, 5, 8] {
+        assert_eq!(index.lookup(&key(id)), None, "{id} deleted");
+    }
+    assert_eq!(index.locate(&key(4)), Some((a.path.as_str(), 3)));
+    assert_eq!(index.live_rows_per_file()[a.path.as_str()], 7);
+    assert_eq!(
+        index.deletion_vector(&a.path).map(|dv| dv.cardinality),
+        Some(3)
+    );
 }

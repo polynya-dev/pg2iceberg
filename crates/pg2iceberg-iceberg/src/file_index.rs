@@ -33,8 +33,16 @@
 //!
 //! On materializer restart, the index is rebuilt from the catalog's
 //! snapshot history — see [`rebuild_from_catalog`].
+//!
+//! ## Positions
+//!
+//! A key maps to its row's file and position there: a v3 table's delete
+//! is a deletion vector, of positions. The index also holds each file's
+//! live deletion vector, which a commit deleting more of its rows
+//! replaces.
 
 use crate::pk::PkKey;
+use crate::DeletionVector;
 use pg2iceberg_core::PartitionLiteral;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -43,6 +51,24 @@ use std::hash::{Hash, Hasher};
 
 /// A data file's slot in [`FileIndex::files`].
 type FileId = u32;
+
+/// Where a key's row is: its file, and its position there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Row {
+    file: FileId,
+    position: u32,
+}
+
+/// A row's position as the index holds it.
+fn position(n: u64) -> u32 {
+    position_of(n)
+}
+
+/// A row's position in a data file, as a `u32`: a data file holds under
+/// 2^32 rows.
+pub(crate) fn position_of(n: u64) -> u32 {
+    u32::try_from(n).expect("a data file holds under 2^32 rows")
+}
 
 /// A key as the map holds it: its encoding, exactly, when that's under 16
 /// bytes — an integer, or a few — else a 120-bit hash of it, which two
@@ -230,18 +256,21 @@ impl KeyFilter {
     }
 }
 
-/// Bytes a key takes in [`FileIndex::keys`]: its [`Slot`], its file and
-/// the map's control byte.
-const KEY_BYTES: usize = 16 + 4 + 1;
+/// Bytes a key takes in [`FileIndex::keys`]: its [`Slot`], its file, its
+/// position and the map's control byte.
+const KEY_BYTES: usize = 16 + 4 + 4 + 1;
 
 /// Live PK → data file map. One entry per live row, up to its budget,
-/// so it is kept compact: a 16-byte [`Slot`] plus a 4-byte file number,
-/// with each file's path stored once.
+/// so it is kept compact: a 16-byte [`Slot`] plus a 4-byte file number
+/// and a 4-byte position, with each file's path stored once.
 #[derive(Clone)]
 pub struct FileIndex {
-    /// PK → the file holding its current row: every live key of the files
-    /// not evicted, and the keys added to evicted ones since.
-    keys: HashMap<Slot, FileId>,
+    /// PK → the file holding its current row, and the row's position
+    /// there: every live key of the files not evicted, and the keys added
+    /// to evicted ones since.
+    keys: HashMap<Slot, Row>,
+    /// Each indexed file's live deletion vector, if it has one.
+    vectors: HashMap<String, DeletionVector>,
     /// Data files holding at least one live row; `None` slots are free.
     files: Vec<Option<IndexedFile>>,
     free: Vec<FileId>,
@@ -313,6 +342,7 @@ impl Default for FileIndex {
     fn default() -> Self {
         Self {
             keys: HashMap::new(),
+            vectors: HashMap::new(),
             files: Vec::new(),
             free: Vec::new(),
             ids: HashMap::new(),
@@ -339,6 +369,11 @@ impl FileIndex {
         let mut index = Self::default();
         index.set_memory(bytes);
         index
+    }
+
+    /// The most keys it holds before evicting the oldest files'.
+    pub fn key_capacity(&self) -> usize {
+        self.max_keys
     }
 
     /// An empty index of the same budget.
@@ -371,27 +406,33 @@ impl FileIndex {
     /// PK→file mapping (the new file is now authoritative for these PKs).
     /// `partition_values` is the data file's partition tuple (empty for
     /// unpartitioned tables).
+    /// Its keys are its rows', in order: each at its position.
     pub fn add_file(
         &mut self,
         path: String,
         pk_keys: impl IntoIterator<Item = PkKey>,
         partition_values: Vec<PartitionLiteral>,
     ) {
-        self.add_file_at(path, pk_keys, partition_values, None);
+        let rows = pk_keys
+            .into_iter()
+            .enumerate()
+            .map(|(i, pk)| (pk, position(i as u64)));
+        self.add_file_at(path, rows, partition_values, None);
     }
 
-    /// [`Self::add_file`], standing among the files at `generation` (see
+    /// [`Self::add_file`], of some of its rows, each a key and its
+    /// position, standing among the files at `generation` (see
     /// [`IndexedFile::generation`]) if it's new.
     pub fn add_file_at(
         &mut self,
         path: String,
-        pk_keys: impl IntoIterator<Item = PkKey>,
+        rows: impl IntoIterator<Item = (PkKey, u32)>,
         partition_values: Vec<PartitionLiteral>,
         generation: Option<u64>,
     ) {
         let id = self.file_id(path, partition_values, generation);
         let mut range: Option<(PkKey, PkKey)> = None;
-        for pk in pk_keys {
+        for (pk, position) in rows {
             let slot = Slot::of(&pk);
             self.hashed |= slot.0[0] == HASHED;
             match &mut range {
@@ -415,13 +456,13 @@ impl FileIndex {
                 }
                 self.evict();
             }
-            match self.keys.insert(slot, id) {
-                Some(prev) if prev == id => {}
+            match self.keys.insert(slot, Row { file: id, position }) {
+                Some(prev) if prev.file == id => {}
                 Some(prev) => {
                     let file = self.file_mut(id);
                     file.live += 1;
                     file.mapped += 1;
-                    self.release(prev);
+                    self.release(prev.file);
                 }
                 None => {
                     let file = self.file_mut(id);
@@ -455,12 +496,14 @@ impl FileIndex {
     pub fn absorb(&mut self, other: FileIndex) {
         let FileIndex {
             keys,
+            vectors,
             files,
             evicted_keys,
             added,
             hashed,
             ..
         } = other;
+        self.vectors.extend(vectors);
         let mut ids: Vec<Option<FileId>> = vec![None; files.len()];
         for (old, file) in files.into_iter().enumerate() {
             let Some(mut file) = file else { continue };
@@ -481,13 +524,17 @@ impl FileIndex {
         filter.layers.extend(evicted_keys.layers);
         filter.full |= filter.bytes >= filter.max_bytes;
         for (slot, old) in keys {
-            let id = ids[old as usize].expect("a key's file is in its index");
+            let id = ids[old.file as usize].expect("a key's file is in its index");
             if self.keys.len() >= self.max_keys && !self.keys.contains_key(&slot) {
                 self.evict();
             }
-            if let Some(prev) = self.keys.insert(slot, id) {
+            let row = Row {
+                file: id,
+                position: old.position,
+            };
+            if let Some(prev) = self.keys.insert(slot, row) {
                 // Of no file of this index: the ranges are apart.
-                debug_assert_eq!(prev, id, "a key in both indexes");
+                debug_assert_eq!(prev, row, "a key in both indexes");
             }
             self.file_mut(id).mapped += 1;
         }
@@ -557,9 +604,35 @@ impl FileIndex {
     /// A key it doesn't may still be in an evicted file
     /// ([`Self::candidates`]).
     pub fn lookup(&self, pk_key: &PkKey) -> Option<&str> {
+        self.locate(pk_key).map(|(path, _)| path)
+    }
+
+    /// [`Self::lookup`], with the row's position in the file.
+    pub fn locate(&self, pk_key: &PkKey) -> Option<(&str, u32)> {
         self.keys
             .get(&Slot::of(pk_key))
-            .map(|&id| self.file(id).path.as_str())
+            .map(|row| (self.file(row.file).path.as_str(), row.position))
+    }
+
+    /// `path`'s live deletion vector, if the index holds the file and it
+    /// has one.
+    pub fn deletion_vector(&self, path: &str) -> Option<&DeletionVector> {
+        self.vectors.get(path)
+    }
+
+    /// `dv` is its data file's live deletion vector now — if the index
+    /// holds the file: one it doesn't has no rows left to delete.
+    pub fn set_deletion_vector(&mut self, dv: DeletionVector) {
+        if self.ids.contains_key(&dv.referenced_data_file) {
+            self.vectors.insert(dv.referenced_data_file.clone(), dv);
+        }
+    }
+
+    /// The partition tuple of `path`, if the index holds it.
+    pub fn partition_values(&self, path: &str) -> Option<&[PartitionLiteral]> {
+        self.ids
+            .get(path)
+            .map(|&id| self.file(id).partition_values.as_slice())
     }
 
     /// Whether the table may hold `pk_key`: never wrongly not. Exact while
@@ -603,7 +676,7 @@ impl FileIndex {
     pub fn partitions_for_pk(&self, pk_key: &PkKey) -> Vec<&[PartitionLiteral]> {
         let slot = Slot::of(pk_key);
         let ids = match self.keys.get(&slot) {
-            Some(&id) => vec![id],
+            Some(row) => vec![row.file],
             None => self.evicted_holding(&slot, pk_key, None),
         };
         let mut out: Vec<&[PartitionLiteral]> = Vec::new();
@@ -639,7 +712,7 @@ impl FileIndex {
             return;
         };
         if self.file(id).mapped > 0 {
-            self.keys.retain(|_, f| *f != id);
+            self.keys.retain(|_, row| row.file != id);
         }
         self.drop_file(id);
     }
@@ -650,7 +723,7 @@ impl FileIndex {
         for pk in pk_keys {
             let slot = Slot::of(pk);
             match self.keys.remove(&slot) {
-                Some(id) => self.release(id),
+                Some(row) => self.release(row.file),
                 None => self.lose_unseen(&slot, pk, None),
             }
         }
@@ -852,11 +925,11 @@ impl FileIndex {
         // Into a table of its own: removed in place, the keys would leave
         // tombstones, which the inserts after would grow the table past.
         let mut kept = HashMap::with_capacity(self.max_keys);
-        for (slot, id) in std::mem::take(&mut self.keys) {
-            if evicting[id as usize] {
+        for (slot, row) in std::mem::take(&mut self.keys) {
+            if evicting[row.file as usize] {
                 self.evicted_keys.insert(&slot);
             } else {
-                kept.insert(slot, id);
+                kept.insert(slot, row);
             }
         }
         self.keys = kept;
@@ -883,19 +956,25 @@ impl FileIndex {
             if file.evicted {
                 self.evicted -= 1;
             }
+            self.vectors.remove(&file.path);
             self.ids.remove(&file.path);
             self.free.push(id);
         }
     }
 
-    /// PK → path, and path → partition tuple: what the index means,
-    /// independent of file numbering.
+    /// PK → path and position, and path → partition tuple: what the index
+    /// means, independent of file numbering.
     #[allow(clippy::type_complexity)]
-    fn view(&self) -> (BTreeMap<&Slot, &str>, BTreeMap<&str, &[PartitionLiteral]>) {
+    fn view(
+        &self,
+    ) -> (
+        BTreeMap<&Slot, (&str, u32)>,
+        BTreeMap<&str, &[PartitionLiteral]>,
+    ) {
         let pks = self
             .keys
             .iter()
-            .map(|(pk, &id)| (pk, self.file(id).path.as_str()))
+            .map(|(pk, row)| (pk, (self.file(row.file).path.as_str(), row.position)))
             .collect();
         let partitions = self
             .live()
@@ -914,7 +993,7 @@ impl PartialEq for FileIndex {
 impl fmt::Debug for FileIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (pks, partitions) = self.view();
-        let pks: BTreeMap<String, &str> = pks
+        let pks: BTreeMap<String, (&str, u32)> = pks
             .into_iter()
             .map(|(slot, path)| {
                 let key = slot
@@ -943,9 +1022,9 @@ impl fmt::Debug for FileIndex {
 /// data file rows whose PK matches at sequence numbers `< N`. Replaying
 /// the live files in sequence-number order — at each, its deletes, then
 /// its data files — therefore leaves exactly the live PKs, as the
-/// materializer's own updates do. Files are streamed a batch at a time and
-/// only their PK columns decoded, so the rebuild holds little beyond the
-/// index itself.
+/// materializer's own updates do. A data file's rows its deletion vector
+/// holds are dead. Files are streamed a batch at a time and only their PK
+/// columns decoded, so the rebuild holds little beyond the index itself.
 pub async fn rebuild_from_catalog(
     catalog: &dyn pg2iceberg_iceberg_dyn::DynCatalog,
     blob_store: &dyn pg2iceberg_stream::BlobStore,
@@ -964,7 +1043,9 @@ pub async fn rebuild_from_catalog(
 ///
 /// Replays only the snapshots after `at`, while history holds every one
 /// of them. Past an expired one it rebuilds instead: a stand-in lists the
-/// files its snapshot added that are still live, not what it removed.
+/// files its snapshot added that are still live, not what it removed. So
+/// too past one removing a deletion vector the index doesn't know, or
+/// without replacing it or removing its data file: rows undeleted.
 pub async fn catch_up_from_catalog(
     fi: &mut FileIndex,
     at: Option<i64>,
@@ -993,6 +1074,9 @@ pub async fn catch_up_from_catalog(
         .iter()
         .zip(at.unwrap_or(0) + 1..)
         .all(|(s, seq)| s.id == seq && !s.expired);
+    let replayable = snapshots[newer..]
+        .iter()
+        .all(|s| removes_vectors_known(fi, s));
 
     let pk_schema: Vec<pg2iceberg_core::ColumnSchema> = schema
         .columns
@@ -1001,7 +1085,7 @@ pub async fn catch_up_from_catalog(
         .cloned()
         .collect();
 
-    if !(at.is_some() && whole && current >= at) {
+    if !(at.is_some() && whole && replayable && current >= at) {
         // Rebuild from the live files. Files superseded by a Replace
         // snapshot don't contribute — as for the verifier.
         *fi = fi.cleared();
@@ -1009,6 +1093,7 @@ pub async fn catch_up_from_catalog(
             .iter()
             .flat_map(|s| s.removed_paths.iter().map(String::as_str))
             .collect();
+        let vectors = crate::live_deletion_vectors(&snapshots);
         let mut live: Vec<(i64, bool, &crate::DataFile)> = Vec::new();
         for snap in &snapshots {
             let files = (snap.delete_files.iter().map(|f| (false, f)))
@@ -1023,14 +1108,31 @@ pub async fn catch_up_from_catalog(
         // snapshot that added it: deletes since apply to it.
         live.sort_by_key(|(seq, data, _)| (*seq, *data));
         for (_, data, df) in live {
-            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
-                if data {
-                    fi.add_file(df.path.clone(), pks, df.partition_values.clone())
-                } else {
+            if !data {
+                for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |_, pks| {
                     fi.remove_pks(&pks)
-                }
+                })
+                .await?;
+                continue;
+            }
+            let dead = match vectors.get(df.path.as_str()) {
+                Some((dv, _)) => crate::deletion_vector::read_deletion_vector(blob_store, dv)
+                    .await
+                    .map_err(VerifyError::Blob)?,
+                None => crate::deletion_vector::Positions::new(),
+            };
+            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |first, pks| {
+                let rows = pks
+                    .into_iter()
+                    .zip(first..)
+                    .filter(|(_, at)| !dead.contains(*at))
+                    .map(|(pk, at)| (pk, position(at)));
+                fi.add_file_at(df.path.clone(), rows, df.partition_values.clone(), None)
             })
             .await?;
+        }
+        for (dv, _) in vectors.values() {
+            fi.set_deletion_vector((*dv).clone());
         }
         return Ok(current);
     }
@@ -1038,7 +1140,7 @@ pub async fn catch_up_from_catalog(
     // Replay what happened since `at`, in order.
     for snap in &snapshots[newer..] {
         for df in &snap.delete_files {
-            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
+            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |_, pks| {
                 fi.remove_pks(&pks)
             })
             .await?;
@@ -1052,22 +1154,32 @@ pub async fn catch_up_from_catalog(
         let evicted_inputs = inputs.iter().any(|p| fi.is_evicted(p));
         let generation = inputs.iter().filter_map(|p| fi.generation(p)).max();
         for df in &snap.data_files {
-            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |pks| {
+            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |first, pks| {
+                let rows = pks
+                    .into_iter()
+                    .zip(first..)
+                    .map(|(pk, at)| (pk, position(at)));
                 if inputs.is_empty() {
-                    return fi.add_file(df.path.clone(), pks, df.partition_values.clone());
+                    return fi.add_file_at(
+                        df.path.clone(),
+                        rows,
+                        df.partition_values.clone(),
+                        None,
+                    );
                 }
+                let rows: Vec<(PkKey, u32)> = rows.collect();
                 if evicted_inputs {
                     fi.add_unseen(
                         df.path.clone(),
                         0,
-                        pks.iter().cloned(),
+                        rows.iter().map(|(pk, _)| pk.clone()),
                         df.partition_values.clone(),
                         generation,
                     );
                 }
-                let moved: Vec<PkKey> = pks
+                let moved: Vec<(PkKey, u32)> = rows
                     .into_iter()
-                    .filter(|pk| fi.lookup(pk).is_some_and(|p| inputs.contains(p)))
+                    .filter(|(pk, _)| fi.lookup(pk).is_some_and(|p| inputs.contains(p)))
                     .collect();
                 fi.add_file_at(
                     df.path.clone(),
@@ -1081,26 +1193,84 @@ pub async fn catch_up_from_catalog(
         for path in inputs {
             fi.remove_file(path);
         }
+        // A vector deletes, beyond the one it replaces, the rows at its new
+        // positions: their keys die, if the map holds them there — or if
+        // it doesn't hold them at all, of an evicted file. One it holds
+        // elsewhere was written again: its row here died then.
+        for dv in &snap.deletion_vectors {
+            let file = dv.referenced_data_file.as_str();
+            let known = match fi.deletion_vector(file) {
+                Some(old) if old.key() == dv.key() => continue,
+                Some(old) => crate::deletion_vector::read_deletion_vector(blob_store, old)
+                    .await
+                    .map_err(VerifyError::Blob)?,
+                None => crate::deletion_vector::Positions::new(),
+            };
+            let positions = crate::deletion_vector::read_deletion_vector(blob_store, dv)
+                .await
+                .map_err(VerifyError::Blob)?;
+            let new: BTreeSet<u64> = positions.iter().filter(|p| !known.contains(*p)).collect();
+            if !new.is_empty() && fi.generation(file).is_some() {
+                let mut dead: Vec<PkKey> = Vec::new();
+                for_each_pk_batch(blob_store, file, &pk_schema, pk_cols, |first, pks| {
+                    for (pk, at) in pks.into_iter().zip(first..) {
+                        if !new.contains(&at) {
+                            continue;
+                        }
+                        match fi.locate(&pk) {
+                            Some(row) if row != (file, position(at)) => {}
+                            _ => dead.push(pk),
+                        }
+                    }
+                })
+                .await?;
+                fi.remove_pks(&dead);
+            }
+            fi.set_deletion_vector(dv.clone());
+        }
     }
     Ok(current)
 }
 
-/// Calls `f` with the PKs of each batch of rows in the file at `path`.
+/// Whether the index can replay `snap`'s removal of deletion vectors:
+/// each one it removes is one the index knows, replaced in `snap` or gone
+/// with its data file.
+fn removes_vectors_known(fi: &FileIndex, snap: &crate::Snapshot) -> bool {
+    snap.removed_deletion_vectors.iter().all(|key| {
+        fi.vectors.values().any(|dv| {
+            &dv.key() == key
+                && (snap.removed_paths.contains(&dv.referenced_data_file)
+                    || snap
+                        .deletion_vectors
+                        .iter()
+                        .any(|new| new.referenced_data_file == dv.referenced_data_file))
+        })
+    })
+}
+
+/// Calls `f` with each batch of rows in the file at `path`: the position
+/// of its first row, and the rows' PKs.
 async fn for_each_pk_batch(
     blob_store: &dyn pg2iceberg_stream::BlobStore,
     path: &str,
     pk_schema: &[pg2iceberg_core::ColumnSchema],
     pk_cols: &[pg2iceberg_core::ColumnName],
-    mut f: impl FnMut(Vec<PkKey>),
+    mut f: impl FnMut(u64, Vec<PkKey>),
 ) -> std::result::Result<(), crate::verify::VerifyError> {
     use crate::verify::VerifyError;
     let bytes = blob_store.get(path).await.map_err(VerifyError::Blob)?;
     let batches =
         crate::reader::RowBatches::new(bytes, pk_schema, crate::compact::DECODE_BATCH_ROWS)
             .map_err(VerifyError::Decode)?;
+    let mut first = 0;
     for batch in batches {
         let rows = batch.map_err(VerifyError::Decode)?;
-        f(rows.iter().map(|r| PkKey::from_row(r, pk_cols)).collect());
+        let n = rows.len() as u64;
+        f(
+            first,
+            rows.iter().map(|r| PkKey::from_row(r, pk_cols)).collect(),
+        );
+        first += n;
     }
     Ok(())
 }
@@ -1305,10 +1475,10 @@ mod tests {
     }
 
     /// Past its budget, the index holds what the budget does: two
-    /// million keys in about a megabyte, none taken for absent.
+    /// million keys in about two megabytes, none taken for absent.
     #[test]
     fn a_budget_bounds_the_index() {
-        const BUDGET: usize = 1 << 20;
+        const BUDGET: usize = 2 << 20;
         let mut fi = FileIndex::with_memory(BUDGET);
         for f in 0..200 {
             let keys = (0..10_000).map(|i| n(f * 10_000 + i));

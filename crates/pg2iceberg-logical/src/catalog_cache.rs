@@ -365,6 +365,8 @@ mod tests {
                 first_row_id: None,
             }],
             equality_deletes: Vec::new(),
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         }
     }
 
