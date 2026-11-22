@@ -55,11 +55,11 @@ pub async fn run(env: Env<'_>, output: &str, force: bool) -> Result<()> {
 
 async fn inspect(cfg: &Config) -> Result<Inspection> {
     let pg = tables::connect_source(cfg).await?;
-    let tls = match cfg.source.postgres.tls_label() {
+    let tls = match cfg.source.tls_label() {
         "webpki" => TlsMode::Webpki,
         _ => TlsMode::Disable,
     };
-    let conn = connect_with(&cfg.source.postgres.dsn(), tls)
+    let conn = connect_with(&cfg.source.dsn(), tls)
         .await
         .context("connect to the source database")?;
     let client = &conn.client;
@@ -115,7 +115,7 @@ async fn inspect(cfg: &Config) -> Result<Inspection> {
         }),
     });
 
-    let slot = &cfg.source.logical.slot_name;
+    let slot = &cfg.source.slot_name;
     let slot_row = one(format!(
         "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = {}), \
                 current_setting('max_replication_slots')::int \
@@ -137,8 +137,8 @@ async fn inspect(cfg: &Config) -> Result<Inspection> {
         }
     });
 
-    let coord = CoordSchema::sanitize(&cfg.state.coordinator_schema);
-    let state_database = &cfg.state.database;
+    let coord = CoordSchema::sanitize(&cfg.source.state_schema);
+    let state_database = &cfg.source.state_database;
     if state_database.is_empty() || *state_database == database {
         let can_create: bool = one(format!(
             "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = {}) \
@@ -183,7 +183,7 @@ async fn inspect(cfg: &Config) -> Result<Inspection> {
 
     // pg2iceberg creates the publication itself, and adding a table to
     // one takes owning it.
-    let publication = &cfg.source.logical.publication_name;
+    let publication = &cfg.source.publication_name;
     let publication_exists: bool = one(format!(
         "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = {})",
         literal(publication)
@@ -256,18 +256,17 @@ pub fn render(cfg: &Config, env: Env, inspection: &Inspection) -> String {
     line(&mut out, "");
 
     line(&mut out, "source:");
-    line(&mut out, "  postgres_url: ${POSTGRES_URL}");
-    let logical = &cfg.source.logical;
-    let default_logical = crate::config::LogicalConfig::default();
-    if logical.slot_name != default_logical.slot_name
-        || logical.publication_name != default_logical.publication_name
+    line(&mut out, "  url: ${POSTGRES_URL}");
+    let source = &cfg.source;
+    let default_source = crate::config::SourceConfig::default();
+    if source.slot_name != default_source.slot_name
+        || source.publication_name != default_source.publication_name
     {
-        line(&mut out, "  logical:");
-        let _ = writeln!(out, "    slot_name: {}", scalar(&logical.slot_name));
+        let _ = writeln!(out, "  slot_name: {}", scalar(&source.slot_name));
         let _ = writeln!(
             out,
-            "    publication_name: {}",
-            scalar(&logical.publication_name)
+            "  publication_name: {}",
+            scalar(&source.publication_name)
         );
     }
     line(&mut out, "");
@@ -492,7 +491,7 @@ mod tests {
             !yaml.contains("hunter2") && !yaml.contains("t0ken"),
             "{yaml}"
         );
-        assert!(yaml.contains("postgres_url: ${POSTGRES_URL}"), "{yaml}");
+        assert!(yaml.contains("  url: ${POSTGRES_URL}"), "{yaml}");
         assert!(
             yaml.contains("catalog_token: ${ICEBERG_CATALOG_TOKEN}"),
             "{yaml}"
@@ -512,7 +511,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["public.orders", "sales.invoices"]
         );
-        assert_eq!(loaded.source.postgres_url, "postgres://u:hunter2@db/app");
+        assert_eq!(loaded.source.url, "postgres://u:hunter2@db/app");
         assert_eq!(loaded.sink.catalog_uri, "https://catalog.example.com");
         assert_eq!(loaded.sink.catalog_token, "t0ken");
         assert_eq!(loaded.sink.warehouse, "s3://lake/");

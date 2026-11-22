@@ -299,7 +299,7 @@ struct Topology {
     /// The source's `server_version_num`: from 17 it has failover slots.
     /// `0`, unknown, skips the version check (the other DSTs' source).
     version: i32,
-    /// `source.logical.failover`.
+    /// `source.failover`.
     slot_failover: bool,
 }
 

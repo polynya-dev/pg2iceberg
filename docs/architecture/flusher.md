@@ -33,7 +33,7 @@ The replication slot's confirmed flush LSN is advanced immediately after staging
 
 The staged-log primitive provides offset-ordered, durable delivery of WAL events from the flusher to one or more materializer workers without a dedicated leader process.
 
-The coordinator role is filled by the **source PostgreSQL database** itself. This is a deliberate choice: the coordinator is technically a single point of failure, but if the source database goes down, replication cannot happen regardless — so there is no additional availability cost to colocating coordination there. It also means pg2iceberg needs no extra infrastructure beyond the database you are already replicating from, and a failover takes the coordinator along with the source ([Failover](../usage/failover.md)). It always lives on the source's server: `state.database` can put it in another database there.
+The coordinator role is filled by the **source PostgreSQL database** itself. This is a deliberate choice: the coordinator is technically a single point of failure, but if the source database goes down, replication cannot happen regardless — so there is no additional availability cost to colocating coordination there. It also means pg2iceberg needs no extra infrastructure beyond the database you are already replicating from, and a failover takes the coordinator along with the source ([Failover](../usage/failover.md)). It always lives on the source's server: `source.state_database` can put it in another database there.
 
 **Coordination tables** (in `_pg2iceberg`):
 
@@ -80,4 +80,4 @@ Replication state is split across several narrow tables — no single "checkpoin
 On startup, pg2iceberg cross-references all four against PG and the slot, and refuses to start on any mismatch. See [validate_startup](https://github.com/polynya-dev/pg2iceberg/blob/main/pg2iceberg-rust/crates/pg2iceberg-validate/src/lib.rs) for the full invariant list.
 
 !!! note "Where coord state lives"
-    Coord state is stored on the source's PostgreSQL server: in the source database by default, or the database `state.database` names there. It can't live on another server: on the source's, it shares the source's WAL and fails over with it, never out of step. Coord state is always Postgres-backed; there is no file-based store option.
+    Coord state is stored on the source's PostgreSQL server: in the source database by default, or the database `source.state_database` names there. It can't live on another server: on the source's, it shares the source's WAL and fails over with it, never out of step. Coord state is always Postgres-backed; there is no file-based store option.

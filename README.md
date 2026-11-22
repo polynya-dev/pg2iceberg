@@ -137,7 +137,7 @@ Every subcommand takes its settings from environment variables and an optional c
 | `maintain` | One-shot: snapshot expiry + orphan-file cleanup over every configured table. Reads `sink.maintenance_retention` / `sink.maintenance_grace`. Refuses with `sink.maintenance: managed`. |
 | `verify` | Diff PG ground truth against Iceberg materialized state for every configured table. Exits non-zero on any diff. Day-2 confidence check. |
 | `stream-only` | Distributed mode: WAL writer only; pair with one or more `materializer-only` workers. |
-| `materializer-only --worker-id <id>` | Distributed mode: materializer worker only. Joins the heartbeat group keyed by `state.group`; tables auto-rebalance on join/leave. |
+| `materializer-only --worker-id <id>` | Distributed mode: materializer worker only. Joins the other workers on the same `source.state_schema`; tables auto-rebalance on join/leave. |
 | `migrate-coord` | Run the coordinator's idempotent schema migration (every statement is `CREATE … IF NOT EXISTS`). |
 | `connect-pg` / `connect-iceberg` | Connectivity smoke tests for the PG / Iceberg-catalog prod paths. |
 
@@ -256,11 +256,11 @@ Settings come from environment variables and an optional YAML file: `--config`, 
 
 | Env var | Config field | Description |
 |---|---|---|
-| `POSTGRES_URL` | `source.postgres_url` | Source database: a URL or `key=value` connection string (required) |
+| `POSTGRES_URL` | `source.url` | Source database: a URL or `key=value` connection string (required) |
 | `PG2ICEBERG_TABLES` | `tables` | Comma-separated `schema.table` or `schema.*`. Default: every table with a primary key |
-| `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.logical.slot_name` / `publication_name` | Default `pg2iceberg_slot` / `pg2iceberg_pub` |
-| `PG2ICEBERG_SLOT_FAILOVER` | `source.logical.failover` | A failover slot on PostgreSQL 17+, to survive a failover to a standby. Default `true` |
-| `PG2ICEBERG_STATE_DATABASE` | `state.database` | The database on the source's server that holds pg2iceberg's state. Default: the source's |
+| `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.slot_name` / `publication_name` | Default `pg2iceberg_slot` / `pg2iceberg_pub` |
+| `PG2ICEBERG_SLOT_FAILOVER` | `source.failover` | A failover slot on PostgreSQL 17+, to survive a failover to a standby. Default `true` |
+| `PG2ICEBERG_STATE_DATABASE` | `source.state_database` | The database on the source's server that holds pg2iceberg's state. Default: the source's |
 | `PG2ICEBERG_CONFIG` | — | The config file |
 | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` | Iceberg REST catalog (required) |
 | `ICEBERG_CATALOG_TOKEN` | `sink.catalog_token` | Bearer token |
@@ -306,9 +306,9 @@ pg2iceberg cleanup --config <path>
 pg2iceberg's state always lives on the source's Postgres server, so a failover takes it along. To keep it in another database there:
 
 ```yaml
-state:
-  database: pg2iceberg
-  coordinator_schema: _pg2iceberg
+source:
+  state_database: pg2iceberg
+  state_schema: _pg2iceberg
 ```
 
 ## Running tests

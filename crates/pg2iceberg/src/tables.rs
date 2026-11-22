@@ -91,7 +91,7 @@ pub fn select(listed: &[TableConfig], found: &[SourceTable], excluded: &[String]
 
 /// Schemas holding pg2iceberg's own tables, never replicated.
 pub fn own_schemas(cfg: &Config) -> Vec<String> {
-    let coord = CoordSchema::sanitize(&cfg.state.coordinator_schema)
+    let coord = CoordSchema::sanitize(&cfg.source.state_schema)
         .as_str()
         .to_string();
     let mut schemas = vec![coord];
@@ -104,11 +104,11 @@ pub fn own_schemas(cfg: &Config) -> Vec<String> {
 
 /// Connect to the source database for queries.
 pub async fn connect_source(cfg: &Config) -> Result<PgClientImpl> {
-    let tls = match cfg.source.postgres.tls_label() {
+    let tls = match cfg.source.tls_label() {
         "webpki" => TlsMode::Webpki,
         _ => TlsMode::Disable,
     };
-    PgClientImpl::connect_with(&cfg.source.postgres.dsn(), tls)
+    PgClientImpl::connect_with(&cfg.source.dsn(), tls)
         .await
         .context("connect to the source database")
 }

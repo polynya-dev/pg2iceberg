@@ -3,16 +3,13 @@ tables:
   - name: public.transfers
 
 source:
-  mode: logical
-  postgres:
-    host: green-postgres
-    port: 5432
-    database: app
-    user: postgres
-    password: postgres
-  logical:
-    publication_name: pg2iceberg_green_pub
-    slot_name: pg2iceberg_green_slot
+  host: green-postgres
+  port: 5432
+  database: app
+  user: postgres
+  password: postgres
+  publication_name: pg2iceberg_green_pub
+  slot_name: pg2iceberg_green_slot
 
 sink:
   catalog_uri: http://iceberg-rest:8181
@@ -26,5 +23,3 @@ sink:
   flush_interval: 2s
   flush_rows: 200
   materializer_interval: 2s
-
-state: {}

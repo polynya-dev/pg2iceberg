@@ -70,7 +70,7 @@
 //!   `consistent_point`. Combined with the marker fence this would
 //!   close the duplicate-event window completely.
 
-use crate::config::PostgresConfig;
+use crate::config::SourceConfig;
 use crate::snapshot_copy;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -141,7 +141,7 @@ impl PgSnapshotSource {
     /// Open the snapshot over `connections` connections, so as many
     /// chunks can be read at once.
     pub async fn open(
-        pg_cfg: &PostgresConfig,
+        pg_cfg: &SourceConfig,
         schemas: &[TableSchema],
         connections: usize,
     ) -> Result<Self> {

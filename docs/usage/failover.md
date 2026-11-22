@@ -10,8 +10,7 @@ To keep a plain slot instead:
 
 ```yaml
 source:
-  logical:
-    failover: false        # or PG2ICEBERG_SLOT_FAILOVER=false
+  failover: false        # or PG2ICEBERG_SLOT_FAILOVER=false
 ```
 
 Before PostgreSQL 17 there are no failover slots, and the setting does nothing. A failover there loses the slot: pg2iceberg refuses to start (`SlotGoneButLsnExists`), and the pipeline needs `pg2iceberg cleanup` and a new snapshot.
@@ -47,7 +46,7 @@ Set `synchronized_standby_slots` on the new primary to its own standbys' slots, 
 
 ## pg2iceberg's state in the source
 
-pg2iceberg keeps its state (the `_pg2iceberg` schema) on the source's server — in the source database, or the one `state.database` names there — so it fails over with the source. With an asynchronous standby, a failover can lose the last few writes to it. Anything pg2iceberg did elsewhere on those writes would survive, though: an acked slot, a commit to Iceberg, a deleted staged file. The state would then remember less than the slot, Iceberg and the object store show.
+pg2iceberg keeps its state (the `_pg2iceberg` schema) on the source's server — in the source database, or the one `source.state_database` names there — so it fails over with the source. With an asynchronous standby, a failover can lose the last few writes to it. Anything pg2iceberg did elsewhere on those writes would survive, though: an acked slot, a commit to Iceberg, a deleted staged file. The state would then remember less than the slot, Iceberg and the object store show.
 
 So pg2iceberg acks the slot, commits to Iceberg and deletes staged files only once the standby has the writes to its state behind them. It tells by the replication stream: once the stream has sent a position, the standby has the WAL before it. A failover then loses only writes nothing has acted on, as a crash would.
 
