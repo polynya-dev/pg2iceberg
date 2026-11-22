@@ -29,6 +29,7 @@ use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::{Clock, IdGen, Lsn, Metrics, Phase, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
 use pg2iceberg_logical::spans::record_outcome;
+use pg2iceberg_logical::standby::Standby;
 use pg2iceberg_logical::work_span;
 use pg2iceberg_logical::{
     materializer::{CompactionJob, CompactionPass, MaterializerNamer},
@@ -233,6 +234,12 @@ pub enum LifecycleError {
     /// shut down under it.
     #[error("materializer tick: {0}")]
     Tick(String),
+    /// The source failed over: the replication stream came back on another
+    /// timeline. What the process holds in memory and its work in flight
+    /// may rest on coordinator writes the failover lost; a new process
+    /// starts from what the coordinator holds.
+    #[error("the source failed over from timeline {from} to {to}")]
+    FailedOver { from: u32, to: u32 },
 }
 
 /// Type alias for backwards-compat — the previous loop-only error
@@ -273,6 +280,11 @@ pub struct LogicalLifecycle<Cat: Catalog + 'static> {
     /// publication + slot if absent, then opens replication.
     pub slot_name: String,
     pub publication_name: String,
+    /// Make the slot a failover slot, kept on standbys that sync slots
+    /// so it survives a failover to one, where the source has them (PG
+    /// 17+); elsewhere this does nothing. The lifecycle creates the slot
+    /// so, or alters an existing one to match.
+    pub slot_failover: bool,
     pub group: String,
     pub schedule: Schedule,
     pub compaction: Option<CompactionConfig>,
@@ -388,6 +400,7 @@ fn instrument<Cat: Catalog + 'static>(
         skip_snapshot_idents,
         slot_name,
         publication_name,
+        slot_failover,
         group,
         schedule,
         compaction,
@@ -415,6 +428,7 @@ fn instrument<Cat: Catalog + 'static>(
         skip_snapshot_idents,
         slot_name,
         publication_name,
+        slot_failover,
         group,
         schedule,
         compaction,
@@ -497,6 +511,7 @@ async fn start<Cat: Catalog + 'static>(
     //    fingerprint mismatch is now caught above by
     //    `set_pipeline_system_identifier`, so this only runs the
     //    other invariants.
+    let server_version_num = lc.pg.server_version_num().await?;
     run_startup_validation(
         lc.pg.as_ref(),
         lc.coord.as_ref(),
@@ -504,9 +519,17 @@ async fn start<Cat: Catalog + 'static>(
         &lc.schemas,
         &lc.slot_name,
         &lc.publication_name,
-        connected_system_id,
+        server_version_num,
     )
     .await?;
+    let failover_supported = pg2iceberg_pg::failover_slots_supported(server_version_num);
+    if lc.slot_failover && !failover_supported {
+        tracing::info!(
+            server_version_num,
+            "failover slots need PostgreSQL 17 or later; the replication slot \
+             won't survive a failover to a standby"
+        );
+    }
 
     // 2. Slot setup. Don't `start_replication` yet — we want the
     //    snapshot phase to run first so we can pass `snap_lsn` as
@@ -546,8 +569,9 @@ async fn start<Cat: Catalog + 'static>(
         {
             tracing::warn!(error = %e, "create_publication failed; assuming it exists");
         }
-        let cp = lc.pg.create_slot(&lc.slot_name).await?;
-        tracing::info!(slot = %lc.slot_name, ?cp, "replication slot created");
+        let failover = lc.slot_failover && failover_supported;
+        let cp = lc.pg.create_slot(&lc.slot_name, failover).await?;
+        tracing::info!(slot = %lc.slot_name, ?cp, failover, "replication slot created");
         // Bootstrap the tamper-detection baseline. PG sets the new
         // slot's `confirmed_flush_lsn` to its `consistent_point`;
         // stamping that value into our record means subsequent
@@ -560,6 +584,9 @@ async fn start<Cat: Catalog + 'static>(
             .map_err(|e| LifecycleError::Coord(e.to_string()))?;
     } else {
         tracing::info!(slot = %lc.slot_name, "replication slot exists, resuming");
+        if failover_supported {
+            reconcile_slot_failover(lc.pg.as_ref(), &lc.slot_name, lc.slot_failover).await;
+        }
     }
 
     // 2.5. Reconcile publication membership. pg2iceberg fully owns
@@ -646,6 +673,10 @@ async fn start<Cat: Catalog + 'static>(
         pg2iceberg_logical::CachingCatalog::<Cat>::DEFAULT_TTL,
     );
     materializer.set_maintenance(lc.maintenance);
+    // Its commits and deletes of staged files wait for the standby the
+    // source fails over to, once replication starts.
+    let standby = Arc::new(StreamStandby::new(Arc::clone(&lc.pg)));
+    materializer.set_standby(standby.clone());
     // Tables that need a backfill snapshot before any of their CDC
     // events are applied to Iceberg. Computed here so we can register
     // each schema with the right gate (`register_table_pending` vs
@@ -878,21 +909,30 @@ async fn start<Cat: Catalog + 'static>(
     //      staged, which can lead the slot's confirmed_flush_lsn (see
     //      `replication_start_lsn`).
     let start_lsn = replication_start_lsn(&*lc.coord, snap_lsn).await?;
-    let mut stream = lc
+    let timeline = lc.pg.timeline().await?;
+    let stream = lc
         .pg
         .start_replication(&lc.slot_name, start_lsn, &lc.publication_name)
         .await?;
-    // 7. Initial standby ack so the slot's confirmed_flush_lsn
-    //    advances to start_lsn — server can recycle WAL behind it.
-    //    Stamp our durable record *before* the ack so on a crash
-    //    between the two writes the slot lags us (safe replay) not
-    //    the other way around (tamper false positive).
+    // Positions the stream sent before: what was staged (not the snapshot
+    // LSN, which it didn't send), and what the slot was acked to.
+    let staged = lc
+        .coord
+        .replicated_lsn()
+        .await
+        .map_err(|e| LifecycleError::Coord(e.to_string()))?;
+    let confirmed = lc.pg.slot_confirmed_flush_lsn(&lc.slot_name).await?;
+    standby.sent(staged.max(confirmed.unwrap_or(Lsn::ZERO)));
+    standby.streaming();
+    // 7. Record the snapshot LSN as flushed, so the main loop's first
+    //    acks advance the slot's confirmed_flush_lsn to it — once a
+    //    standby has the record (see [`AckGate`]) — and the server can
+    //    recycle WAL behind it.
     if let Some(snapshot_lsn) = snap_lsn {
         lc.coord
             .set_flushed_lsn(snapshot_lsn)
             .await
             .map_err(|e| LifecycleError::Coord(e.to_string()))?;
-        stream.send_standby(snapshot_lsn, snapshot_lsn).await?;
     }
     let recorded_lsn = lc
         .coord
@@ -913,6 +953,9 @@ async fn start<Cat: Catalog + 'static>(
         publication_name: lc.publication_name,
         snapshot_lsn: snap_lsn,
         recorded_lsn,
+        ack_gate: AckGate::default(),
+        standby,
+        timeline,
         coord: Arc::clone(&lc.coord),
         slot_monitor,
         watcher,
@@ -929,6 +972,33 @@ async fn start<Cat: Catalog + 'static>(
     Ok(loop_state)
 }
 
+/// Make an existing slot a failover slot, or stop it being one, as
+/// `want` says, on a source that has them. Not fatal: a slot that can't
+/// be altered — a dead connection's walsender still holds it, say —
+/// replicates all the same, only not to standbys, and the next start
+/// tries again.
+async fn reconcile_slot_failover(pg: &dyn PgClient, slot: &str, want: bool) {
+    let current = match pg.slot_health(slot).await {
+        Ok(health) => health.and_then(|h| h.failover),
+        Err(e) => {
+            tracing::warn!(slot, error = %e, "couldn't read the replication slot's failover");
+            return;
+        }
+    };
+    if current.is_none_or(|failover| failover == want) {
+        return;
+    }
+    match pg.set_slot_failover(slot, want).await {
+        Ok(()) => tracing::info!(slot, failover = want, "replication slot failover changed"),
+        Err(e) => tracing::warn!(
+            slot,
+            failover = want,
+            error = %e,
+            "couldn't change the replication slot's failover; the next start tries again"
+        ),
+    }
+}
+
 /// Bridge between [`crate::validate_startup`] (sync) and the lifecycle
 /// helper. Reads each registered table's per-row state from coord,
 /// queries catalog + slot state, runs the invariants. Errors with
@@ -941,7 +1011,7 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
     schemas: &[TableSchema],
     slot_name: &str,
     publication_name: &str,
-    _connected_system_id: u64,
+    server_version_num: i32,
 ) -> Result<(), LifecycleError> {
     // One round-trip lookup of the publication's current tables;
     // we'll cross-reference each schema below. Empty list when the
@@ -1004,7 +1074,6 @@ async fn run_startup_validation<Cat: Catalog + ?Sized>(
         .flushed_lsn()
         .await
         .map_err(|e| LifecycleError::Coord(e.to_string()))?;
-    let server_version_num = pg.server_version_num().await?;
     let v = StartupValidation {
         tables,
         slot,
@@ -1037,6 +1106,13 @@ pub struct LogicalLoop<C: Coordinator + ?Sized + 'static, Cat: Catalog + 'static
     /// [`Coordinator::flushed_lsn`] as this process last stamped or read
     /// it: how far the slot may be acked (see [`record_and_ack`]).
     pub recorded_lsn: Lsn,
+    /// How far of `recorded_lsn` a standby surely has (see [`AckGate`]).
+    pub ack_gate: AckGate,
+    /// The standby the source fails over to, as the stream shows it.
+    pub standby: Arc<StreamStandby>,
+    /// The source's timeline as replication started (see
+    /// [`LifecycleError::FailedOver`]).
+    pub timeline: u32,
     pub coord: Arc<dyn Coordinator>,
     pub slot_monitor: Arc<dyn SlotMonitor>,
     pub watcher: InvariantWatcher,
@@ -1113,15 +1189,30 @@ where
     }));
     let mut ticks = Ticks::default();
     let out = main_loop(&mut loop_state, &mut ticks, shutdown).await;
+    // A tick waiting for the standby, after an error, waits no more: it
+    // ends unmade, and the next process makes it.
+    let standby = loop_state.standby.clone();
+    if out.is_err() {
+        standby.stop();
+    }
     // However the loop ended, a tick and a flush in flight end first:
     // nothing may run beside them — the drain's final cycle and flush,
-    // or, after an error, the next process.
-    let ended = ticks.wait(&mut loop_state).await;
-    let flushed = loop_state.pipeline.wait_flushed().await;
-    out?;
-    ended?;
-    flushed?;
-    drain_and_shutdown(loop_state).await
+    // or, after an error, the next process. They, and the drain, may wait
+    // for the standby, which only the stream shows.
+    let mut stream = std::mem::replace(&mut loop_state.stream, Box::new(Disconnected));
+    let (ended, flushed) = with_stream_positions(&mut *stream, &standby, async {
+        let ended = ticks.wait(&mut loop_state).await;
+        (ended, loop_state.pipeline.wait_flushed().await)
+    })
+    .await;
+    loop_state.stream = stream;
+    let drained = match (out, ended, flushed) {
+        (Err(e), _, _) | (_, Err(e), _) => Err(e),
+        (_, _, Err(e)) => Err(e.into()),
+        _ => drain_and_shutdown(loop_state).await,
+    };
+    standby.stop();
+    drained
 }
 
 async fn main_loop<C, Cat, F>(
@@ -1183,7 +1274,10 @@ where
                 ticks.start_if_wanted(loop_state);
             }
             res = loop_state.stream.recv() => match res {
-                Ok(msg) => process_message(&mut loop_state.pipeline, msg).await?,
+                Ok(msg) => {
+                    loop_state.standby.received(&msg);
+                    process_message(&mut loop_state.pipeline, msg).await?
+                }
                 Err(e) => {
                     if !reopen_stream(loop_state, &mut outage, e, shutdown.as_mut()).await? {
                         break;
@@ -1543,6 +1637,24 @@ where
             _ = shutdown.as_mut() => return Ok(false),
             _ = tokio::time::sleep(reconnect_delay(outage.attempts)) => {}
         }
+        // The stream drops when the source fails over. Then work waiting
+        // for the standby may wait for positions the new timeline never
+        // reaches, on coordinator writes the failover may have lost: a
+        // new process starts over from what the coordinator holds.
+        match loop_state.pg.timeline().await {
+            Ok(to) if to != loop_state.timeline => {
+                return Err(MainLoopError::FailedOver {
+                    from: loop_state.timeline,
+                    to,
+                })
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, attempt = outage.attempts, "replication reconnect failed");
+                cause = e.to_string();
+                continue;
+            }
+        }
         let span = work_span!("replication.reconnect", attempt = outage.attempts);
         let opened = open_stream(loop_state).instrument(span.clone()).await;
         record_outcome(&span, &opened);
@@ -1744,6 +1856,230 @@ where
     (lsn, acked)
 }
 
+/// The standby the source fails over to, as the replication stream shows
+/// it: the [`Standby`] the materializer waits for in the main loop (see
+/// [`pg2iceberg_logical::standby`]).
+///
+/// The source's `synchronized_standby_slots` names the standby, and a
+/// failover slot's walsender sends nothing — no change, no keepalive
+/// position — that it hasn't flushed. So once the stream has sent a
+/// position, the standby has all the WAL before it: a coordinator write
+/// too, when the coordinator lives in the source and the position is past
+/// where its WAL stood once the write committed.
+///
+/// Nothing is waited for before replication starts — the initial
+/// snapshot's commits. While the process stops, a wait gives up after
+/// [`FINAL_STANDBY_WAIT`]; once nothing reads the stream, it fails.
+pub struct StreamStandby {
+    pg: Arc<dyn PgClient>,
+    view: tokio::sync::watch::Sender<StandbyView>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StandbyView {
+    /// The furthest position the stream has sent: a commit's LSN, a
+    /// keepalive's `wal_end`.
+    streamed: Lsn,
+    phase: StandbyPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StandbyPhase {
+    /// Replication hasn't started: nothing to wait for.
+    Before,
+    Streaming,
+    /// The process is stopping: waits are bounded.
+    Draining,
+    /// Nothing reads the stream.
+    Stopped,
+}
+
+impl StreamStandby {
+    pub fn new(pg: Arc<dyn PgClient>) -> Self {
+        let (view, _) = tokio::sync::watch::channel(StandbyView {
+            streamed: Lsn::ZERO,
+            phase: StandbyPhase::Before,
+        });
+        Self { pg, view }
+    }
+
+    /// Replication started: waits wait for the stream from now on.
+    pub fn streaming(&self) {
+        self.view.send_modify(|v| v.phase = StandbyPhase::Streaming);
+    }
+
+    /// The stream sent `msg`.
+    pub fn received(&self, msg: &DecodedMessage) {
+        match msg {
+            DecodedMessage::Commit { commit_lsn, .. } => self.sent(*commit_lsn),
+            DecodedMessage::Keepalive { wal_end, .. } => self.sent(*wal_end),
+            _ => {}
+        }
+    }
+
+    /// The stream has sent up to `position` — this process's, or one
+    /// before it: what was staged, or acked to the slot. An idle stream
+    /// sends no position again that the slot has confirmed.
+    pub fn sent(&self, position: Lsn) {
+        self.view.send_if_modified(|v| {
+            let further = position > v.streamed;
+            if further {
+                v.streamed = position;
+            }
+            further
+        });
+    }
+
+    /// The furthest position the stream has sent.
+    pub fn streamed(&self) -> Lsn {
+        self.view.borrow().streamed
+    }
+
+    /// The process is stopping: a wait gives up after
+    /// [`FINAL_STANDBY_WAIT`].
+    pub fn drain(&self) {
+        self.view.send_modify(|v| {
+            if v.phase == StandbyPhase::Streaming {
+                v.phase = StandbyPhase::Draining;
+            }
+        });
+    }
+
+    /// Nothing reads the stream: waits fail, now and on.
+    pub fn stop(&self) {
+        self.view.send_modify(|v| v.phase = StandbyPhase::Stopped);
+    }
+}
+
+#[async_trait::async_trait]
+impl Standby for StreamStandby {
+    async fn settle(&self) -> std::result::Result<(), String> {
+        match self.view.borrow().phase {
+            StandbyPhase::Before => return Ok(()),
+            StandbyPhase::Stopped => return Err("pg2iceberg is stopping".into()),
+            StandbyPhase::Streaming | StandbyPhase::Draining => {}
+        }
+        let position = self
+            .pg
+            .current_wal_lsn()
+            .await
+            .map_err(|e| format!("reading the source's WAL position: {e}"))?;
+        let stopping = || Err("pg2iceberg is stopping".to_string());
+        let mut view = self.view.subscribe();
+        // Unbounded while streaming; once the process stops, for up to
+        // FINAL_STANDBY_WAIT more.
+        let seen = match view
+            .wait_for(|v| v.phase != StandbyPhase::Streaming || v.streamed >= position)
+            .await
+        {
+            Ok(v) => *v,
+            Err(_) => return stopping(),
+        };
+        if seen.streamed >= position {
+            return Ok(());
+        }
+        if seen.phase == StandbyPhase::Stopped {
+            return stopping();
+        }
+        let bounded = async {
+            view.wait_for(|v| v.phase == StandbyPhase::Stopped || v.streamed >= position)
+                .await
+                .is_ok_and(|v| v.streamed >= position)
+        };
+        if tokio::time::timeout(FINAL_STANDBY_WAIT, bounded)
+            .await
+            .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            stopping()
+        }
+    }
+}
+
+/// How long a commit waits for the standby while the process stops.
+const FINAL_STANDBY_WAIT: Duration = Duration::from_secs(10);
+
+/// Run `work`, as the process stops, while the stream's positions still
+/// reach `standby`, for work waiting for it (each wait bounded: see
+/// [`StreamStandby::drain`]). The changes the stream sends are dropped:
+/// past the last flush, they come again next start. Once the stream
+/// fails, the standby is stopped, failing what still waits.
+async fn with_stream_positions<T>(
+    stream: &mut dyn ReplicationStream,
+    standby: &StreamStandby,
+    work: impl Future<Output = T>,
+) -> T {
+    standby.drain();
+    let pump = async {
+        while let Ok(msg) = stream.recv().await {
+            standby.received(&msg);
+        }
+        standby.stop();
+        std::future::pending::<std::convert::Infallible>().await
+    };
+    tokio::select! {
+        out = work => out,
+        never = pump => match never {},
+    }
+}
+
+/// How far the slot may be acked: to a recorded LSN
+/// ([`Coordinator::set_flushed_lsn`]) once a standby the slot fails over
+/// to surely has the record.
+///
+/// A failover slot is synced to standbys, and when the coordinator lives
+/// in the source, its record is in the source's WAL too — but a standby
+/// can have the one without the other: slot sync copies the slot as soon
+/// as the standby has the WAL up to the slot's position, which the record
+/// of it follows. Failing over to that standby leaves the slot past
+/// anything the coordinator remembers staging, and the changes in between
+/// are never sent again. So the slot is acked to a record only once the
+/// stream has passed where the source's WAL stood just after the record
+/// was made: a failover slot's walsender sends nothing — no change, no
+/// keepalive position — that the standbys `synchronized_standby_slots`
+/// names haven't flushed.
+///
+/// Where there's no standby, this only holds each ack back until the
+/// stream has moved past the record. The main loop can't wait for that,
+/// as the materializer does ([`StreamStandby`]): it reads the stream.
+#[derive(Debug, Default)]
+pub struct AckGate {
+    /// Recorded LSNs not yet ackable, oldest first, each with where the
+    /// source's WAL stood just after it was recorded.
+    pending: Vec<(Lsn, Lsn)>,
+    /// The furthest recorded LSN that is.
+    ackable: Lsn,
+}
+
+impl AckGate {
+    /// Whether `recorded` still wants the source's WAL position to gate
+    /// it by.
+    fn wants_position(&self, recorded: Lsn) -> bool {
+        recorded > self.ackable && self.pending.last().is_none_or(|(lsn, _)| *lsn < recorded)
+    }
+
+    /// `recorded` was recorded before the source's WAL reached `position`.
+    fn recorded(&mut self, recorded: Lsn, position: Lsn) {
+        self.pending.push((recorded, position));
+    }
+
+    /// The furthest recorded LSN the slot may be acked to, the stream
+    /// having sent up to `streamed`.
+    fn ackable(&mut self, streamed: Lsn) -> Lsn {
+        let mut ackable = self.ackable;
+        self.pending.retain(|&(recorded, position)| {
+            let passed = position <= streamed;
+            if passed {
+                ackable = ackable.max(recorded);
+            }
+            !passed
+        });
+        self.ackable = ackable;
+        ackable
+    }
+}
+
 async fn record_then_ack<C, Cat>(
     loop_state: &mut LogicalLoop<C, Cat>,
 ) -> (Lsn, pg2iceberg_pg::Result<()>)
@@ -1763,10 +2099,20 @@ where
             ),
         }
     }
-    let acked = loop_state.recorded_lsn;
-    if acked == Lsn::ZERO {
-        return (acked, Ok(()));
+    let recorded = loop_state.recorded_lsn;
+    if loop_state.ack_gate.wants_position(recorded) {
+        match loop_state.pg.current_wal_lsn().await {
+            Ok(position) => loop_state.ack_gate.recorded(recorded, position),
+            // Retried next tick; the slot is acked no further meanwhile.
+            Err(e) => tracing::warn!(
+                error = %e,
+                "couldn't read the source's WAL position; acking the slot no further for now"
+            ),
+        }
     }
+    // An ack of nothing yet still answers the walsender, which times out
+    // a consumer that doesn't.
+    let acked = loop_state.ack_gate.ackable(loop_state.standby.streamed());
     (acked, loop_state.stream.send_standby(acked, acked).await)
 }
 
@@ -1802,8 +2148,13 @@ where
     // re-process the same staged events. Errors here are logged but
     // not fatal: the staged parquet is durable, so a subsequent
     // start picks up where we left off.
+    // Its commits wait for the standby, which only the stream shows.
     if let Some(materializer) = loop_state.materializer.as_mut() {
-        if let Err(e) = materializer.cycle().await {
+        let mut stream = std::mem::replace(&mut loop_state.stream, Box::new(Disconnected));
+        let cycled =
+            with_stream_positions(&mut *stream, &loop_state.standby, materializer.cycle()).await;
+        loop_state.stream = stream;
+        if let Err(e) = cycled {
             tracing::warn!(error = %e, "final materializer cycle failed");
         }
     }

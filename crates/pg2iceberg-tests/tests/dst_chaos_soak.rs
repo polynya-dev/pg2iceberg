@@ -13,6 +13,11 @@
 //! - Restart (lifecycle stop + restart with same schemas).
 //! - Live AddTable: stop lifecycle, extend YAML, restart — the
 //!   lifecycle's reconcile + background-snapshot task does the rest.
+//! - Failover: a physical standby trails the source by however much the
+//!   workload lets it, slot sync copies failover slots to it, and the
+//!   source fails over to it under the running pipeline — losing what
+//!   the standby lacked, the coordinator's writes too: it lives on the
+//!   source's server.
 //!
 //! The headline invariant after each seed is the one that matters:
 //! **for every registered table, `read_table(SimPostgres) ==
@@ -57,6 +62,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // ── constants ──────────────────────────────────────────────────────
+
+/// Failovers across every case run, for a soak to report.
+static FAILOVERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 const NAMESPACE: &str = "public";
 const PUB: &str = "chaos_pub";
@@ -241,6 +249,17 @@ enum Step {
     /// lifecycle's reconcile path + `register_table_pending` +
     /// background snapshot task do the rest.
     AddTable,
+    /// The standby receives `pct`% of the WAL it lacks.
+    Replicate {
+        pct: u8,
+    },
+    /// A slot sync cycle on the standby.
+    SyncSlots,
+    /// The source fails over to the standby, under the running pipeline
+    /// — once the standby has a synced copy of the slot, as Postgres's
+    /// docs say to check first; a no-op until then. A new standby is
+    /// then made from the new source.
+    Failover,
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
@@ -266,7 +285,43 @@ fn step_strategy() -> impl Strategy<Value = Step> {
             .prop_map(|(op, count)| Step::InjectFault { op, count }),
         // Topology evolution.
         1 => Just(Step::AddTable),
+        // The standby trails; the source fails over to it.
+        8 => (0u8..=100).prop_map(|pct| Step::Replicate { pct }),
+        4 => Just(Step::SyncSlots),
+        2 => Just(Step::Failover),
     ]
+}
+
+/// How a seed's source is set up. pg2iceberg's state lives on its
+/// server, so a failover rolls the coordinator back too.
+#[derive(Clone, Copy, Debug)]
+struct Topology {
+    /// The source's `server_version_num`: from 17 it has failover slots.
+    /// `0`, unknown, skips the version check (the other DSTs' source).
+    version: i32,
+    /// `source.logical.failover`.
+    slot_failover: bool,
+}
+
+impl Default for Topology {
+    /// The source every other DST runs: no failover slots.
+    fn default() -> Self {
+        Self {
+            version: 0,
+            slot_failover: false,
+        }
+    }
+}
+
+fn topology() -> impl Strategy<Value = Topology> {
+    (
+        prop_oneof![1 => Just(160_004), 4 => Just(170_002)],
+        prop::bool::weighted(0.8),
+    )
+        .prop_map(|(version, slot_failover)| Topology {
+            version,
+            slot_failover,
+        })
 }
 
 fn workload() -> impl Strategy<Value = Vec<Step>> {
@@ -311,6 +366,12 @@ struct ChaosHarness {
     next_gen: u64,
     /// Currently-running lifecycle. `None` between restarts.
     running: Option<RunningLifecycle>,
+    topology: Topology,
+    /// Failovers so far.
+    failovers: usize,
+    /// Staged files the coordinator's log named, as a failover left it,
+    /// that were gone.
+    dangling: Vec<String>,
 }
 
 struct RunningLifecycle {
@@ -325,7 +386,15 @@ struct RunningLifecycle {
 
 impl ChaosHarness {
     async fn boot() -> Self {
+        Self::boot_with(Topology::default()).await
+    }
+
+    async fn boot_with(topology: Topology) -> Self {
         let db = SimPostgres::new();
+        db.set_server_version_num(topology.version);
+        // A standby the source's `synchronized_standby_slots` names: what
+        // Postgres's docs require for failover slots.
+        db.attach_standby(true);
         let mut schemas = Vec::new();
         let mut live = Vec::new();
         for i in 0..INITIAL_TABLES {
@@ -355,6 +424,7 @@ impl ChaosHarness {
             CoordSchema::default_name(),
             Arc::clone(&clock),
         ));
+        coord_inner.colocate(&db);
         let blob_inner = Arc::new(MemoryBlobStore::new());
         let catalog_inner = Arc::new(MemoryCatalog::new());
 
@@ -372,20 +442,80 @@ impl ChaosHarness {
             live,
             next_gen,
             running: None,
+            topology,
+            failovers: 0,
+            dangling: Vec::new(),
         };
 
         h.start_lifecycle().await;
         // Initial run needs enough virtual time to complete snapshot
         // phase + drain the post-snapshot CDC stream + run a few
         // materializer cycles. Snapshot is synchronous in lifecycle's
-        // fresh-slot path, so this is bounded by chunk count.
-        h.advance_time(2_000).await;
+        // fresh-slot path, so this is bounded by chunk count. The
+        // standby keeps up meanwhile, and ends caught up, its slot
+        // synced.
+        for _ in 0..4 {
+            h.catch_up_standby();
+            h.advance_time(500).await;
+        }
+        h.catch_up_standby();
         h
     }
 
+    /// The standby receives all the WAL it lacks, then syncs slots.
+    fn catch_up_standby(&self) {
+        self.db.replicate_to_standby(self.db.current_lsn());
+        self.db.sync_standby_slots();
+    }
+
+    /// Fail the source over to its standby under the running pipeline,
+    /// if the standby has a synced copy of the slot; a new standby is
+    /// made from the new source.
+    async fn fail_over(&mut self) {
+        if self.db.standby_slot(SLOT).is_none() {
+            return;
+        }
+        let end = self
+            .db
+            .promote_standby()
+            .expect("the harness replicates DDL before going on");
+        self.coord_inner.fail_over_to(end);
+        self.db.attach_standby(true);
+        self.failovers += 1;
+        // Every staged file the coordinator's log names still exists:
+        // files are deleted once the standby has the truncation dropping
+        // their entries, so one the failover lost leaves them be.
+        use pg2iceberg_stream::BlobStore as _;
+        for schema in &self.schemas {
+            let log = self
+                .coord_inner
+                .read_log(&schema.ident, 0, 1_000_000)
+                .await
+                .unwrap();
+            for entry in log {
+                if self.blob_inner.get(&entry.s3_path).await.is_err() {
+                    self.dangling.push(entry.s3_path);
+                }
+            }
+        }
+        FAILOVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // What the workload knows to exist is what the new source has.
+        for (i, schema) in self.schemas.iter().enumerate() {
+            self.live[i] = self
+                .db
+                .read_table(&schema.ident)
+                .unwrap()
+                .iter()
+                .filter_map(pk_of)
+                .collect();
+        }
+    }
+
     fn build_lifecycle(&self) -> LogicalLifecycle<FaultyCatalog> {
+        // A process's own connection: a failover of the database the
+        // coordinator lives in ends it.
         let coord = Arc::new(FaultyCoordinator::new(
-            Arc::clone(&self.coord_inner),
+            Arc::new(self.coord_inner.connection()),
             self.plan.clone(),
         ));
         let blob = Arc::new(FaultyBlobStore::new(
@@ -404,7 +534,7 @@ impl ChaosHarness {
                 Ok::<
                     Box<dyn pg2iceberg_snapshot::SnapshotSource>,
                     pg2iceberg_validate::LifecycleError,
-                >(Box::new(snapshot_db))
+                >(Box::new(snapshot_db.snapshot_source()))
             })
         });
 
@@ -420,6 +550,7 @@ impl ChaosHarness {
             skip_snapshot_idents: BTreeSet::new(),
             slot_name: SLOT.into(),
             publication_name: PUB.into(),
+            slot_failover: self.topology.slot_failover,
             group: "default".into(),
             schedule: chaos_schedule(),
             // Compaction folded into Materialize tick. Thresholds
@@ -449,6 +580,9 @@ impl ChaosHarness {
     async fn start_lifecycle(&mut self) {
         if self.running.is_some() {
             return;
+        }
+        if std::env::var_os("CHAOS_SOAK_LOG").is_some() {
+            eprintln!("starting a lifecycle");
         }
         let lifecycle = self.build_lifecycle();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -483,6 +617,9 @@ impl ChaosHarness {
 
     async fn stop_lifecycle(&mut self) {
         if let Some(r) = self.running.take() {
+            if std::env::var_os("CHAOS_SOAK_LOG").is_some() {
+                eprintln!("stopping the lifecycle");
+            }
             let _ = r.shutdown_tx.send(());
             // Bump both clocks so main_loop's `tokio::time::sleep`
             // arm wakes and `ticker.fire_due` sees nonzero now.
@@ -502,7 +639,10 @@ impl ChaosHarness {
             // `ensure_lifecycle_alive` will respawn it." Reach for
             // `eprintln!` here when investigating a specific failing
             // seed.
-            let _ = r.handle.await;
+            let exit = r.handle.await;
+            if std::env::var_os("CHAOS_SOAK_LOG").is_some() {
+                eprintln!("lifecycle exited: {exit:?}");
+            }
         }
     }
 
@@ -577,6 +717,9 @@ impl ChaosHarness {
         // WAL with no consumer. Bring the lifecycle back up before
         // doing anything else.
         self.ensure_lifecycle_alive().await;
+        if std::env::var_os("CHAOS_SOAK_LOG").is_some() {
+            eprintln!("step {step:?}");
+        }
 
         match step {
             Step::Insert { table_idx, id } => self.do_insert(*table_idx, *id, 64),
@@ -597,6 +740,15 @@ impl ChaosHarness {
                 self.start_lifecycle().await;
             }
             Step::AddTable => self.add_table().await,
+            Step::Replicate { pct } => {
+                if let Some(flushed) = self.db.standby_flushed() {
+                    let lacking = self.db.current_lsn().0.saturating_sub(flushed.0);
+                    let to = flushed.0 + lacking * u64::from(*pct) / 100;
+                    self.db.replicate_to_standby(pg2iceberg_core::Lsn(to));
+                }
+            }
+            Step::SyncSlots => self.db.sync_standby_slots(),
+            Step::Failover => self.fail_over().await,
         }
     }
 
@@ -612,6 +764,9 @@ impl ChaosHarness {
             self.start_lifecycle().await;
             return;
         }
+        // The DDL reaches the standby before the workload goes on: a
+        // failover losing it isn't modeled.
+        self.db.replicate_to_standby(self.db.current_lsn());
         self.schemas.push(new_schema);
         self.live.push(BTreeSet::new());
         self.start_lifecycle().await;
@@ -731,6 +886,13 @@ fn sort_by_pk(rows: &mut [Row]) {
 ///    long-lived `*_inner` Arcs (FaultyXxx wrappers are dropped with
 ///    the lifecycle, but the underlying state survives).
 async fn assert_no_data_loss(h: &mut ChaosHarness) -> Result<(), String> {
+    if let Some(path) = h.dangling.first() {
+        return Err(format!(
+            "a failover left the coordinator's log naming {path}, a staged file already deleted \
+             ({} in all)",
+            h.dangling.len()
+        ));
+    }
     h.plan.clear_failures();
     // Recovery loop: each iteration restarts the lifecycle if it
     // exited (because a fault tripped main_loop's flush) and gives
@@ -741,7 +903,12 @@ async fn assert_no_data_loss(h: &mut ChaosHarness) -> Result<(), String> {
     // is large.
     for _ in 0..6 {
         h.ensure_lifecycle_alive().await;
-        h.advance_time(2_000).await;
+        // The standby keeps up now: a failover slot's walsender sends
+        // only what it has.
+        for _ in 0..4 {
+            h.catch_up_standby();
+            h.advance_time(500).await;
+        }
     }
     h.stop_lifecycle().await;
 
@@ -803,14 +970,17 @@ proptest! {
     })]
 
     #[test]
-    fn chaos_soak_preserves_data_integrity(steps in workload()) {
+    fn chaos_soak_preserves_data_integrity(topology in topology(), steps in workload()) {
         run_chaos_test(|| async move {
-            let mut h = ChaosHarness::boot().await;
+            let mut h = ChaosHarness::boot_with(topology).await;
             for step in &steps {
                 h.run_step(step).await;
             }
             if let Err(e) = assert_no_data_loss(&mut h).await {
-                panic!("workload {:?}\nfailed: {}", steps, e);
+                panic!(
+                    "{topology:?}, {} failover(s), workload {:?}\nfailed: {}",
+                    h.failovers, steps, e
+                );
             }
         });
     }
@@ -834,19 +1004,19 @@ fn chaos_soak_extended_seeds() {
         ..proptest::test_runner::Config::default()
     });
     runner
-        .run(&workload(), |steps| {
+        .run(&(topology(), workload()), |(topology, steps)| {
             let runtime = paused_runtime();
             let local = tokio::task::LocalSet::new();
             let result: Result<(), proptest::test_runner::TestCaseError> =
                 local.block_on(&runtime, async {
-                    let mut h = ChaosHarness::boot().await;
+                    let mut h = ChaosHarness::boot_with(topology).await;
                     for step in &steps {
                         h.run_step(step).await;
                     }
                     assert_no_data_loss(&mut h).await.map_err(|e| {
                         proptest::test_runner::TestCaseError::fail(format!(
-                            "workload {:?}\nfailed: {}",
-                            steps, e
+                            "{topology:?}, {} failover(s), workload {:?}\nfailed: {}",
+                            h.failovers, steps, e
                         ))
                     })
                 });
@@ -854,6 +1024,10 @@ fn chaos_soak_extended_seeds() {
             Ok(())
         })
         .unwrap();
+    eprintln!(
+        "{cases} cases, {} failovers",
+        FAILOVERS.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 // ── pinned regressions ─────────────────────────────────────────────
@@ -960,6 +1134,258 @@ fn fault_blob_put_then_recovery_keeps_parity() {
         h.run_step(&Step::Tick { ms: 500 }).await;
         h.run_step(&Step::Restart).await;
         h.run_step(&Step::Tick { ms: 500 }).await;
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// Failover with the coordinator in the source: what the soak found.
+#[test]
+fn failover_with_the_coordinator_in_the_source() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot_with(Topology {
+            version: 170_002,
+            slot_failover: true,
+        })
+        .await;
+        for step in [
+            Step::Tick { ms: 150 },
+            Step::Failover,
+            Step::Tick { ms: 286 },
+            Step::Insert {
+                table_idx: 0,
+                id: 1,
+            },
+            Step::Tick { ms: 264 },
+            Step::Replicate { pct: 77 },
+            Step::Update {
+                table_idx: 0,
+                id: 8,
+            },
+            Step::Restart,
+            Step::Replicate { pct: 5 },
+            Step::AddTable,
+        ] {
+            h.run_step(&step).await;
+        }
+        assert_eq!(h.failovers, 1);
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// Failover after a table is added, the coordinator in the source: a
+/// change after the failover has to reach Iceberg.
+#[test]
+fn failover_after_add_table_with_the_coordinator_in_the_source() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot_with(Topology {
+            version: 170_002,
+            slot_failover: true,
+        })
+        .await;
+        for step in [
+            Step::Insert {
+                table_idx: 0,
+                id: 1,
+            },
+            Step::Insert {
+                table_idx: 1,
+                id: 1,
+            },
+            Step::InsertToast {
+                table_idx: 0,
+                id: 2,
+            },
+            Step::AddTable,
+            Step::Failover,
+            Step::InsertToast {
+                table_idx: 0,
+                id: 3,
+            },
+            Step::InjectFault {
+                op: ops::BLOB_PUT,
+                count: 2,
+            },
+        ] {
+            h.run_step(&step).await;
+        }
+        assert_eq!(h.failovers, 1);
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// Failover with added tables, the coordinator in the source: a change
+/// to one after the failover has to reach Iceberg.
+#[test]
+fn failover_with_added_tables_and_the_coordinator_in_the_source() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot_with(Topology {
+            version: 170_002,
+            slot_failover: true,
+        })
+        .await;
+        for step in [
+            Step::AddTable,
+            Step::Insert {
+                table_idx: 2,
+                id: 3,
+            },
+            Step::AddTable,
+            Step::Insert {
+                table_idx: 2,
+                id: 1,
+            },
+            Step::Tick { ms: 120 },
+            Step::AddTable,
+            Step::Failover,
+            Step::Insert {
+                table_idx: 2,
+                id: 4,
+            },
+        ] {
+            h.run_step(&step).await;
+        }
+        assert_eq!(h.failovers, 1);
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// Failover after a failed claim: a change after the failover has to
+/// reach Iceberg.
+#[test]
+fn failover_after_a_failed_claim() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot_with(Topology {
+            version: 170_002,
+            slot_failover: true,
+        })
+        .await;
+        for step in [
+            Step::InjectFault {
+                op: ops::COORD_CLAIM,
+                count: 1,
+            },
+            Step::Insert {
+                table_idx: 0,
+                id: 1,
+            },
+            Step::Insert {
+                table_idx: 0,
+                id: 2,
+            },
+            Step::Replicate { pct: 50 },
+            Step::Tick { ms: 150 },
+            Step::Insert {
+                table_idx: 0,
+                id: 3,
+            },
+            Step::Tick { ms: 50 },
+            Step::SyncSlots,
+            Step::Failover,
+            Step::Insert {
+                table_idx: 0,
+                id: 1,
+            },
+            Step::Replicate { pct: 92 },
+        ] {
+            h.run_step(&step).await;
+        }
+        assert_eq!(h.failovers, 1);
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// Failover after a restart with the standby behind.
+#[test]
+fn failover_after_a_restart_with_the_standby_behind() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot_with(Topology {
+            version: 170_002,
+            slot_failover: true,
+        })
+        .await;
+        for step in [
+            Step::Insert {
+                table_idx: 0,
+                id: 1,
+            },
+            Step::Insert {
+                table_idx: 0,
+                id: 2,
+            },
+            Step::Replicate { pct: 67 },
+            Step::Replicate { pct: 1 },
+            Step::Restart,
+            Step::Tick { ms: 258 },
+            Step::Failover,
+            Step::Replicate { pct: 83 },
+        ] {
+            h.run_step(&step).await;
+        }
+        assert_eq!(h.failovers, 1);
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// A failed staged-file read, then changes: no failover, no failover
+/// slot.
+#[test]
+fn failed_staged_read_then_changes() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot_with(Topology {
+            version: 160_004,
+            slot_failover: false,
+        })
+        .await;
+        for step in [
+            Step::Tick { ms: 359 },
+            Step::Tick { ms: 51 },
+            Step::Tick { ms: 310 },
+            Step::InjectFault {
+                op: ops::BLOB_GET,
+                count: 1,
+            },
+            Step::InsertToast {
+                table_idx: 0,
+                id: 1,
+            },
+            Step::Replicate { pct: 0 },
+            Step::Tick { ms: 150 },
+            Step::Replicate { pct: 0 },
+            Step::Tick { ms: 50 },
+        ] {
+            h.run_step(&step).await;
+        }
+        assert_no_data_loss(&mut h).await.unwrap();
+    });
+}
+
+/// Failover soon after a table is added, the coordinator in the source:
+/// changes from before it have to reach Iceberg.
+#[test]
+fn failover_soon_after_add_table_with_the_coordinator_in_the_source() {
+    run_chaos_test(|| async move {
+        let mut h = ChaosHarness::boot_with(Topology {
+            version: 170_002,
+            slot_failover: true,
+        })
+        .await;
+        for step in [
+            Step::Insert {
+                table_idx: 0,
+                id: 1,
+            },
+            Step::Insert {
+                table_idx: 0,
+                id: 2,
+            },
+            Step::AddTable,
+            Step::Replicate { pct: 13 },
+            Step::Tick { ms: 50 },
+            Step::Failover,
+        ] {
+            h.run_step(&step).await;
+        }
+        assert_eq!(h.failovers, 1);
         assert_no_data_loss(&mut h).await.unwrap();
     });
 }

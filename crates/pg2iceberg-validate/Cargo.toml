@@ -20,7 +20,7 @@ pg2iceberg-logical.workspace = true
 pg2iceberg-snapshot.workspace = true
 pg2iceberg-stream.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["macros", "time"] }
+tokio = { version = "1", features = ["macros", "time", "sync"] }
 tracing = "0.1"
 
 [dev-dependencies]

@@ -19,9 +19,11 @@ use async_trait::async_trait;
 use pg2iceberg_coord::Coordinator;
 use pg2iceberg_core::{Clock, Namespace, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{
-    Catalog, LogRange, PreparedCommit, PreparedCompaction, Result, SchemaChange, Snapshot,
-    TableMetadata,
+    Catalog, IcebergError, LogRange, PreparedCommit, PreparedCompaction, Result, SchemaChange,
+    Snapshot, TableMetadata,
 };
+
+use crate::standby::{NoStandby, Standby};
 
 /// A [`Catalog`] that caches each table's metadata and snapshot history.
 ///
@@ -35,10 +37,14 @@ use pg2iceberg_iceberg::{
 /// A write that fails may have applied anyway, so its table is dropped. A
 /// writer that dies between its commit and the bump leaves the epoch
 /// behind: with a TTL ([`Self::set_ttl`]) nothing is kept longer than it.
+///
+/// Each commit waits first until the standby the source fails over to has
+/// every coordinator write made before it ([`Self::set_standby`]).
 pub struct CachingCatalog<C> {
     inner: Arc<C>,
     coord: Arc<dyn Coordinator>,
     state: Mutex<State>,
+    standby: Mutex<Arc<dyn Standby>>,
 }
 
 #[derive(Default)]
@@ -104,7 +110,24 @@ impl<C: Catalog> CachingCatalog<C> {
             inner,
             coord,
             state: Mutex::default(),
+            standby: Mutex::new(Arc::new(NoStandby)),
         }
+    }
+
+    /// Wait for `standby` before each commit (see [`crate::standby`]).
+    pub fn set_standby(&self, standby: Arc<dyn Standby>) {
+        *self.standby.lock().unwrap() = standby;
+    }
+
+    /// Wait until the standby has every coordinator write so far: a
+    /// commit that can't is refused, unmade.
+    async fn settle(&self) -> Result<()> {
+        let standby = self.standby.lock().unwrap().clone();
+        standby.settle().await.map_err(|e| {
+            IcebergError::Other(format!(
+                "not committing until the standby has caught up: {e}"
+            ))
+        })
     }
 
     /// The catalog itself, for reads that must not be stale whatever
@@ -255,6 +278,7 @@ impl<C: Catalog> Catalog for CachingCatalog<C> {
     }
 
     async fn commit_snapshot(&self, prepared: PreparedCommit) -> Result<TableMetadata> {
+        self.settle().await?;
         let ident = prepared.ident.clone();
         let result = self.inner.commit_snapshot(prepared).await;
         self.written(&ident, result).await
@@ -266,6 +290,7 @@ impl<C: Catalog> Catalog for CachingCatalog<C> {
         log_range: Option<LogRange>,
         remove_properties: std::collections::BTreeSet<String>,
     ) -> Result<TableMetadata> {
+        self.settle().await?;
         let ident = steps.first().map(|s| s.ident.clone());
         let result = self
             .inner
@@ -278,6 +303,7 @@ impl<C: Catalog> Catalog for CachingCatalog<C> {
     }
 
     async fn commit_compaction(&self, prepared: PreparedCompaction) -> Result<TableMetadata> {
+        self.settle().await?;
         let ident = prepared.ident.clone();
         let result = self.inner.commit_compaction(prepared).await;
         self.written(&ident, result).await
@@ -289,6 +315,7 @@ impl<C: Catalog> Catalog for CachingCatalog<C> {
         changes: Vec<SchemaChange>,
         set_properties: std::collections::BTreeMap<String, String>,
     ) -> Result<TableMetadata> {
+        self.settle().await?;
         let result = self
             .inner
             .evolve_schema(ident, changes, set_properties)

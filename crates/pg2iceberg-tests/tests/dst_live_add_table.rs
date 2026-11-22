@@ -230,6 +230,7 @@ async fn live_add_table_backfills_via_background_snapshot() {
         skip_snapshot_idents: BTreeSet::new(),
         slot_name: SLOT.into(),
         publication_name: PUB.into(),
+        slot_failover: false,
         group: "default".into(),
         schedule: Schedule::default(),
         compaction: None,

@@ -359,6 +359,13 @@ pub fn record_slot_health(metrics: &dyn Metrics, health: Option<&SlotHealth>) {
             current,
         );
     }
+    if let Some(failover) = h.failover {
+        metrics.gauge(
+            names::SLOT_FAILOVER,
+            &no_labels,
+            if failover { 1.0 } else { 0.0 },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -651,6 +658,7 @@ mod tests {
                 conflicting: false,
                 safe_wal_size: Some(4_096),
                 current_wal_lsn: Some(Lsn(2_000)),
+                failover: Some(true),
             }),
         );
         let gauge = |name, l: &Labels| metrics.gauge_value(name, l);
@@ -658,6 +666,7 @@ mod tests {
         assert_eq!(gauge(names::REPLICATION_LAG, &none), Some(500.0));
         assert_eq!(gauge(names::SLOT_RETAINED_WAL, &none), Some(1_000.0));
         assert_eq!(gauge(names::SLOT_SAFE_WAL_SIZE, &none), Some(4_096.0));
+        assert_eq!(gauge(names::SLOT_FAILOVER, &none), Some(1.0));
         let status = |s| gauge(names::SLOT_WAL_STATUS, &labels([("status", s)]));
         assert_eq!(status("extended"), Some(1.0));
         assert_eq!(status("reserved"), Some(0.0));

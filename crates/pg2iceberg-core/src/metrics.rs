@@ -181,6 +181,8 @@ catalog! {
         "WAL the source can still write before the slot passes max_slot_wal_keep_size, in bytes; absent when unlimited.";
     SLOT_WAL_STATUS: Gauge "pg2iceberg_slot_wal_status" ["status"]
         "1 for the replication slot's wal_status (reserved, extended, unreserved, lost), 0 for the rest.";
+    SLOT_FAILOVER: Gauge "pg2iceberg_slot_failover" []
+        "1 if the replication slot is a failover slot, kept on standbys that sync slots so it survives a failover; 0 if not; absent before PostgreSQL 17.";
     SLOT_ACK_LAG: Gauge "pg2iceberg_slot_ack_lag_bytes" []
         "WAL staged but not yet acked to the replication slot, in bytes: the next ack's to make.";
     REPLICATION_RECONNECTS_TOTAL: Counter "pg2iceberg_replication_reconnects_total" ["outcome"]

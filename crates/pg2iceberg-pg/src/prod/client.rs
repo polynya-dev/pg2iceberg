@@ -302,15 +302,22 @@ impl PgClient for PgClientImpl {
         simple_exec(&*self.client().await?, &q).await
     }
 
-    async fn create_slot(&self, slot: &str) -> Result<Lsn> {
-        // `NOEXPORT_SNAPSHOT` keeps creation simple — no transactional
-        // snapshot is exposed to the caller. If we later need
-        // initial-snapshot consistency we'll switch to `USE_SNAPSHOT`
-        // inside a `BEGIN ... ` and add a separate API.
-        let q = format!(
-            "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput NOEXPORT_SNAPSHOT",
-            quote_ident(slot)
-        );
+    async fn create_slot(&self, slot: &str, failover: bool) -> Result<Lsn> {
+        // No snapshot is exported: creation stays simple, and the
+        // snapshot phase takes its own. `FAILOVER` (PG 17+) comes only in
+        // the options-list form (PG 15+), so the legacy
+        // `NOEXPORT_SNAPSHOT` keyword serves the rest, back to PG 14.
+        let q = if failover {
+            format!(
+                "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput (SNAPSHOT 'nothing', FAILOVER true)",
+                quote_ident(slot)
+            )
+        } else {
+            format!(
+                "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+                quote_ident(slot)
+            )
+        };
         let rows = self
             .client()
             .await?
@@ -333,6 +340,14 @@ impl PgClient for PgClientImpl {
         Err(PgError::Protocol(
             "CREATE_REPLICATION_SLOT returned no rows".into(),
         ))
+    }
+
+    async fn set_slot_failover(&self, slot: &str, failover: bool) -> Result<()> {
+        let q = format!(
+            "ALTER_REPLICATION_SLOT {} (FAILOVER {failover})",
+            quote_ident(slot)
+        );
+        simple_exec(&*self.client().await?, &q).await
     }
 
     async fn slot_exists(&self, slot: &str) -> Result<bool> {
@@ -410,7 +425,7 @@ impl PgClient for PgClientImpl {
         // `server_version_num`), so `wal_status` and `safe_wal_size`
         // are always direct columns. `conflicting` was added in PG
         // 16, so we read it via `to_jsonb` and degrade to `false` on
-        // older versions.
+        // older versions; `failover` (PG 17) likewise, to NULL.
         let q = format!(
             "SELECT \
                 restart_lsn::text AS restart_lsn, \
@@ -418,6 +433,7 @@ impl PgClient for PgClientImpl {
                 wal_status::text AS wal_status, \
                 safe_wal_size::text AS safe_wal_size, \
                 COALESCE((to_jsonb(pg_replication_slots.*) ->> 'conflicting')::boolean, false) AS conflicting, \
+                (to_jsonb(pg_replication_slots.*) ->> 'failover')::boolean::text AS failover, \
                 (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
                       ELSE pg_current_wal_lsn() END)::text AS current_wal_lsn \
              FROM pg_replication_slots \
@@ -450,6 +466,9 @@ impl PgClient for PgClientImpl {
                 let current_wal_text: Option<&str> = row
                     .try_get("current_wal_lsn")
                     .map_err(|e| PgError::Protocol(e.to_string()))?;
+                let failover_text: Option<&str> = row
+                    .try_get("failover")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?;
 
                 let restart_lsn = restart_text.map(parse_lsn).transpose()?.unwrap_or(Lsn(0));
                 let confirmed_flush_lsn =
@@ -468,6 +487,7 @@ impl PgClient for PgClientImpl {
                     conflicting,
                     safe_wal_size,
                     current_wal_lsn: current_wal_text.map(parse_lsn).transpose()?,
+                    failover: failover_text.map(|s| s == "t" || s == "true"),
                 }));
             }
         }
@@ -599,6 +619,53 @@ impl PgClient for PgClientImpl {
             }
         }
         Err(PgError::Protocol("IDENTIFY_SYSTEM returned no rows".into()))
+    }
+
+    async fn timeline(&self) -> Result<u32> {
+        let rows = self
+            .client()
+            .await?
+            .simple_query("IDENTIFY_SYSTEM")
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let timeline = row
+                    .try_get("timeline")
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                    .ok_or_else(|| {
+                        PgError::Protocol("IDENTIFY_SYSTEM returned NULL timeline".into())
+                    })?;
+                return timeline
+                    .parse::<u32>()
+                    .map_err(|e| PgError::Protocol(format!("parse timeline {timeline:?}: {e}")));
+            }
+        }
+        Err(PgError::Protocol("IDENTIFY_SYSTEM returned no rows".into()))
+    }
+
+    async fn current_wal_lsn(&self) -> Result<Lsn> {
+        let rows = self
+            .client()
+            .await?
+            .simple_query(
+                "SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() \
+                 ELSE pg_current_wal_flush_lsn() END)::text",
+            )
+            .await
+            .map_err(|e| PgError::Protocol(e.to_string()))?;
+        for msg in rows {
+            if let SimpleQueryMessage::Row(row) = msg {
+                let lsn = row
+                    .try_get(0)
+                    .map_err(|e| PgError::Protocol(e.to_string()))?
+                    .ok_or_else(|| PgError::Protocol("the WAL position is NULL".into()))?;
+                return parse_lsn(lsn);
+            }
+        }
+        Err(PgError::Protocol(
+            "the WAL position query returned no rows".into(),
+        ))
     }
 
     async fn server_version_num(&self) -> Result<i32> {

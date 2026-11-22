@@ -84,6 +84,7 @@ Read from `pg_replication_slots` every watcher tick (30 s).
 | `pg2iceberg_slot_retained_wal_bytes` | gauge | | WAL the slot keeps the source from removing. |
 | `pg2iceberg_slot_safe_wal_size_bytes` | gauge | | WAL the source can still write before the slot passes `max_slot_wal_keep_size`. Absent when that's unlimited. |
 | `pg2iceberg_slot_wal_status` | gauge | `status` | 1 for the slot's `wal_status`: `reserved`, `extended`, `unreserved` (WAL is about to be removed) or `lost`. |
+| `pg2iceberg_slot_failover` | gauge | | 1 if the slot is a failover slot, which standbys that sync slots keep a copy of (see [Failover](failover.md)); 0 if not. Absent before PostgreSQL 17. |
 | `pg2iceberg_slot_ack_lag_bytes` | gauge | | WAL staged but not yet acked to the slot. |
 | `pg2iceberg_replication_reconnects_total` | counter | `outcome` | Attempts to reopen a dropped replication stream: `ok` or `error`. |
 | `pg2iceberg_replication_buffered_messages` | gauge | | Decoded messages waiting for the main loop. Near 1000, the main loop is the bottleneck, not Postgres. |

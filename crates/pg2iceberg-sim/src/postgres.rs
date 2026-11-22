@@ -59,6 +59,10 @@ pub enum SimError {
     RowNotFound { table: TableIdent, op: &'static str },
     #[error("table {0} has no primary key")]
     NoPrimaryKey(TableIdent),
+    /// What Postgres refuses as a syntax error before the release that
+    /// added it.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, SimError>;
@@ -168,6 +172,9 @@ pub struct SlotState {
     /// large positive value. Tests don't typically read this; it's
     /// here for the metric surface.
     pub safe_wal_size: i64,
+    /// Mirrors `pg_replication_slots.failover` (PG 17+): whether a
+    /// standby keeps a copy of the slot, so it survives a failover.
+    pub failover: bool,
 }
 
 /// Sim-side mirror of [`pg2iceberg_pg::WalStatus`]. Kept as a
@@ -229,6 +236,30 @@ struct DbState {
     /// `START_REPLICATION`s still to refuse per slot, held by a dead
     /// connection's walsender (see [`SimPostgres::hold_slot`]).
     slot_holds: BTreeMap<String, usize>,
+    /// `server_version_num`; `0` (the default) for unknown, which skips
+    /// the startup version check and has no failover slots.
+    server_version_num: i32,
+    /// A physical standby streaming this source's WAL, which a failover
+    /// promotes (see [`SimPostgres::attach_standby`]).
+    standby: Option<Standby>,
+    /// Bumped by each promotion: every connection made before it — a
+    /// snapshot's too — is gone.
+    promotions: u64,
+}
+
+/// A physical standby: how much of the source's WAL it has, and its
+/// copies of the source's failover slots.
+#[derive(Clone, Debug)]
+struct Standby {
+    /// The WAL position it has flushed to: it holds every record before.
+    flushed: Lsn,
+    /// Its synced copies of failover slots, as slot sync last left them
+    /// (`sync_replication_slots`).
+    slots: BTreeMap<String, SlotState>,
+    /// Whether the source's `synchronized_standby_slots` names it: then
+    /// a failover slot's walsender sends nothing — no change, no
+    /// keepalive position — the standby hasn't flushed.
+    synchronized: bool,
 }
 
 /// A table's rows, keyed by canonical PK.
@@ -287,6 +318,9 @@ impl Default for DbState {
             snapshot_at: None,
             walsender_generation: 0,
             slot_holds: BTreeMap::new(),
+            server_version_num: 0,
+            standby: None,
+            promotions: 0,
         }
     }
 }
@@ -310,6 +344,39 @@ fn relation_columns_from_schema(schema: &TableSchema) -> Vec<pg2iceberg_pg::Rela
 }
 
 impl DbState {
+    /// Take `slot` for a command, unless a dead connection's walsender
+    /// still holds it (see [`SimPostgres::hold_slot`]).
+    fn acquire_slot(&mut self, slot: &str) -> Result<()> {
+        if let Some(holds) = self.slot_holds.get_mut(slot).filter(|n| **n > 0) {
+            *holds -= 1;
+            return Err(SimError::SlotActive(slot.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Where a walsender for `slot` stops decoding: at the standby's
+    /// flushed position if `synchronized_standby_slots` names the
+    /// standby and `slot` is a failover slot, for a failover to it to
+    /// lose nothing the consumer has seen.
+    fn decode_limit(&self, slot: &str) -> Option<Lsn> {
+        let standby = self.standby.as_ref().filter(|s| s.synchronized)?;
+        let failover = self.slots.get(slot).is_some_and(|s| s.failover);
+        failover.then_some(standby.flushed)
+    }
+
+    /// Postgres before 17 has no `FAILOVER` option: a syntax error.
+    fn require_failover_slots(&self) -> Result<()> {
+        if pg2iceberg_pg::failover_slots_supported(self.server_version_num) {
+            Ok(())
+        } else {
+            Err(SimError::Unsupported(format!(
+                "syntax error at or near \"FAILOVER\": failover slots need \
+                 PostgreSQL 17 (server_version_num {})",
+                self.server_version_num
+            )))
+        }
+    }
+
     fn alloc_lsn(&mut self) -> Lsn {
         self.next_lsn += 1;
         Lsn(self.next_lsn)
@@ -928,9 +995,10 @@ impl SimPostgres {
         self.state.lock().unwrap().walsender_generation += 1;
     }
 
-    /// The next `attempts` `START_REPLICATION`s on `slot` fail, as they
-    /// do while a dead connection's walsender still holds the slot —
-    /// until `wal_sender_timeout` or TCP keepalives notice it's gone:
+    /// The next `attempts` acquisitions of `slot` — `START_REPLICATION`,
+    /// `ALTER_REPLICATION_SLOT` — fail, as they do while a dead
+    /// connection's walsender still holds the slot — until
+    /// `wal_sender_timeout` or TCP keepalives notice it's gone:
     /// `replication slot "…" is active for PID …`.
     pub fn hold_slot(&self, slot: &str, attempts: usize) {
         let mut s = self.state.lock().unwrap();
@@ -964,10 +1032,30 @@ impl SimPostgres {
         Ok(())
     }
 
+    /// The source's `server_version_num` (see [`Self::set_server_version_num`]).
+    pub fn server_version_num(&self) -> i32 {
+        self.state.lock().unwrap().server_version_num
+    }
+
+    /// Make the source this Postgres release (`server_version_num`, e.g.
+    /// `170_002`): from 17 it has failover slots.
+    pub fn set_server_version_num(&self, version: i32) {
+        self.state.lock().unwrap().server_version_num = version;
+    }
+
     /// Creates a logical replication slot bound to a publication. Returns the
     /// slot's initial `restart_lsn` (the current WAL position).
     pub fn create_slot(&self, name: &str, publication: &str) -> Result<Lsn> {
+        self.create_slot_with(name, publication, false)
+    }
+
+    /// [`Self::create_slot`], a failover slot if `failover` — which,
+    /// like Postgres, only a release with failover slots takes.
+    pub fn create_slot_with(&self, name: &str, publication: &str, failover: bool) -> Result<Lsn> {
         let mut s = self.state.lock().unwrap();
+        if failover {
+            s.require_failover_slots()?;
+        }
         if s.slots.contains_key(name) {
             return Err(SimError::DuplicateSlot(name.to_string()));
         }
@@ -984,9 +1072,193 @@ impl SimPostgres {
                 wal_status: SimWalStatus::default(),
                 conflicting: false,
                 safe_wal_size: 1024 * 1024 * 1024,
+                failover,
             },
         );
         Ok(lsn)
+    }
+
+    /// `ALTER_REPLICATION_SLOT name (FAILOVER failover)`: only on a
+    /// release with failover slots, and not while a walsender holds the
+    /// slot (see [`Self::hold_slot`]).
+    pub fn set_slot_failover(&self, name: &str, failover: bool) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.require_failover_slots()?;
+        if !s.slots.contains_key(name) {
+            return Err(SimError::UnknownSlot(name.to_string()));
+        }
+        s.acquire_slot(name)?;
+        s.slots.get_mut(name).expect("checked above").failover = failover;
+        Ok(())
+    }
+
+    /// Attach a physical standby, caught up to now (a fresh base backup),
+    /// replacing any other. `synchronized`: the source's
+    /// `synchronized_standby_slots` names it (see [`Standby`]).
+    pub fn attach_standby(&self, synchronized: bool) {
+        let mut s = self.state.lock().unwrap();
+        let flushed = s.current_lsn();
+        s.standby = Some(Standby {
+            flushed,
+            slots: BTreeMap::new(),
+            synchronized,
+        });
+    }
+
+    /// The source's timeline: 1, and one more for each promotion.
+    pub fn timeline(&self) -> u32 {
+        1 + self.state.lock().unwrap().promotions as u32
+    }
+
+    /// The WAL position the standby has flushed to, if there's one.
+    pub fn standby_flushed(&self) -> Option<Lsn> {
+        self.state
+            .lock()
+            .unwrap()
+            .standby
+            .as_ref()
+            .map(|s| s.flushed)
+    }
+
+    /// The standby receives and flushes the source's WAL up to `to`
+    /// (no further than the source has written; never back).
+    pub fn replicate_to_standby(&self, to: Lsn) {
+        let mut s = self.state.lock().unwrap();
+        let current = s.current_lsn();
+        if let Some(standby) = s.standby.as_mut() {
+            standby.flushed = standby.flushed.max(to.min(current));
+        }
+    }
+
+    /// One slot sync cycle on the standby, as PostgreSQL 17's slot sync
+    /// worker runs it: each failover slot is copied as the source has it
+    /// — unless its `confirmed_flush_lsn` is past what the standby has
+    /// flushed, which it skips until the standby catches up. A copy whose
+    /// source slot is gone, or no longer a failover slot, is dropped.
+    pub fn sync_standby_slots(&self) {
+        let mut s = self.state.lock().unwrap();
+        let primary = s.slots.clone();
+        let Some(standby) = s.standby.as_mut() else {
+            return;
+        };
+        standby
+            .slots
+            .retain(|name, _| primary.get(name).is_some_and(|p| p.failover));
+        for (name, slot) in primary.into_iter().filter(|(_, p)| p.failover) {
+            if slot.confirmed_flush_lsn <= standby.flushed {
+                standby.slots.insert(name, slot);
+            }
+        }
+    }
+
+    /// The standby's synced copy of `slot`, if it has one.
+    pub fn standby_slot(&self, slot: &str) -> Option<SlotState> {
+        let s = self.state.lock().unwrap();
+        s.standby.as_ref()?.slots.get(slot).cloned()
+    }
+
+    /// Fail over: the source dies and the standby is promoted in its
+    /// place. Its WAL ends where the standby had flushed to — a
+    /// transaction whose commit the standby lacked never committed, and
+    /// the next record takes the position after the last kept (the new
+    /// timeline reuses positions the old one had written past) — and its
+    /// tables are as of then. Its slots are the standby's synced copies:
+    /// a slot that wasn't a failover slot, or wasn't synced yet, is gone.
+    /// Every connection drops. No standby is attached after; returns the
+    /// position the WAL now ends at.
+    ///
+    /// DDL the standby lacked is lost too: a table it hadn't seen created
+    /// is gone. A lost `ALTER` isn't modeled — it errors.
+    pub fn promote_standby(&self) -> Result<Lsn> {
+        let mut s = self.state.lock().unwrap();
+        let standby = s
+            .standby
+            .clone()
+            .ok_or_else(|| SimError::Unsupported("no standby to promote".into()))?;
+        let end = standby.flushed;
+        // Tables the standby never saw created, and any lost DDL on the
+        // rest (which isn't modeled).
+        let mut lost_tables = BTreeSet::new();
+        for e in s.wal.iter().filter(|e| e.lsn >= end) {
+            if let WalKind::Relation { ident, .. } = &e.kind {
+                let created_before = s.wal.iter().any(|r| {
+                    r.lsn < end
+                        && matches!(&r.kind, WalKind::Relation { ident: i, .. } if i == ident)
+                });
+                if created_before {
+                    return Err(SimError::Unsupported(format!(
+                        "failover losing DDL on {ident} isn't modeled"
+                    )));
+                }
+                lost_tables.insert(ident.clone());
+            }
+        }
+        let lost_xids: BTreeSet<u32> = s
+            .wal
+            .iter()
+            .filter(|e| e.lsn >= end)
+            .filter_map(|e| e.xid)
+            .collect();
+        s.wal
+            .retain(|e| e.lsn < end && e.xid.is_none_or(|x| !lost_xids.contains(&x)));
+        for ident in &lost_tables {
+            s.tables.remove(ident);
+            s.versions.remove(ident);
+            for p in s.publications.values_mut() {
+                p.tables.remove(ident);
+            }
+        }
+        let idents: Vec<TableIdent> = s.tables.keys().cloned().collect();
+        for ident in idents {
+            let versions = s.versions.entry(ident.clone()).or_default();
+            versions.retain(|(lsn, _)| *lsn < end);
+            let rows = versions
+                .last()
+                .map(|(_, rows)| rows.clone())
+                .unwrap_or_default();
+            s.tables.get_mut(&ident).expect("listed above").rows = rows;
+        }
+        // The WAL goes on after the last record kept: a walsender decodes
+        // past the records of a transaction that never committed, which
+        // the sim drops, so no position is left that none can reach.
+        s.next_lsn = s.wal.last().map_or(end.0.saturating_sub(1), |e| e.lsn.0);
+        s.slots = standby.slots;
+        s.slot_holds.clear();
+        s.snapshot_at = None;
+        s.standby = None;
+        s.walsender_generation += 1;
+        s.promotions += 1;
+        Ok(end)
+    }
+
+    /// A write to tables outside every publication — the coordinator's,
+    /// when it lives in this database: a transaction with nothing to
+    /// decode, which only moves the WAL on. Returns its commit LSN.
+    pub fn commit_unpublished(&self) -> Lsn {
+        let mut s = self.state.lock().unwrap();
+        let xid = s.alloc_xid();
+        let begin = s.alloc_lsn();
+        s.wal.push(WalEntry {
+            lsn: begin,
+            xid: Some(xid),
+            kind: WalKind::Begin,
+        });
+        let commit = s.alloc_lsn();
+        s.wal.push(WalEntry {
+            lsn: commit,
+            xid: Some(xid),
+            kind: WalKind::Commit,
+        });
+        commit
+    }
+
+    /// A snapshot source on a connection of its own: it fails once a
+    /// failover drops that connection, as production's does.
+    pub fn snapshot_source(&self) -> SimSnapshotSource {
+        SimSnapshotSource {
+            db: self.clone(),
+            promotions: self.state.lock().unwrap().promotions,
+        }
     }
 
     /// Test hook: force a slot's `wal_status` to model PG's
@@ -1152,10 +1424,7 @@ impl SimPostgres {
             .get(slot)
             .cloned()
             .ok_or_else(|| SimError::UnknownSlot(slot.to_string()))?;
-        if let Some(holds) = s.slot_holds.get_mut(slot).filter(|n| **n > 0) {
-            *holds -= 1;
-            return Err(SimError::SlotActive(slot.to_string()));
-        }
+        s.acquire_slot(slot)?;
         let cursor_lsn = s.decoding_cursor(slot_state.confirmed_flush_lsn.max(start));
         Ok(SimReplicationStream {
             db: self.clone(),
@@ -1719,12 +1988,26 @@ impl SimReplicationStream {
             .expect("slot points to existing publication")
             .tables;
 
+        // A failover slot under `synchronized_standby_slots` decodes only
+        // what the standby has: a transaction once it has the commit.
+        let limit = s.decode_limit(&self.slot);
+        let available = |lsn: Lsn| limit.is_none_or(|l| lsn < l);
         for (i, entry) in s.wal.iter().enumerate() {
             if entry.lsn <= self.cursor_lsn {
                 continue;
             }
+            if !available(entry.lsn) {
+                break;
+            }
             match &entry.kind {
                 WalKind::Begin => {
+                    let commit_available = s.wal[i + 1..]
+                        .iter()
+                        .find(|e| e.xid == entry.xid && matches!(e.kind, WalKind::Commit))
+                        .is_some_and(|c| available(c.lsn));
+                    if !commit_available {
+                        break;
+                    }
                     // pgoutput skips a transaction with nothing for the
                     // publication — no Begin/Commit at all. Jump the
                     // cursor to its Commit; only a later keepalive tells
@@ -1996,6 +2279,65 @@ impl SnapshotSource for SimPostgres {
     }
 }
 
+/// [`SimPostgres`]'s [`SnapshotSource`] on a connection a failover drops
+/// (see [`SimPostgres::snapshot_source`]).
+pub struct SimSnapshotSource {
+    db: SimPostgres,
+    /// [`DbState::promotions`] when the connection was made.
+    promotions: u64,
+}
+
+impl SimSnapshotSource {
+    fn connected(&self) -> std::result::Result<&SimPostgres, SnapshotError> {
+        if self.db.state.lock().unwrap().promotions == self.promotions {
+            Ok(&self.db)
+        } else {
+            Err(SnapshotError::Source(
+                "server closed the connection unexpectedly".into(),
+            ))
+        }
+    }
+}
+
+#[async_trait]
+impl SnapshotSource for SimSnapshotSource {
+    async fn snapshot_lsn(&self) -> std::result::Result<Lsn, SnapshotError> {
+        self.connected()?.snapshot_lsn().await
+    }
+
+    async fn read_chunk(
+        &self,
+        ident: &TableIdent,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> std::result::Result<Vec<Row>, SnapshotError> {
+        self.connected()?
+            .read_chunk(ident, chunk_size, after_pk_key)
+            .await
+    }
+
+    async fn split(
+        &self,
+        ident: &TableIdent,
+        parts: usize,
+        min_rows: usize,
+    ) -> std::result::Result<Vec<KeyRange>, SnapshotError> {
+        self.connected()?.split(ident, parts, min_rows).await
+    }
+
+    async fn read_range(
+        &self,
+        ident: &TableIdent,
+        range: &KeyRange,
+        chunk_size: usize,
+        after_pk_key: Option<&str>,
+    ) -> std::result::Result<Vec<Row>, SnapshotError> {
+        self.connected()?
+            .read_range(ident, range, chunk_size, after_pk_key)
+            .await
+    }
+}
+
 #[async_trait]
 impl pg2iceberg_pg::ColumnDefaultSource for SimPostgres {
     async fn column_defaults(
@@ -2064,7 +2406,7 @@ impl PgClient for SimPgClient {
         Ok(())
     }
 
-    async fn create_slot(&self, slot: &str) -> std::result::Result<Lsn, PgError> {
+    async fn create_slot(&self, slot: &str, failover: bool) -> std::result::Result<Lsn, PgError> {
         let pub_ = self
             .pending_publication
             .lock()
@@ -2080,7 +2422,17 @@ impl PgClient for SimPgClient {
                 )
             })?;
         self.db
-            .create_slot(slot, &pub_)
+            .create_slot_with(slot, &pub_, failover)
+            .map_err(|e| PgError::Other(e.to_string()))
+    }
+
+    async fn set_slot_failover(
+        &self,
+        slot: &str,
+        failover: bool,
+    ) -> std::result::Result<(), PgError> {
+        self.db
+            .set_slot_failover(slot, failover)
             .map_err(|e| PgError::Other(e.to_string()))
     }
 
@@ -2127,6 +2479,8 @@ impl PgClient for SimPgClient {
             conflicting: s.conflicting,
             safe_wal_size: Some(s.safe_wal_size),
             current_wal_lsn: Some(self.db.current_lsn()),
+            failover: pg2iceberg_pg::failover_slots_supported(self.db.server_version_num())
+                .then_some(s.failover),
         }))
     }
 
@@ -2166,10 +2520,17 @@ impl PgClient for SimPgClient {
         Ok(0)
     }
 
+    async fn current_wal_lsn(&self) -> std::result::Result<Lsn, PgError> {
+        Ok(self.db.current_lsn())
+    }
+
+    async fn timeline(&self) -> std::result::Result<u32, PgError> {
+        Ok(self.db.timeline())
+    }
+
     async fn server_version_num(&self) -> std::result::Result<i32, PgError> {
-        // Sim doesn't model PG version differences. Return `0` so the
-        // startup version check skips the assertion in DST runs.
-        Ok(0)
+        // `0` unless a test set one: the startup version check skips it.
+        Ok(self.db.server_version_num())
     }
 
     async fn start_replication(

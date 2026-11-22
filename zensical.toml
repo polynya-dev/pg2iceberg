@@ -70,6 +70,7 @@ nav = [
     { "Partitioning" = "usage/partitioning.md" },
     { "Type Mapping" = "usage/type-mapping.md" },
     { "Operational Modes" = "usage/modes.md" },
+    { "Failover" = "usage/failover.md" },
     { "Observability" = "usage/observability.md" },
     { "Metadata Tables" = "usage/metadata-tables.md" },
     { "CLI Reference" = "usage/reference.md" },

@@ -37,6 +37,16 @@ use tokio_postgres::Client;
 pub struct PostgresCoordinator {
     conn: Mutex<PgConn>,
     schema: CoordSchema,
+    /// The database's timeline as this process first connected, and — once
+    /// a connection came back on another — that one: then every call fails
+    /// ([`CoordError::FailedOver`]).
+    timeline: std::sync::Mutex<Timeline>,
+}
+
+#[derive(Default)]
+struct Timeline {
+    first: Option<u32>,
+    failed_over_to: Option<u32>,
 }
 
 impl PostgresCoordinator {
@@ -46,18 +56,60 @@ impl PostgresCoordinator {
         Self {
             conn: Mutex::new(conn),
             schema,
+            timeline: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The database's timeline: a promotion — a failover to a standby —
+    /// starts a new one.
+    async fn current_timeline(client: &Client) -> Result<u32> {
+        let row = client
+            .query_one(
+                "SELECT substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)",
+                &[],
+            )
+            .await
+            .map_err(pg)?;
+        let hex: String = row.get(0);
+        u32::from_str_radix(&hex, 16)
+            .map_err(|e| CoordError::Pg(format!("parse timeline {hex:?}: {e}")))
+    }
+
+    /// Fail if the database failed over since this process first
+    /// connected: `timeline` is what `client` is on.
+    fn check_timeline(&self, timeline: u32) -> Result<()> {
+        let mut t = self.timeline.lock().unwrap();
+        let first = *t.first.get_or_insert(timeline);
+        if timeline != first {
+            t.failed_over_to = Some(timeline);
+        }
+        match t.failed_over_to {
+            Some(to) => Err(CoordError::FailedOver { from: first, to }),
+            None => Ok(()),
         }
     }
 
     /// The client, on a new connection if the last one closed. Every
     /// method runs whole on one connection — a transaction included — and
     /// leaves nothing on it, so a new one serves as well.
+    ///
+    /// A failover breaks every connection, so each new one, and the first,
+    /// is checked for one ([`CoordError::FailedOver`]).
     async fn client(&self) -> Result<MappedMutexGuard<'_, Client>> {
         let mut conn = self.conn.lock().await;
+        let (first, failed_over_to) = {
+            let t = self.timeline.lock().unwrap();
+            (t.first, t.failed_over_to)
+        };
         if conn.client.is_closed() {
             let fresh = conn.reopen().await?;
             conn.abort.abort();
             *conn = fresh;
+            self.check_timeline(Self::current_timeline(&conn.client).await?)?;
+        } else if first.is_none() {
+            self.check_timeline(Self::current_timeline(&conn.client).await?)?;
+        } else if let (Some(from), Some(to)) = (first, failed_over_to) {
+            return Err(CoordError::FailedOver { from, to });
         }
         Ok(MutexGuard::map(conn, |c| &mut c.client))
     }

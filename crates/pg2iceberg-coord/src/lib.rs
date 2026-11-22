@@ -56,6 +56,15 @@ pub enum CoordError {
          state.coordinator_schema of its own. A group can't be renamed."
     )]
     GroupMismatch { holder: String, configured: String },
+    /// The coordinator's database failed over: this connection came back
+    /// on another timeline. Writes this process made may be gone, and
+    /// what it holds in memory rests on them; it may write nothing more.
+    /// A new process starts from what the coordinator holds.
+    #[error(
+        "the coordinator's database failed over from timeline {from} to {to}: \
+         this process writes nothing more to it"
+    )]
+    FailedOver { from: u32, to: u32 },
     #[error("other: {0}")]
     Other(String),
 }

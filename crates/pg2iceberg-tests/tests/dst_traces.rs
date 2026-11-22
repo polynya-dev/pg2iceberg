@@ -107,6 +107,7 @@ fn lifecycle(
         skip_snapshot_idents: BTreeSet::new(),
         slot_name: "traces-slot".into(),
         publication_name: "traces-pub".into(),
+        slot_failover: false,
         group: "default".into(),
         schedule: pg2iceberg_logical::Schedule {
             flush: second,

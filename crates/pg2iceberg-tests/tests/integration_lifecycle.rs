@@ -222,6 +222,8 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
                 slot_name: slot.into(),
                 standby_interval: String::new(),
                 snapshot_concurrency: 4,
+                // The default: on this PG 16 source, a slot like any other.
+                failover: true,
             },
         },
         sink: SinkConfig {

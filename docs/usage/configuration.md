@@ -39,6 +39,7 @@ sink:
 | `PG2ICEBERG_TABLES` | `tables`: comma-separated `schema.table`, or `schema.*` for every table with a primary key in a schema |
 | `PG2ICEBERG_SLOT` | `source.logical.slot_name` |
 | `PG2ICEBERG_PUBLICATION` | `source.logical.publication_name` |
+| `PG2ICEBERG_SLOT_FAILOVER` | `source.logical.failover`: `true` or `false` |
 | `PG2ICEBERG_STATE_DATABASE` | `state.database` |
 | `PG2ICEBERG_CONFIG` | the config file |
 | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` |
@@ -107,6 +108,7 @@ source:
     slot_name: pg2iceberg_slot
     standby_interval: 10s        # how often the standby_status ack is sent
     snapshot_concurrency: 4      # tables, or ranges of one, the initial snapshot reads at once
+    failover: true               # a failover slot, on PostgreSQL 17+ (see Failover)
 
 # Tables to replicate. Leave out for every table with a primary key.
 tables:
@@ -205,7 +207,8 @@ snapshot_only: false             # legacy field; prefer the `snapshot` subcomman
 ## Notes on individual fields
 
 - **`source.logical.snapshot_concurrency`** — the most tables the initial snapshot reads at once (default 4; 1 reads them one after another). Each is read over a Postgres connection of its own, all in the same snapshot, and written on its own, so the snapshot uses that many cores and connections, and holds up to two chunks of `flush_rows` rows for each table. A table of more than ten chunks is read in ranges of its key, as many at once ([large tables](../architecture/snapshot.md#large-tables)). A table larger than Postgres's memory is read from disk, and more at once keep more reads in flight: a 50 GB table took 558 s with 4, 370 s with 8 and 245 s with 16, on three cores — past that, pg2iceberg's CPU bounds it.
-- **`state.database`** — the database that holds pg2iceberg's state (the `coordinator_schema`), on the source's Postgres server (default: the source's own). It's the only part of where the state lives that can change: it's always on the source's server, so it fails over along with the source. pg2iceberg connects to it as it connects to the source. `state.postgres_url`, which pointed elsewhere, is no longer accepted.
+- **`state.database`** — the database that holds pg2iceberg's state (the `coordinator_schema`), on the source's Postgres server (default: the source's own). It's the only part of where the state lives that can change: it's always on the source's server, so it fails over along with the source ([Failover](failover.md)). pg2iceberg connects to it as it connects to the source. `state.postgres_url`, which pointed elsewhere, is no longer accepted.
+- **`source.logical.failover`** — make the replication slot a failover slot, which standbys that sync slots keep a copy of, so the pipeline carries on after a failover to one (default `true`). Only PostgreSQL 17+ has them; before, it does nothing. An existing slot is altered to match at startup. See [Failover](failover.md) for the Postgres settings it needs.
 - **`source.logical.snapshot_chunk_pages` / `snapshot_target_file_size`** — not yet exposed; the snapshot reads tables in chunks of `flush_rows` rows.
 - **`sink.flush_rows`** — the most change events pg2iceberg holds in memory before staging them. A transaction bigger than this is staged in chunks of this size as it streams in, and claimed in one step when it commits, so readers never see part of it. The initial snapshot reads tables in chunks of this many rows, reading the next while it writes one, so it holds up to twice as many for each table it reads at once (`snapshot_concurrency`). Larger values mean fewer, larger staged files.
 - **`sink.materializer_batch_rows`** — the most change events the materializer folds into one step, which bounds its memory, along with the up to eight staged files it reads ahead (each at most `flush_rows` events). A transaction larger than this is written in several steps committed in one atomic catalog update, so readers of the table never see part of it; catching up, the materializer commits up to four steps at a time anyway. Steps only adding rows share a snapshot ([commit](../architecture/materializer.md)).
