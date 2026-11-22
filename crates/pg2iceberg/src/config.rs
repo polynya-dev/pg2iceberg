@@ -255,6 +255,12 @@ pub struct LogicalConfig {
     /// `sink.flush_rows` rows; 1 reads them one after another.
     #[serde(default = "default_snapshot_concurrency")]
     pub snapshot_concurrency: usize,
+    /// Make the replication slot a failover slot, which standbys that
+    /// sync slots keep a copy of, so pipelines survive a failover to one.
+    /// Only PostgreSQL 17+ has them; on an older source this does
+    /// nothing. An existing slot is altered to match at startup.
+    #[serde(default = "default_failover")]
+    pub failover: bool,
 }
 
 impl Default for LogicalConfig {
@@ -264,6 +270,7 @@ impl Default for LogicalConfig {
             slot_name: default_slot(),
             standby_interval: String::new(),
             snapshot_concurrency: default_snapshot_concurrency(),
+            failover: default_failover(),
         }
     }
 }
@@ -280,6 +287,10 @@ impl LogicalConfig {
 
 fn default_snapshot_concurrency() -> usize {
     pg2iceberg_snapshot::DEFAULT_TABLE_CONCURRENCY
+}
+
+fn default_failover() -> bool {
+    true
 }
 
 fn default_publication() -> String {
@@ -861,6 +872,7 @@ impl Config {
     /// | `POSTGRES_URL` | `source.postgres_url` |
     /// | `PG2ICEBERG_TABLES` | `tables`: comma-separated `schema.table` or `schema.*` |
     /// | `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.logical.slot_name` / `publication_name` |
+    /// | `PG2ICEBERG_SLOT_FAILOVER` | `source.logical.failover`: `true` or `false` |
     /// | `PG2ICEBERG_STATE_DATABASE` | `state.database` |
     /// | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` |
     /// | `ICEBERG_CATALOG_AUTH` | `sink.catalog_auth` |
@@ -917,6 +929,13 @@ impl Config {
         set(&mut self.metrics_addr, "PG2ICEBERG_METRICS_ADDR");
         set(&mut self.liveness_timeout, "PG2ICEBERG_LIVENESS_TIMEOUT");
         set(&mut self.sink.maintenance, "PG2ICEBERG_MAINTENANCE");
+        if let Some(failover) = env("PG2ICEBERG_SLOT_FAILOVER") {
+            self.source.logical.failover = match failover.trim().to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                _ => anyhow::bail!("PG2ICEBERG_SLOT_FAILOVER={failover:?}: expected true or false"),
+            };
+        }
         if let Some(version) = env("PG2ICEBERG_FORMAT_VERSION") {
             self.sink.format_version = version.trim().parse().map_err(|_| {
                 anyhow::anyhow!(
@@ -1879,6 +1898,32 @@ sink:
         .unwrap_err()
         .to_string();
         assert!(err.contains("PG2ICEBERG_STATE_DATABASE"), "{err}");
+    }
+
+    /// The slot is a failover slot unless told not, from the file or the
+    /// environment; an environment value other than true or false fails
+    /// the config load.
+    #[test]
+    fn slot_is_a_failover_slot_unless_told_not() {
+        let failover = |cfg: Config| cfg.source.logical.failover;
+        assert!(failover(Config::from_env(&vars(&[])).unwrap()));
+        let env = vars(&[("PG2ICEBERG_SLOT_FAILOVER", "false")]);
+        assert!(!failover(Config::from_env(&env).unwrap()));
+        let env = vars(&[("PG2ICEBERG_SLOT_FAILOVER", "TRUE")]);
+        assert!(failover(Config::from_env(&env).unwrap()));
+        let yaml = INTERVALS.replace(
+            "    user: u\n",
+            "    user: u\n  logical:\n    failover: false\n",
+        );
+        let env = vars(&[]);
+        let cfg = Config::parse(&yaml, &env).unwrap().finish(&env).unwrap();
+        assert!(!failover(cfg));
+        for bad in ["no", "0", ""] {
+            let err = Config::from_env(&vars(&[("PG2ICEBERG_SLOT_FAILOVER", bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("PG2ICEBERG_SLOT_FAILOVER"), "{bad:?}: {err}");
+        }
     }
 
     /// pg2iceberg maintains the tables unless told the catalog does; a

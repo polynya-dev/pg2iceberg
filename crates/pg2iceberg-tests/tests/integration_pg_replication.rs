@@ -115,7 +115,7 @@ async fn slot_lifecycle_create_inspect_drop() {
         !client.slot_exists(&slot).await.unwrap(),
         "slot must not exist before create"
     );
-    let cp = client.create_slot(&slot).await.expect("create_slot");
+    let cp = client.create_slot(&slot, false).await.expect("create_slot");
     assert!(client.slot_exists(&slot).await.unwrap());
     assert!(cp.0 > 0, "consistent_point LSN should be > 0");
 
@@ -286,7 +286,7 @@ async fn slot_health_query_works_against_real_pg() {
     assert!(none.is_none(), "missing slot should return None");
 
     // Create the slot and probe again.
-    let cp = client.create_slot(&slot).await.expect("create_slot");
+    let cp = client.create_slot(&slot, false).await.expect("create_slot");
     let h = client
         .slot_health(&slot)
         .await
@@ -410,7 +410,7 @@ async fn start_replication_streams_insert_events() {
         .create_publication(&pubname, std::slice::from_ref(&ident))
         .await
         .expect("publication");
-    let cp = client.create_slot(&slot).await.expect("slot");
+    let cp = client.create_slot(&slot, false).await.expect("slot");
 
     // Inserts after slot creation; the slot's consistent_point is the
     // start LSN we hand to start_replication, and these inserts sit
@@ -514,7 +514,7 @@ async fn start_replication_types_columns_as_discovery_does() {
         .create_publication(&pubname, std::slice::from_ref(&ident))
         .await
         .expect("publication");
-    let cp = client.create_slot(&slot).await.expect("slot");
+    let cp = client.create_slot(&slot, false).await.expect("slot");
     regular
         .batch_execute(&format!(
             "INSERT INTO {table} VALUES (1, 5, 'red', '{{1,2}}', '1 day 2 hours')"
@@ -594,7 +594,7 @@ async fn keepalive_wal_end_covers_writes_to_unpublished_tables() {
         .create_publication(&pubname, std::slice::from_ref(&ident))
         .await
         .expect("publication");
-    let cp = client.create_slot(&slot).await.expect("slot");
+    let cp = client.create_slot(&slot, false).await.expect("slot");
     let mut stream = client
         .start_replication(&slot, cp, &pubname)
         .await
@@ -810,7 +810,7 @@ async fn drop_slot_and_publication_against_real_pg() {
         .create_publication(&pubname, &[ident])
         .await
         .expect("create_publication");
-    client.create_slot(&slot).await.expect("create slot");
+    client.create_slot(&slot, false).await.expect("create slot");
     assert!(client.slot_exists(&slot).await.unwrap());
 
     // First drop succeeds.
@@ -865,7 +865,7 @@ async fn drop_slot_rejects_active_slot() {
         .await
         .expect("create_publication");
     let slot = format!("s_{}", uniq());
-    writer.create_slot(&slot).await.expect("create slot");
+    writer.create_slot(&slot, false).await.expect("create slot");
 
     // Hold the replication stream so the slot is `active`.
     let _stream = writer
@@ -932,7 +932,7 @@ async fn client_stays_usable_while_it_streams() {
         .create_publication(&pubname, std::slice::from_ref(&ident))
         .await
         .expect("publication");
-    let cp = client.create_slot(&slot).await.expect("slot");
+    let cp = client.create_slot(&slot, false).await.expect("slot");
     let _stream = client
         .start_replication(&slot, cp, &pubname)
         .await
@@ -993,7 +993,7 @@ async fn start_replication_resumes_after_the_connections_are_dropped() {
         .create_publication(&pubname, std::slice::from_ref(&ident))
         .await
         .expect("publication");
-    let cp = client.create_slot(&slot).await.expect("slot");
+    let cp = client.create_slot(&slot, false).await.expect("slot");
     let mut stream = client
         .start_replication(&slot, cp, &pubname)
         .await

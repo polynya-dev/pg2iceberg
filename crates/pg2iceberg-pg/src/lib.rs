@@ -79,6 +79,20 @@ pub struct SlotHealth {
     /// read with the slot. `None` when unknown. The replication lag is
     /// this minus `confirmed_flush_lsn`.
     pub current_wal_lsn: Option<Lsn>,
+    /// Whether the slot is a failover slot: one that physical standbys
+    /// running `sync_replication_slots` keep a copy of, so it survives a
+    /// failover to one of them. `None` where Postgres has no failover
+    /// slots (before 17; see [`failover_slots_supported`]).
+    pub failover: Option<bool>,
+}
+
+/// The first PostgreSQL `server_version_num` with failover slots: 17.0.
+pub const MIN_FAILOVER_SLOT_VERSION_NUM: i32 = 170_000;
+
+/// Whether a source with this `server_version_num` has failover slots.
+/// `0` (unknown: the sim's default) has none.
+pub fn failover_slots_supported(server_version_num: i32) -> bool {
+    server_version_num >= MIN_FAILOVER_SLOT_VERSION_NUM
 }
 
 #[derive(Clone, Debug, Error)]
@@ -186,6 +200,7 @@ pub trait SlotMonitor: Send + Sync {
             conflicting: false,
             safe_wal_size: None,
             current_wal_lsn: None,
+            failover: None,
         }))
     }
 }
@@ -232,7 +247,16 @@ impl ColumnDefaultSource for std::sync::Arc<dyn PgClient> {
 #[async_trait]
 pub trait PgClient: Send + Sync {
     async fn create_publication(&self, name: &str, tables: &[TableIdent]) -> Result<()>;
-    async fn create_slot(&self, slot: &str) -> Result<Lsn>;
+    /// Create the logical replication slot `slot` for pgoutput, returning
+    /// its consistent point. `failover` makes it a failover slot (see
+    /// [`SlotHealth::failover`]); only a source with failover slots takes
+    /// it (see [`failover_slots_supported`]), and any other errors.
+    async fn create_slot(&self, slot: &str, failover: bool) -> Result<Lsn>;
+    /// Make `slot` a failover slot, or stop it being one
+    /// (`ALTER_REPLICATION_SLOT`). Like [`Self::create_slot`]'s
+    /// `failover`, only on a source with failover slots. Errors while a
+    /// walsender has the slot.
+    async fn set_slot_failover(&self, slot: &str, failover: bool) -> Result<()>;
     async fn slot_exists(&self, slot: &str) -> Result<bool>;
     async fn slot_restart_lsn(&self, slot: &str) -> Result<Option<Lsn>>;
     /// `confirmed_flush_lsn` is the LSN downstream has acked. The watcher
@@ -285,6 +309,11 @@ pub trait PgClient: Send + Sync {
     /// `IDENTIFY_SYSTEM` replication command.
     async fn identify_system_id(&self) -> Result<u64>;
 
+    /// The source's timeline (`IDENTIFY_SYSTEM`): a promotion — a failover
+    /// to a standby — starts a new one, whose WAL goes on from where the
+    /// standby's ended.
+    async fn timeline(&self) -> Result<u32>;
+
     /// PostgreSQL `server_version_num` — encoded as `MMmm00` where
     /// `MM` is the major version and `mm` the minor. PG 13.0 is
     /// `130000`, PG 16.4 is `160004`. pg2iceberg requires PG 14+
@@ -292,6 +321,13 @@ pub trait PgClient: Send + Sync {
     /// the sim impl, which the version check treats as
     /// "skip" — production callers always read a real value.
     async fn server_version_num(&self) -> Result<i32>;
+
+    /// How far the source has flushed its WAL (`pg_current_wal_flush_lsn()`;
+    /// on a standby, how far it has replayed): past every transaction
+    /// committed before the call — a coordinator's write too, when the
+    /// coordinator lives in this database — and a position a walsender
+    /// reaches, where the insert position can sit past a page header.
+    async fn current_wal_lsn(&self) -> Result<Lsn>;
 
     async fn start_replication(
         &self,

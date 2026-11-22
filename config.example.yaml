@@ -59,6 +59,7 @@ source:
     publication_name: pg2iceberg_pub
     slot_name: pg2iceberg_slot
     # standby_interval: 10s
+    # failover: true             # a failover slot, on PostgreSQL 17+
 
 sink:
   catalog_uri: https://catalog.example.com

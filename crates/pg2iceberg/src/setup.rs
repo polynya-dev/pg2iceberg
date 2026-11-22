@@ -129,6 +129,7 @@ where
         skip_snapshot_idents,
         slot_name: cfg.source.logical.slot_name.clone(),
         publication_name: cfg.source.logical.publication_name.clone(),
+        slot_failover: cfg.source.logical.failover,
         group: cfg.state.group.clone(),
         schedule: cfg.sink.schedule()?,
         compaction: if cfg.sink.target_file_size > 0 {

@@ -25,7 +25,7 @@ use std::time::Duration;
 /// operations (the `claim_offsets` algorithm in particular) hold the same
 /// PG-transaction-shaped invariants the prod impl gets from
 /// `pgx.BeginTxFunc`.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, PartialEq)]
 struct State {
     /// `log_seq.next_offset`. Bumped by `claim_offsets`; never decreases.
     next_offset: BTreeMap<TableIdent, u64>,
@@ -75,6 +75,52 @@ struct State {
     marker_emissions: BTreeSet<(String, TableIdent)>,
 }
 
+impl State {
+    /// What the coordinator's tables hold: everything but the test
+    /// hooks' bookkeeping (`claimed`, `crash_groups`), which no failover
+    /// rolls back.
+    fn durable(&self) -> State {
+        let mut s = State {
+            claimed: Vec::new(),
+            crash_groups: BTreeSet::new(),
+            ..State::default()
+        };
+        s.next_offset = self.next_offset.clone();
+        s.table_epochs = self.table_epochs.clone();
+        s.writes_in_flight = self.writes_in_flight.clone();
+        s.log = self.log.clone();
+        s.cursors = self.cursors.clone();
+        s.consumers = self.consumers.clone();
+        s.system_identifier = self.system_identifier;
+        s.consumer_group = self.consumer_group.clone();
+        s.flushed_lsn = self.flushed_lsn;
+        s.replicated_lsn = self.replicated_lsn;
+        s.table_states = self.table_states.clone();
+        s.snapshot_progress = self.snapshot_progress.clone();
+        s.pending_markers = self.pending_markers.clone();
+        s.marker_emissions = self.marker_emissions.clone();
+        s
+    }
+
+    /// Whether `other` holds what this does in the coordinator's tables.
+    fn durably_eq(&self, other: &State) -> bool {
+        self.next_offset == other.next_offset
+            && self.table_epochs == other.table_epochs
+            && self.writes_in_flight == other.writes_in_flight
+            && self.log == other.log
+            && self.cursors == other.cursors
+            && self.consumers == other.consumers
+            && self.system_identifier == other.system_identifier
+            && self.consumer_group == other.consumer_group
+            && self.flushed_lsn == other.flushed_lsn
+            && self.replicated_lsn == other.replicated_lsn
+            && self.table_states == other.table_states
+            && self.snapshot_progress == other.snapshot_progress
+            && self.pending_markers == other.pending_markers
+            && self.marker_emissions == other.marker_emissions
+    }
+}
+
 /// Work [`MemoryCoordinator::before_next_read_log`] runs.
 type Interlude = Box<dyn FnOnce() + Send>;
 
@@ -84,6 +130,59 @@ pub struct MemoryCoordinator {
     clock: Arc<dyn Clock>,
     state: Arc<Mutex<State>>,
     before_read_log: Arc<Mutex<Option<Interlude>>>,
+    /// The source database this coordinator's tables live in, if they do
+    /// (see [`MemoryCoordinator::colocate`]).
+    colocation: Arc<Mutex<Option<Colocation>>>,
+    /// The timeline that database was on when this handle connected, for
+    /// a process's own handle ([`MemoryCoordinator::connection`]).
+    connected_on: Option<u32>,
+}
+
+/// A coordinator living in the source database: each write to it is a
+/// transaction in that database's WAL, which a failover rolls back to
+/// what its standby had.
+struct Colocation {
+    db: crate::postgres::SimPostgres,
+    /// The coordinator's tables as of each write's commit, oldest first;
+    /// the first as of when they moved in.
+    history: Vec<(Lsn, State)>,
+}
+
+/// The coordinator's state, locked; dropping it records a write in the
+/// source's WAL if the coordinator lives there and its tables changed.
+struct StateGuard<'a> {
+    state: std::sync::MutexGuard<'a, State>,
+    colocation: &'a Mutex<Option<Colocation>>,
+}
+
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        let mut colocation = self.colocation.lock().unwrap();
+        let Some(c) = colocation.as_mut() else {
+            return;
+        };
+        let changed = c
+            .history
+            .last()
+            .is_none_or(|(_, last)| !last.durably_eq(&self.state));
+        if changed {
+            let lsn = c.db.commit_unpublished();
+            c.history.push((lsn, self.state.durable()));
+        }
+    }
 }
 
 impl MemoryCoordinator {
@@ -93,7 +192,82 @@ impl MemoryCoordinator {
             clock,
             state: Arc::new(Mutex::new(State::default())),
             before_read_log: Arc::default(),
+            colocation: Arc::default(),
+            connected_on: None,
         }
+    }
+
+    /// A process's own handle on this coordinator, as on a connection of
+    /// its own: once the database it lives in has failed over, the handle
+    /// refuses every call ([`CoordError::FailedOver`]), as production's
+    /// coordinator does when its connection comes back on another
+    /// timeline. A new process takes a new handle.
+    pub fn connection(&self) -> Self {
+        Self {
+            connected_on: self.timeline(),
+            ..self.clone()
+        }
+    }
+
+    /// The timeline of the database this coordinator lives in, if it lives
+    /// in the source.
+    fn timeline(&self) -> Option<u32> {
+        let colocation = self.colocation.lock().unwrap();
+        colocation.as_ref().map(|c| c.db.timeline())
+    }
+
+    /// The state, locked for a call — refused once the database the
+    /// coordinator lives in failed over under this handle.
+    fn lock(&self) -> Result<StateGuard<'_>> {
+        if let (Some(from), Some(to)) = (self.connected_on, self.timeline()) {
+            if from != to {
+                return Err(CoordError::FailedOver { from, to });
+            }
+        }
+        Ok(self.lock_unfenced())
+    }
+
+    /// The state, locked for a test hook.
+    fn lock_unfenced(&self) -> StateGuard<'_> {
+        StateGuard {
+            state: self.state.lock().unwrap(),
+            colocation: &self.colocation,
+        }
+    }
+
+    /// From now on this coordinator's tables live in `db`, the source:
+    /// each write to them is a transaction in its WAL, as production's
+    /// state lives on the source's server. See [`Self::fail_over_to`].
+    pub fn colocate(&self, db: &crate::postgres::SimPostgres) {
+        let now = self.state.lock().unwrap().durable();
+        *self.colocation.lock().unwrap() = Some(Colocation {
+            db: db.clone(),
+            history: vec![(Lsn::ZERO, now)],
+        });
+    }
+
+    /// The source this coordinator lives in failed over, its WAL now
+    /// ending at `end` ([`crate::postgres::SimPostgres::promote_standby`]):
+    /// its tables are as of the last write the standby had. Does nothing
+    /// for a coordinator that doesn't live in the source.
+    pub fn fail_over_to(&self, end: Lsn) {
+        let mut colocation = self.colocation.lock().unwrap();
+        let Some(c) = colocation.as_mut() else {
+            return;
+        };
+        c.history.retain(|(lsn, _)| *lsn < end);
+        let (_, kept) = c
+            .history
+            .last()
+            .expect("the state it moved in with is kept");
+        let mut state = self.state.lock().unwrap();
+        let claimed = std::mem::take(&mut state.claimed);
+        let crash_groups = std::mem::take(&mut state.crash_groups);
+        *state = State {
+            claimed,
+            crash_groups,
+            ..kept.durable()
+        };
     }
 
     /// Convenience constructor for tests.
@@ -118,13 +292,13 @@ impl MemoryCoordinator {
     /// nothing — as for a process that dies before its cursor write
     /// reaches the coordinator. An empty `groups` ends it.
     pub fn crash_on_cursor_write(&self, groups: &[&str]) {
-        self.state.lock().unwrap().crash_groups = groups.iter().map(|g| g.to_string()).collect();
+        self.lock_unfenced().crash_groups = groups.iter().map(|g| g.to_string()).collect();
     }
 
     /// Test hook: every log entry ever claimed for `table`, by offset —
     /// those [`Coordinator::truncate_log`] dropped too.
     pub fn claimed_log(&self, table: &TableIdent) -> Vec<LogEntry> {
-        let state = self.state.lock().unwrap();
+        let state = self.lock_unfenced();
         let mut out: Vec<LogEntry> = state
             .claimed
             .iter()
@@ -146,7 +320,7 @@ impl Coordinator for MemoryCoordinator {
         if batch.claims.is_empty() {
             // No log_index rows to write — but markers still need
             // to be persisted (a marker-only flush has no claims).
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.lock()?;
             for m in &batch.markers {
                 state
                     .pending_markers
@@ -165,7 +339,7 @@ impl Coordinator for MemoryCoordinator {
             *totals.entry(c.table.clone()).or_default() += c.record_count;
         }
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
 
         // Ensure log_seq row + atomically advance per-table next_offset.
         let mut start_offsets: BTreeMap<TableIdent, u64> = BTreeMap::new();
@@ -256,7 +430,7 @@ impl Coordinator for MemoryCoordinator {
         if let Some(f) = interlude {
             f();
         }
-        let state = self.state.lock().unwrap();
+        let state = self.lock()?;
         let mut out: Vec<LogEntry> = state
             .log
             .iter()
@@ -281,7 +455,7 @@ impl Coordinator for MemoryCoordinator {
         if i64::try_from(limit).is_err() {
             return Err(CoordError::Other("limit > i64".into()));
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         // The first `limit` by offset.
         let mut doomed: Vec<u64> = state
             .log
@@ -306,7 +480,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn staged_log_size(&self, table: &TableIdent) -> Result<StagedLogSize> {
-        let state = self.state.lock().unwrap();
+        let state = self.lock()?;
         let mut size = StagedLogSize::default();
         for e in state.log.iter().filter(|e| &e.table == table) {
             size.files += 1;
@@ -316,7 +490,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn ensure_cursor(&self, group: &str, table: &TableIdent) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         state
             .cursors
             .entry((group.to_string(), table.clone()))
@@ -325,7 +499,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn get_cursor(&self, group: &str, table: &TableIdent) -> Result<Option<i64>> {
-        let state = self.state.lock().unwrap();
+        let state = self.lock()?;
         Ok(state
             .cursors
             .get(&(group.to_string(), table.clone()))
@@ -333,7 +507,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn set_cursor(&self, group: &str, table: &TableIdent, to_offset: i64) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         if state.crash_groups.contains(group) {
             return Err(CoordError::Other(format!(
                 "the process died before setting {group}'s cursor"
@@ -350,7 +524,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn table_cursors(&self, table: &TableIdent) -> Result<Vec<(String, i64)>> {
-        let state = self.state.lock().unwrap();
+        let state = self.lock()?;
         Ok(state
             .cursors
             .iter()
@@ -361,7 +535,7 @@ impl Coordinator for MemoryCoordinator {
 
     async fn register_consumer(&self, group: &str, worker: &WorkerId, ttl: Duration) -> Result<()> {
         let now = self.clock.now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         state
             .consumers
             .insert((group.to_string(), worker.clone()), ttl_expiry(now, ttl));
@@ -369,14 +543,14 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn unregister_consumer(&self, group: &str, worker: &WorkerId) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         state.consumers.remove(&(group.to_string(), worker.clone()));
         Ok(())
     }
 
     async fn active_consumers(&self, group: &str) -> Result<Vec<WorkerId>> {
         let now = self.clock.now();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         // Expire stale entries first so the returned list is "live as
         // of now" — matches the prod impl's behaviour.
         state.consumers.retain(|_, exp| *exp >= now);
@@ -390,11 +564,11 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn pipeline_system_identifier(&self) -> Result<u64> {
-        Ok(self.state.lock().unwrap().system_identifier)
+        Ok(self.lock()?.system_identifier)
     }
 
     async fn set_pipeline_system_identifier(&self, sysid: u64) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         if state.system_identifier != 0 && state.system_identifier != sysid {
             return Err(CoordError::SystemIdMismatch {
                 stored: state.system_identifier,
@@ -406,7 +580,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn claim_group(&self, group: &str) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         // Claimed by none yet: another group's cursors hold it anyway.
         let holder = state.consumer_group.clone().or_else(|| {
             state
@@ -429,20 +603,20 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn flushed_lsn(&self) -> Result<Lsn> {
-        Ok(self.state.lock().unwrap().flushed_lsn)
+        Ok(self.lock()?.flushed_lsn)
     }
 
     async fn replicated_lsn(&self) -> Result<Lsn> {
-        Ok(self.state.lock().unwrap().replicated_lsn)
+        Ok(self.lock()?.replicated_lsn)
     }
 
     async fn set_flushed_lsn(&self, lsn: Lsn) -> Result<()> {
-        self.state.lock().unwrap().flushed_lsn = lsn;
+        self.lock()?.flushed_lsn = lsn;
         Ok(())
     }
 
     async fn table_state(&self, ident: &TableIdent) -> Result<Option<TableSnapshotState>> {
-        Ok(self.state.lock().unwrap().table_states.get(ident).cloned())
+        Ok(self.lock()?.table_states.get(ident).cloned())
     }
 
     async fn mark_table_snapshot_complete(
@@ -452,7 +626,7 @@ impl Coordinator for MemoryCoordinator {
         snapshot_lsn: Lsn,
     ) -> Result<()> {
         let now_micros = self.clock.now().0;
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock()?;
         state.table_states.insert(
             ident.clone(),
             TableSnapshotState {
@@ -466,14 +640,14 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn bump_table_epoch(&self, table: &TableIdent) -> Result<i64> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock()?;
         let epoch = s.table_epochs.entry(table.clone()).or_insert(0);
         *epoch += 1;
         Ok(*epoch)
     }
 
     async fn table_epochs(&self, tables: &[TableIdent]) -> Result<BTreeMap<TableIdent, i64>> {
-        let s = self.state.lock().unwrap();
+        let s = self.lock()?;
         Ok(tables
             .iter()
             .filter_map(|t| s.table_epochs.get(t).map(|e| (t.clone(), *e)))
@@ -481,7 +655,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn begin_write(&self, table: &TableIdent, writer: &str, since_ms: i64) -> Result<()> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.lock()?;
         let since = s
             .writes_in_flight
             .entry((table.clone(), writer.to_string()))
@@ -500,7 +674,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn writes_in_flight(&self, table: &TableIdent) -> Result<Vec<WriteInFlight>> {
-        let s = self.state.lock().unwrap();
+        let s = self.lock()?;
         Ok(s.writes_in_flight
             .iter()
             .filter(|((t, _), _)| t == table)
@@ -531,7 +705,7 @@ impl Coordinator for MemoryCoordinator {
     }
 
     async fn clear_snapshot_progress(&self, ident: &TableIdent) -> Result<()> {
-        self.state.lock().unwrap().snapshot_progress.remove(ident);
+        self.lock()?.snapshot_progress.remove(ident);
         Ok(())
     }
 
@@ -540,7 +714,7 @@ impl Coordinator for MemoryCoordinator {
         table: &TableIdent,
         cursor: i64,
     ) -> Result<Vec<MarkerInfo>> {
-        let state = self.state.lock().unwrap();
+        let state = self.lock()?;
         let mut out: Vec<MarkerInfo> = state
             .pending_markers
             .iter()

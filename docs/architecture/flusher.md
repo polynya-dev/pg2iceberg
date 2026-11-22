@@ -33,7 +33,7 @@ The replication slot's confirmed flush LSN is advanced immediately after staging
 
 The staged-log primitive provides offset-ordered, durable delivery of WAL events from the flusher to one or more materializer workers without a dedicated leader process.
 
-The coordinator role is filled by the **source PostgreSQL database** itself. This is a deliberate choice: the coordinator is technically a single point of failure, but if the source database goes down, replication cannot happen regardless — so there is no additional availability cost to colocating coordination there. It also means pg2iceberg needs no extra infrastructure beyond the database you are already replicating from, and a failover takes the coordinator along with the source. It always lives on the source's server: `state.database` can put it in another database there.
+The coordinator role is filled by the **source PostgreSQL database** itself. This is a deliberate choice: the coordinator is technically a single point of failure, but if the source database goes down, replication cannot happen regardless — so there is no additional availability cost to colocating coordination there. It also means pg2iceberg needs no extra infrastructure beyond the database you are already replicating from, and a failover takes the coordinator along with the source ([Failover](../usage/failover.md)). It always lives on the source's server: `state.database` can put it in another database there.
 
 **Coordination tables** (in `_pg2iceberg`):
 

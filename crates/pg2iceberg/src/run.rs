@@ -1151,10 +1151,20 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
                 "create_publication failed; assuming it exists"
             );
         }
-        let cp = pg.create_slot(slot).await.context("create slot")?;
+        let failover = cfg.source.logical.failover
+            && pg2iceberg_pg::failover_slots_supported(
+                pg.server_version_num()
+                    .await
+                    .context("read server_version_num")?,
+            );
+        let cp = pg
+            .create_slot(slot, failover)
+            .await
+            .context("create slot")?;
         tracing::info!(
             slot = %slot,
             consistent_point = ?cp,
+            failover,
             "replication slot created (WAL pinned for later Run)"
         );
     }

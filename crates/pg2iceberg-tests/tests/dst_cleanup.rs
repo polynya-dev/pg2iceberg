@@ -92,7 +92,7 @@ fn cleanup_full_sequence_drops_slot_and_publication() {
     // sequencing of CREATE_REPLICATION_SLOT + START_REPLICATION),
     // so we recreate the publication first.
     block_on(client.create_publication(PUB, &[ident()])).unwrap();
-    let lsn = block_on(client.create_slot(SLOT)).unwrap();
+    let lsn = block_on(client.create_slot(SLOT, false)).unwrap();
     assert!(lsn >= Lsn::ZERO);
 }
 

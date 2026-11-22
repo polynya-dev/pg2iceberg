@@ -26,6 +26,7 @@
 use crate::catalog_cache::CachingCatalog;
 use crate::relation_event;
 use crate::staged_log::{StagedLog, LOG_PAGE_ENTRIES, READ_AHEAD};
+use crate::standby::{NoStandby, Standby};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -765,6 +766,9 @@ pub struct Materializer<C: Catalog> {
     clock: Option<Arc<dyn Clock>>,
     /// The writer its compaction passes record ([`writers`]).
     compaction_writer: &'static str,
+    /// What its commits and its deletes of staged files wait for
+    /// ([`Self::set_standby`]).
+    standby: Arc<dyn Standby>,
 }
 
 /// Distributed-mode parameters. Built by
@@ -890,7 +894,17 @@ impl<C: Catalog> Materializer<C> {
             pk_index_memory: None,
             clock: None,
             compaction_writer: writers::COMPACTION,
+            standby: Arc::new(NoStandby),
         }
+    }
+
+    /// Commit to Iceberg, and delete staged files the coordinator's log no
+    /// longer holds, only once `standby` has every coordinator write made
+    /// before (see [`crate::standby`]): a failover to it then can't leave
+    /// the coordinator behind them.
+    pub fn set_standby(&mut self, standby: Arc<dyn Standby>) {
+        self.catalog.set_standby(standby.clone());
+        self.standby = standby;
     }
 
     /// Enable blue-green meta-marker emission. After every successful
@@ -2121,6 +2135,7 @@ impl<C: Catalog> Materializer<C> {
             pk_index_memory: self.pk_index_memory,
             clock: self.clock.clone(),
             compaction_writer: self.compaction_writer,
+            standby: self.standby.clone(),
         }
     }
 
@@ -2826,11 +2841,15 @@ impl<C: Catalog> Materializer<C> {
             .map(|e| e.log_start);
         let coord = self.coord.clone();
         let blob_store = self.blob_store.clone();
+        let standby = self.standby.clone();
         let ident = ident.clone();
         // The group's cursors over the log: its changes', and its
         // backfill's while one applies.
         let groups = [self.group.clone(), self.snapshot_group()];
-        async move { truncate_log(coord.as_ref(), blob_store.as_ref(), &ident, &groups, due?).await }
+        async move {
+            let stores = (coord.as_ref(), blob_store.as_ref(), standby.as_ref());
+            truncate_log(stores, &ident, &groups, due?).await
+        }
     }
 
     /// Fold and commit the table's changes past its cursor, in units.
@@ -3525,8 +3544,7 @@ fn now_micros() -> i64 {
 /// left some for next time. Best effort: what this leaves the next one
 /// drops — but for files whose delete failed, which stay behind.
 async fn truncate_log(
-    coord: &dyn Coordinator,
-    blob_store: &dyn BlobStore,
+    (coord, blob_store, standby): (&dyn Coordinator, &dyn BlobStore, &dyn Standby),
     ident: &TableIdent,
     groups: &[String],
     log_start: i64,
@@ -3557,6 +3575,17 @@ async fn truncate_log(
         }
     };
     let all = paths.len() < TRUNCATE_BATCH;
+    // Deleted once the standby has the truncation: a failover losing it
+    // leaves the entries in the log, and their files with them.
+    if let Err(e) = standby.settle().await {
+        tracing::warn!(
+            table = %ident,
+            files = paths.len(),
+            error = %e,
+            "staged files the log no longer holds stay behind"
+        );
+        return None;
+    }
     let deleted: Vec<std::result::Result<(), StreamError>> = stream::iter(paths)
         .map(|path| async move { blob_store.delete(&path).await })
         .buffer_unordered(STAGED_DELETES)
