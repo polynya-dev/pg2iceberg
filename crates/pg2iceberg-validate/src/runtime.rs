@@ -24,7 +24,7 @@
 use crate::instrument::Instrumented;
 use crate::watcher::{record_slot_health, InvariantViolation, InvariantWatcher, WatcherInputs};
 use crate::{validate_startup, SlotState, StartupValidation, TableExistence};
-use pg2iceberg_coord::Coordinator;
+use pg2iceberg_coord::{CoordError, Coordinator};
 use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::{Clock, IdGen, Lsn, Metrics, Phase, TableIdent, TableSchema, Timestamp};
 use pg2iceberg_iceberg::{Catalog, CompactionConfig, CompactionOutcome};
@@ -68,8 +68,10 @@ pub struct MaterializeTickOutcome {
 /// compaction. Mirrors the binary's `Handler::Materialize` arm.
 ///
 /// **Failure semantics:**
-/// - `cycle()` failure → propagates `MaterializerError`. The binary
-///   exits on this; pipeline is unrecoverable in-process.
+/// - `cycle()` failure → propagates `MaterializerError`. In
+///   [`run_logical_main_loop`], transient failures are logged and retried
+///   on the next materializer tick while fatal errors (such as a staged-log
+///   gap) still stop the loop.
 /// - `compact_cycle()` failure → captured in
 ///   `MaterializeTickOutcome::compaction_error` and returned `Ok`.
 ///   Compaction is intentionally best-effort: a transient blob-store
@@ -1404,12 +1406,29 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
         for ident in self.ungated.drain(..) {
             materializer.mark_snapshot_complete(&ident);
         }
-        self.again |= materializer.backlogged();
-        self.compact(&materializer, loop_state.compaction.as_ref());
-        loop_state.materializer = Some(materializer);
-        // `cycle` failure is fatal (propagates); compaction failure is
-        // captured in the outcome and only logged.
-        let outcome = out?;
+        // Unrecoverable cycle errors propagate; transient catalog, blob, or
+        // coord failures are logged and retried on the next materializer tick,
+        // matching `materializer-only`, while replication keeps staging.
+        let outcome = match out {
+            Ok(outcome) => {
+                self.again |= materializer.backlogged();
+                self.compact(&materializer, loop_state.compaction.as_ref());
+                loop_state.materializer = Some(materializer);
+                outcome
+            }
+            Err(e) if is_fatal_cycle_error(&e) => {
+                loop_state.materializer = Some(materializer);
+                return Err(e.into());
+            }
+            Err(e) => {
+                // Wait out the next interval rather than spinning on a backlog
+                // or marker while the catalog or store is down.
+                self.again = false;
+                loop_state.materializer = Some(materializer);
+                tracing::warn!(error = %e, "materializer cycle failed; will retry next interval");
+                return Ok(());
+            }
+        };
         if let Some(err) = outcome.compaction_error {
             tracing::warn!(error = %err, "materializer.compact_cycle failed");
         }
@@ -1447,6 +1466,18 @@ impl<Cat: Catalog + 'static> Ticks<Cat> {
         let joined = join_task(&mut self.running).await;
         self.finish(loop_state, joined)
     }
+}
+
+/// Cycle errors that retrying cannot fix: a staged-log gap (missing entries
+/// past the cursor that require a re-snapshot) or cluster/group fencing.
+fn is_fatal_cycle_error(err: &MaterializerError) -> bool {
+    matches!(
+        err,
+        MaterializerError::LogGap { .. }
+            | MaterializerError::Coord(
+                CoordError::SystemIdMismatch { .. } | CoordError::GroupMismatch { .. }
+            )
+    )
 }
 
 async fn process_message<C: Coordinator + ?Sized + 'static>(

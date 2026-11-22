@@ -116,7 +116,7 @@ Read from `pg_replication_slots` every watcher tick (30 s).
 | `pg2iceberg_materializer_commit_duration_seconds` | histogram | | How long a commit took. |
 | `pg2iceberg_materializer_cycle_duration_seconds` | histogram | | How long a cycle over every assigned table took. |
 | `pg2iceberg_materializer_cycle_total` | counter | `table` | Times the materializer looked for staged rows for a table. |
-| `pg2iceberg_materializer_cycle_failures_total` | counter | | Cycles that failed. In `run` that stops the process; `materializer-only` retries. |
+| `pg2iceberg_materializer_cycle_failures_total` | counter | | Cycles that failed. Transient failures are retried on the next interval; unrecoverable errors such as a staged-log gap stop `run`. |
 | `pg2iceberg_unfilled_column_defaults_total` | counter | `table`, `column`, `reason` | Columns added with a default Postgres no longer had for existing rows, which read NULL in Iceberg. |
 | `pg2iceberg_distributed_workers` | gauge | | `materializer-only`: workers in the consumer group. |
 | `pg2iceberg_distributed_assigned_tables` | gauge | | `materializer-only`: tables assigned to this worker. |
