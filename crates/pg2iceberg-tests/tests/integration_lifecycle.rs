@@ -28,9 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pg2iceberg::config::{
-    Config, LogicalConfig, PostgresConfig, SinkConfig, SourceConfig, StateConfig, TableConfig,
-};
+use pg2iceberg::config::{Config, SinkConfig, SourceConfig, StateConfig, TableConfig};
 use pg2iceberg::run::build_rest_catalog;
 use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::{ColumnName, Namespace, PgValue, Phase, TableIdent};
@@ -236,26 +234,19 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             iceberg: Default::default(),
         }],
         source: SourceConfig {
-            mode: "logical".into(),
-            postgres_url: String::new(),
-            postgres: PostgresConfig {
-                url: String::new(),
-                host: pg_host,
-                port: pg_port,
-                database: "postgres".into(),
-                user: "postgres".into(),
-                password: "postgres".into(),
-                sslmode: "disable".into(),
-            },
-            logical: LogicalConfig {
-                publication_name: publication.into(),
-                slot_name: slot.into(),
-                standby_interval: String::new(),
-                snapshot_concurrency: 4,
-                // The default: a failover slot from PG 17, a slot like any
-                // other before.
-                failover: true,
-            },
+            url: String::new(),
+            host: pg_host,
+            port: pg_port,
+            database: "postgres".into(),
+            user: "postgres".into(),
+            password: "postgres".into(),
+            sslmode: "disable".into(),
+            publication_name: publication.into(),
+            slot_name: slot.into(),
+            snapshot_concurrency: 4,
+            // The default: a failover slot from PG 17, a slot like any
+            // other before.
+            failover: true,
         },
         sink: SinkConfig {
             catalog_uri: stack.rest_url.clone(),

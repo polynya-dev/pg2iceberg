@@ -12,7 +12,7 @@ The quickstart docker-compose includes an Iceberg REST catalog backed by MinIO:
 
 ```yaml
 source:
-  postgres_url: "postgres://postgres:postgres@localhost:5432/postgres"
+  url: "postgres://postgres:postgres@localhost:5432/postgres"
 
 sink:
   catalog_uri: "http://localhost:8181"

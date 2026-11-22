@@ -1,6 +1,6 @@
 //! Binary configuration.
 //!
-//! Sections: `tables` (list), `source.{postgres, logical}`,
+//! Sections: `tables` (list), `source` (database + slot/publication),
 //! `sink` (catalog + storage + credential mode + flush knobs),
 //! `state` (coordinator location).
 //!
@@ -123,43 +123,15 @@ pub struct ColumnConfig {
     pub nullable: bool,
 }
 
+/// The source database, and the replication slot and publication
+/// pg2iceberg reads it through.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
-    /// Replication mode. `"logical"` (the default) is the only one;
-    /// kept so existing configs that spell it out still parse.
-    #[serde(default = "default_mode")]
-    pub mode: String,
     /// The source database as one connection string — a URL
     /// (`postgres://user:password@host:5432/db?sslmode=require`) or
-    /// libpq `key=value` pairs — in place of `postgres`'s fields.
-    /// Moved into [`PostgresConfig::url`] on load.
-    #[serde(default)]
-    pub postgres_url: String,
-    #[serde(default)]
-    pub postgres: PostgresConfig,
-    #[serde(default)]
-    pub logical: LogicalConfig,
-}
-
-impl Default for SourceConfig {
-    fn default() -> Self {
-        Self {
-            mode: default_mode(),
-            postgres_url: String::new(),
-            postgres: PostgresConfig::default(),
-            logical: LogicalConfig::default(),
-        }
-    }
-}
-
-fn default_mode() -> String {
-    "logical".into()
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct PostgresConfig {
-    /// A connection string (see [`SourceConfig::postgres_url`]). When
-    /// set, it's used as is, and the fields below are ignored.
+    /// libpq `key=value` pairs. When set, it's used as is, and the
+    /// connection fields below are ignored.
     #[serde(default)]
     pub url: String,
     #[serde(default)]
@@ -178,13 +150,46 @@ pub struct PostgresConfig {
     /// hostname verification flavors aren't yet differentiated.
     #[serde(default)]
     pub sslmode: String,
+    #[serde(default = "default_publication")]
+    pub publication_name: String,
+    #[serde(default = "default_slot")]
+    pub slot_name: String,
+    /// Most tables the initial snapshot reads at once, each over a
+    /// Postgres connection of its own and holding up to two chunks of
+    /// `sink.flush_rows` rows; 1 reads them one after another.
+    #[serde(default = "default_snapshot_concurrency")]
+    pub snapshot_concurrency: usize,
+    /// Make the replication slot a failover slot, which standbys that
+    /// sync slots keep a copy of, so pipelines survive a failover to one.
+    /// Only PostgreSQL 17+ has them; on an older source this does
+    /// nothing. An existing slot is altered to match at startup.
+    #[serde(default = "default_failover")]
+    pub failover: bool,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            host: String::new(),
+            port: default_pg_port(),
+            database: String::new(),
+            user: String::new(),
+            password: String::new(),
+            sslmode: String::new(),
+            publication_name: default_publication(),
+            slot_name: default_slot(),
+            snapshot_concurrency: default_snapshot_concurrency(),
+            failover: default_failover(),
+        }
+    }
 }
 
 fn default_pg_port() -> u16 {
     5432
 }
 
-impl PostgresConfig {
+impl SourceConfig {
     /// The connection string: [`Self::url`], or the fields as libpq-style
     /// `key=value` pairs.
     pub fn dsn(&self) -> String {
@@ -226,6 +231,14 @@ impl PostgresConfig {
     pub fn is_configured(&self) -> bool {
         !self.url.is_empty() || !self.host.is_empty()
     }
+
+    /// The snapshot reads at least one table at a time.
+    pub fn validate_snapshot(&self) -> Result<()> {
+        if self.snapshot_concurrency == 0 {
+            anyhow::bail!("source.snapshot_concurrency must be 1 or more");
+        }
+        Ok(())
+    }
 }
 
 /// The `sslmode` a connection string sets: a URL's query parameter, or a
@@ -240,49 +253,6 @@ fn sslmode_in(dsn: &str) -> Option<&str> {
         .filter_map(|p| p.split_once('='))
         .find(|(k, _)| *k == "sslmode")
         .map(|(_, v)| v)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LogicalConfig {
-    #[serde(default = "default_publication")]
-    pub publication_name: String,
-    #[serde(default = "default_slot")]
-    pub slot_name: String,
-    #[serde(default)]
-    pub standby_interval: String,
-    /// Most tables the initial snapshot reads at once, each over a
-    /// Postgres connection of its own and holding up to two chunks of
-    /// `sink.flush_rows` rows; 1 reads them one after another.
-    #[serde(default = "default_snapshot_concurrency")]
-    pub snapshot_concurrency: usize,
-    /// Make the replication slot a failover slot, which standbys that
-    /// sync slots keep a copy of, so pipelines survive a failover to one.
-    /// Only PostgreSQL 17+ has them; on an older source this does
-    /// nothing. An existing slot is altered to match at startup.
-    #[serde(default = "default_failover")]
-    pub failover: bool,
-}
-
-impl Default for LogicalConfig {
-    fn default() -> Self {
-        Self {
-            publication_name: default_publication(),
-            slot_name: default_slot(),
-            standby_interval: String::new(),
-            snapshot_concurrency: default_snapshot_concurrency(),
-            failover: default_failover(),
-        }
-    }
-}
-
-impl LogicalConfig {
-    /// The snapshot reads at least one table at a time.
-    pub fn validate_snapshot(&self) -> Result<()> {
-        if self.snapshot_concurrency == 0 {
-            anyhow::bail!("source.logical.snapshot_concurrency must be 1 or more");
-        }
-        Ok(())
-    }
 }
 
 fn default_snapshot_concurrency() -> usize {
@@ -791,15 +761,11 @@ impl Config {
 
     fn finish(mut self, env: Env) -> Result<Self> {
         self.apply_env(env)?;
-        if !self.source.postgres_url.is_empty() {
-            self.source.postgres.url = std::mem::take(&mut self.source.postgres_url);
-        }
-        self.validate_mode()?;
         self.validate_tables()?;
         self.sink.schedule()?;
         self.sink.validate_compaction()?;
         self.sink.validate_materializer()?;
-        self.source.logical.validate_snapshot()?;
+        self.source.validate_snapshot()?;
         self.state.validate_location()?;
         self.state.validate_group()?;
         self.metrics_addr()?;
@@ -869,10 +835,10 @@ impl Config {
     ///
     /// | Variable | Field |
     /// |---|---|
-    /// | `POSTGRES_URL` | `source.postgres_url` |
+    /// | `POSTGRES_URL` | `source.url` |
     /// | `PG2ICEBERG_TABLES` | `tables`: comma-separated `schema.table` or `schema.*` |
-    /// | `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.logical.slot_name` / `publication_name` |
-    /// | `PG2ICEBERG_SLOT_FAILOVER` | `source.logical.failover`: `true` or `false` |
+    /// | `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.slot_name` / `publication_name` |
+    /// | `PG2ICEBERG_SLOT_FAILOVER` | `source.failover`: `true` or `false` |
     /// | `PG2ICEBERG_STATE_DATABASE` | `state.database` |
     /// | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` |
     /// | `ICEBERG_CATALOG_AUTH` | `sink.catalog_auth` |
@@ -897,12 +863,9 @@ impl Config {
                 *field = value;
             }
         };
-        set(&mut self.source.postgres_url, "POSTGRES_URL");
-        set(&mut self.source.logical.slot_name, "PG2ICEBERG_SLOT");
-        set(
-            &mut self.source.logical.publication_name,
-            "PG2ICEBERG_PUBLICATION",
-        );
+        set(&mut self.source.url, "POSTGRES_URL");
+        set(&mut self.source.slot_name, "PG2ICEBERG_SLOT");
+        set(&mut self.source.publication_name, "PG2ICEBERG_PUBLICATION");
         set(&mut self.state.database, "PG2ICEBERG_STATE_DATABASE");
         if env("PG2ICEBERG_STATE_URL").is_some() {
             anyhow::bail!(
@@ -930,7 +893,7 @@ impl Config {
         set(&mut self.liveness_timeout, "PG2ICEBERG_LIVENESS_TIMEOUT");
         set(&mut self.sink.maintenance, "PG2ICEBERG_MAINTENANCE");
         if let Some(failover) = env("PG2ICEBERG_SLOT_FAILOVER") {
-            self.source.logical.failover = match failover.trim().to_ascii_lowercase().as_str() {
+            self.source.failover = match failover.trim().to_ascii_lowercase().as_str() {
                 "true" => true,
                 "false" => false,
                 _ => anyhow::bail!("PG2ICEBERG_SLOT_FAILOVER={failover:?}: expected true or false"),
@@ -971,7 +934,7 @@ impl Config {
 
     /// A source database is configured.
     pub fn require_source(&self) -> Result<()> {
-        let pg = &self.source.postgres;
+        let pg = &self.source;
         if !pg.url.is_empty()
             || !(pg.host.is_empty() || pg.database.is_empty() || pg.user.is_empty())
         {
@@ -979,7 +942,7 @@ impl Config {
         }
         anyhow::bail!(
             "no source database configured: set POSTGRES_URL \
-             (postgres://user:password@host:5432/database), or source.postgres_url in {DEFAULT_CONFIG_PATH}"
+             (postgres://user:password@host:5432/database), or source.url in {DEFAULT_CONFIG_PATH}"
         )
     }
 
@@ -1034,24 +997,10 @@ impl Config {
         Ok(())
     }
 
-    /// Reject anything but logical replication up front, so every
-    /// subcommand fails fast with a pointer instead of half-starting.
-    fn validate_mode(&self) -> Result<()> {
-        match self.source.mode.as_str() {
-            "" | "logical" => Ok(()),
-            "query" => anyhow::bail!(
-                "source.mode \"query\" is no longer supported: pg2iceberg only replicates \
-                 via logical replication. Set source.mode to \"logical\" (or remove it) and \
-                 enable wal_level=logical on the source"
-            ),
-            other => anyhow::bail!("unknown source.mode {other:?}; expected \"logical\""),
-        }
-    }
-
     /// Connection string for the coordinator: the source's, in
     /// `state.database` if set.
     pub fn coord_dsn(&self) -> String {
-        with_dbname(&self.source.postgres.dsn(), &self.state.database)
+        with_dbname(&self.source.dsn(), &self.state.database)
     }
 
     /// Bag of REST catalog props derived from sink config. Keys we
@@ -1391,17 +1340,14 @@ tables:
         nullable: true
 
 source:
-  mode: logical
-  postgres:
-    host: localhost
-    port: 5432
-    database: src
-    user: postgres
-    password: secret
-    sslmode: require
-  logical:
-    publication_name: p2i_pub
-    slot_name: p2i_slot
+  host: localhost
+  port: 5432
+  database: src
+  user: postgres
+  password: secret
+  sslmode: require
+  publication_name: p2i_pub
+  slot_name: p2i_slot
 
 sink:
   catalog_uri: http://localhost:8181
@@ -1421,15 +1367,20 @@ state:
   coordinator_schema: _pg2iceberg
 "#;
 
+    /// A key `source` doesn't know fails the parse, so a misspelled or
+    /// misplaced setting (say, a slot name nested under a block of its own)
+    /// isn't silently replaced by its default.
     #[test]
-    fn query_mode_is_rejected_with_a_pointer_to_logical() {
-        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
-        cfg.source.mode = "query".into();
-        let err = cfg.validate_mode().unwrap_err().to_string();
-        assert!(
-            err.contains("no longer supported") && err.contains("wal_level=logical"),
-            "{err}"
-        );
+    fn unknown_source_keys_are_rejected() {
+        for yaml in [
+            "source:\n  mode: logical\n",
+            "source:\n  postgres:\n    host: h\n",
+            "source:\n  logical:\n    slot_name: s\n",
+            "source:\n  slot: s\n",
+        ] {
+            let err = Config::parse(yaml, &vars(&[])).unwrap_err().to_string();
+            assert!(err.contains("unknown field"), "{yaml:?}: {err}");
+        }
     }
 
     #[test]
@@ -1451,17 +1402,12 @@ state:
     fn snapshot_concurrency_is_at_least_one() {
         let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
         for ok in [1, 8] {
-            cfg.source.logical.snapshot_concurrency = ok;
-            cfg.source.logical.validate_snapshot().unwrap();
+            cfg.source.snapshot_concurrency = ok;
+            cfg.source.validate_snapshot().unwrap();
         }
-        cfg.source.logical.snapshot_concurrency = 0;
-        let err = cfg
-            .source
-            .logical
-            .validate_snapshot()
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("snapshot_concurrency"), "{err}");
+        cfg.source.snapshot_concurrency = 0;
+        let err = cfg.source.validate_snapshot().unwrap_err().to_string();
+        assert!(err.contains("source.snapshot_concurrency"), "{err}");
     }
 
     #[test]
@@ -1485,15 +1431,6 @@ state:
         cfg.sink.materializer_concurrency = 0;
         let err = cfg.sink.validate_materializer().unwrap_err().to_string();
         assert!(err.contains("materializer_concurrency"), "{err}");
-    }
-
-    #[test]
-    fn logical_or_unset_mode_is_accepted() {
-        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
-        for mode in ["", "logical"] {
-            cfg.source.mode = mode.into();
-            cfg.validate_mode().unwrap();
-        }
     }
 
     /// A config replicating `tables` (discovered, no explicit columns)
@@ -1554,35 +1491,17 @@ state:
     }
 
     #[test]
-    fn leftover_query_mode_keys_still_parse() {
-        // Configs written for the removed query mode may still carry
-        // its keys after switching to logical; they're ignored.
-        let yaml = SAMPLE
-            .replace(
-                "    primary_key: [id]\n",
-                "    primary_key: [id]\n    watermark_column: updated_at\n",
-            )
-            .replace(
-                "  logical:\n",
-                "  query:\n    poll_interval: 30s\n  logical:\n",
-            );
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
-        cfg.validate_mode().unwrap();
-        assert_eq!(cfg.tables[0].name, "public.orders");
-    }
-
-    #[test]
     fn parses_go_shaped_yaml() {
         let cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
         assert_eq!(cfg.tables.len(), 1);
         assert_eq!(cfg.tables[0].name, "public.orders");
         assert_eq!(cfg.tables[0].primary_key, vec!["id".to_string()]);
         assert_eq!(cfg.tables[0].columns.len(), 2);
-        assert_eq!(cfg.source.mode, "logical");
-        assert_eq!(cfg.source.postgres.host, "localhost");
-        assert_eq!(cfg.source.postgres.port, 5432);
-        assert_eq!(cfg.source.postgres.tls_label(), "webpki");
-        assert_eq!(cfg.source.logical.slot_name, "p2i_slot");
+        assert_eq!(cfg.source.host, "localhost");
+        assert_eq!(cfg.source.port, 5432);
+        assert_eq!(cfg.source.tls_label(), "webpki");
+        assert_eq!(cfg.source.slot_name, "p2i_slot");
+        assert_eq!(cfg.source.publication_name, "p2i_pub");
         assert_eq!(cfg.sink.catalog_uri, "http://localhost:8181");
         assert_eq!(cfg.sink.credential_mode, "static");
         assert_eq!(cfg.sink.s3_endpoint, "http://localhost:9000");
@@ -1593,7 +1512,7 @@ state:
     #[test]
     fn dsn_renders_all_fields() {
         let cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
-        let dsn = cfg.source.postgres.dsn();
+        let dsn = cfg.source.dsn();
         assert!(dsn.contains("host=localhost"));
         assert!(dsn.contains("dbname=src"));
         assert!(dsn.contains("user=postgres"));
@@ -1606,19 +1525,18 @@ state:
             r#"
 tables: []
 source:
-  postgres:
-    host: localhost
-    database: x
-    user: y
+  host: localhost
+  database: x
+  user: y
 sink:
   catalog_uri: http://localhost
   namespace: x
 "#,
         )
         .unwrap();
-        let dsn = cfg.source.postgres.dsn();
+        let dsn = cfg.source.dsn();
         assert!(dsn.contains("sslmode=disable"));
-        assert_eq!(cfg.source.postgres.tls_label(), "disable");
+        assert_eq!(cfg.source.tls_label(), "disable");
     }
 
     #[test]
@@ -1660,10 +1578,9 @@ sink:
             r#"
 tables: []
 source:
-  postgres:
-    host: h
-    database: d
-    user: u
+  host: h
+  database: d
+  user: u
 sink:
   catalog_uri: http://polaris
   namespace: ns
@@ -1716,20 +1633,18 @@ sink:
             r#"
 tables: []
 source:
-  postgres:
-    host: h
-    database: d
-    user: u
+  host: h
+  database: d
+  user: u
 sink:
   catalog_uri: x
   namespace: ns
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.source.mode, "logical");
-        assert_eq!(cfg.source.postgres.port, 5432);
-        assert_eq!(cfg.source.logical.slot_name, "pg2iceberg_slot");
-        assert_eq!(cfg.source.logical.publication_name, "pg2iceberg_pub");
+        assert_eq!(cfg.source.port, 5432);
+        assert_eq!(cfg.source.slot_name, "pg2iceberg_slot");
+        assert_eq!(cfg.source.publication_name, "pg2iceberg_pub");
         // No warehouse: the catalog vends credentials.
         assert_eq!(cfg.sink.resolved_credential_mode(), "vended");
         assert_eq!(cfg.sink.resolved_catalog_auth(), "none");
@@ -1738,7 +1653,7 @@ sink:
         assert_eq!(cfg.sink.materializer_batch_rows, 50_000);
         assert_eq!(cfg.sink.materializer_concurrency, 4);
         assert_eq!(cfg.sink.pk_index_memory, 576 << 20);
-        assert_eq!(cfg.source.logical.snapshot_concurrency, 4);
+        assert_eq!(cfg.source.snapshot_concurrency, 4);
         assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
         assert_eq!(cfg.state.group, "default");
     }
@@ -1746,10 +1661,9 @@ sink:
     const INTERVALS: &str = r#"
 tables: []
 source:
-  postgres:
-    host: h
-    database: d
-    user: u
+  host: h
+  database: d
+  user: u
 sink:
   catalog_uri: x
   namespace: ns
@@ -1862,13 +1776,10 @@ sink:
             );
         }
         // From the fields, and the file.
-        let yaml = INTERVALS.replace(
-            "    user: u\n",
-            "    user: u\nstate:\n  database: pg2iceberg\n",
-        );
+        let yaml = INTERVALS.replace("  user: u\n", "  user: u\nstate:\n  database: pg2iceberg\n");
         let env = vars(&[]);
         let cfg = Config::parse(&yaml, &env).unwrap().finish(&env).unwrap();
-        let (source, coord) = (parsed(&cfg.source.postgres.dsn()), parsed(&cfg.coord_dsn()));
+        let (source, coord) = (parsed(&cfg.source.dsn()), parsed(&cfg.coord_dsn()));
         same_server(&source, &coord);
         assert_eq!(coord.get_dbname(), Some("pg2iceberg"));
     }
@@ -1878,8 +1789,8 @@ sink:
     #[test]
     fn a_connection_string_for_the_state_is_refused() {
         let yaml = INTERVALS.replace(
-            "    user: u\n",
-            "    user: u\nstate:\n  postgres_url: postgres://u@elsewhere/state\n",
+            "  user: u\n",
+            "  user: u\nstate:\n  postgres_url: postgres://u@elsewhere/state\n",
         );
         let env = vars(&[]);
         let err = Config::parse(&yaml, &env)
@@ -1905,16 +1816,13 @@ sink:
     /// the config load.
     #[test]
     fn slot_is_a_failover_slot_unless_told_not() {
-        let failover = |cfg: Config| cfg.source.logical.failover;
+        let failover = |cfg: Config| cfg.source.failover;
         assert!(failover(Config::from_env(&vars(&[])).unwrap()));
         let env = vars(&[("PG2ICEBERG_SLOT_FAILOVER", "false")]);
         assert!(!failover(Config::from_env(&env).unwrap()));
         let env = vars(&[("PG2ICEBERG_SLOT_FAILOVER", "TRUE")]);
         assert!(failover(Config::from_env(&env).unwrap()));
-        let yaml = INTERVALS.replace(
-            "    user: u\n",
-            "    user: u\n  logical:\n    failover: false\n",
-        );
+        let yaml = INTERVALS.replace("  user: u\n", "  user: u\n  failover: false\n");
         let env = vars(&[]);
         let cfg = Config::parse(&yaml, &env).unwrap().finish(&env).unwrap();
         assert!(!failover(cfg));
@@ -1963,10 +1871,10 @@ sink:
         cfg.require_source().unwrap();
         cfg.require_catalog().unwrap();
         assert_eq!(
-            cfg.source.postgres.dsn(),
+            cfg.source.dsn(),
             "postgres://u:p@db:5432/app?sslmode=require"
         );
-        assert_eq!(cfg.source.postgres.tls_label(), "webpki");
+        assert_eq!(cfg.source.tls_label(), "webpki");
         assert_eq!(
             cfg.tables
                 .iter()
@@ -1975,8 +1883,8 @@ sink:
             ["public.orders", "sales.*"]
         );
         assert!(cfg.tables[1].is_pattern());
-        assert_eq!(cfg.source.logical.slot_name, "my_slot");
-        assert_eq!(cfg.source.logical.publication_name, "pg2iceberg_pub");
+        assert_eq!(cfg.source.slot_name, "my_slot");
+        assert_eq!(cfg.source.publication_name, "pg2iceberg_pub");
         assert_eq!(cfg.sink.namespace, "analytics");
         assert_eq!(cfg.sink.resolved_catalog_auth(), "bearer");
         // No keys given: the AWS default credential chain.
@@ -2024,7 +1932,7 @@ sink:
         let yaml = r#"
 # A comment naming ${UNSET} is left alone.
 source:
-  postgres_url: postgres://u@${HOST}/app
+  url: postgres://u@${HOST}/app
 sink:
   catalog_uri: http://catalog
   catalog_token: ${TOKEN}
@@ -2032,7 +1940,7 @@ sink:
     "header.x-price": "$5 and $${literal}"
 "#;
         let cfg = Config::parse(yaml, &env).unwrap();
-        assert_eq!(cfg.source.postgres_url, "postgres://u@db/app");
+        assert_eq!(cfg.source.url, "postgres://u@db/app");
         assert_eq!(cfg.sink.catalog_token, "t0ken");
         assert_eq!(
             cfg.sink
@@ -2051,9 +1959,9 @@ sink:
 
     #[test]
     fn a_connection_strings_sslmode_decides_tls() {
-        let pg = |url: &str| PostgresConfig {
+        let pg = |url: &str| SourceConfig {
             url: url.into(),
-            ..PostgresConfig::default()
+            ..SourceConfig::default()
         };
         assert_eq!(pg("postgres://u@db/app").tls_label(), "disable");
         assert_eq!(
@@ -2182,6 +2090,31 @@ sink:
             Config::parse(include_str!("../../../example/single/config.yaml"), &env).unwrap();
         single.validate_tables().unwrap();
         assert_eq!(single.tables.len(), 5);
+        assert_eq!(single.source.host, "postgres");
+        assert_eq!(single.source.slot_name, "pg2iceberg_slot");
+        for (name, yaml) in [
+            (
+                "blue-green/blue",
+                include_str!("../../../example/blue-green/configs/pg2iceberg-blue.yaml"),
+            ),
+            (
+                "blue-green/green",
+                include_str!("../../../example/blue-green/configs/pg2iceberg-green.yaml"),
+            ),
+            ("tpcc", include_str!("../../../benchmark/tpcc/config.yaml")),
+            (
+                "tpcc/flush100k",
+                include_str!("../../../benchmark/tpcc/config-flush100k.yaml"),
+            ),
+            (
+                "tpcc/nocompact",
+                include_str!("../../../benchmark/tpcc/config-nocompact.yaml"),
+            ),
+        ] {
+            let cfg = Config::parse(yaml, &env).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            cfg.validate_tables().unwrap();
+            cfg.require_source().unwrap();
+        }
     }
 
     #[test]

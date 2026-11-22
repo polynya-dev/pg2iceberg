@@ -10,8 +10,7 @@ To keep a plain slot instead:
 
 ```yaml
 source:
-  logical:
-    failover: false        # or PG2ICEBERG_SLOT_FAILOVER=false
+  failover: false        # or PG2ICEBERG_SLOT_FAILOVER=false
 ```
 
 Before PostgreSQL 17 there are no failover slots, and the setting does nothing. A failover there loses the slot: pg2iceberg refuses to start (`SlotGoneButLsnExists`), and the pipeline needs `pg2iceberg cleanup` and a new snapshot.

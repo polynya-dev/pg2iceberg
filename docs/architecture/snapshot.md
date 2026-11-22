@@ -24,7 +24,7 @@ ORDER BY o_w_id, o_d_id, o_id LIMIT 10000
 
 The primary key's index serves each chunk. Its rows come in Postgres's binary form, as `COPY (SELECT …) TO STDOUT (FORMAT binary)` outputs them, each column cast to the type its Iceberg type is read from — decoding text took a third of a snapshot's CPU. A string column of a type other than `text` or `varchar`, such as `char(n)`, `inet` or an enum, comes as the text its type outputs. A chunk is written to the table's data files, and the next one is read from Postgres meanwhile, so up to two chunks of a table are in memory. The table is committed once, when all of it is read: readers see it empty, then complete, never part of it.
 
-Up to `source.logical.snapshot_concurrency` tables (default 4) are read at once, each on a task and a connection of its own. The first connection exports its snapshot (`pg_export_snapshot()`) and the others import it (`SET TRANSACTION SNAPSHOT`), so every table is read as of the same moment, whichever connection reads it.
+Up to `source.snapshot_concurrency` tables (default 4) are read at once, each on a task and a connection of its own. The first connection exports its snapshot (`pg_export_snapshot()`) and the others import it (`SET TRANSACTION SNAPSHOT`), so every table is read as of the same moment, whichever connection reads it.
 
 ## Large tables
 

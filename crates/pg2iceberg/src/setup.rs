@@ -49,7 +49,7 @@ where
 
     // ── coord ──────────────────────────────────────────────────────
     let coord_dsn = cfg.coord_dsn();
-    let coord_tls = match cfg.source.postgres.tls_label() {
+    let coord_tls = match cfg.source.tls_label() {
         "webpki" => CoordTls::Webpki,
         _ => CoordTls::Disable,
     };
@@ -62,12 +62,12 @@ where
     let coord: Arc<dyn Coordinator> = coord_concrete;
 
     // ── pg source ──────────────────────────────────────────────────
-    let pg_tls = match cfg.source.postgres.tls_label() {
+    let pg_tls = match cfg.source.tls_label() {
         "webpki" => PgTls::Webpki,
         _ => PgTls::Disable,
     };
     let pg_concrete = Arc::new(
-        PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+        PgClientImpl::connect_with(&cfg.source.dsn(), pg_tls)
             .await
             .context("PG connect")?,
     );
@@ -98,8 +98,8 @@ where
     // Closure captures the YAML config so opening the SnapshotSource
     // (REPEATABLE READ tx + LSN capture) only happens if the snapshot
     // phase actually needs to run.
-    let pg_cfg = cfg.source.postgres.clone();
-    let snapshot_concurrency = cfg.source.logical.snapshot_concurrency;
+    let pg_cfg = cfg.source.clone();
+    let snapshot_concurrency = cfg.source.snapshot_concurrency;
     let snapshot_source_factory = Box::new(move |to_snapshot: &[TableSchema]| {
         let pg_cfg = pg_cfg.clone();
         let to_snapshot = to_snapshot.to_vec();
@@ -127,9 +127,9 @@ where
         id_gen,
         schemas,
         skip_snapshot_idents,
-        slot_name: cfg.source.logical.slot_name.clone(),
-        publication_name: cfg.source.logical.publication_name.clone(),
-        slot_failover: cfg.source.logical.failover,
+        slot_name: cfg.source.slot_name.clone(),
+        publication_name: cfg.source.publication_name.clone(),
+        slot_failover: cfg.source.failover,
         group: cfg.state.group.clone(),
         schedule: cfg.sink.schedule()?,
         compaction: if cfg.sink.target_file_size > 0 {

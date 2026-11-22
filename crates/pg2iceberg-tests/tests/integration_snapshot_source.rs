@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use pg2iceberg::config::PostgresConfig;
+use pg2iceberg::config::SourceConfig;
 use pg2iceberg::snapshot_src::PgSnapshotSource;
 use pg2iceberg_core::{ColumnName, PgValue, Row, TableSchema};
 use pg2iceberg_iceberg::pk_key;
@@ -79,7 +79,7 @@ async fn fixture() -> Fixture {
 }
 
 async fn open(f: &Fixture) -> PgSnapshotSource {
-    let cfg = PostgresConfig {
+    let cfg = SourceConfig {
         url: f.dsn.clone(),
         ..Default::default()
     };
@@ -163,7 +163,7 @@ async fn split_and_read(
     parts: usize,
     min_rows: usize,
 ) -> Vec<Vec<Row>> {
-    let cfg = PostgresConfig {
+    let cfg = SourceConfig {
         url: f.dsn.clone(),
         ..Default::default()
     };
@@ -273,7 +273,7 @@ async fn a_cursor_in_the_columns_order_resumes_in_it() {
 #[tokio::test]
 async fn every_connection_reads_the_same_snapshot() {
     let f = fixture().await;
-    let cfg = PostgresConfig {
+    let cfg = SourceConfig {
         url: f.dsn.clone(),
         ..Default::default()
     };
@@ -395,7 +395,7 @@ async fn a_table_of_too_few_rows_known_is_not_split() {
         ),
     )
     .await;
-    let cfg = PostgresConfig {
+    let cfg = SourceConfig {
         url: f.dsn.clone(),
         ..Default::default()
     };
@@ -447,7 +447,7 @@ async fn binary_reads_decode_as_text_reads_do() {
         );",
     )
     .await;
-    let cfg = PostgresConfig {
+    let cfg = SourceConfig {
         url: f.dsn.clone(),
         ..Default::default()
     };

@@ -215,20 +215,20 @@ async fn connect_pg(cfg: &Config) -> Result<()> {
         prod::{PgClientImpl, TlsMode},
         PgClient,
     };
-    let tls = match cfg.source.postgres.tls_label() {
+    let tls = match cfg.source.tls_label() {
         "webpki" => TlsMode::Webpki,
         _ => TlsMode::Disable,
     };
     tracing::info!(
-        slot = %cfg.source.logical.slot_name,
-        publication = %cfg.source.logical.publication_name,
+        slot = %cfg.source.slot_name,
+        publication = %cfg.source.publication_name,
         ?tls,
         "connecting to source PG",
     );
-    let client = PgClientImpl::connect_with(&cfg.source.postgres.dsn(), tls)
+    let client = PgClientImpl::connect_with(&cfg.source.dsn(), tls)
         .await
         .context("PG connect")?;
-    let slot = &cfg.source.logical.slot_name;
+    let slot = &cfg.source.slot_name;
     let exists = client.slot_exists(slot).await.context("slot lookup")?;
     if exists {
         let lsn = client
@@ -289,7 +289,7 @@ async fn migrate_coord(cfg: &Config) -> Result<()> {
         prod::{connect_with, PostgresCoordinator, TlsMode},
         schema::CoordSchema,
     };
-    let tls = match cfg.source.postgres.tls_label() {
+    let tls = match cfg.source.tls_label() {
         "webpki" => TlsMode::Webpki,
         _ => TlsMode::Disable,
     };

@@ -15,7 +15,7 @@ icon: simple/snowflake
 
 ```yaml
 source:
-  postgres_url: "postgres://user:pass@host:5432/db"
+  url: "postgres://user:pass@host:5432/db"
 
 sink:
   catalog_uri: "https://polaris.example.com"

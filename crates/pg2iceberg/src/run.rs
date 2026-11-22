@@ -744,7 +744,7 @@ async fn build_one_shot_materializer(
         .context("build blob store")?;
 
     let coord_dsn = cfg.coord_dsn();
-    let coord_tls = match cfg.source.postgres.tls_label() {
+    let coord_tls = match cfg.source.tls_label() {
         "webpki" => CoordTls::Webpki,
         _ => CoordTls::Disable,
     };
@@ -769,12 +769,12 @@ async fn build_one_shot_materializer(
     // columns can skip it.
     let needs_pg = cfg.tables.iter().any(|t| !t.has_explicit_columns());
     let pg_for_discovery = if needs_pg {
-        let pg_tls = match cfg.source.postgres.tls_label() {
+        let pg_tls = match cfg.source.tls_label() {
             "webpki" => PgTls::Webpki,
             _ => PgTls::Disable,
         };
         Some(
-            PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+            PgClientImpl::connect_with(&cfg.source.dsn(), pg_tls)
                 .await
                 .context("PG connect for schema discovery")?,
         )
@@ -864,12 +864,12 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
     // which columns to SELECT and decode.
     let needs_pg = cfg.tables.iter().any(|t| !t.has_explicit_columns());
     let pg_for_discovery = if needs_pg {
-        let pg_tls = match cfg.source.postgres.tls_label() {
+        let pg_tls = match cfg.source.tls_label() {
             "webpki" => PgTls::Webpki,
             _ => PgTls::Disable,
         };
         Some(
-            PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+            PgClientImpl::connect_with(&cfg.source.dsn(), pg_tls)
                 .await
                 .context("PG connect for schema discovery")?,
         )
@@ -921,7 +921,7 @@ pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
         schemas.push(schema);
     }
 
-    let source = PgSnapshotSource::open(&cfg.source.postgres, &schemas, 1)
+    let source = PgSnapshotSource::open(&cfg.source, &schemas, 1)
         .await
         .context("open verify source")?;
 
@@ -980,15 +980,15 @@ pub async fn run_cleanup(cfg: Config) -> Result<()> {
     use pg2iceberg_pg::PgClient;
 
     // ── 1. Drop slot + publication on the *source* PG. ─────────────
-    let pg_tls = match cfg.source.postgres.tls_label() {
+    let pg_tls = match cfg.source.tls_label() {
         "webpki" => PgTls::Webpki,
         _ => PgTls::Disable,
     };
-    let pg = PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+    let pg = PgClientImpl::connect_with(&cfg.source.dsn(), pg_tls)
         .await
         .context("source PG connect")?;
-    let slot = &cfg.source.logical.slot_name;
-    let pub_name = &cfg.source.logical.publication_name;
+    let slot = &cfg.source.slot_name;
+    let pub_name = &cfg.source.publication_name;
     if !slot.is_empty() {
         pg.drop_slot(slot)
             .await
@@ -1008,7 +1008,7 @@ pub async fn run_cleanup(cfg: Config) -> Result<()> {
     // including log_index, log_seq, cursors, consumers, locks,
     // checkpoints, and pending_markers / marker_emissions.
     let coord_dsn = cfg.coord_dsn();
-    let coord_tls = match cfg.source.postgres.tls_label() {
+    let coord_tls = match cfg.source.tls_label() {
         "webpki" => CoordTls::Webpki,
         _ => CoordTls::Disable,
     };
@@ -1069,7 +1069,7 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
 
     // ── coord ──────────────────────────────────────────────────────
     let coord_dsn = cfg.coord_dsn();
-    let coord_tls = match cfg.source.postgres.tls_label() {
+    let coord_tls = match cfg.source.tls_label() {
         "webpki" => CoordTls::Webpki,
         _ => CoordTls::Disable,
     };
@@ -1086,12 +1086,12 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     let (catalog, blob, coord) = instrument(catalog, blob, coord_concrete, &metrics);
 
     // ── pg + slot ──────────────────────────────────────────────────
-    let pg_tls = match cfg.source.postgres.tls_label() {
+    let pg_tls = match cfg.source.tls_label() {
         "webpki" => PgTls::Webpki,
         _ => PgTls::Disable,
     };
     let pg = Arc::new(
-        PgClientImpl::connect_with(&cfg.source.postgres.dsn(), pg_tls)
+        PgClientImpl::connect_with(&cfg.source.dsn(), pg_tls)
             .await
             .context("source PG connect")?,
     );
@@ -1139,8 +1139,8 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     // Auto-create slot + publication if missing. This pins the WAL
     // from `consistent_point` onward so a later `Run` doesn't lose
     // any commits between snapshot and CDC start.
-    let slot = &cfg.source.logical.slot_name;
-    let pub_name = &cfg.source.logical.publication_name;
+    let slot = &cfg.source.slot_name;
+    let pub_name = &cfg.source.publication_name;
     if pg.slot_exists(slot).await.context("check slot")? {
         tracing::info!(slot = %slot, "replication slot exists, reusing");
     } else {
@@ -1153,7 +1153,7 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
                 "create_publication failed; assuming it exists"
             );
         }
-        let failover = cfg.source.logical.failover
+        let failover = cfg.source.failover
             && pg2iceberg_pg::failover_slots_supported(
                 pg.server_version_num()
                     .await
@@ -1192,9 +1192,9 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     }
 
     // ── run snapshot phase ─────────────────────────────────────────
-    let pg_cfg = cfg.source.postgres.clone();
+    let pg_cfg = cfg.source.clone();
     let to_snapshot = schemas.clone();
-    let tables = cfg.source.logical.snapshot_concurrency;
+    let tables = cfg.source.snapshot_concurrency;
     // A connection for each table, or range of one, read at once.
     let connections = tables;
     let source = crate::snapshot_src::PgSnapshotSource::open(&pg_cfg, &to_snapshot, connections)
