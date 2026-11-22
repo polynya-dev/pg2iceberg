@@ -142,7 +142,8 @@ async fn inspect(cfg: &Config) -> Result<Inspection> {
     });
 
     let coord = CoordSchema::sanitize(&cfg.state.coordinator_schema);
-    if cfg.state.postgres_url.is_empty() {
+    let state_database = &cfg.state.database;
+    if state_database.is_empty() || *state_database == database {
         let can_create: bool = one(format!(
             "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = {}) \
                  OR has_database_privilege(current_database(), 'CREATE')",
@@ -155,7 +156,30 @@ async fn inspect(cfg: &Config) -> Result<Inspection> {
             fix: (!can_create).then(|| {
                 format!(
                     "GRANT CREATE ON DATABASE {database} TO {user}, or keep the state in \
-                     another database (PG2ICEBERG_STATE_URL)"
+                     another database on this server (PG2ICEBERG_STATE_DATABASE)"
+                )
+            }),
+        });
+    } else {
+        // Another database's schemas aren't visible from this one: what
+        // it takes to create one there.
+        let can_create: bool = one(format!(
+            "SELECT COALESCE((SELECT has_database_privilege(oid, 'CONNECT') \
+                 AND has_database_privilege(oid, 'CREATE') \
+                 FROM pg_database WHERE datname = {}), false)",
+            literal(state_database)
+        ))
+        .await?
+        .get(0);
+        checks.push(Check {
+            what: format!(
+                "pg2iceberg can keep its state in schema {} of database {state_database}",
+                coord.as_str()
+            ),
+            fix: (!can_create).then(|| {
+                format!(
+                    "CREATE DATABASE {state_database}, and GRANT CONNECT, CREATE ON DATABASE \
+                     {state_database} TO {user}"
                 )
             }),
         });

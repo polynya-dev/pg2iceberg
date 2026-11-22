@@ -259,7 +259,7 @@ Settings come from environment variables and an optional YAML file: `--config`, 
 | `POSTGRES_URL` | `source.postgres_url` | Source database: a URL or `key=value` connection string (required) |
 | `PG2ICEBERG_TABLES` | `tables` | Comma-separated `schema.table` or `schema.*`. Default: every table with a primary key |
 | `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.logical.slot_name` / `publication_name` | Default `pg2iceberg_slot` / `pg2iceberg_pub` |
-| `PG2ICEBERG_STATE_URL` | `state.postgres_url` | A separate Postgres for pg2iceberg's state. Default: the source |
+| `PG2ICEBERG_STATE_DATABASE` | `state.database` | The database on the source's server that holds pg2iceberg's state. Default: the source's |
 | `PG2ICEBERG_CONFIG` | — | The config file |
 | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` | Iceberg REST catalog (required) |
 | `ICEBERG_CATALOG_TOKEN` | `sink.catalog_token` | Bearer token |
@@ -302,11 +302,11 @@ pg2iceberg cleanup --config <path>
 # Iceberg tables remain — drop them via the catalog separately if you want a full reset.
 ```
 
-To use a separate Postgres for coord state (instead of the source DB):
+pg2iceberg's state always lives on the source's Postgres server, so a failover takes it along. To keep it in another database there:
 
 ```yaml
 state:
-  postgres_url: postgresql://user:pass@host:5432/state-db
+  database: pg2iceberg
   coordinator_schema: _pg2iceberg
 ```
 
