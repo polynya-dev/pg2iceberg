@@ -8182,3 +8182,63 @@ fn a_default_filled_in_keeps_the_rows_ids() {
 fn a_default_filled_in_keeps_the_rows_ids_on_iceberg() {
     dv_case(true, false, false, &default_filled());
 }
+
+/// A FileIndex budget of seven keys: past it, the oldest files' keys are
+/// evicted, and the newest still mapped.
+const SMALL_INDEX_BYTES: usize = 600;
+
+/// Compaction merges files a seven-key FileIndex evicted with files it
+/// holds into one output, which is evicted for the rows it holds that the
+/// map doesn't — and maps the keys of the rows that came from the files
+/// it held. An update of one of those keeps the row's id, which the index
+/// holds: it must not read the output for it, as every update of it would.
+#[test]
+fn an_update_in_an_evicted_compaction_output_reads_no_data_file() {
+    FORMAT_V3.set(true);
+    BOUNDED_INDEX.set(true);
+    let mut h = DstHarness::boot();
+    h.materializer.set_pk_index_memory(SMALL_INDEX_BYTES);
+    for id in 1..=12 {
+        h.run_step(&Step::Insert { id, qty: id });
+        h.run_step(&Step::DriveFlush);
+        h.run_step(&Step::MaterializerCycle);
+    }
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        delete_ratio: 0.0,
+        target_size_bytes: 1 << 20,
+        max_input_bytes_per_pass: 1 << 30,
+    };
+    block_on(h.materializer.compact_table(&ident(), &cfg))
+        .unwrap()
+        .expect("the small files are merged");
+    check_step_invariants(&h).unwrap();
+    let key = |id: i32| {
+        let row = Row::from([(ColumnName("id".into()), PgValue::Int4(id))]);
+        pg2iceberg_iceberg::PkKey::from_row(&row, &[ColumnName("id".into())])
+    };
+    let index = h.materializer.file_index(&ident()).unwrap();
+    let (output, _) = index.locate(&key(12)).expect("row 12's key is mapped");
+    assert!(
+        index.is_evicted(output),
+        "the output holds rows of evicted files: {index:?}"
+    );
+    let output = output.to_string();
+    h.run_step(&Step::Update { id: 12, qty: 120 });
+    h.run_step(&Step::DriveFlush);
+    // The materializer's reads alone: not the audit's, which reads the
+    // whole table after a commit, nor the step's FileIndex check.
+    h.audited
+        .audit_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = h.storage.sim_blob().gets_of(&output);
+    block_on(h.materializer.cycle()).unwrap();
+    let reads = h.storage.sim_blob().gets_of(&output) - before;
+    h.audited
+        .audit_paused
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(reads, 0, "an update of row 12 read its file {reads} times");
+    check_step_invariants(&h).unwrap();
+    check_invariants(&mut h).unwrap();
+}

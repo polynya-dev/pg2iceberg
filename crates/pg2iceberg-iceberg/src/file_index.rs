@@ -50,7 +50,9 @@
 //! plus their position. The index keeps each file's first row id, once
 //! known, and the ids it stores ([`StoredRowIds`]): runs of consecutive
 //! positions with consecutive ids, which count against the budget like
-//! keys, and leave with the file's keys when it's evicted.
+//! keys, and leave with the file's keys when the budget evicts it. A file
+//! evicted only for rows the map doesn't hold — a compaction's output
+//! taking rows of evicted files — keeps them for the keys it does map.
 
 use crate::pk::PkKey;
 use crate::DeletionVector;
@@ -359,8 +361,8 @@ pub struct FileIndex {
     added: u64,
     /// Some key is held as a hash: `keys` can't give every key back.
     hashed: bool,
-    /// The runs of [`IndexedFile::row_ids`] the files not evicted hold,
-    /// which count against `max_keys` like keys.
+    /// The runs of [`IndexedFile::row_ids`] the files hold, which count
+    /// against `max_keys` like keys.
     runs: usize,
 }
 
@@ -392,8 +394,12 @@ struct IndexedFile {
     /// The row id of its first row, once known: the table's catalog
     /// assigns it as it commits the file.
     first_row_id: Option<i64>,
-    /// The row ids it stores. Not kept once it's evicted.
+    /// The row ids it stores, while `row_ids_known`.
     row_ids: StoredRowIds,
+    /// Whether `row_ids` are all it stores: until the budget evicts its
+    /// keys ([`FileIndex::evict`]). A file evicted only for rows the map
+    /// doesn't hold ([`FileIndex::add_unseen`]) still knows them.
+    row_ids_known: bool,
 }
 
 impl IndexedFile {
@@ -641,8 +647,6 @@ impl FileIndex {
         file.live += rows;
         if !file.evicted {
             file.evicted = true;
-            let runs = std::mem::take(&mut file.row_ids).runs();
-            self.runs -= runs;
             self.evicted += 1;
         }
         self.widen_evicted_range(id);
@@ -736,13 +740,14 @@ impl FileIndex {
     }
 
     /// `path` stores the row ids `row_ids`: kept, if the index holds the
-    /// file and it isn't evicted. Their runs may evict the oldest files.
+    /// file and the budget hasn't evicted its keys. Their runs may evict
+    /// the oldest files.
     pub fn store_row_ids(&mut self, path: &str, row_ids: StoredRowIds) {
         let Some(&id) = self.ids.get(path) else {
             return;
         };
         let file = self.file_mut(id);
-        if file.evicted {
+        if !file.row_ids_known {
             return;
         }
         let (added, removed) = (row_ids.runs(), file.row_ids.runs());
@@ -754,11 +759,11 @@ impl FileIndex {
     }
 
     /// The id of `path`'s row at `position`, if the index knows the
-    /// file's: it holds the file, not evicted. (The index takes in the
-    /// ids a file stores as it takes in the file.)
+    /// file's: it holds the file, and the budget hasn't evicted its keys.
+    /// (The index takes in the ids a file stores as it takes in the file.)
     pub fn row_id(&self, path: &str, position: u32) -> Option<RowId> {
         let file = self.file(*self.ids.get(path)?);
-        if file.evicted {
+        if !file.row_ids_known {
             return None;
         }
         Some(match file.row_ids.get(position) {
@@ -1009,6 +1014,7 @@ impl FileIndex {
             unseen_deaths: 0,
             first_row_id: None,
             row_ids: StoredRowIds::default(),
+            row_ids_known: true,
         };
         self.added += 1;
         self.place(file)
@@ -1100,6 +1106,7 @@ impl FileIndex {
                 self.evicted_keys.cover(layer, lo, hi);
                 file.mapped = 0;
                 self.runs -= std::mem::take(&mut file.row_ids).runs();
+                file.row_ids_known = false;
                 if !file.evicted {
                     file.evicted = true;
                     self.evicted += 1;
@@ -1814,10 +1821,12 @@ mod tests {
         assert_eq!(StoredRowIds::new().get(0), None);
     }
 
-    /// A file's row stores its id, or inherits one; once the file is
-    /// evicted the index knows neither, even of a key the map still holds
-    /// there — a compaction's output taking rows of evicted inputs is
-    /// evicted as its keys go in — and has dropped its runs.
+    /// A file's row stores its id, or inherits one. A compaction's output
+    /// taking rows of evicted inputs is evicted as its keys go in — for the
+    /// rows it holds that the map doesn't — and keeps its ids for the keys
+    /// it does map: an update of one must not read the file for its id.
+    /// Once its keys are evicted the index knows neither, and has dropped
+    /// its runs.
     #[test]
     fn an_evicted_files_row_ids_are_unknown() {
         let mut fi = FileIndex::new();
@@ -1832,13 +1841,31 @@ mod tests {
         assert_eq!(fi.row_id("other", 0), None);
 
         fi.add_file("out".into(), [n(4)], Vec::new());
-        fi.store_row_ids("out", ids);
+        let mut out_ids = StoredRowIds::new();
+        out_ids.push(0, 70);
+        fi.store_row_ids("out", out_ids.clone());
         assert_eq!(fi.runs, 2);
         fi.add_unseen("out".into(), 1, [n(5)], Vec::new(), None);
+        assert!(fi.is_evicted("out"));
         assert_eq!(fi.locate(&n(4)), Some(("out", 0)));
-        assert_eq!(fi.row_id("out", 0), None);
-        assert_eq!(fi.runs, 1);
+        assert_eq!(fi.row_id("out", 0), Some(RowId::Stored(70)));
+        assert_eq!(fi.runs, 2);
+
+        // As catch-up takes in such an output: evicted first, then its
+        // keys and ids.
+        fi.add_unseen("caught".into(), 1, [n(8)], Vec::new(), None);
+        fi.add_file_at("caught".into(), [(n(6), 0)], Vec::new(), None);
+        fi.store_row_ids("caught", out_ids);
+        assert_eq!(fi.row_id("caught", 0), Some(RowId::Stored(70)));
+        assert_eq!(fi.runs, 3);
+
         fi.remove_file("f");
+        fi.remove_file("caught");
+        assert_eq!(fi.runs, 1);
+        fi.max_keys = 1;
+        fi.evict();
+        assert_eq!(fi.locate(&n(4)), None);
+        assert_eq!(fi.row_id("out", 0), None);
         assert_eq!(fi.runs, 0);
     }
 
