@@ -80,7 +80,7 @@ POSTGRES_URL=postgres://... pg2iceberg init
 - every table it would replicate, with its estimated size; the tables it would skip are listed, commented out, with the reason;
 - the settings the environment gives; secrets (`POSTGRES_URL`, catalog tokens and client secrets) as `${VAR}` references, so they stay in the environment.
 
-It also checks what replication needs of the database, and says how to fix what's missing: `wal_level = logical`, the replication privilege, a free replication slot, a place for pg2iceberg's state schema, and ownership of the tables (creating the publication takes it).
+It also checks what replication needs of the database, and says how to fix what's missing: `wal_level = logical` (`replica` from PostgreSQL 19), the replication privilege, a free replication slot, a place for pg2iceberg's state schema, and ownership of the tables (creating the publication takes it).
 
 Listing the tables pins them: a table created later isn't replicated until it's added. Delete `tables:` to replicate every table with a primary key again.
 

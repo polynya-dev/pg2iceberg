@@ -1,6 +1,6 @@
-//! Failover against real PostgreSQL 17: a primary, and a physical standby
-//! that syncs slots, which the primary's `synchronized_standby_slots`
-//! names. Checks what pg2iceberg's failover handling rests on, and the
+//! Failover against real PostgreSQL 17, and 19 at `wal_level = replica`:
+//! a primary, and a physical standby that syncs slots, which the primary's
+//! `synchronized_standby_slots` names. Checks what pg2iceberg's failover handling rests on, and the
 //! sim models (`SimPostgres::attach_standby`):
 //!
 //! - its failover slot is synced to the standby, and survives promotion;
@@ -8,7 +8,10 @@
 //!   position — the standby hasn't flushed (pg2iceberg's acks, commits
 //!   and deletes of staged files wait on that);
 //! - promotion starts a new timeline, which the replication client and
-//!   the coordinator see.
+//!   the coordinator see;
+//! - from 19, at `wal_level = replica`, pg2iceberg's slot turns logical
+//!   decoding on, and the promoted standby, holding the synced slot, keeps
+//!   it on.
 //!
 //! Gated behind `--features integration`.
 
@@ -39,6 +42,28 @@ const STANDBY_SLOT: &str = "standby_slot";
 fn uniq() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }
+
+/// The Postgres release of the primary and the standby, and their
+/// `wal_level`.
+#[derive(Clone, Copy, Debug)]
+struct Source {
+    tag: &'static str,
+    wal_level: &'static str,
+}
+
+/// 17: the first release with failover slots.
+const PG17: Source = Source {
+    tag: "17-alpine",
+    wal_level: "logical",
+};
+
+/// From 19, `wal_level = replica` decodes too: creating the first logical
+/// slot turns logical decoding on (`effective_wal_level` then reads
+/// `logical`).
+const PG19_REPLICA: Source = Source {
+    tag: "19-alpine",
+    wal_level: "replica",
+};
 
 async fn regular_client(dsn: &str) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
@@ -83,14 +108,15 @@ struct Pair {
     writable_dsn: String,
 }
 
-async fn pair() -> Pair {
+async fn pair(source: Source) -> Pair {
     let network = format!("p2i-failover-{}", uniq());
     let primary_name = format!("p2i-primary-{}", uniq());
+    let wal_level = format!("wal_level={}", source.wal_level);
     let primary = Postgres::default()
-        .with_tag("17-alpine")
+        .with_tag(source.tag)
         .with_cmd([
             "-c",
-            "wal_level=logical",
+            wal_level.as_str(),
             "-c",
             "max_replication_slots=16",
             "-c",
@@ -146,9 +172,9 @@ done
 echo "primary_conninfo = 'host={primary_name} user=postgres password=postgres dbname=postgres'" >> /tmp/standby/postgresql.auto.conf
 chown -R postgres:postgres /tmp/standby
 chmod 700 /tmp/standby
-exec "$(command -v gosu || command -v su-exec)" postgres postgres -D /tmp/standby -c sync_replication_slots=on -c hot_standby_feedback=on -c wal_level=logical -c max_replication_slots=16 -c max_wal_senders=16"#
+exec "$(command -v gosu || command -v su-exec)" postgres postgres -D /tmp/standby -c sync_replication_slots=on -c hot_standby_feedback=on -c {wal_level} -c max_replication_slots=16 -c max_wal_senders=16"#
     );
-    let standby = GenericImage::new("postgres", "17-alpine")
+    let standby = GenericImage::new("postgres", source.tag)
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept read-only connections",
@@ -226,7 +252,19 @@ fn inserted_id(msg: &DecodedMessage) -> Option<i32> {
 
 #[tokio::test]
 async fn a_failover_slot_follows_the_standby_and_waits_for_it() {
-    let pair = pair().await;
+    failover_on(PG17).await;
+}
+
+/// The same on PostgreSQL 19 at its default `wal_level = replica`, on the
+/// primary and the standby.
+#[tokio::test]
+async fn a_failover_slot_follows_the_standby_on_postgres_19_at_wal_level_replica() {
+    failover_on(PG19_REPLICA).await;
+}
+
+async fn failover_on(source: Source) {
+    let at_replica = source.wal_level == "replica";
+    let pair = pair(source).await;
     let admin = regular_client(&pair.primary_dsn).await;
     admin
         .batch_execute("CREATE TABLE t (id INT PRIMARY KEY)")
@@ -245,9 +283,23 @@ async fn a_failover_slot_follows_the_standby_and_waits_for_it() {
         pg.server_version_num().await.unwrap()
     ));
     pg.create_publication(PUBLICATION, &[table]).await.unwrap();
+    if at_replica {
+        // No logical slot yet: no logical decoding.
+        assert_eq!(
+            text(&admin, "SHOW effective_wal_level").await.as_deref(),
+            Some("replica")
+        );
+    }
     pg.create_slot(SLOT, true)
         .await
         .expect("create a failover slot");
+    if at_replica {
+        assert_eq!(
+            text(&admin, "SHOW effective_wal_level").await.as_deref(),
+            Some("logical"),
+            "the slot turned logical decoding on"
+        );
+    }
     assert_eq!(slot_failover(&pg).await, Some(true));
     pg.set_slot_failover(SLOT, false).await.unwrap();
     assert_eq!(slot_failover(&pg).await, Some(false));
@@ -395,6 +447,13 @@ async fn a_failover_slot_follows_the_standby_and_waits_for_it() {
         .await
         .expect("connect to the promoted standby");
     assert_eq!(promoted.timeline().await.unwrap(), 2);
+    if at_replica {
+        assert_eq!(
+            text(&standby, "SHOW effective_wal_level").await.as_deref(),
+            Some("logical"),
+            "the promoted standby holds a logical slot: logical decoding stays on"
+        );
+    }
     let slot = promoted
         .slot_health(SLOT)
         .await

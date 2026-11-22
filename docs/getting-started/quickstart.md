@@ -22,7 +22,7 @@ SELECT * FROM rideshare.`rideshare.rides`
 
 ## Run it against your database
 
-The source needs `wal_level = logical`, and a role that can replicate. `pg2iceberg init` checks both.
+The source needs `wal_level = logical` (from PostgreSQL 19, the default `replica` does), and a role that can replicate. `pg2iceberg init` checks both.
 
 ### 1. Point pg2iceberg at Postgres and the catalog
 

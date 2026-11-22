@@ -2,7 +2,8 @@
 //! real container stack.
 //!
 //! Stack:
-//!   - source Postgres (logical replication enabled)
+//!   - source Postgres (logical decoding on: `wal_level = logical`, or
+//!     from PostgreSQL 19 `replica`, which turns it on with the slot)
 //!   - MinIO (S3-compatible object store)
 //!   - Apache iceberg-rest-fixture (REST catalog, SQLite-backed)
 //!
@@ -76,6 +77,36 @@ fn uniq() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// The source Postgres: a release, and its `wal_level`.
+#[derive(Clone, Copy, Debug)]
+struct Source {
+    tag: &'static str,
+    wal_level: &'static str,
+}
+
+/// 16 has the slot-health columns we query (`wal_status`,
+/// `safe_wal_size`, `conflicting`).
+const PG16: Source = Source {
+    tag: "16-alpine",
+    wal_level: "logical",
+};
+
+/// From 19, `wal_level = replica` decodes too: creating the first logical
+/// slot turns logical decoding on (`effective_wal_level` then reads
+/// `logical`).
+const PG19_REPLICA: Source = Source {
+    tag: "19-alpine",
+    wal_level: "replica",
+};
+
+/// The source's `effective_wal_level` (PostgreSQL 19 and newer).
+async fn effective_wal_level(src: &tokio_postgres::Client) -> String {
+    src.query_one("SHOW effective_wal_level", &[])
+        .await
+        .expect("SHOW effective_wal_level")
+        .get(0)
+}
+
 /// Bring up the full container stack on a fresh per-test network.
 /// Returns the source-PG DSN, REST-catalog URL, MinIO host:port,
 /// and live container handles (kept alive by the caller).
@@ -92,7 +123,7 @@ struct Stack {
     _rest: ContainerAsync<GenericImage>,
 }
 
-async fn bring_up_stack() -> Stack {
+async fn bring_up_stack(source: Source) -> Stack {
     let network = format!("p2i-it-{}", uniq());
     let bucket = "warehouse".to_string();
 
@@ -138,15 +169,14 @@ async fn bring_up_stack() -> Stack {
     let rest_url = format!("http://{rest_host}:{rest_port}");
 
     // ── Source PG ────────────────────────────────────────────────
-    // Pin to 16-alpine so the slot-health columns we query
-    // (`wal_status`, `safe_wal_size`, `conflicting`) are present.
+    let wal_level = format!("wal_level={}", source.wal_level);
     let src_pg: ContainerAsync<Postgres> = Postgres::default()
-        .with_tag("16-alpine")
+        .with_tag(source.tag)
         .with_cmd([
             "-c",
             "fsync=off",
             "-c",
-            "wal_level=logical",
+            wal_level.as_str(),
             "-c",
             "max_replication_slots=8",
             "-c",
@@ -222,7 +252,8 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
                 slot_name: slot.into(),
                 standby_interval: String::new(),
                 snapshot_concurrency: 4,
-                // The default: on this PG 16 source, a slot like any other.
+                // The default: a failover slot from PG 17, a slot like any
+                // other before.
                 failover: true,
             },
         },
@@ -286,7 +317,7 @@ async fn iam_credentials_with_a_custom_endpoint_commit_snapshots() {
     use pg2iceberg_core::{ColumnSchema, IcebergType, TableSchema};
     use pg2iceberg_iceberg::{Catalog as _, DataFile, PreparedCommit};
 
-    let stack = bring_up_stack().await;
+    let stack = bring_up_stack(PG16).await;
     let mut cfg = config_for_stack(&stack, "unused", "unused", "unused");
     cfg.sink.credential_mode = "iam".into();
     // The credential chain would read the keys from the environment,
@@ -349,7 +380,7 @@ async fn a_rest_catalog_creates_tables_in_the_configured_format_version() {
     use pg2iceberg_core::{ColumnSchema, IcebergType, TableSchema};
     use pg2iceberg_iceberg::{Catalog as _, DataFile, FormatVersion, PreparedCommit};
 
-    let stack = bring_up_stack().await;
+    let stack = bring_up_stack(PG16).await;
     let cfg = config_for_stack(&stack, "unused", "unused", "unused");
     for (version, expected) in [
         (FormatVersion::V2, iceberg::spec::FormatVersion::V2),
@@ -416,6 +447,17 @@ async fn a_rest_catalog_creates_tables_in_the_configured_format_version() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lifecycle_inserts_propagate_pg_to_iceberg() {
+    lifecycle_on(PG16).await;
+}
+
+/// The same on PostgreSQL 19 at its default `wal_level = replica`:
+/// pg2iceberg's slot turns logical decoding on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lifecycle_on_postgres_19_at_wal_level_replica() {
+    lifecycle_on(PG19_REPLICA).await;
+}
+
+async fn lifecycle_on(source: Source) {
     // Surface lifecycle / pipeline / catalog tracing into test output
     // (only when RUST_LOG is set). `try_init` so multiple test
     // invocations in the same process don't conflict.
@@ -426,7 +468,7 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         .with_test_writer()
         .try_init();
 
-    let stack = bring_up_stack().await;
+    let stack = bring_up_stack(source).await;
 
     let table = format!("accounts_{}", uniq());
     let slot = format!("s_{}", uniq());
@@ -441,6 +483,11 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
     ))
     .await
     .expect("create table");
+    let at_replica = source.wal_level == "replica";
+    if at_replica {
+        // No logical slot yet: no logical decoding.
+        assert_eq!(effective_wal_level(&src).await, "replica");
+    }
     for i in 1..=3 {
         src.execute(
             &format!("INSERT INTO {table} (id, balance) VALUES ($1, $2)"),
@@ -547,6 +594,13 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
 
         let expected: BTreeMap<i32, i32> = (1..=6).map(|i| (i, i * 100)).collect();
         wait_for_iceberg(&assert_catalog, blob.as_ref(), &ident, &schema, &expected).await;
+        if at_replica {
+            assert_eq!(
+                effective_wal_level(&src).await,
+                "logical",
+                "pg2iceberg's slot turned logical decoding on"
+            );
+        }
 
         // Then Postgres drops every connection pg2iceberg has to it — the
         // stream's, the slot monitor's, and the coordinator's to the

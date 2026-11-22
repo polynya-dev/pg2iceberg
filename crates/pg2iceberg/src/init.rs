@@ -94,16 +94,12 @@ async fn inspect(cfg: &Config) -> Result<Inspection> {
     let user: String = one("SELECT current_user::text".into()).await?.get(0);
     let mut checks = Vec::new();
 
-    let wal_level: String = one("SHOW wal_level".into()).await?.get(0);
-    checks.push(Check {
-        what: format!("wal_level is {wal_level}"),
-        fix: (wal_level != "logical").then(|| {
-            "set wal_level = logical and restart Postgres (RDS / Aurora: \
-             rds.logical_replication = 1 in the parameter group; Cloud SQL: the \
-             cloudsql.logical_decoding flag)"
-                .into()
-        }),
-    });
+    let wal_row = one("SELECT current_setting('wal_level'), \
+                current_setting('server_version_num')::int"
+        .into())
+    .await?;
+    let (wal_level, server_version_num): (String, i32) = (wal_row.get(0), wal_row.get(1));
+    checks.push(wal_level_check(server_version_num, &wal_level));
 
     let can_replicate: bool = one("SELECT r.rolsuper OR r.rolreplication OR EXISTS ( \
              SELECT 1 FROM pg_roles g \
@@ -404,6 +400,40 @@ fn scalar(s: &str) -> String {
     }
 }
 
+/// The first PostgreSQL `server_version_num` that decodes at
+/// `wal_level = replica`: 19.0. It turns logical decoding on when the
+/// first logical slot is created (`effective_wal_level` then reads
+/// `logical`), and off once no valid logical slot is left.
+const LOGICAL_DECODING_AT_REPLICA_VERSION_NUM: i32 = 190_000;
+
+/// Whether `wal_level` lets pg2iceberg's slot decode.
+fn wal_level_check(server_version_num: i32, wal_level: &str) -> Check {
+    let at_replica = server_version_num >= LOGICAL_DECODING_AT_REPLICA_VERSION_NUM;
+    let (what, fix) = match wal_level {
+        "logical" => ("wal_level is logical".to_string(), None),
+        "replica" if at_replica => (
+            "wal_level is replica: Postgres turns logical decoding on when pg2iceberg \
+             creates its slot"
+                .to_string(),
+            None,
+        ),
+        _ if at_replica => (
+            format!("wal_level is {wal_level}"),
+            Some("set wal_level = replica (or logical) and restart Postgres".to_string()),
+        ),
+        _ => (
+            format!("wal_level is {wal_level}"),
+            Some(
+                "set wal_level = logical and restart Postgres (RDS / Aurora: \
+                 rds.logical_replication = 1 in the parameter group; Cloud SQL: the \
+                 cloudsql.logical_decoding flag)"
+                    .to_string(),
+            ),
+        ),
+    };
+    Check { what, fix }
+}
+
 /// A SQL string literal.
 fn literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -516,5 +546,22 @@ mod tests {
         assert_eq!(count(340), "340");
         assert_eq!(count(12_345), "12k");
         assert_eq!(count(1_204_331), "1.2M");
+    }
+
+    #[test]
+    fn replica_is_enough_from_postgres_19() {
+        let fails = |version, level| wal_level_check(version, level).fix.is_some();
+        for version in [140_000, 180_004, 190_000, 190_001, 200_000] {
+            assert!(!fails(version, "logical"), "{version}");
+            assert!(fails(version, "minimal"), "{version}");
+        }
+        assert!(fails(180_004, "replica"));
+        assert!(!fails(190_000, "replica"));
+        assert!(!fails(200_000, "replica"));
+        // From 19, minimal needs only replica.
+        let fix = wal_level_check(190_000, "minimal").fix.unwrap();
+        assert!(fix.contains("wal_level = replica"), "{fix}");
+        let fix = wal_level_check(180_004, "minimal").fix.unwrap();
+        assert!(fix.contains("wal_level = logical"), "{fix}");
     }
 }
