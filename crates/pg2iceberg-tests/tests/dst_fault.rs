@@ -3771,6 +3771,230 @@ async fn lifecycle_shuts_down_while_reconnecting() {
         .expect("a clean shutdown");
 }
 
+// ── Materializer cycle failures in single-process `run` ───────────
+
+/// A catalog outage during `pg2iceberg run` fails materializer cycles, but the
+/// main loop stays up, replication keeps staging and advancing the slot past
+/// durable data, and once the catalog recovers every change is committed
+/// exactly once.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_retries_failed_materializer_cycles_until_catalog_recovers() {
+    use pg2iceberg_core::metrics::{labels, names, Labels};
+    use pg2iceberg_core::Registry;
+    use pg2iceberg_iceberg::{read_data_file, Catalog as _};
+    use pg2iceberg_stream::BlobStore as _;
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let catalog_plan = FaultPlan::new();
+    let catalog = Arc::new(FaultyCatalog::new(
+        stores.catalog.clone(),
+        catalog_plan.clone(),
+    ));
+    let registry = Arc::new(Registry::new(stores.clock.clone()));
+    let mut lifecycle = sim_lifecycle_with(&db, &stores, every_second(), catalog);
+    lifecycle.metrics = registry.clone();
+
+    let script = db.clone();
+    let outage_plan = catalog_plan.clone();
+    let obs_metrics = registry.clone();
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let record = observed.clone();
+    let shutdown = Box::pin(async move {
+        // Past startup and an initial successful materializer tick.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mat_label = labels([("stage", "materialize")]);
+
+        // Simulate a REST catalog outage (load_table + commit_snapshots fail).
+        outage_plan.fail_all(ops::CAT_LOAD_TABLE);
+        outage_plan.fail_all(ops::CAT_COMMIT_SNAPSHOT);
+
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(5, 50));
+        tx.insert(&ident(), row(6, 60));
+        tx.commit(Timestamp(0)).unwrap();
+
+        // Wait for the first batch to flush and the first failing tick to run.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let last_mat_before = obs_metrics.gauge_value(names::LAST_SUCCESS, &mat_label);
+
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(7, 70));
+        tx.update(&ident(), row(1, 11));
+        tx.delete(&ident(), row(2, 20));
+        tx.commit(Timestamp(0)).unwrap();
+        let outage_end_lsn = script.current_lsn();
+
+        // Let several flush, standby, and failing materializer ticks run.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let failures_during =
+            obs_metrics.counter_value(names::MATERIALIZER_CYCLE_FAILURES_TOTAL, &Labels::new());
+        let acked_during = script
+            .slot_state(LIFECYCLE_SLOT)
+            .unwrap()
+            .confirmed_flush_lsn;
+        let last_mat_during = obs_metrics.gauge_value(names::LAST_SUCCESS, &mat_label);
+
+        // Catalog recovers; write one more row and wait for catch-up.
+        outage_plan.clear_failures();
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(8, 80));
+        tx.commit(Timestamp(0)).unwrap();
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let last_mat_after = obs_metrics.gauge_value(names::LAST_SUCCESS, &mat_label);
+        *record.lock().unwrap() = Some((
+            last_mat_before,
+            last_mat_during,
+            last_mat_after,
+            failures_during,
+            acked_during,
+            outage_end_lsn,
+        ));
+    });
+
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .expect("lifecycle rides through catalog outage and shuts down cleanly");
+
+    let (
+        last_mat_before,
+        last_mat_during,
+        last_mat_after,
+        failures_during,
+        acked_during,
+        outage_end_lsn,
+    ) = observed.lock().unwrap().expect("outage script ran");
+
+    assert!(
+        (3..=10).contains(&failures_during),
+        "expected multiple interval-paced cycle failures during outage, got {failures_during}"
+    );
+    assert!(
+        acked_during >= outage_end_lsn,
+        "slot should keep advancing past staged data during catalog outage: acked {acked_during:?} < {outage_end_lsn:?}"
+    );
+    assert!(last_mat_before.is_some());
+    assert_eq!(
+        last_mat_during, last_mat_before,
+        "failed cycles must not advance LAST_SUCCESS for materialize"
+    );
+    assert!(
+        last_mat_after > last_mat_before,
+        "LAST_SUCCESS for materialize should advance after recovery: {last_mat_after:?} <= {last_mat_before:?}"
+    );
+
+    // PG <-> Iceberg parity after recovery.
+    let mut iceberg = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    let mut pg_rows = db.read_table(&ident()).unwrap();
+    sort_by_pk(&mut iceberg);
+    sort_by_pk(&mut pg_rows);
+    assert_eq!(iceberg, pg_rows, "PG <-> Iceberg parity after recovery");
+    assert_eq!(pg_rows.len(), 7);
+
+    // Each outage-inserted row (5, 6, 7) and post-recovery row (8) must be
+    // committed in data files across all snapshots exactly once.
+    let snapshots = stores.catalog.snapshots(&ident()).await.unwrap();
+    let mut counts: BTreeMap<i32, usize> = BTreeMap::new();
+    for snap in &snapshots {
+        for df in &snap.data_files {
+            let bytes = stores.blob.get(&df.path).await.unwrap();
+            for r in read_data_file(&bytes, &schema().columns).unwrap() {
+                if let Some(PgValue::Int4(id)) = r.get(&ColumnName("id".into())) {
+                    *counts.entry(*id).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    for id in [5, 6, 7, 8] {
+        assert_eq!(
+            counts.get(&id).copied().unwrap_or(0),
+            1,
+            "row id={id} should be committed exactly once across all snapshots: {counts:?}"
+        );
+    }
+}
+
+/// An unrecoverable staged-log gap (`MaterializerError::LogGap`) stays fatal
+/// in `run` rather than retrying forever while the table stalls.
+#[tokio::test(start_paused = true)]
+async fn lifecycle_exits_on_fatal_log_gap_materializer_error() {
+    use pg2iceberg_logical::MaterializerError;
+    use pg2iceberg_validate::LifecycleError;
+    use std::time::Duration;
+
+    let db = seeded_db();
+    let stores = SimStores::new();
+    let second = Duration::from_secs(1);
+    let schedule = pg2iceberg_logical::Schedule {
+        flush: second,
+        materialize: Duration::from_secs(10),
+        standby: second,
+        watcher: second,
+    };
+    let lifecycle = sim_lifecycle_on(&db, &stores, schedule);
+
+    let script = db.clone();
+    let coord = stores.coord.clone();
+    let dropped_end = Arc::new(std::sync::Mutex::new(None));
+    let record_end = dropped_end.clone();
+    let shutdown = Box::pin(async move {
+        // Stage two separate log entries before the first 10s materialize tick.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(5, 50));
+        tx.commit(Timestamp(0)).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut tx = script.begin_tx();
+        tx.insert(&ident(), row(6, 60));
+        tx.commit(Timestamp(0)).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Drop the first unmaterialized log entry while the cursor is still
+        // unset, leaving the second entry with a gap ahead of it.
+        let entries = coord.read_log(&ident(), 0, 10).await.unwrap();
+        assert!(
+            entries.len() >= 2,
+            "expected at least 2 staged entries, got {}",
+            entries.len()
+        );
+        let first_end = entries[0].end_offset;
+        let dropped = coord.truncate_log(&ident(), first_end, 100).await.unwrap();
+        assert_eq!(dropped.len(), 1, "expected to drop the first staged entry");
+        *record_end.lock().unwrap() = Some(first_end);
+
+        // Wait well past the 10s materialize tick; the loop must exit before this.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let err = pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .expect_err("fatal LogGap must stop the lifecycle");
+    let expected_start = dropped_end.lock().unwrap().expect("truncated first entry");
+    assert!(
+        matches!(
+            &err,
+            LifecycleError::Materialize(MaterializerError::LogGap {
+                cursor: -1,
+                start,
+                ..
+            }) if *start == expected_start
+        ),
+        "expected LifecycleError::Materialize(LogGap {{ cursor: -1, start: {expected_start} }}), got: {err:?}"
+    );
+}
+
 // ── Smoke-style proptest ──────────────────────────────────────────
 
 use proptest::prelude::*;
