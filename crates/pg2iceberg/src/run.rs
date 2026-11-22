@@ -407,7 +407,7 @@ pub async fn run_stream_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<(
 /// staged parquet comes from the coord log written by a paired
 /// `stream-only` process.
 ///
-/// Multiple workers under the same `state.group` heartbeat into
+/// Multiple workers sharing a `source.state_schema` heartbeat into
 /// `_pg2iceberg.consumers` and round-robin tables across themselves
 /// deterministically (sorted tables → sorted workers → `[i % N]`).
 /// Joins and leaves rebalance on the next cycle automatically.
@@ -446,7 +446,7 @@ pub async fn run_materializer_only(
 
     tracing::info!(
         worker = %worker_id,
-        group = %cfg.state.group,
+        group = crate::config::GROUP,
         interval = ?cycle_interval,
         "materializer-only worker starting"
     );
@@ -751,14 +751,14 @@ async fn build_one_shot_materializer(
     let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
         .await
         .context("coord connect")?;
-    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord_schema = CoordSchema::sanitize(&cfg.source.state_schema);
     let concrete = PostgresCoordinator::new(coord_conn, coord_schema);
     if cursors == Cursors::Claim {
         // Started before the process that replicates, it migrates the
         // schema itself: the claim needs its newest columns.
         concrete.migrate().await.context("coord migrate")?;
         concrete
-            .claim_group(&cfg.state.group)
+            .claim_group(crate::config::GROUP)
             .await
             .context("claim the consumer group")?;
     }
@@ -827,7 +827,7 @@ async fn build_one_shot_materializer(
         blob,
         catalog,
         storage.materializer_namer,
-        &cfg.state.group,
+        crate::config::GROUP,
         cfg.sink.materializer_batch_rows,
         metrics,
     )
@@ -1015,7 +1015,7 @@ pub async fn run_cleanup(cfg: Config) -> Result<()> {
     let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
         .await
         .context("coord connect")?;
-    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord_schema = CoordSchema::sanitize(&cfg.source.state_schema);
     let coord = PostgresCoordinator::new(coord_conn, coord_schema.clone());
     coord
         .teardown()
@@ -1076,11 +1076,11 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
         .await
         .context("coord connect")?;
-    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord_schema = CoordSchema::sanitize(&cfg.source.state_schema);
     let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
     coord_concrete.migrate().await.context("coord migrate")?;
     coord_concrete
-        .claim_group(&cfg.state.group)
+        .claim_group(crate::config::GROUP)
         .await
         .context("claim the consumer group")?;
     let (catalog, blob, coord) = instrument(catalog, blob, coord_concrete, &metrics);
@@ -1177,7 +1177,7 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
         Arc::clone(&blob),
         Arc::clone(&catalog),
         materializer_namer,
-        &cfg.state.group,
+        crate::config::GROUP,
         cfg.sink.materializer_batch_rows,
         metrics.clone(),
     )

@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pg2iceberg::config::{Config, SinkConfig, SourceConfig, StateConfig, TableConfig};
+use pg2iceberg::config::{Config, SinkConfig, SourceConfig, TableConfig};
 use pg2iceberg::run::build_rest_catalog;
 use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::{ColumnName, Namespace, PgValue, Phase, TableIdent};
@@ -247,6 +247,8 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             // The default: a failover slot from PG 17, a slot like any
             // other before.
             failover: true,
+            state_database: String::new(), // the source's own
+            state_schema: format!("_pg2iceberg_{}", uniq()),
         },
         sink: SinkConfig {
             catalog_uri: stack.rest_url.clone(),
@@ -284,13 +286,6 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
             format_version: 2,
             catalog_props: BTreeMap::new(),
             meta_namespace: String::new(),
-        },
-        state: StateConfig {
-            path: String::new(),
-            postgres_url: String::new(),
-            database: String::new(), // the source's own
-            coordinator_schema: format!("_pg2iceberg_{}", uniq()),
-            group: "default".into(),
         },
         metrics_addr: String::new(),
         liveness_timeout: String::new(),
@@ -498,7 +493,7 @@ async fn lifecycle_on(source: Source) {
         .await
         .expect("create the state's database");
     let mut cfg = config_for_stack(&stack, &table, &slot, &publication);
-    cfg.state.database = state_db.clone();
+    cfg.source.state_database = state_db.clone();
 
     // Construct the lifecycle the same way the binary does. We build
     // two catalog handles against the same REST server: one is
@@ -747,8 +742,7 @@ async fn lifecycle_on(source: Source) {
     assert_eq!(metrics.phase(), Some(Phase::Stopping));
 
     // The state is in its database, not the source's.
-    let coord_schema =
-        pg2iceberg_coord::schema::CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord_schema = pg2iceberg_coord::schema::CoordSchema::sanitize(&cfg.source.state_schema);
     assert!(stack.pg_dsn.contains("dbname=postgres"));
     let state_dsn = stack
         .pg_dsn

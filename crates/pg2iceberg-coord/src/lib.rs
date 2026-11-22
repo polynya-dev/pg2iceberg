@@ -53,7 +53,7 @@ pub enum CoordError {
         "this coordinator schema serves consumer group {holder:?}, not {configured:?}: \
          one schema serves one group. To materialize the same tables into another \
          sink, run another pipeline, with a replication slot and \
-         state.coordinator_schema of its own. A group can't be renamed."
+         source.state_schema of its own."
     )]
     GroupMismatch { holder: String, configured: String },
     /// The coordinator's database failed over: this connection came back

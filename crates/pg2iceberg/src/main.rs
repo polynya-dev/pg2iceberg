@@ -293,11 +293,11 @@ async fn migrate_coord(cfg: &Config) -> Result<()> {
         "webpki" => TlsMode::Webpki,
         _ => TlsMode::Disable,
     };
-    tracing::info!(schema = %cfg.state.coordinator_schema, ?tls, "connecting to coord PG");
+    tracing::info!(schema = %cfg.source.state_schema, ?tls, "connecting to coord PG");
     let conn = connect_with(&cfg.coord_dsn(), tls)
         .await
         .context("coord connect")?;
-    let schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let schema = CoordSchema::sanitize(&cfg.source.state_schema);
     let coord = PostgresCoordinator::new(conn, schema);
     coord.migrate().await.context("coord migrate")?;
     println!("OK: coordinator schema migrated");

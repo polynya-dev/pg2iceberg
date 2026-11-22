@@ -56,7 +56,7 @@ where
     let coord_conn = coord_connect_with(&coord_dsn, coord_tls)
         .await
         .context("coord connect")?;
-    let coord_schema = CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    let coord_schema = CoordSchema::sanitize(&cfg.source.state_schema);
     let coord_concrete = Arc::new(PostgresCoordinator::new(coord_conn, coord_schema));
     coord_concrete.migrate().await.context("coord migrate")?;
     let coord: Arc<dyn Coordinator> = coord_concrete;
@@ -130,7 +130,7 @@ where
         slot_name: cfg.source.slot_name.clone(),
         publication_name: cfg.source.publication_name.clone(),
         slot_failover: cfg.source.failover,
-        group: cfg.state.group.clone(),
+        group: crate::config::GROUP.to_string(),
         schedule: cfg.sink.schedule()?,
         compaction: if cfg.sink.target_file_size > 0 {
             Some(cfg.sink.compaction_config())

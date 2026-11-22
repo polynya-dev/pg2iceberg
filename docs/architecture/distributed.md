@@ -59,7 +59,7 @@ A worker leaving (crash or graceful shutdown) is detected within one heartbeat T
 
 `mat_cursor` is keyed by `(group_name, table_name)` — workers within the same group share cursors per table because the deterministic round-robin assignment guarantees only one worker materializes any given table per cycle. There's no `worker_id` in the cursor key; ownership is recomputed at each cycle's start, not persisted.
 
-A coordinator schema serves one consumer group. The first process to start records its `state.group`; a process configured with another refuses to start. The staged log, the tables' snapshot status and the log's truncation all assume one reader, so to materialize the same tables into another sink, run another pipeline — with a replication slot and `state.coordinator_schema` of its own. A group can't be renamed: its name is in its cursors and in the tables' Iceberg metadata.
+A coordinator schema serves one consumer group, always named `default`: the staged log, the tables' snapshot status and the log's truncation all assume one reader. To materialize the same tables into another sink, run another pipeline — with a replication slot and `source.state_schema` of its own. The group's name is in its cursors and in the tables' Iceberg metadata.
 
 ## Commit isolation
 

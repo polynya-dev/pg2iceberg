@@ -57,6 +57,9 @@ source:
   slot_name: pg2iceberg_slot
   # snapshot_concurrency: 4  # tables the initial snapshot reads at once
   # failover: true           # a failover slot, on PostgreSQL 17+
+  # pg2iceberg's state, always on this server:
+  # state_database: pg2iceberg  # the database that holds it; default: `database`
+  # state_schema: _pg2iceberg   # the schema there that holds it; one per pipeline
 
 sink:
   catalog_uri: https://catalog.example.com
@@ -139,13 +142,6 @@ sink:
   # field for.
   # catalog_props:
   #   "header.X-Custom-Header": "value"
-
-state:
-  # The database on the source's Postgres server that holds the
-  # _pg2iceberg.* coordinator schema; default: the source's own.
-  # database: pg2iceberg
-  coordinator_schema: _pg2iceberg
-  # group: default
 
 # /metrics (Prometheus), /healthz and /readyz, served by run, stream-only,
 # materializer-only and snapshot. `off` serves nothing.

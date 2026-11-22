@@ -23,5 +23,3 @@ sink:
   flush_interval: 2s
   flush_rows: 200
   materializer_interval: 2s
-
-state: {}

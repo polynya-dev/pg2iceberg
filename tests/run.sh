@@ -297,8 +297,8 @@ sink:
   flush_rows: ${FLUSH_ROWS}
   materializer_interval: 5s
 
-state:
-  coordinator_schema: _pg2iceberg_${table}
+source:
+  state_schema: _pg2iceberg_${table}
 YAML
 }
 

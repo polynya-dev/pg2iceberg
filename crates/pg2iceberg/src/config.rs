@@ -1,8 +1,8 @@
 //! Binary configuration.
 //!
-//! Sections: `tables` (list), `source` (database + slot/publication),
-//! `sink` (catalog + storage + credential mode + flush knobs),
-//! `state` (coordinator location).
+//! Sections: `tables` (list), `source` (database, slot/publication,
+//! and where on it pg2iceberg keeps its state), `sink` (catalog +
+//! storage + credential mode + flush knobs).
 //!
 //! Every section is optional: a YAML file (see [`Config::load`]) and
 //! environment variables (see [`Config::apply_env`]) each supply what
@@ -39,6 +39,7 @@ pub fn process_env(name: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Tables to replicate. Empty: every table with a primary key (see
     /// [`TableConfig::is_pattern`] for `schema.*`).
@@ -48,8 +49,6 @@ pub struct Config {
     pub source: SourceConfig,
     #[serde(default)]
     pub sink: SinkConfig,
-    #[serde(default)]
-    pub state: StateConfig,
     /// Where long-running subcommands serve `/metrics`, `/healthz` and
     /// `/readyz`: `host:port`, or `:port` for every interface. Empty:
     /// [`DEFAULT_METRICS_ADDR`]. `off` serves nothing. See
@@ -165,6 +164,15 @@ pub struct SourceConfig {
     /// nothing. An existing slot is altered to match at startup.
     #[serde(default = "default_failover")]
     pub failover: bool,
+    /// The database on the source's server that holds pg2iceberg's state
+    /// (`state_schema`); empty: the source's own. Only the database can
+    /// differ: on the source's server, the state shares the source's WAL,
+    /// and fails over with it.
+    #[serde(default)]
+    pub state_database: String,
+    /// The schema that holds pg2iceberg's state: its coordinator tables.
+    #[serde(default = "default_state_schema")]
+    pub state_schema: String,
 }
 
 impl Default for SourceConfig {
@@ -181,6 +189,8 @@ impl Default for SourceConfig {
             slot_name: default_slot(),
             snapshot_concurrency: default_snapshot_concurrency(),
             failover: default_failover(),
+            state_database: String::new(),
+            state_schema: default_state_schema(),
         }
     }
 }
@@ -270,6 +280,16 @@ fn default_publication() -> String {
 fn default_slot() -> String {
     "pg2iceberg_slot".into()
 }
+
+fn default_state_schema() -> String {
+    "_pg2iceberg".into()
+}
+
+/// The materialization group (consumer / cursor key) every pipeline uses.
+/// A state schema serves one group, so its name isn't configurable; it
+/// stays `"default"` because cursors and Iceberg snapshot properties
+/// (`pg2iceberg.log-group`) already carry it.
+pub const GROUP: &str = "default";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SinkConfig {
@@ -650,79 +670,6 @@ fn default_maintenance_grace() -> String {
     "30m".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct StateConfig {
-    /// File-backed state path (sim-only / dev). Not honored in the
-    /// Rust prod path — leave empty.
-    #[serde(default)]
-    pub path: String,
-    /// Retired: the state lives on the source's Postgres server (see
-    /// [`Self::database`]). Set, the config fails to load.
-    #[serde(default)]
-    pub postgres_url: String,
-    /// The database on the source's Postgres server that holds
-    /// pg2iceberg's state (`coordinator_schema`); empty: the source's own.
-    /// Only the database can differ: on the source's server, the state
-    /// shares the source's WAL, and fails over with it.
-    #[serde(default)]
-    pub database: String,
-    #[serde(default = "default_coord_schema")]
-    pub coordinator_schema: String,
-    /// Materialization group name (consumer / mat_cursor key): the
-    /// distributed workers of one pipeline. A coordinator schema serves
-    /// one group ([`pg2iceberg_coord::Coordinator::claim_group`]).
-    /// Defaults to `"default"`.
-    #[serde(default = "default_group")]
-    pub group: String,
-}
-
-impl Default for StateConfig {
-    fn default() -> Self {
-        Self {
-            path: String::new(),
-            postgres_url: String::new(),
-            database: String::new(),
-            coordinator_schema: default_coord_schema(),
-            group: default_group(),
-        }
-    }
-}
-
-impl StateConfig {
-    /// The state lives on the source's server: a connection string of
-    /// its own would put it elsewhere.
-    pub fn validate_location(&self) -> Result<()> {
-        if !self.postgres_url.is_empty() {
-            anyhow::bail!(
-                "state.postgres_url is no longer supported: pg2iceberg keeps its state on the \
-                 source's Postgres server, which a failover takes along with the source. Remove \
-                 it; to keep the state in another database on that server, set state.database"
-            );
-        }
-        Ok(())
-    }
-
-    /// A group names its cursors `group` and `group#…`: `#` would make one
-    /// group's cursors look like another's.
-    pub fn validate_group(&self) -> Result<()> {
-        if self.group.is_empty() || self.group.contains('#') {
-            anyhow::bail!(
-                "state.group must be a non-empty name without '#', not {:?}",
-                self.group
-            );
-        }
-        Ok(())
-    }
-}
-
-fn default_coord_schema() -> String {
-    "_pg2iceberg".into()
-}
-
-fn default_group() -> String {
-    "default".into()
-}
-
 impl Config {
     /// Load the config from the environment, and a YAML file if there is
     /// one: `path`, else `PG2ICEBERG_CONFIG`, else `pg2iceberg.yaml` if it
@@ -766,8 +713,6 @@ impl Config {
         self.sink.validate_compaction()?;
         self.sink.validate_materializer()?;
         self.source.validate_snapshot()?;
-        self.state.validate_location()?;
-        self.state.validate_group()?;
         self.metrics_addr()?;
         self.liveness_timeout()?;
         self.sink.resolved_maintenance()?;
@@ -839,7 +784,7 @@ impl Config {
     /// | `PG2ICEBERG_TABLES` | `tables`: comma-separated `schema.table` or `schema.*` |
     /// | `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.slot_name` / `publication_name` |
     /// | `PG2ICEBERG_SLOT_FAILOVER` | `source.failover`: `true` or `false` |
-    /// | `PG2ICEBERG_STATE_DATABASE` | `state.database` |
+    /// | `PG2ICEBERG_STATE_DATABASE` | `source.state_database` |
     /// | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` |
     /// | `ICEBERG_CATALOG_AUTH` | `sink.catalog_auth` |
     /// | `ICEBERG_CATALOG_TOKEN` | `sink.catalog_token` |
@@ -866,15 +811,7 @@ impl Config {
         set(&mut self.source.url, "POSTGRES_URL");
         set(&mut self.source.slot_name, "PG2ICEBERG_SLOT");
         set(&mut self.source.publication_name, "PG2ICEBERG_PUBLICATION");
-        set(&mut self.state.database, "PG2ICEBERG_STATE_DATABASE");
-        if env("PG2ICEBERG_STATE_URL").is_some() {
-            anyhow::bail!(
-                "PG2ICEBERG_STATE_URL is no longer supported: pg2iceberg keeps its state on the \
-                 source's Postgres server, which a failover takes along with the source. Unset \
-                 it; to keep the state in another database on that server, set \
-                 PG2ICEBERG_STATE_DATABASE"
-            );
-        }
+        set(&mut self.source.state_database, "PG2ICEBERG_STATE_DATABASE");
         set(&mut self.sink.catalog_uri, "ICEBERG_CATALOG_URL");
         set(&mut self.sink.catalog_auth, "ICEBERG_CATALOG_AUTH");
         set(&mut self.sink.catalog_token, "ICEBERG_CATALOG_TOKEN");
@@ -998,9 +935,9 @@ impl Config {
     }
 
     /// Connection string for the coordinator: the source's, in
-    /// `state.database` if set.
+    /// `source.state_database` if set.
     pub fn coord_dsn(&self) -> String {
-        with_dbname(&self.source.dsn(), &self.state.database)
+        with_dbname(&self.source.dsn(), &self.source.state_database)
     }
 
     /// Bag of REST catalog props derived from sink config. Keys we
@@ -1362,9 +1299,6 @@ sink:
   s3_region: us-east-1
   flush_interval: 10s
   flush_rows: 1000
-
-state:
-  coordinator_schema: _pg2iceberg
 "#;
 
     /// A key `source` doesn't know fails the parse, so a misspelled or
@@ -1408,17 +1342,6 @@ state:
         cfg.source.snapshot_concurrency = 0;
         let err = cfg.source.validate_snapshot().unwrap_err().to_string();
         assert!(err.contains("source.snapshot_concurrency"), "{err}");
-    }
-
-    #[test]
-    fn group_is_a_name_without_hashes() {
-        let mut cfg: Config = serde_yaml::from_str(SAMPLE).unwrap();
-        cfg.state.validate_group().unwrap();
-        for bad in ["", "a#b"] {
-            cfg.state.group = bad.into();
-            let err = cfg.state.validate_group().unwrap_err().to_string();
-            assert!(err.contains("state.group"), "{err}");
-        }
     }
 
     #[test]
@@ -1506,7 +1429,6 @@ state:
         assert_eq!(cfg.sink.credential_mode, "static");
         assert_eq!(cfg.sink.s3_endpoint, "http://localhost:9000");
         assert_eq!(cfg.sink.namespace, "public");
-        assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
     }
 
     #[test]
@@ -1654,8 +1576,8 @@ sink:
         assert_eq!(cfg.sink.materializer_concurrency, 4);
         assert_eq!(cfg.sink.pk_index_memory, 576 << 20);
         assert_eq!(cfg.source.snapshot_concurrency, 4);
-        assert_eq!(cfg.state.coordinator_schema, "_pg2iceberg");
-        assert_eq!(cfg.state.group, "default");
+        assert_eq!(cfg.source.state_database, "");
+        assert_eq!(cfg.source.state_schema, "_pg2iceberg");
     }
 
     const INTERVALS: &str = r#"
@@ -1738,7 +1660,7 @@ sink:
     }
 
     /// The state lives on the source's server, in the source's database
-    /// or the one `state.database` names: the coordinator connects as
+    /// or the one `source.state_database` names: the coordinator connects as
     /// the source does, to that database.
     #[test]
     fn the_state_lives_on_the_sources_server() {
@@ -1776,7 +1698,7 @@ sink:
             );
         }
         // From the fields, and the file.
-        let yaml = INTERVALS.replace("  user: u\n", "  user: u\nstate:\n  database: pg2iceberg\n");
+        let yaml = INTERVALS.replace("  user: u\n", "  user: u\n  state_database: pg2iceberg\n");
         let env = vars(&[]);
         let cfg = Config::parse(&yaml, &env).unwrap().finish(&env).unwrap();
         let (source, coord) = (parsed(&cfg.source.dsn()), parsed(&cfg.coord_dsn()));
@@ -1784,31 +1706,18 @@ sink:
         assert_eq!(coord.get_dbname(), Some("pg2iceberg"));
     }
 
-    /// A connection string for the state, which could put it on another
-    /// server, fails the config load, from the file or the environment.
+    /// A key the config doesn't know fails the parse, at the top level
+    /// too: a leftover `state:` block would otherwise drop its schema
+    /// name and start a new pipeline in the default one.
     #[test]
-    fn a_connection_string_for_the_state_is_refused() {
-        let yaml = INTERVALS.replace(
-            "  user: u\n",
-            "  user: u\nstate:\n  postgres_url: postgres://u@elsewhere/state\n",
-        );
-        let env = vars(&[]);
-        let err = Config::parse(&yaml, &env)
-            .unwrap()
-            .finish(&env)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("state.postgres_url") && err.contains("state.database"),
-            "{err}"
-        );
-        let err = Config::from_env(&vars(&[(
-            "PG2ICEBERG_STATE_URL",
-            "postgres://u@elsewhere/s",
-        )]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("PG2ICEBERG_STATE_DATABASE"), "{err}");
+    fn unknown_top_level_keys_are_rejected() {
+        for yaml in [
+            "state:\n  coordinator_schema: _p2i\n",
+            "sources:\n  host: h\n",
+        ] {
+            let err = Config::parse(yaml, &vars(&[])).unwrap_err().to_string();
+            assert!(err.contains("unknown field"), "{yaml:?}: {err}");
+        }
     }
 
     /// The slot is a failover slot unless told not, from the file or the

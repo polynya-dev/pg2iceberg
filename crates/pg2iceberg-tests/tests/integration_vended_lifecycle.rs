@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use pg2iceberg::config::{Config, SinkConfig, SourceConfig, StateConfig, TableConfig};
+use pg2iceberg::config::{Config, SinkConfig, SourceConfig, TableConfig};
 use pg2iceberg::run::build_rest_catalog;
 use pg2iceberg_core::{Namespace, TableIdent};
 use pg2iceberg_iceberg::prod::IcebergRustCatalog;
@@ -298,7 +298,6 @@ fn config_for_vended_stack(stack: &VendedStack) -> Config {
             catalog_props: BTreeMap::new(),
             meta_namespace: String::new(),
         },
-        state: StateConfig::default(),
         metrics_addr: String::new(),
         liveness_timeout: String::new(),
         snapshot_only: false,

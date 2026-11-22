@@ -137,8 +137,8 @@ async fn inspect(cfg: &Config) -> Result<Inspection> {
         }
     });
 
-    let coord = CoordSchema::sanitize(&cfg.state.coordinator_schema);
-    let state_database = &cfg.state.database;
+    let coord = CoordSchema::sanitize(&cfg.source.state_schema);
+    let state_database = &cfg.source.state_database;
     if state_database.is_empty() || *state_database == database {
         let can_create: bool = one(format!(
             "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = {}) \

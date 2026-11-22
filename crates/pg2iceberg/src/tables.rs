@@ -91,7 +91,7 @@ pub fn select(listed: &[TableConfig], found: &[SourceTable], excluded: &[String]
 
 /// Schemas holding pg2iceberg's own tables, never replicated.
 pub fn own_schemas(cfg: &Config) -> Vec<String> {
-    let coord = CoordSchema::sanitize(&cfg.state.coordinator_schema)
+    let coord = CoordSchema::sanitize(&cfg.source.state_schema)
         .as_str()
         .to_string();
     let mut schemas = vec![coord];

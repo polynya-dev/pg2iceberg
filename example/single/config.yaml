@@ -28,5 +28,3 @@ sink:
   s3_region: us-east-1
   flush_interval: 10s
   flush_rows: 1000
-
-state: {}
