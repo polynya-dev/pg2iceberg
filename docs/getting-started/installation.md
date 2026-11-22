@@ -59,6 +59,8 @@ max_replication_slots = 10
 max_wal_senders = 10
 ```
 
+On PostgreSQL 19 and newer, the default `wal_level = replica` is enough. Postgres turns logical decoding on when pg2iceberg creates its replication slot, and turns it off again once no logical slot is left. `SHOW effective_wal_level` reads `logical` while it is on.
+
 pg2iceberg auto-creates the replication slot and publication on first run; you don't need to create them manually. If you do want to pre-create:
 
 ```sql
