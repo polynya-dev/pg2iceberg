@@ -367,6 +367,8 @@ async fn iam_credentials_with_a_custom_endpoint_commit_snapshots() {
                 first_row_id: None,
             }],
             equality_deletes: vec![],
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         })
         .await
         .expect("commit, writing manifests to MinIO");
@@ -424,6 +426,8 @@ async fn a_rest_catalog_creates_tables_in_the_configured_format_version() {
                     first_row_id: None,
                 }],
                 equality_deletes: vec![],
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await
             .expect("commit");

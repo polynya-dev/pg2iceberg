@@ -47,7 +47,7 @@ graph LR
 
 pg2iceberg captures WAL change events via PostgreSQL logical replication and stages them as Parquet files in S3 via [leaderless log protocol](https://github.com/lakestream-io/leaderless-log-protocol/). A lightweight coordination layer in the source Postgres database (`_pg2iceberg` schema) tracks offsets and materializer progress. Since the write path only involves S3 uploads + a small PG transaction (no Iceberg catalog on the hot path), the replication slot LSN can be advanced quickly, minimizing WAL retention on the source.
 
-A materializer, which runs at a separate interval, reads the staged Parquet files and merges them into the corresponding Iceberg tables using merge-on-read (equality deletes for updates/deletes, data files for inserts).
+A materializer, which runs at a separate interval, reads the staged Parquet files and merges them into the corresponding Iceberg tables using merge-on-read: data files for inserts and, for updates and deletes, equality deletes on format v2 tables and deletion vectors on v3.
 
 Staged files use a fixed Parquet schema regardless of source table changes: metadata columns (`_op`, `_lsn`, `_ts`, `_unchanged_cols`) plus a JSON `_data` column containing user data. Schema evolution (`ALTER TABLE`) only affects the Iceberg materialized table, not the staging layer.
 
@@ -274,7 +274,7 @@ Settings come from environment variables and an optional YAML file: `--config`, 
 | `PG2ICEBERG_LOG_FORMAT` | — | `text` (default) or `json` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Export traces over OTLP/HTTP to this collector. Default: none |
 | `PG2ICEBERG_MAINTENANCE` | `sink.maintenance` | `pg2iceberg` / `managed` (the catalog compacts, expires and cleans the tables). Default: `pg2iceberg` |
-| `PG2ICEBERG_FORMAT_VERSION` | `sink.format_version` | Iceberg format version of the tables pg2iceberg creates: `2` or `3` (row lineage). Default: `2` |
+| `PG2ICEBERG_FORMAT_VERSION` | `sink.format_version` | Iceberg format version of the tables pg2iceberg creates: `2` or `3` (row lineage; deletion vectors instead of equality deletes). Default: `2` |
 | `AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, ... | `sink.s3_*` | Read as AWS tools read them; the file's `sink.s3_*` take precedence |
 
 ### Inferred settings

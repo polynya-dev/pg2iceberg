@@ -185,6 +185,8 @@ fn data_path(location: &str, kind: &str, partition_segment: &str, id: &str) -> S
     match (kind, partition_segment) {
         ("data" | "eq-delete", "") => format!("{dir}/{kind}-{id}.parquet"),
         ("data" | "eq-delete", segment) => format!("{dir}/{segment}/{kind}-{id}.parquet"),
+        // A Puffin file of deletion vectors, of any partitions.
+        ("dv", _) => format!("{dir}/dv-{id}.puffin"),
         (other, _) => format!("{dir}/{other}/{other}-{id}.parquet"),
     }
 }

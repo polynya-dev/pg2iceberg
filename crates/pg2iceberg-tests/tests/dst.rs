@@ -64,6 +64,15 @@
 //! delete may give the row a new id: the spec allows it, since the
 //! writer never read the old one.
 //!
+//! pg2iceberg deletes the rows of a v3 table through deletion vectors —
+//! bitmaps of the positions deleted from one data file, as blobs in Puffin
+//! files — and never adds equality deletes to one (invariant 24), which
+//! v4 forbids. Each vector is as the spec has them (25): one per data file
+//! at most, in its partition and at a sequence number no lower, deleting
+//! only rows the file has, gone with the file, and described by its Puffin
+//! file's footer just as its manifest entry says. The oracle reads them
+//! with a decoder of its own (`pg2iceberg_sim::deletion_vector`).
+//!
 //! The staged log keeps only what's left to apply, and the entry each
 //! table's cursor sits at the end of: the materializer drops the rest from
 //! `log_index`, and deletes their files (22) — never an entry Iceberg
@@ -99,7 +108,10 @@ use pg2iceberg_sim::catalog::MemoryCatalog;
 use pg2iceberg_sim::clock::TestClock;
 use pg2iceberg_sim::coord::MemoryCoordinator;
 use pg2iceberg_sim::id::SeqIdGen;
-use pg2iceberg_sim::oracle::{engine_read, engine_read_lineage, live_files_from_history, LiveFile};
+use pg2iceberg_sim::oracle::{
+    check_deletion_vectors, engine_read, engine_read_lineage, live_files_from_history, Content,
+    LiveFile,
+};
 use pg2iceberg_sim::pgoutput::ReplicaIdentity;
 use pg2iceberg_sim::postgres::{SimPostgres, SimReplicationStream};
 use pg2iceberg_snapshot::Snapshotter;
@@ -503,6 +515,15 @@ enum Step {
     /// is in flight, which then lands on top of it (iceberg-rust retries a
     /// commit that lost the race).
     ExternalCompactMidCommit,
+    /// The materializer's own compaction, as `run` compacts: a pass
+    /// planned and written on a task of its own
+    /// ([`Materializer::compaction_job`]) while cycles go on — held until
+    /// `BackgroundCompactCommit`.
+    BackgroundCompactPlan,
+    /// The materializer commits the pass it holds, after the cycles
+    /// meanwhile: rows they deleted from its inputs are still in its
+    /// outputs.
+    BackgroundCompactCommit,
     /// The next catalog commit applies, then reports failure (its
     /// response is lost). The materializer must not lose or duplicate
     /// anything when it retries.
@@ -546,6 +567,10 @@ enum Step {
     /// In `V3_UPGRADED` cases, another engine upgrades the tables to v3
     /// now, whatever they hold, if it hasn't yet.
     UpgradeToV3,
+    /// In `V3_UPGRADED` cases, another engine upgrades the tables to v3
+    /// while the materializer's next commit is in flight: what it prepared
+    /// for a v2 table lands on a v3 one.
+    UpgradeToV3MidCommit,
 }
 
 fn step_strategy() -> impl Strategy<Value = Step> {
@@ -592,6 +617,8 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         2 => Just(Step::ExternalCompactPlan),
         2 => Just(Step::ExternalCompactCommit),
         1 => Just(Step::ExternalCompactMidCommit),
+        2 => Just(Step::BackgroundCompactPlan),
+        2 => Just(Step::BackgroundCompactCommit),
         1 => Just(Step::CleanupOrphans),
         2 => any::<bool>()
             .prop_map(|own_sequence_number| Step::CatalogCompactPlan { own_sequence_number }),
@@ -600,6 +627,7 @@ fn step_strategy() -> impl Strategy<Value = Step> {
         1 => Just(Step::CatalogExpire),
         1 => Just(Step::CatalogRemoveDanglingDeletes),
         1 => Just(Step::UpgradeToV3),
+        1 => Just(Step::UpgradeToV3MidCommit),
     ]
 }
 
@@ -839,6 +867,16 @@ impl Storage {
         }
     }
 
+    /// Whether `ident` is a v3 table — one with row lineage.
+    async fn is_v3(&self, ident: &TableIdent) -> Result<bool, String> {
+        let next_row_id = match &self.backend {
+            Backend::Sim { catalog, .. } => catalog.next_row_id(ident),
+            #[cfg(feature = "integration")]
+            Backend::Prod { iceberg } => prod_backend::next_row_id(iceberg, ident).await?,
+        };
+        Ok(next_row_id.is_some())
+    }
+
     /// Upgrade `ident`, which has no snapshots yet, to format v3.
     async fn upgrade_to_v3(&self, ident: &TableIdent) -> Result<(), String> {
         match &self.backend {
@@ -1042,9 +1080,10 @@ impl Storage {
 mod prod_backend {
     use super::*;
     use iceberg::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
-    use iceberg::spec::{DataContentType, FormatVersion};
+    use iceberg::spec::{DataContentType, DataFileFormat, FormatVersion};
     use iceberg::{CatalogBuilder, NamespaceIdent};
     use pg2iceberg_iceberg::prod::IcebergRustCatalog;
+    use pg2iceberg_sim::deletion_vector::DeletionVectorRef;
     use pg2iceberg_stream::ObjectStoreBlobStore;
     use std::collections::HashMap;
 
@@ -1105,7 +1144,12 @@ mod prod_backend {
                 let df = entry.data_file();
                 let (files, records) = match df.content_type() {
                     DataContentType::Data => ("total-data-files", "total-records"),
-                    _ => ("total-delete-files", "total-equality-deletes"),
+                    DataContentType::EqualityDeletes => {
+                        ("total-delete-files", "total-equality-deletes")
+                    }
+                    DataContentType::PositionDeletes => {
+                        ("total-delete-files", "total-position-deletes")
+                    }
                 };
                 *held.entry(files).or_default() += 1;
                 *held.entry(records).or_default() += df.record_count();
@@ -1117,6 +1161,7 @@ mod prod_backend {
             "total-data-files",
             "total-delete-files",
             "total-equality-deletes",
+            "total-position-deletes",
         ] {
             let claims = summary.get(key).map(String::as_str).unwrap_or("none");
             let holds = held.get(key).copied().unwrap_or(0);
@@ -1162,13 +1207,41 @@ mod prod_backend {
                 let df = entry.data_file();
                 // A v3 data file's first row id: iceberg-rust inherits it on
                 // load, as Java's `ManifestReader` does.
-                let (equality_ids, first_row_id) = match df.content_type() {
-                    DataContentType::Data => (None, df.first_row_id()),
-                    DataContentType::EqualityDeletes => {
-                        (Some(df.equality_ids().unwrap_or_default()), None)
-                    }
+                let (content, first_row_id) = match df.content_type() {
+                    DataContentType::Data => (Content::Data, df.first_row_id()),
+                    DataContentType::EqualityDeletes => (
+                        Content::EqualityDeletes(df.equality_ids().unwrap_or_default()),
+                        None,
+                    ),
+                    // Only a deletion vector: v3 tables take no position
+                    // delete files, and pg2iceberg writes none to v2 ones.
                     DataContentType::PositionDeletes => {
-                        return Err(format!("unexpected position delete {}", df.file_path()))
+                        let dv = match (
+                            df.file_format(),
+                            df.referenced_data_file(),
+                            df.content_offset(),
+                            df.content_size_in_bytes(),
+                        ) {
+                            (
+                                DataFileFormat::Puffin,
+                                Some(referenced),
+                                Some(offset),
+                                Some(size),
+                            ) => DeletionVectorRef {
+                                referenced_data_file: referenced,
+                                offset: u64::try_from(offset).map_err(|e| e.to_string())?,
+                                length: u64::try_from(size).map_err(|e| e.to_string())?,
+                            },
+                            (format, referenced, offset, size) => {
+                                return Err(format!(
+                                    "{}: a position delete file that isn't a deletion vector: \
+                                     {format:?}, referenced data file {referenced:?}, content \
+                                     at {offset:?}, {size:?} bytes",
+                                    df.file_path()
+                                ))
+                            }
+                        };
+                        (Content::DeletionVector(dv), None)
                     }
                 };
                 out.push(LiveFile {
@@ -1181,7 +1254,8 @@ mod prod_backend {
                         .iter()
                         .map(partition_literal)
                         .collect::<Result<_, _>>()?,
-                    equality_ids,
+                    record_count: df.record_count(),
+                    content,
                     first_row_id,
                 });
             }
@@ -1258,7 +1332,11 @@ mod prod_backend {
     /// than that sequence number, as Java's rewrite validates when its
     /// outputs take the commit's own number. With `no_row_ids` — `added`
     /// stores no row lineage — it fails if a removed data file's rows
-    /// have ids, as the sim's rewrites and pg2iceberg's do.
+    /// have ids, as the sim's rewrites and pg2iceberg's do. The deletion
+    /// vectors of the data files it removes go with them, as `DELETED`
+    /// entries; and a rewrite — one that read the table at `added_seq` or
+    /// `no_deletes_since` — fails if one landed after it read the table,
+    /// as Java's validates.
     #[allow(clippy::too_many_arguments)]
     pub async fn commit_foreign(
         iceberg: &Arc<iceberg::memory::MemoryCatalog>,
@@ -1317,19 +1395,31 @@ mod prod_backend {
         records: u64,
         delete_files: u64,
         equality_deletes: u64,
+        position_deletes: u64,
         bytes: u64,
     }
 
     impl Totals {
         fn add(&mut self, df: &iceberg::spec::DataFile) {
-            self.bytes += df.file_size_in_bytes();
-            if df.content_type() == DataContentType::Data {
-                self.data_files += 1;
-                self.records += df.record_count();
-            } else {
-                self.delete_files += 1;
-                self.equality_deletes += df.record_count();
+            match df.content_type() {
+                DataContentType::Data => {
+                    self.data_files += 1;
+                    self.records += df.record_count();
+                }
+                DataContentType::EqualityDeletes => {
+                    self.delete_files += 1;
+                    self.equality_deletes += df.record_count();
+                }
+                DataContentType::PositionDeletes => {
+                    self.delete_files += 1;
+                    self.position_deletes += df.record_count();
+                }
             }
+            // A deletion vector, at its blob's size, as Java counts it.
+            self.bytes += match df.content_size_in_bytes() {
+                Some(size) if df.content_type() == DataContentType::PositionDeletes => size as u64,
+                _ => df.file_size_in_bytes(),
+            };
         }
 
         fn properties(&self) -> HashMap<String, String> {
@@ -1338,7 +1428,7 @@ mod prod_backend {
                 ("total-files-size", self.bytes),
                 ("total-data-files", self.data_files),
                 ("total-delete-files", self.delete_files),
-                ("total-position-deletes", 0),
+                ("total-position-deletes", self.position_deletes),
                 ("total-equality-deletes", self.equality_deletes),
             ]
             .into_iter()
@@ -1397,8 +1487,45 @@ mod prod_backend {
             let mut found = BTreeSet::new();
             let mut totals = Totals::default();
             let list = table.manifest_list_reader(current).load().await?;
+            let mut read_manifests = Vec::new();
             for manifest_file in list.entries() {
                 let manifest = table.manifest_reader().read(manifest_file).await?;
+                read_manifests.push((manifest_file, manifest));
+            }
+            // The vectors of the data files it removes go with them. One
+            // that landed after the rewrite read the table deletes rows
+            // its added files hold.
+            let read = self.added_seq.or(self.no_deletes_since);
+            let mut vectors: BTreeSet<(String, i64)> = BTreeSet::new();
+            for (_, manifest) in &read_manifests {
+                for e in manifest.entries().iter().filter(|e| e.is_alive()) {
+                    let df = e.data_file();
+                    let (Some(referenced), Some(offset)) =
+                        (df.referenced_data_file(), df.content_offset())
+                    else {
+                        continue;
+                    };
+                    if !self.removed.contains(&referenced) {
+                        continue;
+                    }
+                    if let (Some(read), Some(seq)) = (read, e.sequence_number()) {
+                        if seq > read {
+                            return Err(conflict(format!(
+                                "deletion vectors landed since the rewrite read sequence \
+                                 number {read}: {referenced}"
+                            )));
+                        }
+                    }
+                    vectors.insert((df.file_path().to_string(), offset));
+                }
+            }
+            let removes = |df: &iceberg::spec::DataFile| {
+                self.removed.contains(df.file_path())
+                    || df
+                        .content_offset()
+                        .is_some_and(|o| vectors.contains(&(df.file_path().to_string(), o)))
+            };
+            for (manifest_file, manifest) in read_manifests {
                 // A rewrite drops the entries earlier commits left `DELETED`.
                 let alive: Vec<_> = manifest.entries().iter().filter(|e| e.is_alive()).collect();
                 if let Some(read) = self.no_deletes_since {
@@ -1411,10 +1538,7 @@ mod prod_backend {
                         )));
                     }
                 }
-                if !alive
-                    .iter()
-                    .any(|e| self.removed.contains(e.data_file().file_path()))
-                {
+                if !alive.iter().any(|e| removes(e.data_file())) {
                     alive.iter().for_each(|e| totals.add(e.data_file()));
                     manifests.push(manifest_file.clone());
                     continue;
@@ -1435,8 +1559,10 @@ mod prod_backend {
                             df.file_path()
                         )));
                     }
-                    if self.removed.contains(df.file_path()) {
-                        found.insert(df.file_path().to_string());
+                    if removes(&df) {
+                        if self.removed.contains(df.file_path()) {
+                            found.insert(df.file_path().to_string());
+                        }
                         writer.add_delete_file(df, entry_seq, e.file_sequence_number)?;
                     } else {
                         totals.add(&df);
@@ -1672,6 +1798,33 @@ fn like_production(m: &mut Materializer<AuditedCatalog>, clock: &TestClock, stor
     }
 }
 
+/// How the harness has the materializer compact: every file is worth
+/// rewriting.
+fn dst_compaction() -> CompactionConfig {
+    CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        delete_ratio: 0.0,
+        // Around the size of a few-row file, so the table mixes small
+        // files with large ones only deletes make worth rewriting.
+        target_size_bytes: 1024,
+        max_input_bytes_per_pass: 1,
+    }
+}
+
+/// Whether a compaction pass failing with `error` is one the lifecycle
+/// shrugs off: its commit's response lost (it applied anyway), a pass
+/// that lost to another process's over the same files, or one that read
+/// rows before they had ids, which they've had since (the table upgraded
+/// to v3) — each plans again next time.
+fn compaction_may_lose(error: &str) -> bool {
+    let error = error.to_lowercase();
+    error.contains("response lost")
+        // Production's catalog capitalizes it: "Rewrite removes ...".
+        || error.contains("rewrite removes files no longer in the table")
+        || error.contains(pg2iceberg_iceberg::ROW_IDS_CONFLICT)
+}
+
 /// One materializer cycle; `None` if it failed because a commit's
 /// response was lost — the lifecycle just runs the next cycle.
 fn cycle(m: &mut Materializer<AuditedCatalog>) -> Option<usize> {
@@ -1759,6 +1912,9 @@ struct DstHarness {
     /// A compaction pass another process (a `pg2iceberg compact` job)
     /// has planned and written but not yet committed.
     pending_external: Option<PreparedCompaction>,
+    /// The materializer's own pass, planned on a task of its own and not
+    /// yet committed (see [`Step::BackgroundCompactPlan`]).
+    pending_background: Option<pg2iceberg_logical::materializer::CompactionPass>,
     /// A pass the catalog's own compaction has planned and written but not
     /// yet committed, and whether its outputs take the commit's sequence
     /// number (see [`Step::CatalogCompactPlan`]).
@@ -1843,6 +1999,7 @@ impl DstHarness {
             lose_next_response: Default::default(),
             land_before_next_commit: Default::default(),
             cleanup_before_next_commit: Default::default(),
+            upgrade_before_next_commit: Default::default(),
             coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
             managed: MANAGED.get(),
@@ -1903,6 +2060,7 @@ impl DstHarness {
             next_bulk_id: 1000,
             id_gen,
             pending_external: None,
+            pending_background: None,
             pending_catalog: None,
             upgraded: false,
             #[cfg(feature = "integration")]
@@ -1984,6 +2142,7 @@ impl DstHarness {
             lose_next_response: Default::default(),
             land_before_next_commit: Default::default(),
             cleanup_before_next_commit: Default::default(),
+            upgrade_before_next_commit: Default::default(),
             coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
             managed: MANAGED.get(),
@@ -2044,6 +2203,7 @@ impl DstHarness {
             next_bulk_id: 1000,
             id_gen,
             pending_external: None,
+            pending_background: None,
             pending_catalog: None,
             upgraded: false,
             #[cfg(feature = "integration")]
@@ -2286,7 +2446,7 @@ impl DstHarness {
         let deletes: BTreeSet<String> = block_on(self.storage.live_files(&ident()))
             .unwrap()
             .into_iter()
-            .filter(|f| f.equality_ids.is_some())
+            .filter(|f| f.equality_ids().is_some())
             .map(|f| f.path)
             .collect();
         pass.removed_paths.retain(|p| !deletes.contains(p));
@@ -2306,6 +2466,8 @@ impl DstHarness {
             if block_on(self.storage.catalog.load_table(&table))
                 .unwrap()
                 .is_some()
+                // An upgrade mid-commit may have come first.
+                && !block_on(self.storage.is_v3(&table)).unwrap()
             {
                 block_on(self.storage.upgrade_to_v3(&table)).unwrap();
             }
@@ -2319,14 +2481,10 @@ impl DstHarness {
             return;
         }
         let live = block_on(self.storage.live_files(&ident())).unwrap();
-        let oldest_data = live
-            .iter()
-            .filter(|f| f.equality_ids.is_none())
-            .map(|f| f.seq)
-            .min();
+        let oldest_data = live.iter().filter(|f| f.is_data()).map(|f| f.seq).min();
         let dangling: Vec<String> = live
             .iter()
-            .filter(|f| f.equality_ids.is_some() && oldest_data.is_none_or(|s| f.seq <= s))
+            .filter(|f| f.equality_ids().is_some() && oldest_data.is_none_or(|s| f.seq <= s))
             .map(|f| f.path.clone())
             .collect();
         if dangling.is_empty() {
@@ -2355,7 +2513,7 @@ impl DstHarness {
         let live = block_on(self.storage.live_files(&ident())).unwrap();
         Some(
             live.into_iter()
-                .filter(|f| f.equality_ids.is_none() && removed.contains(&f.path))
+                .filter(|f| f.is_data() && removed.contains(&f.path))
                 .collect(),
         )
     }
@@ -2364,16 +2522,7 @@ impl DstHarness {
     /// audited catalog checks the commit against transaction boundaries;
     /// this checks the stronger before == after.
     fn compact(&mut self) {
-        let cfg = CompactionConfig {
-            data_file_threshold: 1,
-            delete_file_threshold: 1,
-            delete_ratio: 0.0,
-            // Around the size of a few-row file, so the table mixes
-            // small files with large ones only deletes make worth
-            // rewriting.
-            target_size_bytes: 1024,
-            max_input_bytes_per_pass: 1,
-        };
+        let cfg = dst_compaction();
         let state = |h: &Self| {
             let mut rows = block_on(h.storage.engine_rows(&ident())).unwrap();
             sort_by_pk(&mut rows);
@@ -2407,13 +2556,15 @@ impl DstHarness {
                 let live = block_on(self.storage.live_files(&ident())).unwrap();
                 let oldest_data = live
                     .iter()
-                    .filter(|f| f.equality_ids.is_none())
+                    .filter(|f| f.is_data())
                     .chain(removed_meanwhile)
                     .map(|f| f.seq)
                     .min();
                 let dangling: Vec<&str> = live
                     .iter()
-                    .filter(|f| f.equality_ids.is_some() && oldest_data.is_none_or(|s| f.seq <= s))
+                    .filter(|f| {
+                        f.equality_ids().is_some() && oldest_data.is_none_or(|s| f.seq <= s)
+                    })
                     .map(|f| f.path.as_str())
                     .collect();
                 if !dangling.is_empty() {
@@ -2423,18 +2574,7 @@ impl DstHarness {
                     ));
                 }
             }
-            Err(e) if e.to_string().contains("response lost") => {}
-            // Production's catalog capitalizes it: "Rewrite removes ...".
-            Err(e)
-                if e.to_string()
-                    .to_lowercase()
-                    .contains("rewrite removes files no longer in the table") => {}
-            // A pass that read rows before they had ids, which they've had
-            // since (the table upgraded to v3): it plans again.
-            Err(e)
-                if e.to_string()
-                    .to_lowercase()
-                    .contains(pg2iceberg_iceberg::ROW_IDS_CONFLICT) => {}
+            Err(e) if compaction_may_lose(&e.to_string()) => {}
             Err(e) => panic!("compaction: {e}"),
         }
         // The materializer updates its FileIndex from what the pass
@@ -2523,6 +2663,8 @@ impl DstHarness {
             materializer.enable_distributed_mode(worker("a"), WORKER_TTL);
         }
         self.materializer = materializer;
+        // Its task died with it.
+        self.pending_background = None;
     }
 
     /// A cycle whose commits land but whose cursor updates don't: the
@@ -2807,6 +2949,41 @@ impl DstHarness {
                         Some(HeldPass::Job(pass));
                 }
             }
+            Step::BackgroundCompactPlan => {
+                if self.pending_background.is_none() {
+                    let job = self
+                        .materializer
+                        .compaction_job(&ident(), &dst_compaction());
+                    self.pending_background = job.map(|job| block_on(job.run()));
+                }
+            }
+            Step::BackgroundCompactCommit => {
+                if let Some(pass) = self.pending_background.take() {
+                    let state = |h: &Self| {
+                        let mut rows = block_on(h.storage.engine_rows(&ident())).unwrap();
+                        sort_by_pk(&mut rows);
+                        rows
+                    };
+                    let before = state(self);
+                    match block_on(self.materializer.commit_compaction_pass(pass)) {
+                        Ok(_) => {}
+                        Err(e) if compaction_may_lose(&e.to_string()) => {}
+                        Err(e) => panic!("the materializer's compaction commit: {e}"),
+                    }
+                    if !DISTRIBUTED.get() {
+                        if let Err(e) = file_index_matches_catalog(self, &self.materializer, true) {
+                            panic!("after the materializer's compaction commit: {e}");
+                        }
+                    }
+                    let after = state(self);
+                    if before != after {
+                        self.audited.violations.lock().unwrap().push(format!(
+                            "the materializer's held pass changed the table: before \
+                             {before:?}, after {after:?}"
+                        ));
+                    }
+                }
+            }
             Step::CatalogCompactPlan {
                 own_sequence_number,
             } => self.catalog_compact_plan(*own_sequence_number),
@@ -2841,6 +3018,13 @@ impl DstHarness {
             }
             Step::CatalogRemoveDanglingDeletes => self.catalog_remove_dangling_deletes(),
             Step::UpgradeToV3 => self.upgrade_to_v3(),
+            Step::UpgradeToV3MidCommit => {
+                if V3_UPGRADED.get() && !self.upgraded {
+                    self.audited
+                        .upgrade_before_next_commit
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
             Step::LoseCommitResponse => self
                 .audited
                 .lose_next_response
@@ -3033,10 +3217,18 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
     // ... and to the very files readers read, at their sequence numbers:
     // the rows alone can't tell a file that applies nothing (a delete
     // older than every data file) from no file at all.
-    let files = |files: Vec<LiveFile>| -> BTreeSet<(String, i64, bool)> {
+    // A deletion vector is its blob, not its Puffin file: one file holds
+    // many.
+    let files = |files: Vec<LiveFile>| -> BTreeSet<(String, i64, Content)> {
         files
             .into_iter()
-            .map(|f| (f.path, f.seq, f.equality_ids.is_some()))
+            .map(|f| {
+                let content = match f.content {
+                    Content::EqualityDeletes(_) => Content::EqualityDeletes(Vec::new()),
+                    content => content,
+                };
+                (f.path, f.seq, content)
+            })
             .collect()
     };
     let readers = files(
@@ -3051,6 +3243,13 @@ fn check_step_invariants(h: &DstHarness) -> Result<(), String> {
             "invariant 12: Catalog::snapshots replays to files {history:?}, readers read {readers:?}"
         ));
     }
+
+    // 25. Deletion vectors are as the spec has them (see
+    //     `check_deletion_vectors`).
+    let live = block_on(h.storage.live_files(&ident()))
+        .map_err(|e| format!("invariant 25: readers' files: {e}"))?;
+    block_on(check_deletion_vectors(h.blob_store.as_ref(), &live))
+        .map_err(|e| format!("invariant 25 (deletion vectors): {e}"))?;
     Ok(())
 }
 
@@ -3370,6 +3569,10 @@ struct AuditedCatalog {
     /// `maintain`'s orphan cleanup, run first when the next commit — data
     /// or compaction — is ([`Step::CleanupOrphansMidCommit`]).
     cleanup_before_next_commit: Mutex<Option<CleanupHook>>,
+    /// Another engine's upgrade of the tables to v3, made first when the
+    /// next commit — data or compaction — is
+    /// ([`Step::UpgradeToV3MidCommit`]).
+    upgrade_before_next_commit: std::sync::atomic::AtomicBool,
     /// Where a pg2iceberg process records its writes, as every one does
     /// (see `CachingCatalog`).
     coord: Arc<dyn Coordinator>,
@@ -3395,6 +3598,27 @@ enum HeldPass {
 }
 
 impl AuditedCatalog {
+    /// 24. A v3 table takes no new equality deletes: pg2iceberg deletes
+    ///     its rows through deletion vectors, as v4 requires. (Those it
+    ///     took while v2 stay, until compaction retires them.)
+    async fn check_deletes_by_vector(&self, ident: &TableIdent, equality_deletes: usize) {
+        if equality_deletes == 0 {
+            return;
+        }
+        match self.storage.is_v3(ident).await {
+            Ok(false) => {}
+            Ok(true) => self.violations.lock().unwrap().push(format!(
+                "invariant 24 (deletion vectors): pg2iceberg commits {equality_deletes} \
+                 equality delete files to v3 table {ident}"
+            )),
+            Err(e) => self
+                .violations
+                .lock()
+                .unwrap()
+                .push(format!("invariant 24: {ident}'s format version: {e}")),
+        }
+    }
+
     /// `result` of a commit that applied; turned into an error if this
     /// commit's response is to be lost.
     fn respond<T>(&self, result: T) -> pg2iceberg_iceberg::Result<T> {
@@ -3414,6 +3638,18 @@ impl AuditedCatalog {
     /// Commit [`Self::land_before_next_commit`]'s pass, if one is held —
     /// after [`Self::cleanup_before_next_commit`]'s cleanup, if one is.
     async fn land_other_pass(&self) -> pg2iceberg_iceberg::Result<()> {
+        if self
+            .upgrade_before_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            for table in [ident(), other_ident()] {
+                if self.inner.load_table(&table).await?.is_some()
+                    && !self.storage.is_v3(&table).await.unwrap()
+                {
+                    self.storage.upgrade_to_v3(&table).await.unwrap();
+                }
+            }
+        }
         let cleanup = self.cleanup_before_next_commit.lock().unwrap().take();
         if let Some(cleanup) = cleanup {
             cleanup().await;
@@ -3469,7 +3705,7 @@ impl AuditedCatalog {
         let data: BTreeSet<String> = match self.storage.live_files(&prepared.ident).await {
             Ok(files) => files
                 .into_iter()
-                .filter(|f| f.equality_ids.is_none())
+                .filter(|f| f.is_data())
                 .map(|f| f.path)
                 .collect(),
             Err(e) => {
@@ -3580,7 +3816,10 @@ impl Catalog for AuditedCatalog {
         &self,
         prepared: PreparedCommit,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
+        let ident = prepared.ident.clone();
+        let equality_deletes = prepared.equality_deletes.len();
         let meta = self.inner.commit_snapshot(prepared).await?;
+        self.check_deletes_by_vector(&ident, equality_deletes).await;
         self.audit().await;
         let meta = self.respond(meta)?;
         Ok(meta)
@@ -3601,10 +3840,14 @@ impl Catalog for AuditedCatalog {
         }
         self.land_other_pass().await?;
         let ident = steps.first().map(|s| s.ident.clone());
+        let equality_deletes = steps.iter().map(|s| s.equality_deletes.len()).sum();
         let meta = self
             .inner
             .commit_snapshots(steps, log_range.clone(), remove_properties)
             .await?;
+        if let Some(ident) = &ident {
+            self.check_deletes_by_vector(ident, equality_deletes).await;
+        }
         // 16. Each log entry is applied at most once: a commit's range
         //     starts where the last one that landed ended, or later.
         if let (Some(ident), Some(range)) = (ident, log_range) {
@@ -6975,4 +7218,415 @@ fn a_jobs_pass_across_an_upgrade(prod: bool) {
     ]
     .concat();
     v3_case(prod, false, &steps);
+}
+
+// ---------- Iceberg v3: deletion vectors ----------
+
+/// Run `steps` on v3 tables — `upgraded` ones, created v2 — as
+/// [`v3_case`] does.
+fn dv_case(prod: bool, managed: bool, upgraded: bool, steps: &[Step]) {
+    V3_UPGRADED.set(upgraded);
+    v3_case(prod, managed, steps);
+}
+
+/// Updates and a delete of rows committed before, each in its own
+/// commit: the table takes a deletion vector for each, never an equality
+/// delete (invariant 24).
+#[test]
+fn a_v3_table_deletes_rows_through_deletion_vectors() {
+    dv_case(false, false, false, &writes());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_v3_table_deletes_rows_through_deletion_vectors_on_iceberg() {
+    dv_case(true, false, false, &writes());
+}
+
+/// A transaction too big for one step updates every row twice: its later
+/// steps delete rows its earlier ones wrote — vectors on data files of the
+/// same commit, which apply at their own sequence number.
+fn rows_of_the_same_commit() -> Vec<Step> {
+    vec![
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::BigTx { inserts: 3, qty: 5 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]
+}
+
+#[test]
+fn a_transaction_deletes_rows_its_earlier_steps_wrote() {
+    dv_case(false, false, false, &rows_of_the_same_commit());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_transaction_deletes_rows_its_earlier_steps_wrote_on_iceberg() {
+    dv_case(true, false, false, &rows_of_the_same_commit());
+}
+
+/// Rows of one file deleted over several commits: each commit's vector
+/// for the file holds the deletes of the vectors before it, and replaces
+/// the last — a file has one (invariant 25).
+fn one_file_deleted_from_repeatedly() -> Vec<Step> {
+    let mut steps: Vec<Step> = (1..=4)
+        .map(|id| Step::Insert { id, qty: id * 10 })
+        .collect();
+    steps.extend([Step::DriveFlush, Step::MaterializerCycle]);
+    for step in [
+        Step::Update { id: 1, qty: 11 },
+        Step::Delete { id: 2 },
+        Step::Update { id: 1, qty: 12 },
+        Step::Update { id: 3, qty: 31 },
+    ] {
+        steps.extend([step, Step::DriveFlush, Step::MaterializerCycle]);
+    }
+    steps
+}
+
+#[test]
+fn a_files_deletion_vector_grows_one_commit_at_a_time() {
+    dv_case(false, false, false, &one_file_deleted_from_repeatedly());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_files_deletion_vector_grows_one_commit_at_a_time_on_iceberg() {
+    dv_case(true, false, false, &one_file_deleted_from_repeatedly());
+}
+
+/// Rows of files a one-key FileIndex evicted ([`BOUNDED_INDEX`]): their
+/// positions aren't in memory, but their deletes are still vectors —
+/// found by reading the files their keys may be in.
+fn evicted_rows_deleted() -> Vec<Step> {
+    [
+        &evicted_files()[..],
+        &[
+            Step::Delete { id: 1 },
+            Step::Update { id: 3, qty: 31 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Truncate { reinsert: None },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn rows_the_index_evicted_are_deleted_through_deletion_vectors() {
+    BOUNDED_INDEX.set(true);
+    dv_case(false, false, false, &evicted_rows_deleted());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn rows_the_index_evicted_are_deleted_through_deletion_vectors_on_iceberg() {
+    BOUNDED_INDEX.set(true);
+    dv_case(true, false, false, &evicted_rows_deleted());
+}
+
+/// Rows deleted while a `pg2iceberg compact` pass holds their file, its
+/// commit after theirs: the pass must not bring them back — nor leave
+/// their vector behind on the file it removes.
+fn deleted_under_a_held_pass(mid_commit: bool) -> Vec<Step> {
+    let mut steps = dirty_file();
+    steps.extend([
+        Step::ExternalCompactPlan,
+        Step::Update { id: 2, qty: 21 },
+        Step::Delete { id: 1 },
+        Step::DriveFlush,
+    ]);
+    if mid_commit {
+        // The pass lands first; the materializer's vectors name the files
+        // it removed.
+        steps.extend([Step::ExternalCompactMidCommit, Step::MaterializerCycle]);
+    } else {
+        steps.extend([Step::MaterializerCycle, Step::ExternalCompactCommit]);
+    }
+    steps.extend([
+        Step::Insert { id: 5, qty: 50 },
+        Step::Update { id: 2, qty: 22 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Compact,
+    ]);
+    steps
+}
+
+#[test]
+fn a_held_pass_keeps_the_deletes_made_meanwhile() {
+    dv_case(false, false, false, &deleted_under_a_held_pass(false));
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_held_pass_keeps_the_deletes_made_meanwhile_on_iceberg() {
+    dv_case(true, false, false, &deleted_under_a_held_pass(false));
+}
+
+#[test]
+fn deletes_of_files_a_pass_removed_mid_commit_find_the_rows_again() {
+    dv_case(false, false, false, &deleted_under_a_held_pass(true));
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn deletes_of_files_a_pass_removed_mid_commit_find_the_rows_again_on_iceberg() {
+    dv_case(true, false, false, &deleted_under_a_held_pass(true));
+}
+
+/// Rows deleted while the materializer's own pass — on a task of its own,
+/// as `run` compacts — holds their file: its commit carries their deletes
+/// over to its outputs, as vectors of their own.
+fn deleted_under_the_materializers_pass() -> Vec<Step> {
+    let mut steps = dirty_file();
+    steps.extend([
+        Step::BackgroundCompactPlan,
+        Step::Update { id: 2, qty: 21 },
+        Step::Delete { id: 1 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::BackgroundCompactCommit,
+        Step::Insert { id: 5, qty: 50 },
+        Step::Update { id: 2, qty: 22 },
+        Step::Delete { id: 5 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Compact,
+    ]);
+    steps
+}
+
+#[test]
+fn the_materializers_pass_carries_the_deletes_made_meanwhile() {
+    dv_case(false, false, false, &deleted_under_the_materializers_pass());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn the_materializers_pass_carries_the_deletes_made_meanwhile_on_iceberg() {
+    dv_case(true, false, false, &deleted_under_the_materializers_pass());
+}
+
+/// A column added with a default, over files the FileIndex evicted whose
+/// rows vectors deleted: those stay deleted — the fill rewrites only the
+/// rows the table holds.
+fn default_over_evicted_deleted_rows() -> Vec<Step> {
+    [
+        &evicted_files()[..],
+        &[
+            Step::Delete { id: 1 },
+            Step::Delete { id: 4 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::DropNote,
+            Step::AddNoteWithDefault,
+            Step::Insert { id: 7, qty: 70 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn a_default_fills_none_of_the_rows_vectors_deleted() {
+    BOUNDED_INDEX.set(true);
+    dv_case(false, false, false, &default_over_evicted_deleted_rows());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_default_fills_none_of_the_rows_vectors_deleted_on_iceberg() {
+    BOUNDED_INDEX.set(true);
+    dv_case(true, false, false, &default_over_evicted_deleted_rows());
+}
+
+/// The same, against the catalog's compaction (`MANAGED`), as Java's
+/// rewrite does it: it removes the vectors of the files it rewrites, and
+/// refuses to commit if one landed since it planned.
+fn deleted_under_the_catalogs_pass(mid_commit: bool) -> Vec<Step> {
+    let mut steps = dirty_file();
+    steps.extend([
+        Step::CatalogCompactPlan {
+            own_sequence_number: false,
+        },
+        Step::Update { id: 2, qty: 21 },
+        Step::DriveFlush,
+    ]);
+    if mid_commit {
+        steps.extend([Step::CatalogCompactMidCommit, Step::MaterializerCycle]);
+    } else {
+        steps.extend([Step::MaterializerCycle, Step::CatalogCompactCommit]);
+    }
+    steps.extend([
+        Step::Delete { id: 1 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]);
+    steps.extend(catalog_compaction());
+    steps
+}
+
+#[test]
+fn the_catalogs_pass_keeps_the_deletes_made_meanwhile() {
+    dv_case(false, true, false, &deleted_under_the_catalogs_pass(false));
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn the_catalogs_pass_keeps_the_deletes_made_meanwhile_on_iceberg() {
+    dv_case(true, true, false, &deleted_under_the_catalogs_pass(false));
+}
+
+#[test]
+fn deletes_of_files_the_catalog_removed_mid_commit_find_the_rows_again() {
+    dv_case(false, true, false, &deleted_under_the_catalogs_pass(true));
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn deletes_of_files_the_catalog_removed_mid_commit_find_the_rows_again_on_iceberg() {
+    dv_case(true, true, false, &deleted_under_the_catalogs_pass(true));
+}
+
+/// A table upgraded from v2 keeps the equality deletes it took then —
+/// until compaction retires them — and takes vectors from the upgrade on.
+fn upgraded_with_equality_deletes() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &[
+            Step::UpgradeToV3,
+            Step::Update { id: 2, qty: 21 },
+            Step::Delete { id: 1 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Compact,
+            Step::Update { id: 2, qty: 22 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn an_upgraded_table_takes_deletion_vectors_from_the_upgrade_on() {
+    dv_case(false, false, true, &upgraded_with_equality_deletes());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn an_upgraded_table_takes_deletion_vectors_from_the_upgrade_on_iceberg() {
+    dv_case(true, false, true, &upgraded_with_equality_deletes());
+}
+
+/// Another engine upgrades the table while a commit pg2iceberg prepared
+/// for v2 — equality deletes and all — is in flight: it must not land on
+/// the v3 table as it is (as one prepared for v3 must not land on v4).
+fn upgraded_mid_commit() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &[
+            Step::Update { id: 2, qty: 21 },
+            Step::DriveFlush,
+            Step::UpgradeToV3MidCommit,
+            Step::MaterializerCycle,
+            Step::Delete { id: 1 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn a_commit_prepared_before_an_upgrade_lands_as_deletion_vectors() {
+    dv_case(false, false, true, &upgraded_mid_commit());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_commit_prepared_before_an_upgrade_lands_as_deletion_vectors_on_iceberg() {
+    dv_case(true, false, true, &upgraded_mid_commit());
+}
+
+/// Deletion vectors through a materializer restart (its FileIndex rebuilt
+/// from the table, positions and vectors too), `maintain` — expiry and
+/// orphan cleanup, which must keep every Puffin file a live vector is in —
+/// and compaction, which takes the vectors with the files it rewrites.
+fn vectors_through_maintenance() -> Vec<Step> {
+    [
+        &one_file_deleted_from_repeatedly()[..],
+        &[
+            Step::RestartMaterializer,
+            Step::Update { id: 4, qty: 41 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Expire,
+            Step::CleanupOrphans,
+            Step::Delete { id: 3 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Compact,
+            Step::Expire,
+            Step::CleanupOrphans,
+            Step::RestartMaterializer,
+            Step::Update { id: 1, qty: 13 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn deletion_vectors_survive_restart_maintenance_and_compaction() {
+    dv_case(false, false, false, &vectors_through_maintenance());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn deletion_vectors_survive_restart_maintenance_and_compaction_on_iceberg() {
+    dv_case(true, false, false, &vectors_through_maintenance());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// v3 tables delete through deletion vectors alone under random
+    /// workloads that compact after every round — over a bounded index or
+    /// not, maintained by the catalog or not.
+    #[test]
+    fn deletion_vectors_survive_random_workloads_that_compact(
+        (managed, steps) in any::<bool>()
+            .prop_flat_map(|managed| (Just(managed), compacting_rounds(managed))),
+        prod_backend in integration_only(),
+        partitioned in any::<bool>(),
+        upgraded in any::<bool>(),
+        bounded in any::<bool>(),
+    ) {
+        PARTITIONED.set(partitioned);
+        BOUNDED_INDEX.set(bounded);
+        FORMAT_V3.set(true);
+        V3_UPGRADED.set(upgraded);
+        MANAGED.set(managed);
+        PROD_BACKEND.set(prod_backend);
+        let mut h = DstHarness::boot();
+        for (i, step) in steps.iter().enumerate() {
+            h.run_step(step);
+            if let Err(e) = check_step_invariants(&h) {
+                panic!("workload {steps:?}\nfailed after step {i}: {e}");
+            }
+        }
+        if let Err(e) = check_invariants(&mut h) {
+            panic!("workload {steps:?}\nfailed: {e}");
+        }
+    }
 }

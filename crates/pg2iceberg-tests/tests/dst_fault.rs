@@ -1621,6 +1621,8 @@ fn lifecycle_skips_snapshot_when_slot_already_exists() {
         ident: ident(),
         data_files: vec![],
         equality_deletes: vec![],
+        deletion_vectors: Vec::new(),
+        removed_deletion_vectors: Vec::new(),
     }))
     .unwrap();
     block_on(coord_inner.mark_table_snapshot_complete(&ident(), 0, pg2iceberg_core::Lsn(1)))

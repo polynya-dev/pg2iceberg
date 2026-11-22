@@ -4,6 +4,7 @@
 //! metadata in memory.
 
 pub mod compact;
+pub mod deletion_vector;
 pub mod file_index;
 pub mod fold;
 pub mod materialize;
@@ -75,6 +76,10 @@ pub struct TableMetadata {
     /// The table's properties.
     #[serde(default)]
     pub properties: std::collections::BTreeMap<String, String>,
+    /// The table's format version: how its deletes are written —
+    /// equality deletes on v2, deletion vectors on v3.
+    #[serde(default)]
+    pub format_version: FormatVersion,
 }
 
 /// The change-log range a materializer commit applied for one cursor
@@ -166,13 +171,108 @@ pub fn log_ends_property(
 pub struct PreparedCommit {
     pub ident: TableIdent,
     pub data_files: Vec<DataFile>,
+    /// A v2 table's deletes.
     pub equality_deletes: Vec<DataFile>,
+    /// A v3 table's deletes: per data file, the positions of its deleted
+    /// rows — those it had (the vector it had, if any, is in
+    /// `removed_deletion_vectors`) and the new ones.
+    pub deletion_vectors: Vec<DeletionVector>,
+    /// The vectors `deletion_vectors` replace. The commit fails if one is
+    /// gone from the table by then, or a data file it names has one it
+    /// doesn't replace: it holds positions this commit would drop.
+    pub removed_deletion_vectors: Vec<DeletionVectorKey>,
+}
+
+impl PreparedCommit {
+    /// A commit of no files, data or deletes, to `ident`.
+    pub fn empty(ident: TableIdent) -> Self {
+        Self {
+            ident,
+            data_files: Vec::new(),
+            equality_deletes: Vec::new(),
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
+        }
+    }
+
+    /// Whether it changes nothing: a catalog commits no snapshot for it.
+    pub fn is_empty(&self) -> bool {
+        self.data_files.is_empty()
+            && self.equality_deletes.is_empty()
+            && self.deletion_vectors.is_empty()
+            && self.removed_deletion_vectors.is_empty()
+    }
+}
+
+/// What a catalog's conflict error says when a commit removes a deletion
+/// vector the table no longer has, or adds one for a data file whose
+/// vector it doesn't replace (see [`PreparedCommit`]).
+pub const DELETION_VECTOR_CONFLICT: &str = "deletion vectors changed since the commit read them";
+
+/// What a catalog's conflict error says when a commit's deletion vector
+/// names a data file the table no longer has: a rewrite removed it.
+pub const MISSING_DATA_FILE_CONFLICT: &str = "deletion vectors name data files no longer live";
+
+/// What a catalog's conflict error says when pg2iceberg commits equality
+/// deletes to a v3 table — one upgraded since the commit was prepared:
+/// a v3 table takes deletion vectors.
+pub const EQUALITY_DELETES_ON_V3_CONFLICT: &str =
+    "equality deletes prepared for a table now on format v3";
+
+/// The deleted rows of one data file, as positions in it: a blob in a
+/// Puffin file (`deletion-vector-v1`, Iceberg v3). It applies to its data
+/// file while both are live, if the data file's sequence number is no
+/// higher than its own — so to rows of its own snapshot too, unlike an
+/// equality delete. A table holds at most one per data file: a commit
+/// deleting more of a file's rows replaces the file's vector with one
+/// holding the old positions and the new.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletionVector {
+    /// The Puffin file holding it — often with others.
+    pub path: String,
+    /// The Puffin file's size.
+    pub byte_size: u64,
+    /// Where its blob starts in the Puffin file.
+    pub offset: u64,
+    /// Its blob's length.
+    pub length: u64,
+    /// The path of the data file whose rows it deletes.
+    pub referenced_data_file: String,
+    /// How many positions it holds.
+    pub cardinality: u64,
+    /// Its data file's partition.
+    pub partition_values: Vec<PartitionLiteral>,
+    /// As [`DataFile::sequence_number`].
+    pub sequence_number: Option<i64>,
+}
+
+impl DeletionVector {
+    /// Which vector it is.
+    pub fn key(&self) -> DeletionVectorKey {
+        DeletionVectorKey {
+            path: self.path.clone(),
+            offset: self.offset,
+        }
+    }
+
+    /// Its data sequence number, as listed in `snapshot`. It applies to
+    /// its data file if that one's is no higher.
+    pub fn sequence_number_in(&self, snapshot: &Snapshot) -> i64 {
+        self.sequence_number.unwrap_or(snapshot.id)
+    }
+}
+
+/// Which deletion vector: its Puffin file, and its blob's offset there.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeletionVectorKey {
+    pub path: String,
+    pub offset: u64,
 }
 
 /// The Iceberg format version of the tables pg2iceberg creates. Tables
 /// that already exist keep theirs: pg2iceberg writes each as its own
 /// format version says.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FormatVersion {
     /// What every engine reads.
     #[default]
@@ -228,7 +328,32 @@ pub struct PreparedCompaction {
     /// commit if the rows it moves have since been given theirs (the table
     /// upgraded to v3 meanwhile): the catalog refuses it, as a conflict.
     pub stores_row_lineage: bool,
+    /// The deletion vectors of the data files it removes: they go with
+    /// them. The commit fails if one is gone by then, or a removed file
+    /// has one not listed — rows deleted since, which `deletion_vectors`
+    /// would have had to carry over.
+    pub removed_deletion_vectors: Vec<DeletionVectorKey>,
+    /// Vectors for the added files: rows deleted from the removed ones
+    /// after the pass read them, at their positions in the added files.
+    pub deletion_vectors: Vec<DeletionVector>,
 }
+
+impl PreparedCompaction {
+    /// Whether it changes nothing: a catalog commits no snapshot for it.
+    pub fn is_empty(&self) -> bool {
+        self.added_data_files.is_empty()
+            && self.removed_paths.is_empty()
+            && self.removed_deletion_vectors.is_empty()
+            && self.deletion_vectors.is_empty()
+    }
+}
+
+/// What a catalog's conflict error says when a rewrite removes a data
+/// file whose deletion vector it doesn't remove: rows were deleted from
+/// the file after the rewrite read it (see
+/// [`PreparedCompaction::removed_deletion_vectors`]).
+pub const DELETES_SINCE_REWRITE_CONFLICT: &str =
+    "rows deleted from rewritten files since the rewrite read them";
 
 /// What a catalog's conflict error says when a compaction that stores no
 /// row lineage would move rows that have row ids (see
@@ -268,6 +393,30 @@ impl DataFile {
     }
 }
 
+/// The deletion vectors `snapshots` (a table's history, as
+/// [`Catalog::snapshots`] gives it) leave live, by the path of the data
+/// file each names, with its data sequence number.
+pub fn live_deletion_vectors(
+    snapshots: &[Snapshot],
+) -> std::collections::BTreeMap<&str, (&DeletionVector, i64)> {
+    let removed: std::collections::BTreeSet<&DeletionVectorKey> = snapshots
+        .iter()
+        .flat_map(|s| &s.removed_deletion_vectors)
+        .collect();
+    let mut live = std::collections::BTreeMap::new();
+    for snap in snapshots {
+        for dv in &snap.deletion_vectors {
+            if !removed.contains(&dv.key()) {
+                live.insert(
+                    dv.referenced_data_file.as_str(),
+                    (dv, dv.sequence_number_in(snap)),
+                );
+            }
+        }
+    }
+    live
+}
+
 /// One Iceberg snapshot. Snapshots are append-only and ordered by `id`.
 /// Iceberg MoR semantics: a delete file at snapshot `N` applies only to data
 /// files with a data sequence number `< N` — their snapshot's, unless they
@@ -279,14 +428,25 @@ impl DataFile {
 /// referenced by this snapshot's manifest list. Verifier and FileIndex
 /// rebuild paths skip any data/delete file whose path appears in a
 /// compaction's `removed_paths` set.
+///
+/// A v3 table's deletes are deletion vectors, listed apart:
+/// `deletion_vectors` and `removed_deletion_vectors`. A snapshot that
+/// replaces a data file's vector lists both the old and the new; one
+/// that removes a data file removes its vector too.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub id: i64,
     pub data_files: Vec<DataFile>,
+    /// Equality-delete files.
     pub delete_files: Vec<DataFile>,
-    /// File paths superseded by this snapshot. Empty for non-compaction
-    /// snapshots.
+    /// Data and equality-delete file paths superseded by this snapshot.
+    /// Empty for non-compaction snapshots.
     pub removed_paths: Vec<String>,
+    /// Deletion vectors the snapshot added.
+    pub deletion_vectors: Vec<DeletionVector>,
+    /// Deletion vectors the snapshot removed: replaced, or gone with
+    /// their data file.
+    pub removed_deletion_vectors: Vec<DeletionVectorKey>,
     /// Wall-clock timestamp in milliseconds since epoch. Used by
     /// snapshot expiry — `expire_snapshots(retention)` drops snapshots
     /// older than `now - retention`. Surfaced from
@@ -615,10 +775,7 @@ pub trait Catalog: Send + Sync {
                 "commit_snapshots: this catalog can't remove properties".into(),
             ));
         }
-        let mut steps: Vec<PreparedCommit> = steps
-            .into_iter()
-            .filter(|s| !s.data_files.is_empty() || !s.equality_deletes.is_empty())
-            .collect();
+        let mut steps: Vec<PreparedCommit> = steps.into_iter().filter(|s| !s.is_empty()).collect();
         match steps.len() {
             0 => Err(IcebergError::Other(
                 "commit_snapshots: no non-empty steps".into(),
@@ -662,7 +819,8 @@ pub trait Catalog: Send + Sync {
     }
     /// Append-only snapshot history for `ident`, ordered by snapshot id
     /// ascending. Replaying it — each snapshot's deletes and data files,
-    /// minus every `removed_paths` — yields the table's current state;
+    /// minus every `removed_paths`, and its deletion vectors, minus every
+    /// `removed_deletion_vectors` — yields the table's current state;
     /// the verifier, FileIndex rebuild, compaction and orphan cleanup all
     /// rely on that.
     ///

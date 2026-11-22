@@ -20,8 +20,8 @@ For each table:
     - `UPDATE` with unresolved TOAST columns: read the row's previous version and backfill the missing columns (the data files holding them, up to eight at once)
 4. **Prepare** — serialize each step's folded rows into Iceberg data and delete files and upload them, together:
     - Inserts and updates → Parquet data files (partitioned by the table's partition spec)
-    - Deletes, and the previous version of updated rows → Parquet equality delete files (PK columns only)
-5. **Commit** — at a transaction boundary, commit every step prepared so far as **one atomic catalog update**: the table's `main` branch moves once. A step with deletes becomes a snapshot of its own, so that they apply to the rows of the steps before it — an equality delete applies to rows of lower sequence numbers — and a step only adding rows joins the snapshot before it. An initial snapshot, all inserts, is one snapshot, however many steps it takes; one for each would make the commit's metadata grow with the square of its steps, each snapshot's manifest list naming every manifest before it. With more than a step to apply — catching up — a commit waits for four steps (or the cycle's row budget, or the end of the log): each commit is a round of catalog requests, whatever it carries. The last snapshot's summary records the log range the commit applied (`pg2iceberg.log-group`, `pg2iceberg.log-start`, `pg2iceberg.log-end`), and how far each cursor group has applied the log (`pg2iceberg.log-ends`)
+    - Deletes, and the previous version of updated rows → on a v2 table, Parquet equality delete files (PK columns only); on v3, [deletion vectors](#deletion-vectors) of the files holding them
+5. **Commit** — at a transaction boundary, commit every step prepared so far as **one atomic catalog update**: the table's `main` branch moves once. A step with deletes becomes a snapshot of its own, so that they apply to the rows of the steps before it — an equality delete applies to rows of lower sequence numbers — and a step only adding rows joins the snapshot before it. A v3 table's commit is always one snapshot: a deletion vector names the rows it deletes by position, whichever step wrote them. An initial snapshot, all inserts, is one snapshot, however many steps it takes; one for each would make the commit's metadata grow with the square of its steps, each snapshot's manifest list naming every manifest before it. With more than a step to apply — catching up — a commit waits for four steps (or the cycle's row budget, or the end of the log): each commit is a round of catalog requests, whatever it carries. The last snapshot's summary records the log range the commit applied (`pg2iceberg.log-group`, `pg2iceberg.log-start`, `pg2iceberg.log-end`), and how far each cursor group has applied the log (`pg2iceberg.log-ends`)
 6. **Advance cursor** — only after the commit succeeds; then continue with the next entries until the log is drained or the cycle has read its row budget. A cycle that stops at its budget is followed by the next as soon as it ends; one that drained the log waits `materializer_interval`
 
 ### Applying each change once
@@ -34,7 +34,7 @@ Snapshot expiry doesn't lose that record: every snapshot pg2iceberg commits — 
 
 ### Large transactions
 
-Steps bound the materializer's memory, but a source transaction is never split across commits. When a transaction spans several steps, they're committed together: each step is a snapshot with the next sequence number, so a later step's equality deletes hide rows an earlier step wrote, and readers of the table see either none of the transaction or all of it.
+Steps bound the materializer's memory, but a source transaction is never split across commits. When a transaction spans several steps, they're committed together, and readers of the table see either none of the transaction or all of it. On a v2 table, each step with deletes is a snapshot with the next sequence number, so its equality deletes hide rows an earlier step wrote; on v3, the steps are one snapshot, whose deletion vectors name those rows in the earlier steps' files.
 
 Atomicity is per table. A transaction touching several tables is committed table by table, since Iceberg has no multi-table commit yet.
 
@@ -50,19 +50,20 @@ A catalog that maintains the tables itself (`sink.maintenance: managed`) commits
 
 ## File index
 
-For each table, the materializer keeps a map from each live row's primary key to the data file holding it, built from the table's data files at startup and updated with every commit. It uses it to:
+For each table, the materializer keeps a map from each live row's primary key to the data file holding it and the row's position there, built from the table's data files at startup and updated with every commit. It uses it to:
 
-- turn an insert of a key the table already holds into an update, whose equality delete hides the old row;
+- turn an insert of a key the table already holds into an update, whose delete hides the old row;
+- find, on a v3 table, the file and position of each row an update or delete replaces, for its [deletion vector](#deletion-vectors);
 - find the values an update leaves out — unchanged TOAST columns, which Postgres doesn't send — in the old row's file ([TOAST](toast.md));
 - place an equality delete in the partition of the row it deletes, on a partitioned table;
 - expand a `TRUNCATE` into a delete of each key, and fill a column added with a default into the rows that predate it;
 - count each file's live rows, for [compaction](compaction.md).
 
-A key a row makes the map a table's worth of keys: `sink.pk_index_memory` (512 MiB by default) bounds it for each table. Within the budget — about 7 million keys at 512 MiB — the map holds every key, in about 21 bytes each. Past it, the oldest files' keys are evicted, into a Bloom filter that tells a key that may be theirs from one that surely isn't, and each evicted file keeps the range of its keys and a count of its live rows that's never too high. The filter grows a layer at a time, each knowing the range of its keys, and a key is looked for only in those whose range holds it: files are evicted oldest first, mostly a range of keys at a time. The cost falls on the rows of evicted files:
+A key a row makes the map a table's worth of keys: `sink.pk_index_memory` (576 MiB by default) bounds it for each table. Within the budget — about 7 million keys at 576 MiB — the map holds every key, in about 25 bytes each. Past it, the oldest files' keys are evicted, into a Bloom filter that tells a key that may be theirs from one that surely isn't, and each evicted file keeps the range of its keys and a count of its live rows that's never too high. The filter grows a layer at a time, each knowing the range of its keys, and a key is looked for only in those whose range holds it: files are evicted oldest first, mostly a range of keys at a time. The cost falls on the rows of evicted files:
 
-- an insert of a key the filter may hold writes an equality delete, which deletes nothing if the key wasn't there;
+- an insert of a key the filter may hold writes an equality delete, which deletes nothing if the key wasn't there; on a v3 table, it reads the evicted files whose range holds the key instead, as does an update or delete of one, to find the row's position;
 - an update leaving TOAST columns out reads the evicted files whose range holds its key, to find the old row;
-- a delete on a partitioned table goes to each partition such a file is in;
+- a delete on a partitioned v2 table goes to each partition such a file is in;
 - a `TRUNCATE`, or a column added with a default, reads those files;
 - compaction may rewrite an evicted file it needn't, counting its rows conservatively.
 
@@ -73,6 +74,14 @@ A key a row makes the map a table's worth of keys: `sink.pk_index_memory` (512 M
 pg2iceberg uses Iceberg's **merge-on-read** write mode. Rather than rewriting existing data files on every update or delete, it appends:
 
 - New data files for inserts and updates
-- Equality delete files for deletes and updates-as-deletes (keyed by primary key)
+- Deletes for deletes and updates-as-deletes: on a v2 table, equality delete files (keyed by primary key); on v3, deletion vectors
 
-This keeps the write path fast. Query engines apply the equality deletes at read time. Over time, accumulated delete files increase read amplification — which is why [compaction](compaction.md) exists.
+This keeps the write path fast. Query engines apply the deletes at read time. Over time, accumulated deletes increase read amplification — which is why [compaction](compaction.md) exists.
+
+### Deletion vectors
+
+A v3 table gets deletion vectors, never new equality deletes: v3 added them to replace position delete files, and the spec for v4, still in development, forbids writing equality deletes. A deletion vector is a bitmap of the positions of a data file's deleted rows, which readers skip without matching keys. A table holds at most one for each data file, so a commit deleting more of a file's rows writes one with the old positions and the new, and removes the old. A commit's vectors are blobs in one Puffin file, committed in one snapshot with its data files.
+
+A vector names a file, so a commit fails if the table changed under it: another engine's rewrite removed a file it names, or the table was upgraded to v3 after the commit prepared equality deletes. The materializer then prepares the commit again from the log.
+
+A table upgraded from v2 keeps the equality deletes it has until compaction drops them.

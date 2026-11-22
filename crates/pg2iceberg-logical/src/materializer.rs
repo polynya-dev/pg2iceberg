@@ -37,15 +37,17 @@ use pg2iceberg_core::{
     is_snapshot_xid, Clock, ColumnName, ColumnSchema, IdGen, Lsn, Metrics, Namespace, NoopMetrics,
     Op, PgValue, Row, TableIdent, TableSchema, Timestamp,
 };
+use pg2iceberg_iceberg::deletion_vector::{read_deletion_vector, Positions, PuffinWriter};
 use pg2iceberg_iceberg::meta::{
     self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
 };
 use pg2iceberg_iceberg::reader::RowBatches;
 use pg2iceberg_iceberg::{
     apply_schema_changes, catch_up_from_catalog, fold_events, is_dropped_column,
-    promote_re_inserts, read_data_file, reconcile_columns, resolve_unchanged_cols, toast_files,
-    Catalog, DataFile, Deletes, FileIndex, IcebergError, LiveRows, LogRange, MaterializedRow,
-    PkKey, PreparedCommit, SchemaChange, TableMetadata, TableWriter, WriterError,
+    live_deletion_vectors, promote_re_inserts, read_data_file, reconcile_columns,
+    resolve_unchanged_cols, toast_files, Catalog, DataFile, Deletes, DeletionVector, FileIndex,
+    FormatVersion, IcebergError, LiveRows, LogRange, MaterializedRow, PkKey, PreparedCommit,
+    SchemaChange, TableMetadata, TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
@@ -120,6 +122,13 @@ pub enum MaterializerError {
     /// update never happened. Handled within a cycle, never returned.
     #[error("log already applied up to offset {end}")]
     AlreadyApplied { end: u64 },
+    /// A unit's commit conflicted with the table as it is now: upgraded to
+    /// v3 since the unit was prepared, or another commit removed files or
+    /// deletion vectors its vectors name — a rewrite. The unit is prepared
+    /// again, from the log, against the table as it is ([`Materializer::apply_table`]):
+    /// handled within a cycle, unless it keeps happening.
+    #[error("the table changed under the commit: {0}")]
+    TableChanged(String),
     /// The table's log starts past its cursor: entries it hasn't applied
     /// are gone ([`Materializer::log_continues`]).
     #[error(
@@ -138,7 +147,8 @@ pub type Result<T> = std::result::Result<T, MaterializerError>;
 #[async_trait]
 pub trait MaterializerNamer: Send + Sync {
     /// Generate a unique blob path for a materialized file. `kind`
-    /// is one of `"data"`, `"eq-delete"`, `"compact"`, `"meta"`,
+    /// is one of `"data"`, `"eq-delete"`, `"dv"` (a Puffin file of
+    /// deletion vectors: see [`file_extension`]), `"compact"`, `"meta"`,
     /// `"meta-marker"`. `partition_segment` is the Hive-style
     /// `col=val/col2=val2` path component for partitioned data /
     /// delete files; empty for unpartitioned tables and for
@@ -252,13 +262,23 @@ fn file_path(
 ) -> String {
     let dir = table_dir(base, table);
     let kind_dir = match kind {
-        "data" | "eq-delete" => "data",
+        "data" | "eq-delete" | "dv" => "data",
         other => other,
     };
+    let extension = file_extension(kind);
     if partition_segment.is_empty() {
-        format!("{dir}/{kind_dir}/{kind}-{id}.parquet")
+        format!("{dir}/{kind_dir}/{kind}-{id}.{extension}")
     } else {
-        format!("{dir}/{kind_dir}/{partition_segment}/{kind}-{id}.parquet")
+        format!("{dir}/{kind_dir}/{partition_segment}/{kind}-{id}.{extension}")
+    }
+}
+
+/// The extension of a materialized file of `kind`: a Puffin file of
+/// deletion vectors (`"dv"`), or Parquet.
+pub fn file_extension(kind: &str) -> &'static str {
+    match kind {
+        "dv" => "puffin",
+        _ => "parquet",
     }
 }
 
@@ -391,6 +411,9 @@ fn hive_escape(s: &str) -> String {
 
 struct TableEntry {
     schema: TableSchema,
+    /// The table's format version, as last read: how its deletes are
+    /// written — equality deletes on v2, deletion vectors on v3.
+    format_version: FormatVersion,
     pk_cols: Vec<ColumnName>,
     file_index: FileIndex,
     /// The table's snapshot `file_index` reflects (`None`: before its
@@ -469,8 +492,9 @@ const TRUNCATE_BATCH: usize = 1000;
 const STAGED_DELETES: usize = 8;
 /// Default most bytes a table's FileIndex holds
 /// ([`Materializer::with_pk_index_memory`]): pg2iceberg's, not a bare
-/// `Materializer`'s.
-pub const DEFAULT_PK_INDEX_MEMORY: usize = 512 << 20;
+/// `Materializer`'s. About 7 million keys: a key takes 25 bytes, and the
+/// map's table grows in powers of two, so 512 MiB holds half as many.
+pub const DEFAULT_PK_INDEX_MEMORY: usize = 576 << 20;
 
 /// The writers whose writes in flight a materializer records
 /// ([`Coordinator::begin_write`]): files it uploaded for a table and
@@ -518,6 +542,28 @@ struct Unit {
     /// Whether its steps' uploads are recorded as a write in flight
     /// ([`Materializer::unit_writer`]).
     writing: bool,
+    /// A v3 table's deletes: per data file its steps deleted rows of —
+    /// or looked for them in — its deletion vector to be.
+    vectors: BTreeMap<String, PendingVector>,
+}
+
+/// The deletion vector a unit writes for one data file: the positions of
+/// the file's vector as the unit first found it, and those it deleted.
+#[derive(Debug)]
+struct PendingVector {
+    /// The file's vector as the unit first found it, which this one
+    /// replaces.
+    replaces: Option<DeletionVector>,
+    positions: Positions,
+    partition_values: Vec<pg2iceberg_core::PartitionLiteral>,
+    /// Whether the unit deleted any rows of the file.
+    deletes: bool,
+}
+
+impl PendingVector {
+    fn delete(&mut self, position: u64) {
+        self.deletes |= self.positions.insert(position);
+    }
 }
 
 impl Unit {
@@ -531,6 +577,17 @@ impl Unit {
         self.max_lsn = self.max_lsn.max(other.max_lsn);
         self.max_source_ts_micros = self.max_source_ts_micros.max(other.max_source_ts_micros);
         self.writing |= other.writing;
+        for (file, theirs) in other.vectors {
+            match self.vectors.get_mut(&file) {
+                Some(ours) => {
+                    ours.positions.union_with(&theirs.positions);
+                    ours.deletes |= theirs.deletes;
+                }
+                None => {
+                    self.vectors.insert(file, theirs);
+                }
+            }
+        }
     }
 }
 
@@ -1126,6 +1183,8 @@ impl<C: Catalog> Materializer<C> {
                     ident: state.schema.ident.clone(),
                     data_files,
                     equality_deletes: Vec::new(),
+                    deletion_vectors: Vec::new(),
+                    removed_deletion_vectors: Vec::new(),
                 })
                 .await?;
         }
@@ -1148,15 +1207,18 @@ impl<C: Catalog> Materializer<C> {
         // of the source's *current* columns apply yet: the stream may
         // still replay transactions from before a change. Its Relation
         // messages, staged in the log, evolve the schema in order.
-        let schema = match self.catalog.load_table(&ident).await? {
+        let (schema, format_version) = match self.catalog.load_table(&ident).await? {
             None => {
-                self.catalog.create_table(&schema).await?;
-                schema
+                let meta = self.catalog.create_table(&schema).await?;
+                (schema, meta.format_version)
             }
-            Some(meta) => TableSchema {
-                columns: meta.schema.columns,
-                ..schema
-            },
+            Some(meta) => (
+                TableSchema {
+                    columns: meta.schema.columns,
+                    ..schema
+                },
+                meta.format_version,
+            ),
         };
         // Notify the blob store that the table now exists in the
         // catalog. Static-creds backends ignore this; the
@@ -1198,6 +1260,7 @@ impl<C: Catalog> Materializer<C> {
             ident,
             TableEntry {
                 schema,
+                format_version,
                 pk_cols,
                 file_index,
                 index_at,
@@ -1443,8 +1506,11 @@ impl<C: Catalog> Materializer<C> {
         };
         for path in files {
             let bytes = self.blob_store.get(&path).await?;
+            let mut position: u64 = 0;
             for batch in RowBatches::new(bytes, &schema.columns, self.batch_rows.max(1))? {
                 for mut row in batch? {
+                    let row_at = position;
+                    position += 1;
                     // A row deleted or updated since lives elsewhere, or
                     // nowhere.
                     let index = &self
@@ -1453,11 +1519,18 @@ impl<C: Catalog> Materializer<C> {
                         .expect("checked by caller")
                         .file_index;
                     let key = PkKey::from_row(&row, &pk_cols);
-                    let live = match index.lookup(&key) {
-                        Some(holding) => holding == path,
+                    let live = match index.locate(&key) {
+                        Some(holding) => holding == (path.as_str(), row_at as u32),
                         None => {
                             index.is_evicted(&path)
-                                && deletes.as_ref().is_some_and(|d| !d.hides(&path, &key))
+                                && deletes
+                                    .as_ref()
+                                    .is_some_and(|d| !d.hides(&path, row_at, &key))
+                                // Nor deleted by this unit's steps so far.
+                                && !unit
+                                    .vectors
+                                    .get(&path)
+                                    .is_some_and(|v| v.positions.contains(row_at))
                         }
                     };
                     if !live {
@@ -2065,6 +2138,7 @@ impl<C: Catalog> Materializer<C> {
         };
         let entry = TableEntry {
             schema: entry.schema.clone(),
+            format_version: entry.format_version,
             pk_cols: entry.pk_cols.clone(),
             file_index,
             index_at: entry.index_at,
@@ -2467,9 +2541,14 @@ impl<C: Catalog> Materializer<C> {
         }
         let outcome = match pass {
             Ok(None) => return Ok(None),
-            Ok(Some(prepared)) => {
+            Ok(Some(mut prepared)) => {
                 let committing = now_micros();
-                let committed = self.catalog.commit_compaction(prepared.commit).await;
+                let committed = match self.carry_deletes(&ident, &mut prepared).await {
+                    Ok(()) => self.catalog.commit_compaction(prepared.commit).await,
+                    Err(e) => Err(IcebergError::Other(format!(
+                        "carry rows deleted since the pass read them: {e}"
+                    ))),
+                };
                 // Its outputs are the table's now, or orphans.
                 end_write(self.coord.as_ref(), &ident, writer).await;
                 seconds += seconds_since(committing);
@@ -2486,6 +2565,98 @@ impl<C: Catalog> Materializer<C> {
         };
         self.compaction_done(&ident, started_micros, seconds, &unseen_deaths, outcome)
             .await
+    }
+
+    /// Carry the rows deleted from `pass`'s inputs since it read them — by
+    /// deletion vectors committed meanwhile, the materializer's own — over
+    /// to its outputs: deleted at the positions they moved to, by vectors
+    /// of the outputs, in a Puffin file of their own. Its commit removes
+    /// the inputs' vectors as they are now. Rewriting the inputs again
+    /// instead would lose to deletes landing on hot files every time.
+    async fn carry_deletes(
+        &self,
+        ident: &TableIdent,
+        pass: &mut pg2iceberg_iceberg::PreparedPass,
+    ) -> Result<()> {
+        if pass.outcome.rewritten_files.is_empty() {
+            return Ok(());
+        }
+        let snapshots = self.catalog.snapshots(ident).await?;
+        let live = live_deletion_vectors(&snapshots);
+        // Per input, by its place among them, the positions deleted since.
+        let mut since: BTreeMap<u32, Positions> = BTreeMap::new();
+        let mut removed = Vec::new();
+        for (i, input) in pass.outcome.rewritten_files.iter().enumerate() {
+            let now = live.get(input.as_str()).map(|(dv, _)| *dv);
+            let read = pass.read_vectors.get(input);
+            match (now, read) {
+                (Some(now), Some(read)) if now.key() == read.key() => removed.push(now.key()),
+                (None, None) => {}
+                // Gone since, rows undeleted: the commit fails on it.
+                (None, Some(read)) => removed.push(read.key()),
+                (Some(now), read) => {
+                    removed.push(now.key());
+                    let mut positions = read_deletion_vector(self.blob_store.as_ref(), now).await?;
+                    if let Some(read) = read {
+                        let before = read_deletion_vector(self.blob_store.as_ref(), read).await?;
+                        positions = positions.iter().filter(|p| !before.contains(*p)).collect();
+                    }
+                    since.insert(i as u32, positions);
+                }
+            }
+        }
+        pass.commit.removed_deletion_vectors = removed;
+        if since.is_empty() {
+            return Ok(());
+        }
+        // Where those rows went.
+        let mut carried: BTreeMap<usize, Positions> = BTreeMap::new();
+        for (j, f) in pass.outcome.added_files.iter().enumerate() {
+            let rows = f.pk_sources.iter().zip(&f.pk_positions);
+            for (at, (source, position)) in rows.enumerate() {
+                if since
+                    .get(source)
+                    .is_some_and(|p| p.contains(*position as u64))
+                {
+                    carried.entry(j).or_default().insert(at as u64);
+                }
+            }
+        }
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let mut puffin = PuffinWriter::new();
+        let places: Vec<(usize, u64, u64)> = carried
+            .iter()
+            .map(|(&j, positions)| {
+                let (offset, length) = puffin.add(&pass.outcome.added_files[j].path, positions);
+                (j, offset, length)
+            })
+            .collect();
+        let bytes = puffin.finish();
+        let byte_size = bytes.len() as u64;
+        // Under the pass's write in flight, as its outputs.
+        let path = self.namer.next_path(ident, "dv", "").await;
+        self.blob_store.put(&path, bytes).await?;
+        let vectors: Vec<DeletionVector> = places
+            .into_iter()
+            .map(|(j, offset, length)| {
+                let f = &pass.outcome.added_files[j];
+                DeletionVector {
+                    path: path.clone(),
+                    byte_size,
+                    offset,
+                    length,
+                    referenced_data_file: f.path.clone(),
+                    cardinality: carried[&j].len(),
+                    partition_values: f.partition_values.clone(),
+                    sequence_number: None,
+                }
+            })
+            .collect();
+        pass.commit.deletion_vectors = vectors.clone();
+        pass.outcome.vectors = vectors;
+        Ok(())
     }
 
     /// Account for a compaction pass that ran for `seconds`: its metrics,
@@ -2560,11 +2731,12 @@ impl<C: Catalog> Materializer<C> {
                     .max();
                 for f in &o.added_files {
                     let index = &entry_mut.file_index;
-                    let mut moved: Vec<PkKey> = Vec::new();
+                    // Each at its position in the output.
+                    let mut moved: Vec<(PkKey, u32)> = Vec::new();
                     let mut unseen: u64 = 0;
-                    for (k, &source) in f.pk_keys.iter().zip(&f.pk_sources) {
+                    for (at, (k, &source)) in f.pk_keys.iter().zip(&f.pk_sources).enumerate() {
                         match index.lookup(k) {
-                            Some(p) if rewritten.contains(p) => moved.push(k.clone()),
+                            Some(p) if rewritten.contains(p) => moved.push((k.clone(), at as u32)),
                             // Updated or deleted since.
                             Some(_) => {}
                             None if index.is_evicted(&o.rewritten_files[source as usize]) => {
@@ -2589,6 +2761,9 @@ impl<C: Catalog> Materializer<C> {
                             generation,
                         );
                     }
+                }
+                for dv in &o.vectors {
+                    entry_mut.file_index.set_deletion_vector(dv.clone());
                 }
                 for path in &o.rewritten_files {
                     entry_mut.file_index.remove_file(path);
@@ -2776,6 +2951,7 @@ impl<C: Catalog> Materializer<C> {
                 return Ok(folded);
             }
         }
+        let mut changed = 0;
         let folded = loop {
             match self.apply_changes(ident).await {
                 // Skip what landed, and apply what's past it.
@@ -2786,6 +2962,11 @@ impl<C: Catalog> Materializer<C> {
                     if let Some(entry) = self.tables.get_mut(ident) {
                         entry.cursor = end as i64;
                     }
+                }
+                // Its cursor stayed where the unit began: read it again.
+                Err(MaterializerError::TableChanged(why)) if changed < TABLE_CHANGED_RETRIES => {
+                    changed += 1;
+                    tracing::info!(table = %ident, %why, "preparing the commit again");
                 }
                 result => break result?,
             }
@@ -3005,13 +3186,32 @@ impl<C: Catalog> Materializer<C> {
             return Ok(());
         }
         unit.folded += folded.len();
+        // A v3 table's deletes are deletion vectors: where each row an
+        // update or delete replaces is — its file and position — before
+        // the index takes this step's rows.
+        let v3 = entry.format_version == FormatVersion::V3;
+        let replaced: Vec<PkKey> = match v3 {
+            true => folded
+                .iter()
+                .filter(|r| r.op != Op::Insert)
+                .map(|r| PkKey::from_row(&r.row, &entry.pk_cols))
+                .collect(),
+            false => Vec::new(),
+        };
+        if v3 {
+            self.delete_rows(ident, unit, &replaced).await?;
+        }
+        let entry = self.tables.get(ident).expect("checked above");
 
         // Prepare + upload. Output is one parquet file per (partition,
         // kind) — for unpartitioned tables that's a single file per kind.
         // The writer consults FileIndex for tier-2 resolution of
         // partition tuples on `Delete` rows whose row payload doesn't
         // carry the partition source columns.
-        let prepared_files = entry.writer.prepare(&folded, &entry.file_index)?;
+        let prepared_files = match v3 {
+            true => entry.writer.prepare_data(&folded, &entry.file_index)?,
+            false => entry.writer.prepare(&folded, &entry.file_index)?,
+        };
         let pk_field_ids = entry.writer.pk_field_ids();
 
         // Track per-data-file which PKs ended up where, so the FileIndex
@@ -3019,7 +3219,7 @@ impl<C: Catalog> Materializer<C> {
         let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared_files.data.len());
         let mut data_pk_groups: Vec<(String, Vec<PkKey>, Vec<pg2iceberg_core::PartitionLiteral>)> =
             Vec::with_capacity(prepared_files.data.len());
-        let mut deleted_pks: Vec<PkKey> = Vec::new();
+        let mut deleted_pks: Vec<PkKey> = replaced;
 
         // The step's files, uploaded together below.
         let mut uploads: Vec<(String, Bytes)> =
@@ -3089,6 +3289,8 @@ impl<C: Catalog> Materializer<C> {
             ident: ident.clone(),
             data_files,
             equality_deletes: delete_files,
+            deletion_vectors: Vec::new(),
+            removed_deletion_vectors: Vec::new(),
         });
         Ok(())
     }
@@ -3124,19 +3326,21 @@ impl<C: Catalog> Materializer<C> {
             None if !unit.direct => return Ok(0),
             end => end,
         };
+        let vectors = self.write_vectors(ident, &mut unit).await?;
         let files = || unit.steps.iter().flat_map(|s| s.data_files.iter());
         let data_files_count = files().count() as i32;
         let delete_files_count = unit
             .steps
             .iter()
-            .map(|s| s.equality_deletes.len())
+            .map(|s| s.equality_deletes.len() + s.deletion_vectors.len())
             .sum::<usize>() as i32;
         let bytes_written: i64 = unit
             .steps
             .iter()
             .flat_map(|s| s.data_files.iter().chain(s.equality_deletes.iter()))
             .map(|f| f.byte_size as i64)
-            .sum();
+            .sum::<i64>()
+            + vectors.first().map_or(0, |dv| dv.byte_size as i64);
 
         let span = tracing::Span::current();
         span.record("rows", unit.folded);
@@ -3145,11 +3349,7 @@ impl<C: Catalog> Materializer<C> {
         span.record("bytes", bytes_written);
 
         // The commit adds one snapshot per step: each has files.
-        let snapshots = unit
-            .steps
-            .iter()
-            .filter(|s| !s.data_files.is_empty() || !s.equality_deletes.is_empty())
-            .count() as i64;
+        let snapshots = unit.steps.iter().filter(|s| !s.is_empty()).count() as i64;
 
         let group = self.unit_group(&unit);
         let log_range = log_end.map(|end| LogRange {
@@ -3188,6 +3388,9 @@ impl<C: Catalog> Materializer<C> {
                     }
                     if meta.current_snapshot_id == expected {
                         entry.index_at = expected;
+                        for dv in vectors {
+                            entry.file_index.set_deletion_vector(dv);
+                        }
                     } else {
                         self.rebuild_file_index(ident).await?;
                     }
@@ -3204,7 +3407,7 @@ impl<C: Catalog> Materializer<C> {
                     // find out. (Rows read straight from Postgres record
                     // no log range to tell by: they're read again.)
                     let Some(end_offset) = log_end else {
-                        return Err(e.into());
+                        return Err(table_changed(e));
                     };
                     let applied = self
                         .catalog
@@ -3212,7 +3415,7 @@ impl<C: Catalog> Materializer<C> {
                         .await?
                         .and_then(|meta| meta.log_ends.get(&group).copied());
                     if applied.is_none_or(|end| end < end_offset) {
-                        return Err(e.into());
+                        return Err(table_changed(e));
                     }
                     tracing::warn!(error = %e, table = %ident, "commit reported failure but landed");
                     None
@@ -3316,6 +3519,205 @@ impl<C: Catalog> Materializer<C> {
         Ok(unit.folded)
     }
 
+    /// Record in `unit` the rows of a v3 table `keys` replace — updated or
+    /// deleted — at their files' positions. A key the index holds is where
+    /// it says. One it may hold in an evicted file is found by reading the
+    /// files that may hold it, newest first: its row is where no delete
+    /// holds its position. One it surely doesn't hold is nowhere: its row
+    /// is new.
+    async fn delete_rows(&self, ident: &TableIdent, unit: &mut Unit, keys: &[PkKey]) -> Result<()> {
+        let entry = self.tables.get(ident).expect("checked by caller");
+        let index = &entry.file_index;
+        let mut found: Vec<(String, u64)> = Vec::new();
+        let mut evicted: Vec<(&PkKey, Vec<String>)> = Vec::new();
+        for key in keys {
+            match index.locate(key) {
+                Some((path, at)) => found.push((path.to_string(), at as u64)),
+                None => {
+                    let files: Vec<String> = index
+                        .candidates(key)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                    if !files.is_empty() {
+                        evicted.push((key, files));
+                    }
+                }
+            }
+        }
+        let files: BTreeSet<String> = found
+            .iter()
+            .map(|(path, _)| path.clone())
+            .chain(evicted.iter().flat_map(|(_, files)| files.iter().cloned()))
+            .collect();
+        self.pend_vectors(ident, unit, files).await?;
+        for (path, at) in found {
+            unit.vectors
+                .get_mut(&path)
+                .expect("pended above")
+                .delete(at);
+        }
+        if evicted.is_empty() {
+            return Ok(());
+        }
+        // Where the keys looked for are in each file that may hold them.
+        let mut wanted: BTreeMap<&str, std::collections::HashSet<&PkKey>> = BTreeMap::new();
+        for (key, files) in &evicted {
+            for f in files {
+                wanted.entry(f.as_str()).or_default().insert(*key);
+            }
+        }
+        let entry = self.tables.get(ident).expect("checked by caller");
+        let pk_schema: Vec<ColumnSchema> = entry
+            .pk_cols
+            .iter()
+            .filter_map(|pk| entry.schema.columns.iter().find(|c| c.name == pk.0))
+            .cloned()
+            .collect();
+        let mut held: BTreeMap<(&str, &PkKey), Vec<u64>> = BTreeMap::new();
+        for (path, keys) in &wanted {
+            let bytes = self.blob_store.get(path).await?;
+            let mut at: u64 = 0;
+            for batch in RowBatches::new(bytes, &pk_schema, self.batch_rows.max(1))? {
+                for row in batch? {
+                    let key = PkKey::from_row(&row, &entry.pk_cols);
+                    if let Some(k) = keys.get(&key) {
+                        held.entry((*path, *k)).or_default().push(at);
+                    }
+                    at += 1;
+                }
+            }
+        }
+        for (key, files) in &evicted {
+            for f in files {
+                let vector = unit.vectors.get_mut(f).expect("pended above");
+                let live = held
+                    .get(&(f.as_str(), *key))
+                    .and_then(|at| at.iter().find(|at| !vector.positions.contains(**at)));
+                if let Some(&at) = live {
+                    vector.delete(at);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Start `unit`'s vector of each of `files` it has none of yet: the
+    /// file's live vector's positions, as the index knows it.
+    async fn pend_vectors(
+        &self,
+        ident: &TableIdent,
+        unit: &mut Unit,
+        files: BTreeSet<String>,
+    ) -> Result<()> {
+        let index = &self
+            .tables
+            .get(ident)
+            .expect("checked by caller")
+            .file_index;
+        let starts: Vec<(
+            String,
+            Option<DeletionVector>,
+            Vec<pg2iceberg_core::PartitionLiteral>,
+        )> = files
+            .into_iter()
+            .filter(|f| !unit.vectors.contains_key(f))
+            .map(|f| {
+                let replaces = index.deletion_vector(&f).cloned();
+                let partition_values = index.partition_values(&f).unwrap_or_default().to_vec();
+                (f, replaces, partition_values)
+            })
+            .collect();
+        let blob_store = self.blob_store.clone();
+        let started: Vec<(String, PendingVector)> = stream::iter(starts)
+            .map(|(file, replaces, partition_values)| {
+                let blob_store = blob_store.clone();
+                async move {
+                    let positions = match &replaces {
+                        Some(dv) => read_deletion_vector(blob_store.as_ref(), dv).await?,
+                        None => Positions::new(),
+                    };
+                    let vector = PendingVector {
+                        replaces,
+                        positions,
+                        partition_values,
+                        deletes: false,
+                    };
+                    Ok::<_, StreamError>((file, vector))
+                }
+            })
+            .buffered(READ_AHEAD)
+            .try_collect()
+            .await?;
+        unit.vectors.extend(started);
+        Ok(())
+    }
+
+    /// Write `unit`'s deletion vectors — of each data file it deleted rows
+    /// of: the positions its vector had, and those — in one Puffin file,
+    /// and put them on its snapshot, replacing the vectors they had. A v3
+    /// table's commit is one snapshot: its vectors apply to its own rows
+    /// too. Returns them.
+    async fn write_vectors(
+        &mut self,
+        ident: &TableIdent,
+        unit: &mut Unit,
+    ) -> Result<Vec<DeletionVector>> {
+        let pending: Vec<(String, PendingVector)> = std::mem::take(&mut unit.vectors)
+            .into_iter()
+            .filter(|(_, v)| v.deletes)
+            .collect();
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        if unit.steps.len() > 1 {
+            return Err(MaterializerError::Catalog(IcebergError::Other(format!(
+                "{ident}: deletion vectors for a commit of {} snapshots",
+                unit.steps.len()
+            ))));
+        }
+        let mut puffin = PuffinWriter::new();
+        let places: Vec<(u64, u64)> = pending
+            .iter()
+            .map(|(file, v)| puffin.add(file, &v.positions))
+            .collect();
+        let bytes = puffin.finish();
+        let byte_size = bytes.len() as u64;
+        let path = self.namer.next_path(ident, "dv", "").await;
+        // It stays unreferenced until the unit commits.
+        if !unit.writing {
+            let since_ms = now_ms(self.clock.as_deref());
+            self.coord
+                .begin_write(ident, Self::unit_writer(unit), since_ms)
+                .await?;
+            unit.writing = true;
+        }
+        self.blob_store.put(&path, bytes).await?;
+        let mut vectors = Vec::with_capacity(pending.len());
+        let mut replaced = Vec::new();
+        for ((file, v), (offset, length)) in pending.into_iter().zip(places) {
+            replaced.extend(v.replaces.as_ref().map(DeletionVector::key));
+            vectors.push(DeletionVector {
+                path: path.clone(),
+                byte_size,
+                offset,
+                length,
+                referenced_data_file: file,
+                cardinality: v.positions.len(),
+                partition_values: v.partition_values,
+                sequence_number: None,
+            });
+        }
+        if unit.steps.is_empty() {
+            unit.steps.push(PreparedCommit::empty(ident.clone()));
+        }
+        let step = unit.steps.last_mut().expect("one at least");
+        step.deletion_vectors = vectors.clone();
+        step.removed_deletion_vectors = replaced;
+        Ok(vectors)
+    }
+
     async fn rebuild_file_index(&mut self, ident: &TableIdent) -> Result<()> {
         let entry = self.tables.get_mut(ident).expect("checked by caller");
         entry.file_index = entry.file_index.cleared();
@@ -3333,6 +3735,9 @@ impl<C: Catalog> Materializer<C> {
         let current = meta.as_ref().and_then(|m| m.current_snapshot_id);
         if let Some(meta) = &meta {
             self.sync_schema(ident, &meta.schema);
+            // Upgraded by another engine, maybe.
+            let entry = self.tables.get_mut(ident).expect("checked by caller");
+            entry.format_version = meta.format_version;
         }
         let log_ends = meta.map(|m| m.log_ends).unwrap_or_default();
         let entry = self.tables.get(ident).expect("checked by caller");
@@ -3460,6 +3865,8 @@ impl<C: Catalog> Materializer<C> {
                 ident: meta.schema.ident.clone(),
                 data_files,
                 equality_deletes: Vec::new(),
+                deletion_vectors: Vec::new(),
+                removed_deletion_vectors: Vec::new(),
             })
             .await?;
         for m in &pending {
@@ -3501,6 +3908,21 @@ impl<C: Catalog> Materializer<C> {
             .into_iter()
             .map(|(path, bytes)| Ok((path, read_data_file(&bytes, &schema.columns)?)))
             .collect()
+    }
+}
+
+/// Most times a cycle prepares a table's commit again after it conflicts
+/// with the table ([`MaterializerError::TableChanged`]).
+const TABLE_CHANGED_RETRIES: usize = 3;
+
+/// `e`, a commit's failure: a conflict — the catalog's checks of the
+/// commit against the table as it is, which its transaction doesn't
+/// retry — says the table changed under it
+/// ([`MaterializerError::TableChanged`]).
+fn table_changed(e: IcebergError) -> MaterializerError {
+    match e {
+        IcebergError::Conflict(why) => MaterializerError::TableChanged(why),
+        e => e.into(),
     }
 }
 
@@ -3681,3 +4103,17 @@ pub use pg2iceberg_coord::LogEntry as MaterializerLogEntry;
 
 #[allow(dead_code)]
 fn _hint(_: LogEntry) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default budget holds about 7 million keys, as it did before
+    /// the index took each row's position: the map's table grows in
+    /// powers of two, so 4 bytes more a key can halve what a budget holds.
+    #[test]
+    fn the_default_index_budget_holds_7_million_keys() {
+        let capacity = FileIndex::with_memory(DEFAULT_PK_INDEX_MEMORY).key_capacity();
+        assert!(capacity >= 7_000_000, "{capacity}");
+    }
+}
