@@ -263,7 +263,8 @@ fn config_for_stack(stack: &Stack, table: &str, slot: &str, publication: &str) -
         },
         state: StateConfig {
             path: String::new(),
-            postgres_url: String::new(), // coord lives in source PG
+            postgres_url: String::new(),
+            database: String::new(), // the source's own
             coordinator_schema: format!("_pg2iceberg_{}", uniq()),
             group: "default".into(),
         },
@@ -447,7 +448,13 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         .expect("seed insert");
     }
 
-    let cfg = config_for_stack(&stack, &table, &slot, &publication);
+    // pg2iceberg's state, in another database on the source's server.
+    let state_db = format!("state_{}", uniq());
+    src.batch_execute(&format!("CREATE DATABASE {state_db}"))
+        .await
+        .expect("create the state's database");
+    let mut cfg = config_for_stack(&stack, &table, &slot, &publication);
+    cfg.state.database = state_db.clone();
 
     // Construct the lifecycle the same way the binary does. We build
     // two catalog handles against the same REST server: one is
@@ -540,16 +547,16 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         wait_for_iceberg(&assert_catalog, blob.as_ref(), &ident, &schema, &expected).await;
 
         // Then Postgres drops every connection pg2iceberg has to it — the
-        // stream's, the coordinator's, the slot monitor's — as a restart
-        // or failover would. It reconnects in-process: changes made after
-        // still arrive.
+        // stream's, the slot monitor's, and the coordinator's to the
+        // state's database — as a restart would. It reconnects
+        // in-process: changes made after still arrive.
         let terminated: i64 = src
             .query_one(
                 "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, 10000)) \
                  FROM pg_stat_activity \
-                 WHERE pid <> pg_backend_pid() AND datname = current_database() \
+                 WHERE pid <> pg_backend_pid() AND datname IN (current_database(), $1) \
                  AND backend_type IN ('client backend', 'walsender')",
-                &[],
+                &[&state_db],
             )
             .await
             .expect("terminate pg2iceberg's connections")
@@ -687,6 +694,26 @@ async fn lifecycle_inserts_propagate_pg_to_iceberg() {
         "a commit time in Unix seconds"
     );
     assert_eq!(metrics.phase(), Some(Phase::Stopping));
+
+    // The state is in its database, not the source's.
+    let coord_schema =
+        pg2iceberg_coord::schema::CoordSchema::sanitize(&cfg.state.coordinator_schema);
+    assert!(stack.pg_dsn.contains("dbname=postgres"));
+    let state_dsn = stack
+        .pg_dsn
+        .replace("dbname=postgres", &format!("dbname={state_db}"));
+    for (dsn, holds) in [(&state_dsn, true), (&stack.pg_dsn, false)] {
+        let has_schema: bool = regular_client(dsn)
+            .await
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)",
+                &[&coord_schema.as_str()],
+            )
+            .await
+            .expect("look for the coordinator's schema")
+            .get(0);
+        assert_eq!(has_schema, holds, "{dsn}");
+    }
 }
 
 /// Poll Iceberg until the table reads `expected` (id → balance), or

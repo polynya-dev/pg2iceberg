@@ -675,10 +675,16 @@ pub struct StateConfig {
     /// Rust prod path — leave empty.
     #[serde(default)]
     pub path: String,
-    /// Postgres URL for the coordinator. If absent, the source PG
-    /// hosts the `_pg2iceberg.*` schema.
+    /// Retired: the state lives on the source's Postgres server (see
+    /// [`Self::database`]). Set, the config fails to load.
     #[serde(default)]
     pub postgres_url: String,
+    /// The database on the source's Postgres server that holds
+    /// pg2iceberg's state (`coordinator_schema`); empty: the source's own.
+    /// Only the database can differ: on the source's server, the state
+    /// shares the source's WAL, and fails over with it.
+    #[serde(default)]
+    pub database: String,
     #[serde(default = "default_coord_schema")]
     pub coordinator_schema: String,
     /// Materialization group name (consumer / mat_cursor key): the
@@ -694,6 +700,7 @@ impl Default for StateConfig {
         Self {
             path: String::new(),
             postgres_url: String::new(),
+            database: String::new(),
             coordinator_schema: default_coord_schema(),
             group: default_group(),
         }
@@ -701,6 +708,19 @@ impl Default for StateConfig {
 }
 
 impl StateConfig {
+    /// The state lives on the source's server: a connection string of
+    /// its own would put it elsewhere.
+    pub fn validate_location(&self) -> Result<()> {
+        if !self.postgres_url.is_empty() {
+            anyhow::bail!(
+                "state.postgres_url is no longer supported: pg2iceberg keeps its state on the \
+                 source's Postgres server, which a failover takes along with the source. Remove \
+                 it; to keep the state in another database on that server, set state.database"
+            );
+        }
+        Ok(())
+    }
+
     /// A group names its cursors `group` and `group#…`: `#` would make one
     /// group's cursors look like another's.
     pub fn validate_group(&self) -> Result<()> {
@@ -769,6 +789,7 @@ impl Config {
         self.sink.validate_compaction()?;
         self.sink.validate_materializer()?;
         self.source.logical.validate_snapshot()?;
+        self.state.validate_location()?;
         self.state.validate_group()?;
         self.metrics_addr()?;
         self.liveness_timeout()?;
@@ -840,7 +861,7 @@ impl Config {
     /// | `POSTGRES_URL` | `source.postgres_url` |
     /// | `PG2ICEBERG_TABLES` | `tables`: comma-separated `schema.table` or `schema.*` |
     /// | `PG2ICEBERG_SLOT` / `PG2ICEBERG_PUBLICATION` | `source.logical.slot_name` / `publication_name` |
-    /// | `PG2ICEBERG_STATE_URL` | `state.postgres_url` |
+    /// | `PG2ICEBERG_STATE_DATABASE` | `state.database` |
     /// | `ICEBERG_CATALOG_URL` | `sink.catalog_uri` |
     /// | `ICEBERG_CATALOG_AUTH` | `sink.catalog_auth` |
     /// | `ICEBERG_CATALOG_TOKEN` | `sink.catalog_token` |
@@ -870,7 +891,15 @@ impl Config {
             &mut self.source.logical.publication_name,
             "PG2ICEBERG_PUBLICATION",
         );
-        set(&mut self.state.postgres_url, "PG2ICEBERG_STATE_URL");
+        set(&mut self.state.database, "PG2ICEBERG_STATE_DATABASE");
+        if env("PG2ICEBERG_STATE_URL").is_some() {
+            anyhow::bail!(
+                "PG2ICEBERG_STATE_URL is no longer supported: pg2iceberg keeps its state on the \
+                 source's Postgres server, which a failover takes along with the source. Unset \
+                 it; to keep the state in another database on that server, set \
+                 PG2ICEBERG_STATE_DATABASE"
+            );
+        }
         set(&mut self.sink.catalog_uri, "ICEBERG_CATALOG_URL");
         set(&mut self.sink.catalog_auth, "ICEBERG_CATALOG_AUTH");
         set(&mut self.sink.catalog_token, "ICEBERG_CATALOG_TOKEN");
@@ -1000,14 +1029,10 @@ impl Config {
         }
     }
 
-    /// Connection string for the coordinator. Defaults to the source
-    /// PG when `state.postgres_url` is unset.
+    /// Connection string for the coordinator: the source's, in
+    /// `state.database` if set.
     pub fn coord_dsn(&self) -> String {
-        if !self.state.postgres_url.is_empty() {
-            self.state.postgres_url.clone()
-        } else {
-            self.source.postgres.dsn()
-        }
+        with_dbname(&self.source.postgres.dsn(), &self.state.database)
     }
 
     /// Bag of REST catalog props derived from sink config. Keys we
@@ -1296,6 +1321,34 @@ fn parse_pg_type(name: &str) -> Result<PgType> {
         "oid" => PgType::Oid,
         _ => anyhow::bail!("unknown pg_type: {name}"),
     })
+}
+
+/// `dsn`, a connection string as a URL or as libpq `key=value` pairs, in
+/// database `dbname` (unchanged if empty): appended, so it wins over one
+/// `dsn` names.
+fn with_dbname(dsn: &str, dbname: &str) -> String {
+    if dbname.is_empty() {
+        return dsn.to_string();
+    }
+    let url = ["postgres://", "postgresql://"]
+        .iter()
+        .any(|scheme| dsn.starts_with(scheme));
+    if url {
+        let encoded: String = dbname
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        format!("{dsn}{separator}dbname={encoded}")
+    } else {
+        let quoted = dbname.replace('\\', "\\\\").replace('\'', "\\'");
+        format!("{dsn} dbname='{quoted}'")
+    }
 }
 
 /// Suppress unused-import warning when `IcebergType` is exported but
@@ -1749,6 +1802,83 @@ sink:
                 .to_string();
             assert!(err.contains("format"), "{bad}: {err}");
         }
+    }
+
+    /// The state lives on the source's server, in the source's database
+    /// or the one `state.database` names: the coordinator connects as
+    /// the source does, to that database.
+    #[test]
+    fn the_state_lives_on_the_sources_server() {
+        fn parsed(dsn: &str) -> tokio_postgres::Config {
+            dsn.parse().unwrap_or_else(|e| panic!("{dsn}: {e}"))
+        }
+        let same_server = |source: &tokio_postgres::Config, coord: &tokio_postgres::Config| {
+            assert_eq!(source.get_hosts(), coord.get_hosts());
+            assert_eq!(source.get_ports(), coord.get_ports());
+            assert_eq!(source.get_user(), coord.get_user());
+            assert_eq!(source.get_password(), coord.get_password());
+            assert_eq!(source.get_ssl_mode(), coord.get_ssl_mode());
+        };
+        for url in [
+            "postgres://u:p@db.example.com:6543/app",
+            "postgresql://u:p@db.example.com:6543/app?sslmode=require",
+            "host=db.example.com port=6543 user=u password=p dbname=app",
+        ] {
+            let env = vars(&[("POSTGRES_URL", url)]);
+            let cfg = Config::from_env(&env).unwrap();
+            assert_eq!(cfg.coord_dsn(), url, "the source's own database");
+
+            let env = vars(&[
+                ("POSTGRES_URL", url),
+                ("PG2ICEBERG_STATE_DATABASE", "pg 'state'"),
+            ]);
+            let cfg = Config::from_env(&env).unwrap();
+            let (source, coord) = (parsed(url), parsed(&cfg.coord_dsn()));
+            same_server(&source, &coord);
+            assert_eq!(
+                coord.get_dbname(),
+                Some("pg 'state'"),
+                "{}",
+                cfg.coord_dsn()
+            );
+        }
+        // From the fields, and the file.
+        let yaml = INTERVALS.replace(
+            "    user: u\n",
+            "    user: u\nstate:\n  database: pg2iceberg\n",
+        );
+        let env = vars(&[]);
+        let cfg = Config::parse(&yaml, &env).unwrap().finish(&env).unwrap();
+        let (source, coord) = (parsed(&cfg.source.postgres.dsn()), parsed(&cfg.coord_dsn()));
+        same_server(&source, &coord);
+        assert_eq!(coord.get_dbname(), Some("pg2iceberg"));
+    }
+
+    /// A connection string for the state, which could put it on another
+    /// server, fails the config load, from the file or the environment.
+    #[test]
+    fn a_connection_string_for_the_state_is_refused() {
+        let yaml = INTERVALS.replace(
+            "    user: u\n",
+            "    user: u\nstate:\n  postgres_url: postgres://u@elsewhere/state\n",
+        );
+        let env = vars(&[]);
+        let err = Config::parse(&yaml, &env)
+            .unwrap()
+            .finish(&env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("state.postgres_url") && err.contains("state.database"),
+            "{err}"
+        );
+        let err = Config::from_env(&vars(&[(
+            "PG2ICEBERG_STATE_URL",
+            "postgres://u@elsewhere/s",
+        )]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("PG2ICEBERG_STATE_DATABASE"), "{err}");
     }
 
     /// pg2iceberg maintains the tables unless told the catalog does; a

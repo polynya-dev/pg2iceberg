@@ -143,9 +143,9 @@ sink:
   #   "header.X-Custom-Header": "value"
 
 state:
-  # Optional dedicated PG for the _pg2iceberg.* coordinator schema.
-  # If absent, the source PG hosts it (matches Go).
-  # postgres_url: postgres://coord_user:secret@coord-db.example.com/coord?sslmode=require
+  # The database on the source's Postgres server that holds the
+  # _pg2iceberg.* coordinator schema; default: the source's own.
+  # database: pg2iceberg
   coordinator_schema: _pg2iceberg
   # group: default
 
