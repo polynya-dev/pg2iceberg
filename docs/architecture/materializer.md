@@ -53,7 +53,7 @@ A catalog that maintains the tables itself (`sink.maintenance: managed`) commits
 For each table, the materializer keeps a map from each live row's primary key to the data file holding it and the row's position there, built from the table's data files at startup and updated with every commit. Another process's commits — a `compact` job, the catalog maintaining the table — it replays from the snapshot it last saw. Once that snapshot is expired it rebuilds the map from the live files instead: the catalog forgets an expired snapshot's files, and with them what the snapshot after it removed. It uses the map to:
 
 - turn an insert of a key the table already holds into an update, whose delete hides the old row;
-- find, on a v3 table, the file and position of each row an update or delete replaces, for its [deletion vector](#deletion-vectors);
+- find, on a v3 table, the file and position of each row an update or delete replaces, for its [deletion vector](#deletion-vectors), and the row id an update keeps ([row lineage](#row-lineage));
 - find the values an update leaves out — unchanged TOAST columns, which Postgres doesn't send — in the old row's file ([TOAST](toast.md));
 - place an equality delete in the partition of the row it deletes, on a partitioned table;
 - expand a `TRUNCATE` into a delete of each key, and fill a column added with a default into the rows that predate it;
@@ -61,7 +61,7 @@ For each table, the materializer keeps a map from each live row's primary key to
 
 A key a row makes the map a table's worth of keys: `sink.pk_index_memory` (576 MiB by default) bounds it for each table. Within the budget — about 7 million keys at 576 MiB — the map holds every key, in about 25 bytes each. Past it, the oldest files' keys are evicted, into a Bloom filter that tells a key that may be theirs from one that surely isn't, and each evicted file keeps the range of its keys and a count of its live rows that's never too high. The filter grows a layer at a time, each knowing the range of its keys, and a key is looked for only in those whose range holds it: files are evicted oldest first, mostly a range of keys at a time. The cost falls on the rows of evicted files:
 
-- an insert of a key the filter may hold writes an equality delete, which deletes nothing if the key wasn't there; on a v3 table, it reads the evicted files whose range holds the key instead, as does an update or delete of one, to find the row's position;
+- an insert of a key the filter may hold writes an equality delete, which deletes nothing if the key wasn't there; on a v3 table, it reads the evicted files whose range holds the key instead, as does an update or delete of one, to find the row's position and id;
 - an update leaving TOAST columns out reads the evicted files whose range holds its key, to find the old row;
 - a delete on a partitioned v2 table goes to each partition such a file is in;
 - a `TRUNCATE`, or a column added with a default, reads those files;
@@ -85,3 +85,9 @@ A v3 table gets deletion vectors, never new equality deletes: v3 added them to r
 A vector names a file, so a commit fails if the table changed under it: another engine's rewrite removed a file it names, or the table was upgraded to v3 after the commit prepared equality deletes. The materializer then prepares the commit again from the log.
 
 A table upgraded from v2 keeps the equality deletes it has until compaction drops them.
+
+### Row lineage
+
+A v3 table gives every row a `_row_id` and the sequence number of the commit that last changed it, `_last_updated_sequence_number`, which engines use to read the table incrementally. An update keeps the row's id, as the spec has a writer that modifies a row do: the materializer finds the row it replaces, for its deletion vector, and writes the new row with that row's id — stored in the new data file, which stores ids only for such rows — and without a sequence number, so the row takes its commit's. An update changing the primary key keeps the id too: the row moves to its new key. A row deleted and inserted again, in one commit or across several, or after a `TRUNCATE`, is a new row, with a new id.
+
+A row's id is the one its data file stores, else the file's first row id — which the catalog assigns as it commits the file — plus the row's position in it. The file index holds both for the files whose keys it holds: the ids a file stores, taken in as it takes in the file (each run of consecutive ids a key's worth of its budget), and the first row ids its commits assign, as each commit's snapshot reports them. Of an evicted file, both are read with the row's position. A file's first row id the commit didn't report — a table's first commit since its upgrade to v3 gives one to every file it held without — is read from the table's history, when an update needs it.

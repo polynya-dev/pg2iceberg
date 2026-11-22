@@ -67,6 +67,8 @@ impl MemTable {
     /// `record_count` of them, in order. Every commit does: its manifest
     /// list assigns ids to each manifest it names that has none. A v2
     /// table has no row lineage.
+    /// The snapshot's row range ([`TableMetadata::row_range`]) is the ids
+    /// it gave out.
     fn assign_row_ids(&mut self, files: &mut [DataFile]) {
         if self.format_version != FormatVersion::V3 {
             return;
@@ -77,10 +79,15 @@ impl MemTable {
             .iter_mut()
             .flat_map(|s| s.data_files.iter_mut())
             .filter(|f| f.first_row_id.is_none() && live.contains(&f.path));
+        let first_row_id = self.next_row_id;
         for f in earlier.chain(files.iter_mut()) {
             f.first_row_id = Some(self.next_row_id);
             self.next_row_id += f.record_count as i64;
         }
+        self.metadata.row_range = Some(pg2iceberg_iceberg::RowRange {
+            first_row_id,
+            rows: (self.next_row_id - first_row_id) as u64,
+        });
     }
 
     /// Record snapshot `id`, just committed: it carries the table's log
@@ -543,6 +550,7 @@ impl Catalog for MemoryCatalog {
             log_ends: BTreeMap::new(),
             properties: BTreeMap::new(),
             format_version: self.format_version,
+            row_range: None,
         };
         s.tables.insert(
             ident,

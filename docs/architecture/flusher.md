@@ -21,7 +21,7 @@ For each transaction, the flusher:
     | `_xid` | `int64` | PostgreSQL transaction ID |
     | `_unchanged_cols` | `string` | Comma-separated unresolved TOAST columns |
     | `_data` | `binary` | The row's columns, binary-encoded |
-    | `_moved_from` | `binary` | An update's old key, when it changed the key with TOAST columns unchanged |
+    | `_moved_from` | `binary` | An update's old key, when it changed the key: where unchanged TOAST columns resolve from, and the row whose id it keeps |
 
     The staging schema is fixed regardless of the source table structure. Schema evolution only affects the materialized Iceberg table, not the staged files. A row's columns are numbered into the column names its file lists once, in its key-value metadata, beside the format's version: a version of pg2iceberg reads only files of its own format, so materialize what's staged before upgrading across a change of it.
 

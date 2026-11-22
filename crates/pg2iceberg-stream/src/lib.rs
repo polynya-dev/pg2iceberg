@@ -58,8 +58,9 @@ pub struct MatEvent {
     pub xid: Option<u32>,
     pub unchanged_cols: Vec<ColumnName>,
     pub row: Row,
-    /// For an `Update` that moved its row from another key with TOAST
-    /// columns unchanged: the old key, whose row holds their values.
+    /// For an `Update` that moved its row from another key: the old key,
+    /// whose row holds the values of its unchanged TOAST columns, and the
+    /// id the row keeps (row lineage).
     pub moved_from: Option<Row>,
 }
 

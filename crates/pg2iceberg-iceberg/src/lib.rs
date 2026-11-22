@@ -21,8 +21,8 @@ pub use compact::{
     compact_table, prepare_pass, retire_deletes, CompactError, CompactedFile, CompactionConfig,
     CompactionOutcome, Deletes, LiveRows, PreparedPass,
 };
-pub use file_index::{catch_up_from_catalog, rebuild_from_catalog, FileIndex};
-pub use fold::{fold_events, pk_key, MaterializedRow};
+pub use file_index::{catch_up_from_catalog, rebuild_from_catalog, FileIndex, RowId, StoredRowIds};
+pub use fold::{fold_events, fold_events_with_sources, pk_key, MaterializedRow};
 pub use materialize::{promote_re_inserts, resolve_unchanged_cols, toast_files};
 pub use orphan::{cleanup_orphans, CleanupError, CleanupOutcome};
 pub use pk::PkKey;
@@ -80,6 +80,21 @@ pub struct TableMetadata {
     /// equality deletes on v2, deletion vectors on v3.
     #[serde(default)]
     pub format_version: FormatVersion,
+    /// On a v3 table, the row ids its current snapshot assigned.
+    #[serde(default)]
+    pub row_range: Option<RowRange>,
+}
+
+/// The row ids a v3 table's snapshot assigned: `rows` of them, from
+/// `first_row_id` on — to the rows of each data file it added and of
+/// each it holds that had none yet (a table's first commit since its
+/// upgrade). When `rows` is just its added data files' rows, those took
+/// them in the order the commit listed the files, each the next
+/// `record_count`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowRange {
+    pub first_row_id: i64,
+    pub rows: u64,
 }
 
 /// The change-log range a materializer commit applied for one cursor
@@ -300,6 +315,28 @@ pub const ROW_ID_FIELD_ID: i32 = 2147483540;
 /// The field id the spec reserves for row lineage's
 /// `_last_updated_sequence_number`.
 pub const LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID: i32 = 2147483539;
+
+/// The `_row_id` column, to read a data file's stored row ids with rows
+/// of the table's columns ([`reader::RowBatches`]): under a name no
+/// Postgres column has — Postgres names hold no NUL — so it's apart from
+/// them in a row. A file that stores none reads it as NULL.
+pub fn row_id_column() -> pg2iceberg_core::ColumnSchema {
+    pg2iceberg_core::ColumnSchema {
+        name: "\0_row_id".into(),
+        field_id: ROW_ID_FIELD_ID,
+        ty: pg2iceberg_core::IcebergType::Long,
+        nullable: true,
+        is_primary_key: false,
+    }
+}
+
+/// The row id a row read with [`row_id_column`] stores, if any.
+pub fn stored_row_id(row: &pg2iceberg_core::Row) -> Option<i64> {
+    match row.get(&pg2iceberg_core::ColumnName(row_id_column().name)) {
+        Some(pg2iceberg_core::PgValue::Int8(id)) => Some(*id),
+        _ => None,
+    }
+}
 
 /// Built by [`crate::compact::compact_table`] and consumed by
 /// [`Catalog::commit_compaction`]. Produces an `Operation::Replace`

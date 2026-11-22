@@ -79,7 +79,7 @@ use crate::reader::{value_at, ArrowBatches};
 use crate::writer::{StreamingDataFile, TableWriter, WriterError};
 use crate::{
     Catalog, DataFile, DeletionVector, FileIndex, IcebergError, PkKey, PreparedCompaction,
-    Snapshot, LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID, ROW_ID_FIELD_ID,
+    Snapshot, StoredRowIds, LAST_UPDATED_SEQUENCE_NUMBER_FIELD_ID, ROW_ID_FIELD_ID,
 };
 use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch};
 use arrow_select::filter::filter_record_batch;
@@ -203,6 +203,9 @@ pub struct CompactedFile {
     /// `pk_keys`.
     pub pk_positions: Vec<u32>,
     pub partition_values: Vec<PartitionLiteral>,
+    /// The row ids it stores, by position in it: on a v3 table, every
+    /// row's it moved.
+    pub row_ids: StoredRowIds,
 }
 
 /// What the caller's PK → file index knows of a table's rows: each data
@@ -584,6 +587,7 @@ where
                     &survivors.slice(start, len),
                     survivor_keys.by_ref().take(len),
                     source,
+                    lineage,
                 )?;
                 if out.open_size() >= config.target_size_bytes {
                     out.close(&mut io, &path_for_chunk, ident).await?;
@@ -612,7 +616,8 @@ where
         .iter()
         .zip(std::mem::take(&mut out.added_pks))
         .zip(std::mem::take(&mut out.added_sources))
-        .map(|((f, rows), pk_sources)| {
+        .zip(std::mem::take(&mut out.added_row_ids))
+        .map(|(((f, rows), pk_sources), row_ids)| {
             let (pk_keys, pk_positions) = rows.into_iter().unzip();
             CompactedFile {
                 path: f.path.clone(),
@@ -620,6 +625,7 @@ where
                 pk_sources,
                 pk_positions,
                 partition_values: f.partition_values.clone(),
+                row_ids,
             }
         })
         .collect();
@@ -713,17 +719,22 @@ struct OutputFiles {
     open_pks: Vec<(PkKey, u32)>,
     /// The input each of `open_pks` came from.
     open_sources: Vec<u32>,
+    /// The row ids the open file stores.
+    open_row_ids: StoredRowIds,
     added: Vec<DataFile>,
     /// PK keys of each added file, with their positions in their inputs,
     /// parallel to `added`.
     added_pks: Vec<Vec<(PkKey, u32)>>,
     /// Their inputs, parallel to `added_pks`.
     added_sources: Vec<Vec<u32>>,
+    /// The row ids each added file stores, parallel to `added`.
+    added_row_ids: Vec<StoredRowIds>,
 }
 
 impl OutputFiles {
     /// Append rows of partition `tuple`, whose keys are `keys`, from input
-    /// `source`; the caller closes any open file of another tuple first.
+    /// `source` — with their row lineage, its last two columns, if
+    /// `lineage`; the caller closes any open file of another tuple first.
     fn write(
         &mut self,
         writer: &TableWriter,
@@ -731,12 +742,27 @@ impl OutputFiles {
         rows: &RecordBatch,
         keys: impl Iterator<Item = (PkKey, u32)>,
         source: u32,
+        lineage: bool,
     ) -> Result<()> {
         if self.open.is_none() {
             self.open = Some((tuple.to_vec(), writer.start_data_file()?));
         }
         let (_, file) = self.open.as_mut().expect("opened above");
+        let first = file.record_count();
         file.write_batch(rows)?;
+        if lineage {
+            let ids = rows
+                .column(rows.num_columns() - 2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| WriterError::Encode("row lineage column isn't a long".into()))?;
+            for i in 0..rows.num_rows() {
+                if !ids.is_null(i) {
+                    let at = crate::file_index::position_of(first + i as u64);
+                    self.open_row_ids.push(at, ids.value(i));
+                }
+            }
+        }
         let before = self.open_pks.len();
         self.open_pks.extend(keys);
         let added = self.open_pks.len() - before;
@@ -768,6 +794,7 @@ impl OutputFiles {
         };
         let pks = std::mem::take(&mut self.open_pks);
         let sources = std::mem::take(&mut self.open_sources);
+        let row_ids = std::mem::take(&mut self.open_row_ids);
         if file.record_count() == 0 {
             return Ok(());
         }
@@ -786,6 +813,7 @@ impl OutputFiles {
         });
         self.added_pks.push(pks);
         self.added_sources.push(sources);
+        self.added_row_ids.push(row_ids);
         Ok(())
     }
 }

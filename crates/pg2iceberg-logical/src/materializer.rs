@@ -43,15 +43,16 @@ use pg2iceberg_iceberg::meta::{
 };
 use pg2iceberg_iceberg::reader::RowBatches;
 use pg2iceberg_iceberg::{
-    apply_schema_changes, catch_up_from_catalog, fold_events, is_dropped_column,
+    apply_schema_changes, catch_up_from_catalog, fold_events_with_sources, is_dropped_column,
     live_deletion_vectors, promote_re_inserts, read_data_file, reconcile_columns,
-    resolve_unchanged_cols, toast_files, Catalog, DataFile, Deletes, DeletionVector, FileIndex,
-    FormatVersion, IcebergError, LiveRows, LogRange, MaterializedRow, PkKey, PreparedCommit,
-    SchemaChange, TableMetadata, TableWriter, WriterError,
+    resolve_unchanged_cols, row_id_column, stored_row_id, toast_files, Catalog, DataFile, Deletes,
+    DeletionVector, FileIndex, FormatVersion, IcebergError, LiveRows, LogRange, MaterializedRow,
+    PkKey, PreparedCommit, RowId, SchemaChange, StoredRowIds, TableMetadata, TableWriter,
+    WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
@@ -545,6 +546,15 @@ struct Unit {
     /// A v3 table's deletes: per data file its steps deleted rows of —
     /// or looked for them in — its deletion vector to be.
     vectors: BTreeMap<String, PendingVector>,
+}
+
+/// Where a row of a v3 table an update or delete replaces was: its file
+/// and position there — and, if it was found by reading its file (its key
+/// evicted from the index), the row id the file stores for it, if any.
+struct Replaced {
+    path: String,
+    position: u64,
+    read: Option<Option<i64>>,
 }
 
 /// The deletion vector a unit writes for one data file: the positions of
@@ -2752,6 +2762,9 @@ impl<C: Catalog> Materializer<C> {
                         f.partition_values.clone(),
                         generation,
                     );
+                    entry_mut
+                        .file_index
+                        .store_row_ids(&f.path, f.row_ids.clone());
                     if unseen > 0 {
                         entry_mut.file_index.add_unseen(
                             f.path.clone(),
@@ -3172,7 +3185,7 @@ impl<C: Catalog> Materializer<C> {
 
         // Fold + TOAST + re-insert. Pre-fetch any prior data files needed
         // for TOAST resolution; that's cheap when no UPDATE has unchanged_cols.
-        let mut folded = fold_events(events, &entry.pk_cols);
+        let (mut folded, sources) = fold_events_with_sources(events, &entry.pk_cols);
         let prior_paths = collect_toast_paths(&folded, &entry.file_index, &entry.pk_cols);
         let prior_rows_by_path = self.fetch_prior_rows(&prior_paths, &entry.schema).await?;
         resolve_unchanged_cols(
@@ -3188,7 +3201,8 @@ impl<C: Catalog> Materializer<C> {
         unit.folded += folded.len();
         // A v3 table's deletes are deletion vectors: where each row an
         // update or delete replaces is — its file and position — before
-        // the index takes this step's rows.
+        // the index takes this step's rows. A row continuing one keeps
+        // its id (row lineage).
         let v3 = entry.format_version == FormatVersion::V3;
         let replaced: Vec<PkKey> = match v3 {
             true => folded
@@ -3198,8 +3212,20 @@ impl<C: Catalog> Materializer<C> {
                 .collect(),
             false => Vec::new(),
         };
+        let mut row_ids = HashMap::new();
         if v3 {
-            self.delete_rows(ident, unit, &replaced).await?;
+            let found = self.delete_rows(ident, unit, &replaced).await?;
+            let entry = self.tables.get(ident).expect("checked above");
+            let continued: Vec<(PkKey, &Replaced)> = folded
+                .iter()
+                .zip(&sources)
+                .filter(|(r, _)| r.op != Op::Delete)
+                .filter_map(|(r, source)| {
+                    let at = found.get(source.as_ref()?)?;
+                    Some((PkKey::from_row(&r.row, &entry.pk_cols), at))
+                })
+                .collect();
+            row_ids = self.row_ids(ident, unit, continued).await?;
         }
         let entry = self.tables.get(ident).expect("checked above");
 
@@ -3209,7 +3235,9 @@ impl<C: Catalog> Materializer<C> {
         // partition tuples on `Delete` rows whose row payload doesn't
         // carry the partition source columns.
         let prepared_files = match v3 {
-            true => entry.writer.prepare_data(&folded, &entry.file_index)?,
+            true => entry
+                .writer
+                .prepare_data(&folded, &entry.file_index, &row_ids)?,
             false => entry.writer.prepare(&folded, &entry.file_index)?,
         };
         let pk_field_ids = entry.writer.pk_field_ids();
@@ -3217,8 +3245,13 @@ impl<C: Catalog> Materializer<C> {
         // Track per-data-file which PKs ended up where, so the FileIndex
         // update below points at the right partition file.
         let mut data_files: Vec<DataFile> = Vec::with_capacity(prepared_files.data.len());
-        let mut data_pk_groups: Vec<(String, Vec<PkKey>, Vec<pg2iceberg_core::PartitionLiteral>)> =
-            Vec::with_capacity(prepared_files.data.len());
+        #[allow(clippy::type_complexity)]
+        let mut data_pk_groups: Vec<(
+            String,
+            Vec<PkKey>,
+            Vec<pg2iceberg_core::PartitionLiteral>,
+            StoredRowIds,
+        )> = Vec::with_capacity(prepared_files.data.len());
         let mut deleted_pks: Vec<PkKey> = replaced;
 
         // The step's files, uploaded together below.
@@ -3239,7 +3272,7 @@ impl<C: Catalog> Materializer<C> {
                 sequence_number: None,
                 first_row_id: None,
             });
-            data_pk_groups.push((path, chunk.pk_keys, chunk.partition_values));
+            data_pk_groups.push((path, chunk.pk_keys, chunk.partition_values, chunk.row_ids));
         }
 
         let mut delete_files: Vec<DataFile> =
@@ -3282,8 +3315,11 @@ impl<C: Catalog> Materializer<C> {
         let entry_mut = self.tables.get_mut(ident).expect("checked above");
         // Removed PKs first (so a later add for the same PK overrides cleanly).
         entry_mut.file_index.remove_pks(&deleted_pks);
-        for (path, pks, partition_values) in data_pk_groups {
-            entry_mut.file_index.add_file(path, pks, partition_values);
+        for (path, pks, partition_values, row_ids) in data_pk_groups {
+            entry_mut
+                .file_index
+                .add_file(path.clone(), pks, partition_values);
+            entry_mut.file_index.store_row_ids(&path, row_ids);
         }
         unit.steps.push(PreparedCommit {
             ident: ident.clone(),
@@ -3358,6 +3394,15 @@ impl<C: Catalog> Materializer<C> {
             end,
         });
 
+        // The data files it adds, in order: on a v3 table, they take the
+        // row ids its snapshot assigns in that order.
+        let added: Vec<(String, u64)> = unit
+            .steps
+            .iter()
+            .flat_map(|s| &s.data_files)
+            .map(|f| (f.path.clone(), f.record_count))
+            .collect();
+
         // Commit catalog snapshots — durability gate.
         let started_micros = now_micros();
         let has_steps = !unit.steps.is_empty();
@@ -3390,6 +3435,9 @@ impl<C: Catalog> Materializer<C> {
                         entry.index_at = expected;
                         for dv in vectors {
                             entry.file_index.set_deletion_vector(dv);
+                        }
+                        if let Some(range) = meta.row_range {
+                            learn_added_row_ids(&mut entry.file_index, range, &added);
                         }
                     } else {
                         self.rebuild_file_index(ident).await?;
@@ -3524,15 +3572,20 @@ impl<C: Catalog> Materializer<C> {
     /// it says. One it may hold in an evicted file is found by reading the
     /// files that may hold it, newest first: its row is where no delete
     /// holds its position. One it surely doesn't hold is nowhere: its row
-    /// is new.
-    async fn delete_rows(&self, ident: &TableIdent, unit: &mut Unit, keys: &[PkKey]) -> Result<()> {
+    /// is new. Returns where each key's row was found.
+    async fn delete_rows(
+        &self,
+        ident: &TableIdent,
+        unit: &mut Unit,
+        keys: &[PkKey],
+    ) -> Result<HashMap<PkKey, Replaced>> {
         let entry = self.tables.get(ident).expect("checked by caller");
         let index = &entry.file_index;
-        let mut found: Vec<(String, u64)> = Vec::new();
+        let mut found: Vec<(&PkKey, String, u64)> = Vec::new();
         let mut evicted: Vec<(&PkKey, Vec<String>)> = Vec::new();
         for key in keys {
             match index.locate(key) {
-                Some((path, at)) => found.push((path.to_string(), at as u64)),
+                Some((path, at)) => found.push((key, path.to_string(), at as u64)),
                 None => {
                     let files: Vec<String> = index
                         .candidates(key)
@@ -3547,18 +3600,27 @@ impl<C: Catalog> Materializer<C> {
         }
         let files: BTreeSet<String> = found
             .iter()
-            .map(|(path, _)| path.clone())
+            .map(|(_, path, _)| path.clone())
             .chain(evicted.iter().flat_map(|(_, files)| files.iter().cloned()))
             .collect();
         self.pend_vectors(ident, unit, files).await?;
-        for (path, at) in found {
+        let mut replaced = HashMap::with_capacity(keys.len());
+        for (key, path, at) in found {
             unit.vectors
                 .get_mut(&path)
                 .expect("pended above")
                 .delete(at);
+            replaced.insert(
+                key.clone(),
+                Replaced {
+                    path,
+                    position: at,
+                    read: None,
+                },
+            );
         }
         if evicted.is_empty() {
-            return Ok(());
+            return Ok(replaced);
         }
         // Where the keys looked for are in each file that may hold them.
         let mut wanted: BTreeMap<&str, std::collections::HashSet<&PkKey>> = BTreeMap::new();
@@ -3568,21 +3630,26 @@ impl<C: Catalog> Materializer<C> {
             }
         }
         let entry = self.tables.get(ident).expect("checked by caller");
-        let pk_schema: Vec<ColumnSchema> = entry
+        // Their keys, and the row ids they store.
+        let mut read_schema: Vec<ColumnSchema> = entry
             .pk_cols
             .iter()
             .filter_map(|pk| entry.schema.columns.iter().find(|c| c.name == pk.0))
             .cloned()
             .collect();
-        let mut held: BTreeMap<(&str, &PkKey), Vec<u64>> = BTreeMap::new();
+        read_schema.push(row_id_column());
+        #[allow(clippy::type_complexity)]
+        let mut held: BTreeMap<(&str, &PkKey), Vec<(u64, Option<i64>)>> = BTreeMap::new();
         for (path, keys) in &wanted {
             let bytes = self.blob_store.get(path).await?;
             let mut at: u64 = 0;
-            for batch in RowBatches::new(bytes, &pk_schema, self.batch_rows.max(1))? {
+            for batch in RowBatches::new(bytes, &read_schema, self.batch_rows.max(1))? {
                 for row in batch? {
                     let key = PkKey::from_row(&row, &entry.pk_cols);
                     if let Some(k) = keys.get(&key) {
-                        held.entry((*path, *k)).or_default().push(at);
+                        held.entry((*path, *k))
+                            .or_default()
+                            .push((at, stored_row_id(&row)));
                     }
                     at += 1;
                 }
@@ -3593,11 +3660,135 @@ impl<C: Catalog> Materializer<C> {
                 let vector = unit.vectors.get_mut(f).expect("pended above");
                 let live = held
                     .get(&(f.as_str(), *key))
-                    .and_then(|at| at.iter().find(|at| !vector.positions.contains(**at)));
-                if let Some(&at) = live {
+                    .and_then(|at| at.iter().find(|(at, _)| !vector.positions.contains(*at)));
+                if let Some(&(at, row_id)) = live {
                     vector.delete(at);
+                    replaced.insert(
+                        (*key).clone(),
+                        Replaced {
+                            path: f.clone(),
+                            position: at,
+                            read: Some(row_id),
+                        },
+                    );
                     break;
                 }
+            }
+        }
+        Ok(replaced)
+    }
+
+    /// The row ids of a v3 table's rows `continued` — each by its key,
+    /// with where the row it continues was: the id that row had, which an
+    /// update keeps (row lineage). Its file stores it, or it's the file's
+    /// first row id plus its position. A row of a file `unit` wrote, not
+    /// committed yet, has only the id the file stores: the rest take
+    /// theirs as the unit commits. So does one whose file the table's
+    /// catalog gave no first row id — not yet, since the table's upgrade
+    /// to v3.
+    async fn row_ids(
+        &mut self,
+        ident: &TableIdent,
+        unit: &Unit,
+        continued: Vec<(PkKey, &Replaced)>,
+    ) -> Result<HashMap<PkKey, i64>> {
+        if continued.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // What each row's file stores of its id, as the index knows it —
+        // or the read that found the row. One of a file it doesn't know
+        // whole (evicted, its keys added again) is read from the file.
+        let index = &self
+            .tables
+            .get(ident)
+            .expect("checked by caller")
+            .file_index;
+        let mut known: Vec<(PkKey, &Replaced, Option<RowId>)> = continued
+            .into_iter()
+            .map(|(key, at)| {
+                let id = match at.read {
+                    Some(Some(id)) => Some(RowId::Stored(id)),
+                    Some(None) => Some(RowId::Inherited),
+                    None => index.row_id(&at.path, at.position as u32),
+                };
+                (key, at, id)
+            })
+            .collect();
+        let unknown: BTreeSet<&str> = known
+            .iter()
+            .filter(|(_, _, id)| id.is_none())
+            .map(|(_, at, _)| at.path.as_str())
+            .collect();
+        let mut stored: HashMap<&str, StoredRowIds> = HashMap::new();
+        for path in unknown {
+            let bytes = self.blob_store.get(path).await?;
+            let mut ids = StoredRowIds::new();
+            let mut at: u32 = 0;
+            for batch in RowBatches::new(bytes, &[row_id_column()], self.batch_rows.max(1))? {
+                for row in batch? {
+                    if let Some(id) = stored_row_id(&row) {
+                        ids.push(at, id);
+                    }
+                    at += 1;
+                }
+            }
+            stored.insert(path, ids);
+        }
+        for (_, at, id) in &mut known {
+            if id.is_none() {
+                *id = Some(match stored[at.path.as_str()].get(at.position as u32) {
+                    Some(stored) => RowId::Stored(stored),
+                    None => RowId::Inherited,
+                });
+            }
+        }
+        // A committed file's first row id the index didn't learn as it took
+        // the file in — or that the catalog gave it later: one the table
+        // held as it was upgraded gets one at its next commit.
+        let pending: BTreeSet<&str> = unit
+            .steps
+            .iter()
+            .flat_map(|s| s.data_files.iter().map(|f| f.path.as_str()))
+            .collect();
+        let inherited = known
+            .iter()
+            .filter(|(_, at, id)| {
+                *id == Some(RowId::Inherited) && !pending.contains(at.path.as_str())
+            })
+            .map(|(_, at, _)| at.path.as_str());
+        if !index.without_first_row_id(inherited).is_empty() {
+            self.learn_first_row_ids(ident).await?;
+        }
+        let index = &self
+            .tables
+            .get(ident)
+            .expect("checked by caller")
+            .file_index;
+        // (A file not committed has none.)
+        Ok(known
+            .into_iter()
+            .filter_map(|(key, at, id)| {
+                let id = match id.expect("known or read above") {
+                    RowId::Stored(id) => id,
+                    RowId::Inherited => index.first_row_id(&at.path)? + at.position as i64,
+                };
+                Some((key, id))
+            })
+            .collect())
+    }
+
+    /// Learn, from the table's history, the first row ids of the data
+    /// files the index holds without one known.
+    async fn learn_first_row_ids(&mut self, ident: &TableIdent) -> Result<()> {
+        let snapshots = self.catalog.snapshots(ident).await?;
+        let index = &mut self
+            .tables
+            .get_mut(ident)
+            .expect("checked by caller")
+            .file_index;
+        for df in snapshots.iter().flat_map(|s| &s.data_files) {
+            if let Some(first) = df.first_row_id {
+                index.set_first_row_id(&df.path, first);
             }
         }
         Ok(())
@@ -4040,6 +4231,26 @@ async fn truncate_log(
 /// The Truncate sentinel events are dropped from the output — they
 /// have no row payload of their own and the writer would reject
 /// them.
+/// Learn the first row ids of `added`, the data files — each with its
+/// record count — of a commit whose snapshot assigned the row ids
+/// `range`: if it assigned just theirs, they took them in order.
+/// Otherwise it gave some to files the table held without (its first
+/// commit since its upgrade), and theirs are learned when needed.
+fn learn_added_row_ids(
+    index: &mut FileIndex,
+    range: pg2iceberg_iceberg::RowRange,
+    added: &[(String, u64)],
+) {
+    if added.iter().map(|(_, rows)| rows).sum::<u64>() != range.rows {
+        return;
+    }
+    let mut next = range.first_row_id;
+    for (path, rows) in added {
+        index.set_first_row_id(path, next);
+        next += *rows as i64;
+    }
+}
+
 fn expand_truncates(events: Vec<MatEvent>, keys: &[PkKey], schema: &TableSchema) -> Vec<MatEvent> {
     if !events.iter().any(|e| e.op == Op::Truncate) {
         return events;
