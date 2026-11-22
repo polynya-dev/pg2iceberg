@@ -1915,6 +1915,9 @@ struct DstHarness {
     /// The materializer's own pass, planned on a task of its own and not
     /// yet committed (see [`Step::BackgroundCompactPlan`]).
     pending_background: Option<pg2iceberg_logical::materializer::CompactionPass>,
+    /// Whether a restart dropped such a pass, its write in flight
+    /// recorded.
+    background_dropped: bool,
     /// A pass the catalog's own compaction has planned and written but not
     /// yet committed, and whether its outputs take the commit's sequence
     /// number (see [`Step::CatalogCompactPlan`]).
@@ -2061,6 +2064,7 @@ impl DstHarness {
             id_gen,
             pending_external: None,
             pending_background: None,
+            background_dropped: false,
             pending_catalog: None,
             upgraded: false,
             #[cfg(feature = "integration")]
@@ -2204,6 +2208,7 @@ impl DstHarness {
             id_gen,
             pending_external: None,
             pending_background: None,
+            background_dropped: false,
             pending_catalog: None,
             upgraded: false,
             #[cfg(feature = "integration")]
@@ -2664,7 +2669,7 @@ impl DstHarness {
         }
         self.materializer = materializer;
         // Its task died with it.
-        self.pending_background = None;
+        self.background_dropped |= self.pending_background.take().is_some();
     }
 
     /// A cycle whose commits land but whose cursor updates don't: the
@@ -3940,6 +3945,15 @@ fn write_after_schema_change(h: &DstHarness) {
 }
 
 fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
+    // The materializer's own pass commits once written, as on `run`'s
+    // task. One a restart dropped left its write in flight recorded,
+    // which the restarted process's next pass ends — `run` passes over
+    // every table, due or not (invariant 19).
+    h.run_step(&Step::BackgroundCompactCommit);
+    if std::mem::take(&mut h.background_dropped) {
+        h.run_step(&Step::BackgroundCompactPlan);
+        h.run_step(&Step::BackgroundCompactCommit);
+    }
     // The upgrade comes, if the workload didn't bring it.
     h.upgrade_to_v3();
     while h.backfilling {
@@ -7412,6 +7426,45 @@ fn the_materializers_pass_carries_the_deletes_made_meanwhile() {
 #[test]
 fn the_materializers_pass_carries_the_deletes_made_meanwhile_on_iceberg() {
     dv_case(true, false, false, &deleted_under_the_materializers_pass());
+}
+
+/// The workload ends with the materializer's own pass written, its commit
+/// yet to come (`BackgroundCompactPlan`): as on `run`'s task, it commits
+/// once written, which ends its write in flight (invariant 19).
+fn a_pass_held_at_the_end() -> Vec<Step> {
+    [&dirty_file()[..], &[Step::BackgroundCompactPlan]].concat()
+}
+
+#[test]
+fn the_materializers_pass_held_at_the_end_commits() {
+    orphan_case(false, &a_pass_held_at_the_end());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn the_materializers_pass_held_at_the_end_commits_on_iceberg() {
+    orphan_case(true, &a_pass_held_at_the_end());
+}
+
+/// A restart drops the pass's task with the process, its write in flight
+/// recorded: the restarted materializer's own passes end it.
+fn a_pass_dropped_by_a_restart() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &[Step::BackgroundCompactPlan, Step::RestartMaterializer],
+    ]
+    .concat()
+}
+
+#[test]
+fn a_pass_a_restart_drops_leaves_no_write_in_flight() {
+    orphan_case(false, &a_pass_dropped_by_a_restart());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_pass_a_restart_drops_leaves_no_write_in_flight_on_iceberg() {
+    orphan_case(true, &a_pass_dropped_by_a_restart());
 }
 
 /// A column added with a default, over files the FileIndex evicted whose
