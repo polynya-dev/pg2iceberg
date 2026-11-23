@@ -50,7 +50,7 @@ A catalog that maintains the tables itself (`sink.maintenance: managed`) commits
 
 ## File index
 
-For each table, the materializer keeps a map from each live row's primary key to the data file holding it and the row's position there, built from the table's data files at startup and updated with every commit. It uses it to:
+For each table, the materializer keeps a map from each live row's primary key to the data file holding it and the row's position there, built from the table's data files at startup and updated with every commit. Another process's commits — a `compact` job, the catalog maintaining the table — it replays from the snapshot it last saw. Once that snapshot is expired it rebuilds the map from the live files instead: the catalog forgets an expired snapshot's files, and with them what the snapshot after it removed. It uses the map to:
 
 - turn an insert of a key the table already holds into an update, whose delete hides the old row;
 - find, on a v3 table, the file and position of each row an update or delete replaces, for its [deletion vector](#deletion-vectors);
