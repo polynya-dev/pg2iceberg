@@ -471,9 +471,10 @@ impl<C: Coordinator + ?Sized + 'static> Pipeline<C> {
                             // their values from the old tuple when it
                             // has them (REPLICA IDENTITY FULL; a TOASTed
                             // value is never NULL, so NULL is a key-only
-                            // tuple's filler). Otherwise stage the old
-                            // key as the update's `before`, for the
-                            // materializer to resolve them from.
+                            // tuple's filler). The update's `before` is
+                            // the old key: where the materializer
+                            // resolves the rest from, and the row whose
+                            // id the moved one keeps (row lineage).
                             if let Some(after) = upd.after.as_mut() {
                                 upd.unchanged_cols.retain(|c| match old.get(c) {
                                     Some(v) if *v != PgValue::Null => {
@@ -483,13 +484,11 @@ impl<C: Coordinator + ?Sized + 'static> Pipeline<C> {
                                     _ => true,
                                 });
                             }
-                            if !upd.unchanged_cols.is_empty() {
-                                upd.before = Some(
-                                    pks.iter()
-                                        .filter_map(|c| old.get(c).map(|v| (c.clone(), v.clone())))
-                                        .collect(),
-                                );
-                            }
+                            upd.before = Some(
+                                pks.iter()
+                                    .filter_map(|c| old.get(c).map(|v| (c.clone(), v.clone())))
+                                    .collect(),
+                            );
                             self.sink.record_change(upd)?;
                             self.spill_if_full(xid).await?;
                             return Ok(());

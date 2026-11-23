@@ -1437,6 +1437,14 @@ fn metadata_from_table(ident: &TableIdent, table: &iceberg::table::Table) -> Res
             FormatVersion::V3 => crate::FormatVersion::V3,
             FormatVersion::V1 | FormatVersion::V2 => crate::FormatVersion::V2,
         },
+        row_range: table
+            .metadata()
+            .current_snapshot()
+            .and_then(|s| s.row_range())
+            .map(|(first_row_id, rows)| crate::RowRange {
+                first_row_id: first_row_id as i64,
+                rows,
+            }),
     })
 }
 

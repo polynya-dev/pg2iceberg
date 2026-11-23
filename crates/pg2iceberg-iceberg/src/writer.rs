@@ -5,7 +5,7 @@
 //! `(partition_tuple, kind)` group; the materializer then commits each group
 //! as a separate `DataFile` with its `partition_values` carried through.
 
-use crate::file_index::FileIndex;
+use crate::file_index::{FileIndex, StoredRowIds};
 use crate::fold::{pk_key, MaterializedRow};
 use crate::pk::PkKey;
 use arrow_array::builder::{
@@ -99,6 +99,8 @@ pub struct PreparedChunk {
     /// `FileIndex` (data chunks) or uses them as the "deleted PKs" set
     /// (equality-delete chunks).
     pub pk_keys: Vec<PkKey>,
+    /// The row ids the chunk stores ([`TableWriter::prepare_data`]).
+    pub row_ids: StoredRowIds,
 }
 
 #[derive(Debug)]
@@ -171,17 +173,21 @@ impl TableWriter {
         rows: &[MaterializedRow],
         file_index: &FileIndex,
     ) -> Result<PreparedFiles> {
-        self.prepare_with(rows, file_index, true)
+        self.prepare_with(rows, file_index, true, &HashMap::new())
     }
 
     /// [`Self::prepare`] for a v3 table, whose deletes are deletion
-    /// vectors, which the caller writes: only the data files.
+    /// vectors, which the caller writes: only the data files. A row that
+    /// replaces one with a row id — an update — keeps it: `row_ids` has
+    /// it by the row's key, and the row's file stores it (row lineage).
+    /// Its last-updated sequence number is left for the commit's.
     pub fn prepare_data(
         &self,
         rows: &[MaterializedRow],
         file_index: &FileIndex,
+        row_ids: &HashMap<PkKey, i64>,
     ) -> Result<PreparedFiles> {
-        self.prepare_with(rows, file_index, false)
+        self.prepare_with(rows, file_index, false, row_ids)
     }
 
     fn prepare_with(
@@ -189,6 +195,7 @@ impl TableWriter {
         rows: &[MaterializedRow],
         file_index: &FileIndex,
         equality_deletes: bool,
+        row_ids: &HashMap<PkKey, i64>,
     ) -> Result<PreparedFiles> {
         if rows.is_empty() {
             return Ok(PreparedFiles {
@@ -227,6 +234,7 @@ impl TableWriter {
             &self.schema.columns,
             file_index,
             false,
+            row_ids,
         )?;
         let equality_deletes = self.group_and_encode(
             &delete_rows,
@@ -234,6 +242,7 @@ impl TableWriter {
             &self.pk_columns,
             file_index,
             true,
+            &HashMap::new(),
         )?;
 
         Ok(PreparedFiles {
@@ -245,6 +254,7 @@ impl TableWriter {
 
     /// `deletes`: `rows` are equality deletes (of a Delete, or of an
     /// Update's previous version), partitioned where their rows live.
+    /// `row_ids`: those rows keep, by key.
     fn group_and_encode(
         &self,
         rows: &[&MaterializedRow],
@@ -252,6 +262,7 @@ impl TableWriter {
         cols: &[ColumnSchema],
         file_index: &FileIndex,
         deletes: bool,
+        row_ids: &HashMap<PkKey, i64>,
     ) -> Result<Vec<PreparedChunk>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -262,13 +273,13 @@ impl TableWriter {
         // bit-for-bit.
         if !self.schema.is_partitioned() {
             let row_refs: Vec<&Row> = rows.iter().map(|r| &r.row).collect();
-            let chunk = write_chunk(arrow_schema, cols, &row_refs)?;
-            let pk_keys = self.pk_keys(&row_refs);
-            return Ok(vec![PreparedChunk {
-                partition_values: Vec::new(),
-                chunk,
-                pk_keys,
-            }]);
+            return Ok(vec![self.encode(
+                Vec::new(),
+                &row_refs,
+                arrow_schema,
+                cols,
+                row_ids,
+            )?]);
         }
 
         // Partitioned table: compute per-row tuple, group by tuple, encode
@@ -295,15 +306,50 @@ impl TableWriter {
         let mut out: Vec<PreparedChunk> = Vec::with_capacity(groups.len());
         for (partition_values, group_rows) in groups {
             let row_refs: Vec<&Row> = group_rows.iter().map(|r| &r.row).collect();
-            let chunk = write_chunk(arrow_schema, cols, &row_refs)?;
-            let pk_keys = self.pk_keys(&row_refs);
-            out.push(PreparedChunk {
-                partition_values,
-                chunk,
-                pk_keys,
-            });
+            out.push(self.encode(partition_values, &row_refs, arrow_schema, cols, row_ids)?);
         }
         Ok(out)
+    }
+
+    /// One chunk of `rows`, of partition `partition_values`: storing, if
+    /// any of them keeps one, the row ids `row_ids` has for them.
+    fn encode(
+        &self,
+        partition_values: Vec<PartitionLiteral>,
+        rows: &[&Row],
+        arrow_schema: &Arc<Schema>,
+        cols: &[ColumnSchema],
+        row_ids: &HashMap<PkKey, i64>,
+    ) -> Result<PreparedChunk> {
+        let pk_keys = self.pk_keys(rows);
+        let ids: Vec<Option<i64>> = match row_ids.is_empty() {
+            true => Vec::new(),
+            false => pk_keys.iter().map(|k| row_ids.get(k).copied()).collect(),
+        };
+        let mut stored = StoredRowIds::new();
+        for (at, id) in ids.iter().enumerate() {
+            if let Some(id) = id {
+                stored.push(at as u32, *id);
+            }
+        }
+        let chunk = match stored.is_empty() {
+            true => write_chunk(arrow_schema, cols, rows, None)?,
+            false => {
+                let mut with_ids = cols.to_vec();
+                with_ids.push(ColumnSchema {
+                    name: "_row_id".into(),
+                    ..crate::row_id_column()
+                });
+                let schema = Arc::new(arrow_schema_for(&with_ids));
+                write_chunk(&schema, cols, rows, Some(ids))?
+            }
+        };
+        Ok(PreparedChunk {
+            partition_values,
+            chunk,
+            pk_keys,
+            row_ids: stored,
+        })
     }
 
     /// Each row's key, as [`PkKey::from_row`] makes it.
@@ -598,12 +644,18 @@ fn decimal_to_arrow_i128(d: &pg2iceberg_core::value::Decimal, target_scale: i32)
     Some(value)
 }
 
+/// `rows`, of columns `cols` — and, if `row_ids`, of a last column of
+/// those, `arrow_schema`'s last — as a Parquet file.
 fn write_chunk(
     arrow_schema: &Arc<Schema>,
     cols: &[ColumnSchema],
     rows: &[&Row],
+    row_ids: Option<Vec<Option<i64>>>,
 ) -> Result<DataChunk> {
-    let arrays = build_arrays(cols, rows)?;
+    let mut arrays = build_arrays(cols, rows)?;
+    if let Some(ids) = row_ids {
+        arrays.push(Arc::new(arrow_array::Int64Array::from(ids)));
+    }
     let batch = RecordBatch::try_new(arrow_schema.clone(), arrays)
         .map_err(|e| WriterError::Encode(format!("build record batch: {e}")))?;
 
@@ -1072,6 +1124,49 @@ mod tests {
         let mut batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>().unwrap();
         assert_eq!(batches.len(), 1, "expected exactly one row group");
         batches.pop().unwrap()
+    }
+
+    /// An update keeps its row's id: the data file stores it, by field id,
+    /// for that row alone — the rest inherit theirs — and leaves the
+    /// last-updated sequence number to the commit's.
+    #[test]
+    fn prepare_data_stores_the_ids_updated_rows_keep() {
+        let w = TableWriter::new(schema_id_qty());
+        let rows: Vec<MaterializedRow> = [(Op::Insert, 1), (Op::Update, 2), (Op::Delete, 3)]
+            .into_iter()
+            .map(|(op, id)| MaterializedRow {
+                op,
+                row: if op == Op::Delete {
+                    pk_only(id)
+                } else {
+                    row(id, 10)
+                },
+                unchanged_cols: vec![],
+                unchanged_from: None,
+            })
+            .collect();
+        let ids = HashMap::from([(PkKey::from_row(&pk_only(2), &[col("id")]), 77)]);
+        let p = w.prepare_data(&rows, &FileIndex::new(), &ids).unwrap();
+        assert!(p.equality_deletes.is_empty());
+        let [chunk] = &p.data[..] else {
+            panic!("one data file: {:?}", p.data.len())
+        };
+        assert_eq!(chunk.row_ids.get(0), None);
+        assert_eq!(chunk.row_ids.get(1), Some(77));
+        let mut cols = schema_id_qty().columns;
+        cols.push(crate::row_id_column());
+        let read = crate::read_data_file_by_field_id(chunk.chunk.bytes.clone(), &cols).unwrap();
+        let stored: Vec<Option<i64>> = read.iter().map(crate::stored_row_id).collect();
+        assert_eq!(stored, [None, Some(77)]);
+        let batch = read_parquet(&chunk.chunk.bytes);
+        assert_eq!(batch.num_columns(), 3, "no last-updated sequence number");
+
+        // None kept: no row id column at all.
+        let p = w
+            .prepare_data(&rows, &FileIndex::new(), &HashMap::new())
+            .unwrap();
+        assert!(p.data[0].row_ids.is_empty());
+        assert_eq!(read_parquet(&p.data[0].chunk.bytes).num_columns(), 2);
     }
 
     #[test]

@@ -19,8 +19,10 @@
 //! staged rows as JSON objects: refused, not misread.
 //!
 //! `_moved_from` is the old key of an `Update` that moved its row to a new
-//! key with TOAST columns unchanged (the event's `before`, which the
-//! pipeline keeps only then).
+//! key (the event's `before`, which the pipeline keeps only then): where
+//! the materializer resolves unchanged TOAST columns from, and the row
+//! whose id the moved one keeps. Files staged before it kept it only with
+//! TOAST columns unchanged.
 //!
 //! Field IDs are persisted in Parquet column metadata under `PARQUET:field_id`
 //! so Iceberg readers resolve columns by ID, not name.

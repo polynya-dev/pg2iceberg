@@ -60,9 +60,10 @@
 //! commit that last changed it (`_last_updated_sequence_number`). Every
 //! live row has both, and no two rows share an id (invariant 20); a
 //! commit that only moves rows — anyone's compaction, a removal of
-//! delete files — keeps each row's (21). An update through an equality
-//! delete may give the row a new id: the spec allows it, since the
-//! writer never read the old one.
+//! delete files — keeps each row's (21). A row's lineage follows the
+//! source row (26): an update — of its key too — keeps its id and takes
+//! the sequence number of the commit applying it; a row deleted and
+//! inserted again is another row, with a new id.
 //!
 //! pg2iceberg deletes the rows of a v3 table through deletion vectors —
 //! bitmaps of the positions deleted from one data file, as blobs in Puffin
@@ -2026,6 +2027,7 @@ impl DstHarness {
             coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
             managed: MANAGED.get(),
+            rows: Default::default(),
         });
         let mut materializer = Materializer::with_metrics(
             coord.clone() as Arc<dyn Coordinator>,
@@ -2170,6 +2172,7 @@ impl DstHarness {
             coord: coord.clone() as Arc<dyn Coordinator>,
             applied: Default::default(),
             managed: MANAGED.get(),
+            rows: Default::default(),
         });
         let mut materializer = Materializer::with_metrics(
             coord.clone() as Arc<dyn Coordinator>,
@@ -3395,11 +3398,19 @@ fn bounded_index_is_safe(
     Ok(())
 }
 
-/// Invariant 10: Iceberg matches PG as of some transaction boundary.
-/// Lagging behind is fine; a partly applied transaction is not.
-async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), String> {
-    let mut iceberg = storage.engine_rows(&ident()).await?;
-    sort_by_pk(&mut iceberg);
+/// One transaction boundary of the source table, as its WAL replays.
+struct Boundary {
+    rows: Vec<Row>,
+    /// The source's columns then.
+    columns: Vec<String>,
+    /// Each row's identity in Postgres, by primary key — the same from
+    /// its INSERT to its DELETE, through its updates, a key change too —
+    /// and how many updates it has had.
+    identities: BTreeMap<i32, (u64, u64)>,
+}
+
+/// The source table at each of its transaction boundaries, oldest first.
+fn boundaries(db: &SimPostgres) -> Result<Vec<Boundary>, String> {
     let events: Vec<_> = db
         .dump_change_events(PUB)
         .map_err(|e| format!("dump_change_events: {e}"))?
@@ -3411,8 +3422,13 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
         _ => i32::MAX,
     };
     let mut state: BTreeMap<i32, Row> = BTreeMap::new();
-    // Each boundary's rows, with the source's columns then.
-    let mut boundaries: Vec<(Vec<Row>, Vec<String>)> = vec![(Vec::new(), Vec::new())];
+    let mut identities: BTreeMap<i32, (u64, u64)> = BTreeMap::new();
+    let mut next_identity: u64 = 0;
+    let mut boundaries = vec![Boundary {
+        rows: Vec::new(),
+        columns: Vec::new(),
+        identities: BTreeMap::new(),
+    }];
     let mut i = 0;
     let mut last_lsn = None;
     while i < events.len() {
@@ -3432,7 +3448,11 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
             for row in state.values_mut() {
                 row.retain(|c, _| kept.contains(&c.0));
             }
-            boundaries.push((state.values().cloned().collect(), columns.clone()));
+            boundaries.push(Boundary {
+                rows: state.values().cloned().collect(),
+                columns: columns.clone(),
+                identities: identities.clone(),
+            });
         }
         // A column added since has, in the rows already there, the value
         // Postgres gave them (its default), which no WAL carries.
@@ -3457,7 +3477,11 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
                     }
                 }
             }
-            boundaries.push((state.values().cloned().collect(), columns.clone()));
+            boundaries.push(Boundary {
+                rows: state.values().cloned().collect(),
+                columns: columns.clone(),
+                identities: identities.clone(),
+            });
         }
         while i < events.len() && events[i].xid == xid {
             let e = &events[i];
@@ -3466,9 +3490,12 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
                     let mut after = stored(e.after.clone().expect("insert/update carries after"));
                     // A key-changing UPDATE moves the row.
                     let old_pk = e.before.as_ref().map(|b| pk(&stored(b.clone())));
-                    let prev = match old_pk {
-                        Some(k) if k != pk(&after) => state.remove(&k),
-                        _ => state.get(&pk(&after)).cloned(),
+                    let (prev, identity) = match old_pk {
+                        Some(k) if k != pk(&after) => (state.remove(&k), identities.remove(&k)),
+                        _ => (
+                            state.get(&pk(&after)).cloned(),
+                            identities.get(&pk(&after)).copied(),
+                        ),
                     };
                     // Unchanged (TOASTed) columns keep their stored values.
                     for col in &e.unchanged_cols {
@@ -3476,30 +3503,148 @@ async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), St
                             after.insert(col.clone(), v.clone());
                         }
                     }
+                    let identity = match (e.op, identity) {
+                        (Op::Update, Some((identity, updates))) => (identity, updates + 1),
+                        _ => {
+                            next_identity += 1;
+                            (next_identity, 0)
+                        }
+                    };
+                    identities.insert(pk(&after), identity);
                     state.insert(pk(&after), after);
                 }
                 Op::Delete => {
                     let before = stored(e.before.clone().expect("delete carries before"));
                     state.remove(&pk(&before));
+                    identities.remove(&pk(&before));
                 }
-                _ => state.clear(),
+                _ => {
+                    state.clear();
+                    identities.clear();
+                }
             }
             last_lsn = Some(e.lsn);
             i += 1;
         }
-        boundaries.push((state.values().cloned().collect(), columns));
+        boundaries.push(Boundary {
+            rows: state.values().cloned().collect(),
+            columns,
+            identities: identities.clone(),
+        });
     }
-    // Compare on the source's columns at each boundary: Iceberg keeps
-    // dropped columns, and learns of a schema change only with the
-    // table's next change (a column dropped then re-added still reads
-    // as the dropped one until then).
-    let matches = boundaries
+    Ok(boundaries)
+}
+
+/// The transaction boundaries `iceberg` — the table's rows, sorted by
+/// primary key — matches. Compared on the source's columns at each:
+/// Iceberg keeps dropped columns, and learns of a schema change only with
+/// the table's next change (a column dropped then re-added still reads as
+/// the dropped one until then).
+fn matching_boundaries(iceberg: &[Row], db: &SimPostgres) -> Result<Vec<Boundary>, String> {
+    Ok(boundaries(db)?
         .into_iter()
-        .any(|(rows, cols)| on_columns(&cols, iceberg.clone()) == on_columns(&cols, rows));
-    if !matches {
+        .filter(|b| {
+            on_columns(&b.columns, iceberg.to_vec()) == on_columns(&b.columns, b.rows.clone())
+        })
+        .collect())
+}
+
+/// Invariant 10: Iceberg matches PG as of some transaction boundary.
+/// Lagging behind is fine; a partly applied transaction is not.
+async fn atomic_visibility(storage: &Storage, db: &SimPostgres) -> Result<(), String> {
+    let mut iceberg = storage.engine_rows(&ident()).await?;
+    sort_by_pk(&mut iceberg);
+    if matching_boundaries(&iceberg, db)?.is_empty() {
         return Err(format!(
             "invariant 10 (atomic visibility): Iceberg state matches no transaction boundary: {iceberg:?}"
         ));
+    }
+    Ok(())
+}
+
+/// What the commits so far showed of each source row's lineage
+/// ([`lineage_follows_rows`]).
+#[derive(Default)]
+struct RowHistory {
+    /// By the row's identity in Postgres: the row id it was seen with,
+    /// and the number of updates it had then, with its last-updated
+    /// sequence number — when the boundary Iceberg was at told them.
+    by_identity: BTreeMap<u64, (i64, Option<(u64, i64)>)>,
+    /// Which row each row id was seen on.
+    by_row_id: BTreeMap<i64, u64>,
+}
+
+/// 26. A row's lineage follows the source row: on a v3 table, an update
+///     — of a key too — keeps the row's id and gives it the sequence
+///     number of the commit that applied it; a row deleted and inserted
+///     again is a new row, with a new id. pg2iceberg finds each row it
+///     replaces — its deletion vector names it — so it reads the id it
+///     had: the spec has a writer that modifies a row keep it.
+///
+/// Checked against every transaction boundary Iceberg's rows match
+/// (invariant 10): where several do and disagree on which source row a
+/// key holds, Iceberg's must fit one of them, and teaches nothing.
+async fn lineage_follows_rows(
+    storage: &Storage,
+    db: &SimPostgres,
+    history: &Mutex<RowHistory>,
+) -> Result<(), String> {
+    let Some(lineage) = storage.lineage(&ident()).await? else {
+        return Ok(());
+    };
+    let mut iceberg = storage.engine_rows(&ident()).await?;
+    sort_by_pk(&mut iceberg);
+    let candidates = matching_boundaries(&iceberg, db)?;
+    let mut history = history.lock().unwrap();
+    for (row, row_id, seq) in lineage.values() {
+        let pk = match row.get(&ColumnName("id".into())) {
+            Some(PgValue::Int4(n)) => *n,
+            _ => continue,
+        };
+        let options: BTreeSet<(u64, u64)> = candidates
+            .iter()
+            .filter_map(|b| b.identities.get(&pk).copied())
+            .collect();
+        let fits = |&(identity, updates): &(u64, u64)| -> Result<(), String> {
+            if let Some((was_id, was)) = history.by_identity.get(&identity) {
+                if was_id != row_id {
+                    return Err(format!(
+                        "{row:?} had row id {was_id}, now {row_id}: an update gave it a new one"
+                    ));
+                }
+                if let Some((was_updates, was_seq)) = was {
+                    if updates > *was_updates && seq <= was_seq {
+                        return Err(format!(
+                            "{row:?} was updated since it had last-updated sequence number \
+                             {was_seq}, but has {seq}"
+                        ));
+                    }
+                }
+            }
+            match history.by_row_id.get(row_id) {
+                Some(other) if *other != identity => Err(format!(
+                    "{row:?} has row id {row_id}, another row's: a row inserted again took \
+                     the id of the one deleted"
+                )),
+                _ => Ok(()),
+            }
+        };
+        let fit: Vec<Result<(), String>> = options.iter().map(fits).collect();
+        if let Some(Err(e)) = fit.first().filter(|_| fit.iter().all(Result::is_err)) {
+            return Err(format!("invariant 26 (lineage follows the row): {e}"));
+        }
+        let identities: BTreeSet<u64> = options.iter().map(|(identity, _)| *identity).collect();
+        let [identity] = identities.into_iter().collect::<Vec<_>>()[..] else {
+            continue;
+        };
+        let seen = history
+            .by_identity
+            .entry(identity)
+            .or_insert((*row_id, None));
+        if let [(_, updates)] = options.iter().collect::<Vec<_>>()[..] {
+            seen.1 = Some((*updates, *seq));
+        }
+        history.by_row_id.insert(*row_id, identity);
     }
     Ok(())
 }
@@ -3606,6 +3751,9 @@ struct AuditedCatalog {
     applied: Mutex<BTreeMap<(TableIdent, String), u64>>,
     /// Whether the catalog maintains the table itself (`MANAGED`).
     managed: bool,
+    /// What the commits so far showed of the source rows' lineage
+    /// (invariant 26).
+    rows: Mutex<RowHistory>,
 }
 
 /// A `maintain` process's orphan cleanup, held for
@@ -3762,7 +3910,7 @@ impl AuditedCatalog {
                 .unwrap()
                 .push(format!("after a commit: {e}"));
         }
-        if let Err(e) = self.storage.lineage(&ident()).await {
+        if let Err(e) = lineage_follows_rows(&self.storage, &self.db, &self.rows).await {
             self.violations
                 .lock()
                 .unwrap()
@@ -7748,4 +7896,349 @@ proptest! {
             panic!("workload {steps:?}\nfailed: {e}");
         }
     }
+}
+
+// ---------- Iceberg v3: the lineage of updated rows ----------
+
+/// Rows updated over several commits — one through a TOASTed column —
+/// each keeping its id, and taking each update's sequence number
+/// (invariant 26).
+fn updated_rows() -> Vec<Step> {
+    let mut steps: Vec<Step> = (1..=3)
+        .map(|id| Step::Insert { id, qty: id * 10 })
+        .collect();
+    steps.extend([Step::DriveFlush, Step::MaterializerCycle]);
+    for round in [
+        &[
+            Step::Update { id: 1, qty: 11 },
+            Step::ToastUpdate { id: 2, qty: 21 },
+        ][..],
+        &[Step::Update { id: 1, qty: 12 }][..],
+        &[
+            Step::Update { id: 1, qty: 13 },
+            Step::Update { id: 3, qty: 31 },
+        ][..],
+    ] {
+        steps.extend_from_slice(round);
+        steps.extend([Step::DriveFlush, Step::MaterializerCycle]);
+    }
+    steps
+}
+
+#[test]
+fn an_update_keeps_the_rows_id() {
+    dv_case(false, false, false, &updated_rows());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn an_update_keeps_the_rows_id_on_iceberg() {
+    dv_case(true, false, false, &updated_rows());
+}
+
+/// Updates that change a row's key — with its TOASTed column unchanged or
+/// not — move the row and its id; one moves a row back, another frees a
+/// key a new row takes in the same commit.
+fn moved_rows() -> Vec<Step> {
+    vec![
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::ChangePk {
+            from: 1,
+            to: 5,
+            toast: false,
+        },
+        Step::ChangePk {
+            from: 2,
+            to: 6,
+            toast: true,
+        },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::ChangePk {
+            from: 5,
+            to: 1,
+            toast: true,
+        },
+        Step::ChangePk {
+            from: 6,
+            to: 7,
+            toast: false,
+        },
+        Step::Insert { id: 6, qty: 60 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]
+}
+
+#[test]
+fn a_changed_key_keeps_the_rows_id() {
+    dv_case(false, false, false, &moved_rows());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_changed_key_keeps_the_rows_id_on_iceberg() {
+    dv_case(true, false, false, &moved_rows());
+}
+
+/// A row deleted and inserted again — in the same commit, or by a
+/// TRUNCATE and an INSERT — is another row, with an id of its own.
+fn rows_deleted_and_inserted_again() -> Vec<Step> {
+    vec![
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Delete { id: 1 },
+        Step::Insert { id: 1, qty: 11 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Truncate {
+            reinsert: Some((2, 22)),
+        },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]
+}
+
+#[test]
+fn a_row_inserted_again_takes_a_new_id() {
+    dv_case(false, false, false, &rows_deleted_and_inserted_again());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_row_inserted_again_takes_a_new_id_on_iceberg() {
+    dv_case(true, false, false, &rows_deleted_and_inserted_again());
+}
+
+/// Rows updated once compaction moved them — into a file that stores
+/// their ids — and again after a restart, whose FileIndex learns those
+/// ids from the table.
+fn compacted_rows_updated() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &[
+            Step::Compact,
+            Step::Update { id: 2, qty: 21 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Compact,
+            Step::RestartMaterializer,
+            Step::Update { id: 1, qty: 12 },
+            Step::Update { id: 2, qty: 22 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn an_update_of_a_compacted_row_keeps_its_id() {
+    dv_case(false, false, false, &compacted_rows_updated());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn an_update_of_a_compacted_row_keeps_its_id_on_iceberg() {
+    dv_case(true, false, false, &compacted_rows_updated());
+}
+
+/// Rows of files a one-key FileIndex evicted, updated: their ids are
+/// read with their positions, from the files their keys may be in —
+/// one an update stored (row 2's), one inherited. Then compaction moves
+/// rows of evicted files and of the one held into files evicted too, a
+/// key the map holds among them (row 3's): its file's ids are read.
+fn evicted_rows_updated() -> Vec<Step> {
+    [
+        &evicted_files()[..],
+        &[
+            Step::Update { id: 1, qty: 11 },
+            Step::Update { id: 3, qty: 31 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Update { id: 2, qty: 22 },
+            Step::Update { id: 5, qty: 51 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Update { id: 3, qty: 32 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Compact,
+            Step::Update { id: 4, qty: 41 },
+            Step::Update { id: 3, qty: 33 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn an_evicted_rows_update_keeps_its_id() {
+    BOUNDED_INDEX.set(true);
+    dv_case(false, false, false, &evicted_rows_updated());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn an_evicted_rows_update_keeps_its_id_on_iceberg() {
+    BOUNDED_INDEX.set(true);
+    dv_case(true, false, false, &evicted_rows_updated());
+}
+
+/// Rows the catalog's compaction moved (`MANAGED`), then updated: the
+/// FileIndex learns the ids its outputs store as it catches up.
+fn rows_the_catalog_compacted_updated() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &catalog_compaction()[..],
+        &[
+            Step::Update { id: 2, qty: 21 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn an_update_of_a_row_the_catalog_compacted_keeps_its_id() {
+    dv_case(false, true, false, &rows_the_catalog_compacted_updated());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn an_update_of_a_row_the_catalog_compacted_keeps_its_id_on_iceberg() {
+    dv_case(true, true, false, &rows_the_catalog_compacted_updated());
+}
+
+/// A table upgraded from v2 with rows: its next commit gives them ids —
+/// one updating a row among them, which had none to keep — and later
+/// updates keep them, though the FileIndex learned their files before
+/// they had any.
+fn upgraded_rows_updated() -> Vec<Step> {
+    vec![
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::Insert { id: 3, qty: 30 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::UpgradeToV3,
+        Step::Update { id: 3, qty: 31 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Update { id: 1, qty: 11 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Update { id: 1, qty: 12 },
+        Step::Update { id: 2, qty: 21 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]
+}
+
+#[test]
+fn an_upgraded_tables_updates_keep_the_ids_it_gave_its_rows() {
+    dv_case(false, false, true, &upgraded_rows_updated());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn an_upgraded_tables_updates_keep_the_ids_it_gave_its_rows_on_iceberg() {
+    dv_case(true, false, true, &upgraded_rows_updated());
+}
+
+/// A column added with a default, filled into the rows the table holds:
+/// they keep their ids.
+fn default_filled() -> Vec<Step> {
+    [
+        &dirty_file()[..],
+        &[
+            Step::DropNote,
+            Step::AddNoteWithDefault,
+            Step::Insert { id: 3, qty: 30 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+            Step::Update { id: 1, qty: 12 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ],
+    ]
+    .concat()
+}
+
+#[test]
+fn a_default_filled_in_keeps_the_rows_ids() {
+    dv_case(false, false, false, &default_filled());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_default_filled_in_keeps_the_rows_ids_on_iceberg() {
+    dv_case(true, false, false, &default_filled());
+}
+
+/// A FileIndex budget of seven keys: past it, the oldest files' keys are
+/// evicted, and the newest still mapped.
+const SMALL_INDEX_BYTES: usize = 600;
+
+/// Compaction merges files a seven-key FileIndex evicted with files it
+/// holds into one output, which is evicted for the rows it holds that the
+/// map doesn't — and maps the keys of the rows that came from the files
+/// it held. An update of one of those keeps the row's id, which the index
+/// holds: it must not read the output for it, as every update of it would.
+#[test]
+fn an_update_in_an_evicted_compaction_output_reads_no_data_file() {
+    FORMAT_V3.set(true);
+    BOUNDED_INDEX.set(true);
+    let mut h = DstHarness::boot();
+    h.materializer.set_pk_index_memory(SMALL_INDEX_BYTES);
+    for id in 1..=12 {
+        h.run_step(&Step::Insert { id, qty: id });
+        h.run_step(&Step::DriveFlush);
+        h.run_step(&Step::MaterializerCycle);
+    }
+    let cfg = CompactionConfig {
+        data_file_threshold: 1,
+        delete_file_threshold: 1,
+        delete_ratio: 0.0,
+        target_size_bytes: 1 << 20,
+        max_input_bytes_per_pass: 1 << 30,
+    };
+    block_on(h.materializer.compact_table(&ident(), &cfg))
+        .unwrap()
+        .expect("the small files are merged");
+    check_step_invariants(&h).unwrap();
+    let key = |id: i32| {
+        let row = Row::from([(ColumnName("id".into()), PgValue::Int4(id))]);
+        pg2iceberg_iceberg::PkKey::from_row(&row, &[ColumnName("id".into())])
+    };
+    let index = h.materializer.file_index(&ident()).unwrap();
+    let (output, _) = index.locate(&key(12)).expect("row 12's key is mapped");
+    assert!(
+        index.is_evicted(output),
+        "the output holds rows of evicted files: {index:?}"
+    );
+    let output = output.to_string();
+    h.run_step(&Step::Update { id: 12, qty: 120 });
+    h.run_step(&Step::DriveFlush);
+    // The materializer's reads alone: not the audit's, which reads the
+    // whole table after a commit, nor the step's FileIndex check.
+    h.audited
+        .audit_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = h.storage.sim_blob().gets_of(&output);
+    block_on(h.materializer.cycle()).unwrap();
+    let reads = h.storage.sim_blob().gets_of(&output) - before;
+    h.audited
+        .audit_paused
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(reads, 0, "an update of row 12 read its file {reads} times");
+    check_step_invariants(&h).unwrap();
+    check_invariants(&mut h).unwrap();
 }

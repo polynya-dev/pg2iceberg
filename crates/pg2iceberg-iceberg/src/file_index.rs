@@ -40,6 +40,19 @@
 //! is a deletion vector, of positions. The index also holds each file's
 //! live deletion vector, which a commit deleting more of its rows
 //! replaces.
+//!
+//! ## Row ids
+//!
+//! A v3 table's rows have ids (row lineage), which an update keeps: the
+//! index knows each row's, where its file is held. A file stores the
+//! ids of some rows — a compaction's output of all it moved, a commit's
+//! of the rows it updated — and the rest have the file's first row id
+//! plus their position. The index keeps each file's first row id, once
+//! known, and the ids it stores ([`StoredRowIds`]): runs of consecutive
+//! positions with consecutive ids, which count against the budget like
+//! keys, and leave with the file's keys when the budget evicts it. A file
+//! evicted only for rows the map doesn't hold — a compaction's output
+//! taking rows of evicted files — keeps them for the keys it does map.
 
 use crate::pk::PkKey;
 use crate::DeletionVector;
@@ -260,6 +273,66 @@ impl KeyFilter {
 /// position and the map's control byte.
 const KEY_BYTES: usize = 16 + 4 + 4 + 1;
 
+/// The row ids a data file stores ([row lineage](self#row-ids)), by
+/// position: runs of consecutive positions whose ids are consecutive too.
+/// A row the file stores none for has the file's first row id plus its
+/// position.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoredRowIds {
+    /// Each run's first position, its length and its first id, by
+    /// position.
+    runs: Vec<(u32, u32, i64)>,
+}
+
+/// About how many bytes a run of [`StoredRowIds`] takes.
+const RUN_BYTES: usize = 16;
+
+impl StoredRowIds {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The file stores `id` for its row at `position`, past any before.
+    pub fn push(&mut self, position: u32, id: i64) {
+        if let Some((first, len, first_id)) = self.runs.last_mut() {
+            debug_assert!(position >= *first + *len, "positions out of order");
+            if position == *first + *len && id == *first_id + i64::from(*len) {
+                *len += 1;
+                return;
+            }
+        }
+        self.runs.push((position, 1, id));
+    }
+
+    /// The id the file stores for its row at `position`, if any.
+    pub fn get(&self, position: u32) -> Option<i64> {
+        let i = self
+            .runs
+            .partition_point(|(first, _, _)| *first <= position);
+        let (first, len, first_id) = *self.runs.get(i.checked_sub(1)?)?;
+        (position < first + len).then(|| first_id + i64::from(position - first))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// How many runs it takes.
+    pub fn runs(&self) -> usize {
+        self.runs.len()
+    }
+}
+
+/// A row's id, as [`FileIndex::row_id`] knows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowId {
+    /// Its file stores this one.
+    Stored(i64),
+    /// Its file stores none: it's the file's first row id plus the row's
+    /// position, where the file has one ([`FileIndex::first_row_id`]).
+    Inherited,
+}
+
 /// Live PK → data file map. One entry per live row, up to its budget,
 /// so it is kept compact: a 16-byte [`Slot`] plus a 4-byte file number
 /// and a 4-byte position, with each file's path stored once.
@@ -288,6 +361,9 @@ pub struct FileIndex {
     added: u64,
     /// Some key is held as a hash: `keys` can't give every key back.
     hashed: bool,
+    /// The runs of [`IndexedFile::row_ids`] the files hold, which count
+    /// against `max_keys` like keys.
+    runs: usize,
 }
 
 #[derive(Clone)]
@@ -315,6 +391,15 @@ struct IndexedFile {
     /// Rows it may have lost unseen: keys deleted or written again that
     /// `keys` didn't hold, in its range.
     unseen_deaths: u64,
+    /// The row id of its first row, once known: the table's catalog
+    /// assigns it as it commits the file.
+    first_row_id: Option<i64>,
+    /// The row ids it stores, while `row_ids_known`.
+    row_ids: StoredRowIds,
+    /// Whether `row_ids` are all it stores: until the budget evicts its
+    /// keys ([`FileIndex::evict`]). A file evicted only for rows the map
+    /// doesn't hold ([`FileIndex::add_unseen`]) still knows them.
+    row_ids_known: bool,
 }
 
 impl IndexedFile {
@@ -352,6 +437,7 @@ impl Default for FileIndex {
             max_keys: usize::MAX,
             added: 0,
             hashed: false,
+            runs: 0,
         }
     }
 }
@@ -446,7 +532,7 @@ impl FileIndex {
                 }
             }
             // Room first: a key past its most would grow the map's table.
-            if self.keys.len() >= self.max_keys && !self.keys.contains_key(&slot) {
+            if self.load() >= self.max_keys && !self.keys.contains_key(&slot) {
                 // Its keys so far may leave for the filter, which takes
                 // their range from the file's.
                 if let Some((lo, hi)) = &range {
@@ -501,8 +587,10 @@ impl FileIndex {
             evicted_keys,
             added,
             hashed,
+            runs,
             ..
         } = other;
+        self.runs += runs;
         self.vectors.extend(vectors);
         let mut ids: Vec<Option<FileId>> = vec![None; files.len()];
         for (old, file) in files.into_iter().enumerate() {
@@ -525,7 +613,7 @@ impl FileIndex {
         filter.full |= filter.bytes >= filter.max_bytes;
         for (slot, old) in keys {
             let id = ids[old.file as usize].expect("a key's file is in its index");
-            if self.keys.len() >= self.max_keys && !self.keys.contains_key(&slot) {
+            if self.load() >= self.max_keys && !self.keys.contains_key(&slot) {
                 self.evict();
             }
             let row = Row {
@@ -633,6 +721,70 @@ impl FileIndex {
         self.ids
             .get(path)
             .map(|&id| self.file(id).partition_values.as_slice())
+    }
+
+    /// The row id of `path`'s first row, if the index holds the file and
+    /// knows it.
+    pub fn first_row_id(&self, path: &str) -> Option<i64> {
+        self.ids
+            .get(path)
+            .and_then(|&id| self.file(id).first_row_id)
+    }
+
+    /// `path`'s first row has row id `first_row_id`, if the index holds
+    /// the file.
+    pub fn set_first_row_id(&mut self, path: &str, first_row_id: i64) {
+        if let Some(&id) = self.ids.get(path) {
+            self.file_mut(id).first_row_id = Some(first_row_id);
+        }
+    }
+
+    /// `path` stores the row ids `row_ids`: kept, if the index holds the
+    /// file and the budget hasn't evicted its keys. Their runs may evict
+    /// the oldest files.
+    pub fn store_row_ids(&mut self, path: &str, row_ids: StoredRowIds) {
+        let Some(&id) = self.ids.get(path) else {
+            return;
+        };
+        let file = self.file_mut(id);
+        if !file.row_ids_known {
+            return;
+        }
+        let (added, removed) = (row_ids.runs(), file.row_ids.runs());
+        file.row_ids = row_ids;
+        self.runs = self.runs + added - removed;
+        if self.load() > self.max_keys {
+            self.evict();
+        }
+    }
+
+    /// The id of `path`'s row at `position`, if the index knows the
+    /// file's: it holds the file, and the budget hasn't evicted its keys.
+    /// (The index takes in the ids a file stores as it takes in the file.)
+    pub fn row_id(&self, path: &str, position: u32) -> Option<RowId> {
+        let file = self.file(*self.ids.get(path)?);
+        if !file.row_ids_known {
+            return None;
+        }
+        Some(match file.row_ids.get(position) {
+            Some(id) => RowId::Stored(id),
+            None => RowId::Inherited,
+        })
+    }
+
+    /// The files held without a first row id known, of `paths`.
+    pub fn without_first_row_id<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<&'a str> {
+        paths
+            .into_iter()
+            .filter(|p| {
+                self.ids
+                    .get(*p)
+                    .is_some_and(|&id| self.file(id).first_row_id.is_none())
+            })
+            .collect()
     }
 
     /// Whether the table may hold `pk_key`: never wrongly not. Exact while
@@ -819,6 +971,7 @@ impl FileIndex {
     pub fn memory_bytes(&self) -> usize {
         // A map's capacity is 7/8 of its buckets.
         self.keys.capacity() / 7 * 8 * KEY_BYTES
+            + self.runs * RUN_BYTES
             + self.evicted_keys.bytes()
             + self
                 .live()
@@ -828,6 +981,12 @@ impl FileIndex {
 
     fn live(&self) -> impl Iterator<Item = &IndexedFile> {
         self.files.iter().flatten()
+    }
+
+    /// What counts against `max_keys`: the keys the map holds, and the
+    /// runs of row ids the files not evicted store.
+    fn load(&self) -> usize {
+        self.keys.len() + self.runs
     }
 
     fn file(&self, id: FileId) -> &IndexedFile {
@@ -853,6 +1012,9 @@ impl FileIndex {
             generation: generation.unwrap_or(self.added),
             evicted: false,
             unseen_deaths: 0,
+            first_row_id: None,
+            row_ids: StoredRowIds::default(),
+            row_ids_known: true,
         };
         self.added += 1;
         self.place(file)
@@ -912,13 +1074,14 @@ impl FileIndex {
             .collect();
         oldest.sort_unstable();
         let mut evicting = vec![false; self.files.len()];
-        let mut left = self.keys.len();
+        let mut left = self.load();
         for (_, id) in oldest {
             if left <= target {
                 break;
             }
             evicting[id as usize] = true;
-            left -= self.file(id).mapped as usize;
+            let file = self.file(id);
+            left -= file.mapped as usize + file.row_ids.runs();
         }
         // The layers the keys go in: the last, and those they fill.
         let layer = self.evicted_keys.layers.len().saturating_sub(1);
@@ -942,6 +1105,8 @@ impl FileIndex {
                     .expect("a file holding keys has a range");
                 self.evicted_keys.cover(layer, lo, hi);
                 file.mapped = 0;
+                self.runs -= std::mem::take(&mut file.row_ids).runs();
+                file.row_ids_known = false;
                 if !file.evicted {
                     file.evicted = true;
                     self.evicted += 1;
@@ -956,31 +1121,34 @@ impl FileIndex {
             if file.evicted {
                 self.evicted -= 1;
             }
+            self.runs -= file.row_ids.runs();
             self.vectors.remove(&file.path);
             self.ids.remove(&file.path);
             self.free.push(id);
         }
     }
 
-    /// PK → path and position, and path → partition tuple: what the index
-    /// means, independent of file numbering.
+    /// PK → path and position, and path → partition tuple and the row
+    /// ids the file stores: what the index means, independent of file
+    /// numbering. (Not first row ids: one the commit didn't tell is
+    /// learned when needed.)
     #[allow(clippy::type_complexity)]
     fn view(
         &self,
     ) -> (
         BTreeMap<&Slot, (&str, u32)>,
-        BTreeMap<&str, &[PartitionLiteral]>,
+        BTreeMap<&str, (&[PartitionLiteral], &StoredRowIds)>,
     ) {
         let pks = self
             .keys
             .iter()
             .map(|(pk, row)| (pk, (self.file(row.file).path.as_str(), row.position)))
             .collect();
-        let partitions = self
+        let files = self
             .live()
-            .map(|f| (f.path.as_str(), f.partition_values.as_slice()))
+            .map(|f| (f.path.as_str(), (f.partition_values.as_slice(), &f.row_ids)))
             .collect();
-        (pks, partitions)
+        (pks, files)
     }
 }
 
@@ -992,7 +1160,7 @@ impl PartialEq for FileIndex {
 
 impl fmt::Debug for FileIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (pks, partitions) = self.view();
+        let (pks, files) = self.view();
         let pks: BTreeMap<String, (&str, u32)> = pks
             .into_iter()
             .map(|(slot, path)| {
@@ -1004,7 +1172,7 @@ impl fmt::Debug for FileIndex {
             .collect();
         f.debug_struct("FileIndex")
             .field("pks", &pks)
-            .field("partitions", &partitions)
+            .field("files", &files)
             .field("evicted", &self.evicted_files())
             .finish()
     }
@@ -1091,6 +1259,9 @@ pub async fn catch_up_from_catalog(
         .filter(|c| c.is_primary_key)
         .cloned()
         .collect();
+    // A data file's keys, and the row ids it stores.
+    let mut data_schema = pk_schema.clone();
+    data_schema.push(crate::row_id_column());
 
     if !(at.is_some() && whole && replayable && current >= at) {
         // Rebuild from the live files. Files superseded by a Replace
@@ -1116,7 +1287,7 @@ pub async fn catch_up_from_catalog(
         live.sort_by_key(|(seq, data, _)| (*seq, *data));
         for (_, data, df) in live {
             if !data {
-                for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |_, pks| {
+                for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |_, pks, _| {
                     fi.remove_pks(&pks)
                 })
                 .await?;
@@ -1128,15 +1299,24 @@ pub async fn catch_up_from_catalog(
                     .map_err(VerifyError::Blob)?,
                 None => crate::deletion_vector::Positions::new(),
             };
-            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |first, pks| {
-                let rows = pks
-                    .into_iter()
-                    .zip(first..)
-                    .filter(|(_, at)| !dead.contains(*at))
-                    .map(|(pk, at)| (pk, position(at)));
-                fi.add_file_at(df.path.clone(), rows, df.partition_values.clone(), None)
-            })
+            let mut row_ids = StoredRowIds::new();
+            for_each_pk_batch(
+                blob_store,
+                &df.path,
+                &data_schema,
+                pk_cols,
+                |first, pks, ids| {
+                    store(&mut row_ids, first, &ids);
+                    let rows = pks
+                        .into_iter()
+                        .zip(first..)
+                        .filter(|(_, at)| !dead.contains(*at))
+                        .map(|(pk, at)| (pk, position(at)));
+                    fi.add_file_at(df.path.clone(), rows, df.partition_values.clone(), None)
+                },
+            )
             .await?;
+            learn_row_ids(fi, df, row_ids);
         }
         for (dv, _) in vectors.values() {
             fi.set_deletion_vector((*dv).clone());
@@ -1147,7 +1327,7 @@ pub async fn catch_up_from_catalog(
     // Replay what happened since `at`, in order.
     for snap in &snapshots[newer..] {
         for df in &snap.delete_files {
-            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |_, pks| {
+            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |_, pks, _| {
                 fi.remove_pks(&pks)
             })
             .await?;
@@ -1161,41 +1341,50 @@ pub async fn catch_up_from_catalog(
         let evicted_inputs = inputs.iter().any(|p| fi.is_evicted(p));
         let generation = inputs.iter().filter_map(|p| fi.generation(p)).max();
         for df in &snap.data_files {
-            for_each_pk_batch(blob_store, &df.path, &pk_schema, pk_cols, |first, pks| {
-                let rows = pks
-                    .into_iter()
-                    .zip(first..)
-                    .map(|(pk, at)| (pk, position(at)));
-                if inputs.is_empty() {
-                    return fi.add_file_at(
+            let mut row_ids = StoredRowIds::new();
+            for_each_pk_batch(
+                blob_store,
+                &df.path,
+                &data_schema,
+                pk_cols,
+                |first, pks, ids| {
+                    store(&mut row_ids, first, &ids);
+                    let rows = pks
+                        .into_iter()
+                        .zip(first..)
+                        .map(|(pk, at)| (pk, position(at)));
+                    if inputs.is_empty() {
+                        return fi.add_file_at(
+                            df.path.clone(),
+                            rows,
+                            df.partition_values.clone(),
+                            None,
+                        );
+                    }
+                    let rows: Vec<(PkKey, u32)> = rows.collect();
+                    if evicted_inputs {
+                        fi.add_unseen(
+                            df.path.clone(),
+                            0,
+                            rows.iter().map(|(pk, _)| pk.clone()),
+                            df.partition_values.clone(),
+                            generation,
+                        );
+                    }
+                    let moved: Vec<(PkKey, u32)> = rows
+                        .into_iter()
+                        .filter(|(pk, _)| fi.lookup(pk).is_some_and(|p| inputs.contains(p)))
+                        .collect();
+                    fi.add_file_at(
                         df.path.clone(),
-                        rows,
-                        df.partition_values.clone(),
-                        None,
-                    );
-                }
-                let rows: Vec<(PkKey, u32)> = rows.collect();
-                if evicted_inputs {
-                    fi.add_unseen(
-                        df.path.clone(),
-                        0,
-                        rows.iter().map(|(pk, _)| pk.clone()),
+                        moved,
                         df.partition_values.clone(),
                         generation,
-                    );
-                }
-                let moved: Vec<(PkKey, u32)> = rows
-                    .into_iter()
-                    .filter(|(pk, _)| fi.lookup(pk).is_some_and(|p| inputs.contains(p)))
-                    .collect();
-                fi.add_file_at(
-                    df.path.clone(),
-                    moved,
-                    df.partition_values.clone(),
-                    generation,
-                )
-            })
+                    )
+                },
+            )
             .await?;
+            learn_row_ids(fi, df, row_ids);
         }
         for path in inputs {
             fi.remove_file(path);
@@ -1219,7 +1408,7 @@ pub async fn catch_up_from_catalog(
             let new: BTreeSet<u64> = positions.iter().filter(|p| !known.contains(*p)).collect();
             if !new.is_empty() && fi.generation(file).is_some() {
                 let mut dead: Vec<PkKey> = Vec::new();
-                for_each_pk_batch(blob_store, file, &pk_schema, pk_cols, |first, pks| {
+                for_each_pk_batch(blob_store, file, &pk_schema, pk_cols, |first, pks, _| {
                     for (pk, at) in pks.into_iter().zip(first..) {
                         if !new.contains(&at) {
                             continue;
@@ -1255,20 +1444,20 @@ fn removes_vectors_known(fi: &FileIndex, snap: &crate::Snapshot) -> bool {
     })
 }
 
-/// Calls `f` with each batch of rows in the file at `path`: the position
-/// of its first row, and the rows' PKs.
+/// Calls `f` with each batch of rows in the file at `path`, read as
+/// `schema` — the key's columns, maybe with [`crate::row_id_column`]: the
+/// position of its first row, the rows' PKs, and the row ids they store.
 async fn for_each_pk_batch(
     blob_store: &dyn pg2iceberg_stream::BlobStore,
     path: &str,
-    pk_schema: &[pg2iceberg_core::ColumnSchema],
+    schema: &[pg2iceberg_core::ColumnSchema],
     pk_cols: &[pg2iceberg_core::ColumnName],
-    mut f: impl FnMut(u64, Vec<PkKey>),
+    mut f: impl FnMut(u64, Vec<PkKey>, Vec<Option<i64>>),
 ) -> std::result::Result<(), crate::verify::VerifyError> {
     use crate::verify::VerifyError;
     let bytes = blob_store.get(path).await.map_err(VerifyError::Blob)?;
-    let batches =
-        crate::reader::RowBatches::new(bytes, pk_schema, crate::compact::DECODE_BATCH_ROWS)
-            .map_err(VerifyError::Decode)?;
+    let batches = crate::reader::RowBatches::new(bytes, schema, crate::compact::DECODE_BATCH_ROWS)
+        .map_err(VerifyError::Decode)?;
     let mut first = 0;
     for batch in batches {
         let rows = batch.map_err(VerifyError::Decode)?;
@@ -1276,10 +1465,32 @@ async fn for_each_pk_batch(
         f(
             first,
             rows.iter().map(|r| PkKey::from_row(r, pk_cols)).collect(),
+            rows.iter().map(crate::stored_row_id).collect(),
         );
         first += n;
     }
     Ok(())
+}
+
+/// Add to `row_ids` the ids a batch of rows stores, its first at
+/// position `first`.
+fn store(row_ids: &mut StoredRowIds, first: u64, ids: &[Option<i64>]) {
+    for (at, id) in (first..).zip(ids) {
+        if let Some(id) = id {
+            row_ids.push(position(at), *id);
+        }
+    }
+}
+
+/// The index just took in data file `df`, which stores `row_ids`: learn
+/// its row ids — those, and its first row id, as the catalog gives it.
+fn learn_row_ids(fi: &mut FileIndex, df: &crate::DataFile, row_ids: StoredRowIds) {
+    if let Some(first) = df.first_row_id {
+        fi.set_first_row_id(&df.path, first);
+    }
+    if !row_ids.is_empty() {
+        fi.store_row_ids(&df.path, row_ids);
+    }
 }
 
 /// Avoid a circular module reference by re-exporting `DynCatalog` through a
@@ -1582,5 +1793,99 @@ mod tests {
         a.remove_pks(&[n(5), n(1005)]);
         exact.remove_pks(&[n(5), n(1005)]);
         assert_safe(&a, &exact);
+    }
+
+    /// Consecutive positions of consecutive ids make one run; a gap in
+    /// either starts another.
+    #[test]
+    fn stored_row_ids_run_where_they_can() {
+        let mut ids = StoredRowIds::new();
+        for (at, id) in [(0, 100), (1, 101), (2, 102), (4, 103), (5, 7), (6, 8)] {
+            ids.push(at, id);
+        }
+        assert_eq!(ids.runs(), 3);
+        let got: Vec<Option<i64>> = (0..8).map(|at| ids.get(at)).collect();
+        assert_eq!(
+            got,
+            [
+                Some(100),
+                Some(101),
+                Some(102),
+                None,
+                Some(103),
+                Some(7),
+                Some(8),
+                None
+            ]
+        );
+        assert_eq!(StoredRowIds::new().get(0), None);
+    }
+
+    /// A file's row stores its id, or inherits one. A compaction's output
+    /// taking rows of evicted inputs is evicted as its keys go in — for the
+    /// rows it holds that the map doesn't — and keeps its ids for the keys
+    /// it does map: an update of one must not read the file for its id.
+    /// Once its keys are evicted the index knows neither, and has dropped
+    /// its runs.
+    #[test]
+    fn an_evicted_files_row_ids_are_unknown() {
+        let mut fi = FileIndex::new();
+        fi.add_file("f".into(), [n(1), n(2), n(3)], Vec::new());
+        let mut ids = StoredRowIds::new();
+        ids.push(1, 40);
+        fi.store_row_ids("f", ids.clone());
+        fi.set_first_row_id("f", 10);
+        assert_eq!(fi.row_id("f", 0), Some(RowId::Inherited));
+        assert_eq!(fi.row_id("f", 1), Some(RowId::Stored(40)));
+        assert_eq!(fi.first_row_id("f"), Some(10));
+        assert_eq!(fi.row_id("other", 0), None);
+
+        fi.add_file("out".into(), [n(4)], Vec::new());
+        let mut out_ids = StoredRowIds::new();
+        out_ids.push(0, 70);
+        fi.store_row_ids("out", out_ids.clone());
+        assert_eq!(fi.runs, 2);
+        fi.add_unseen("out".into(), 1, [n(5)], Vec::new(), None);
+        assert!(fi.is_evicted("out"));
+        assert_eq!(fi.locate(&n(4)), Some(("out", 0)));
+        assert_eq!(fi.row_id("out", 0), Some(RowId::Stored(70)));
+        assert_eq!(fi.runs, 2);
+
+        // As catch-up takes in such an output: evicted first, then its
+        // keys and ids.
+        fi.add_unseen("caught".into(), 1, [n(8)], Vec::new(), None);
+        fi.add_file_at("caught".into(), [(n(6), 0)], Vec::new(), None);
+        fi.store_row_ids("caught", out_ids);
+        assert_eq!(fi.row_id("caught", 0), Some(RowId::Stored(70)));
+        assert_eq!(fi.runs, 3);
+
+        fi.remove_file("f");
+        fi.remove_file("caught");
+        assert_eq!(fi.runs, 1);
+        fi.max_keys = 1;
+        fi.evict();
+        assert_eq!(fi.locate(&n(4)), None);
+        assert_eq!(fi.row_id("out", 0), None);
+        assert_eq!(fi.runs, 0);
+    }
+
+    /// The runs files store count against the budget like keys: past it,
+    /// the oldest files are evicted, runs and all.
+    #[test]
+    fn stored_row_ids_count_against_the_budget() {
+        let mut fi = FileIndex::new();
+        fi.max_keys = 8;
+        fi.add_file("old".into(), (0..3).map(n), Vec::new());
+        let mut ids = StoredRowIds::new();
+        for at in 0..3 {
+            ids.push(at, i64::from(at) * 10);
+        }
+        fi.store_row_ids("old", ids);
+        assert_eq!(fi.load(), 6);
+        fi.add_file("new".into(), (10..13).map(n), Vec::new());
+        assert!(fi.is_evicted("old"));
+        assert!(fi.load() <= fi.max_keys);
+        assert_eq!(fi.row_id("old", 0), None);
+        assert!(fi.memory_bytes() > 0);
     }
 }

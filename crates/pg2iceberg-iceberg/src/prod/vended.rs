@@ -725,6 +725,7 @@ mod tests {
             log_ends: BTreeMap::new(),
             properties: BTreeMap::new(),
             format_version: Default::default(),
+            row_range: None,
         }
     }
 
