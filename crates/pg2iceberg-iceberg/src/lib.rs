@@ -10,6 +10,7 @@ pub mod fold;
 pub mod materialize;
 pub mod meta;
 pub mod orphan;
+pub mod partial;
 pub mod pk;
 #[cfg(feature = "prod")]
 pub mod prod;
@@ -25,6 +26,7 @@ pub use file_index::{catch_up_from_catalog, rebuild_from_catalog, FileIndex, Row
 pub use fold::{fold_events, fold_events_with_sources, pk_key, MaterializedRow};
 pub use materialize::{promote_re_inserts, resolve_unchanged_cols, toast_files};
 pub use orphan::{cleanup_orphans, CleanupError, CleanupOutcome};
+pub use partial::PartialFile;
 pub use pk::PkKey;
 pub use reader::{read_data_file, read_data_file_by_field_id};
 pub use verify::read_materialized_state;

@@ -206,6 +206,8 @@ pub struct CompactedFile {
     /// The row ids it stores, by position in it: on a v3 table, every
     /// row's it moved.
     pub row_ids: StoredRowIds,
+    /// Its size in bytes.
+    pub byte_size: u64,
 }
 
 /// What the caller's PK → file index knows of a table's rows: each data
@@ -626,6 +628,7 @@ where
                 pk_positions,
                 partition_values: f.partition_values.clone(),
                 row_ids,
+                byte_size: f.byte_size,
             }
         })
         .collect();

@@ -400,6 +400,9 @@ struct IndexedFile {
     /// keys ([`FileIndex::evict`]). A file evicted only for rows the map
     /// doesn't hold ([`FileIndex::add_unseen`]) still knows them.
     row_ids_known: bool,
+    /// Its size in bytes, once known: what reading only part of it
+    /// takes ([`crate::PartialFile`]).
+    size: Option<u64>,
 }
 
 impl IndexedFile {
@@ -739,6 +742,18 @@ impl FileIndex {
         }
     }
 
+    /// `path` is `size` bytes, if the index holds the file.
+    pub fn set_size(&mut self, path: &str, size: u64) {
+        if let Some(&id) = self.ids.get(path) {
+            self.file_mut(id).size = Some(size);
+        }
+    }
+
+    /// `path`'s size in bytes, if the index holds the file and knows it.
+    pub fn size(&self, path: &str) -> Option<u64> {
+        self.ids.get(path).and_then(|&id| self.file(id).size)
+    }
+
     /// `path` stores the row ids `row_ids`: kept, if the index holds the
     /// file and the budget hasn't evicted its keys. Their runs may evict
     /// the oldest files.
@@ -1015,6 +1030,7 @@ impl FileIndex {
             first_row_id: None,
             row_ids: StoredRowIds::default(),
             row_ids_known: true,
+            size: None,
         };
         self.added += 1;
         self.place(file)
@@ -1137,7 +1153,7 @@ impl FileIndex {
         &self,
     ) -> (
         BTreeMap<&Slot, (&str, u32)>,
-        BTreeMap<&str, (&[PartitionLiteral], &StoredRowIds)>,
+        BTreeMap<&str, (&[PartitionLiteral], &StoredRowIds, Option<u64>)>,
     ) {
         let pks = self
             .keys
@@ -1146,7 +1162,10 @@ impl FileIndex {
             .collect();
         let files = self
             .live()
-            .map(|f| (f.path.as_str(), (f.partition_values.as_slice(), &f.row_ids)))
+            .map(|f| {
+                let file = (f.partition_values.as_slice(), &f.row_ids, f.size);
+                (f.path.as_str(), file)
+            })
             .collect();
         (pks, files)
     }
@@ -1316,7 +1335,7 @@ pub async fn catch_up_from_catalog(
                 },
             )
             .await?;
-            learn_row_ids(fi, df, row_ids);
+            learn_file(fi, df, row_ids);
         }
         for (dv, _) in vectors.values() {
             fi.set_deletion_vector((*dv).clone());
@@ -1384,7 +1403,7 @@ pub async fn catch_up_from_catalog(
                 },
             )
             .await?;
-            learn_row_ids(fi, df, row_ids);
+            learn_file(fi, df, row_ids);
         }
         for path in inputs {
             fi.remove_file(path);
@@ -1483,8 +1502,10 @@ fn store(row_ids: &mut StoredRowIds, first: u64, ids: &[Option<i64>]) {
 }
 
 /// The index just took in data file `df`, which stores `row_ids`: learn
-/// its row ids — those, and its first row id, as the catalog gives it.
-fn learn_row_ids(fi: &mut FileIndex, df: &crate::DataFile, row_ids: StoredRowIds) {
+/// its size and row ids — those, and its first row id, as the catalog
+/// gives it.
+fn learn_file(fi: &mut FileIndex, df: &crate::DataFile, row_ids: StoredRowIds) {
+    fi.set_size(&df.path, df.byte_size);
     if let Some(first) = df.first_row_id {
         fi.set_first_row_id(&df.path, first);
     }

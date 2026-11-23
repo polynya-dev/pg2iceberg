@@ -41,18 +41,18 @@ use pg2iceberg_iceberg::deletion_vector::{read_deletion_vector, Positions, Puffi
 use pg2iceberg_iceberg::meta::{
     self as meta_schema, CheckpointStats, CompactionStats, FlushStats, MaintenanceStats,
 };
+use pg2iceberg_iceberg::partial::{self, PartialFile};
 use pg2iceberg_iceberg::reader::RowBatches;
 use pg2iceberg_iceberg::{
     apply_schema_changes, catch_up_from_catalog, fold_events_with_sources, is_dropped_column,
     live_deletion_vectors, promote_re_inserts, read_data_file, reconcile_columns,
-    resolve_unchanged_cols, row_id_column, stored_row_id, toast_files, Catalog, DataFile, Deletes,
-    DeletionVector, FileIndex, FormatVersion, IcebergError, LiveRows, LogRange, MaterializedRow,
-    PkKey, PreparedCommit, RowId, SchemaChange, StoredRowIds, TableMetadata, TableWriter,
-    WriterError,
+    resolve_unchanged_cols, toast_files, Catalog, DataFile, Deletes, DeletionVector, FileIndex,
+    FormatVersion, IcebergError, LiveRows, LogRange, MaterializedRow, PkKey, PreparedCommit, RowId,
+    SchemaChange, StoredRowIds, TableMetadata, TableWriter, WriterError,
 };
 use pg2iceberg_stream::codec::decode_chunk;
 use pg2iceberg_stream::{BlobStore, MatEvent, StreamError};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use thiserror::Error;
@@ -141,6 +141,15 @@ pub enum MaterializerError {
         cursor: i64,
         start: u64,
     },
+}
+
+impl From<partial::ReadError> for MaterializerError {
+    fn from(e: partial::ReadError) -> Self {
+        match e {
+            partial::ReadError::Blob(e) => e.into(),
+            partial::ReadError::Decode(e) => e.into(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, MaterializerError>;
@@ -484,6 +493,9 @@ const DEFAULT_STEPS_PER_CYCLE: usize = 8;
 pub const STEPS_PER_COMMIT: usize = 4;
 /// Most files a step uploads at once.
 const STEP_UPLOADS: usize = 8;
+/// Most data files a step reads in part at once, to find rows whose keys
+/// the index evicted, or their row ids.
+const EVICTED_READS: usize = 8;
 /// Default most tables a cycle applies at once.
 pub const DEFAULT_TABLE_CONCURRENCY: usize = 4;
 /// Most log entries a cycle truncates of a table: a long log — of a
@@ -2765,6 +2777,7 @@ impl<C: Catalog> Materializer<C> {
                     entry_mut
                         .file_index
                         .store_row_ids(&f.path, f.row_ids.clone());
+                    entry_mut.file_index.set_size(&f.path, f.byte_size);
                     if unseen > 0 {
                         entry_mut.file_index.add_unseen(
                             f.path.clone(),
@@ -3251,6 +3264,7 @@ impl<C: Catalog> Materializer<C> {
             Vec<PkKey>,
             Vec<pg2iceberg_core::PartitionLiteral>,
             StoredRowIds,
+            u64,
         )> = Vec::with_capacity(prepared_files.data.len());
         let mut deleted_pks: Vec<PkKey> = replaced;
 
@@ -3272,7 +3286,13 @@ impl<C: Catalog> Materializer<C> {
                 sequence_number: None,
                 first_row_id: None,
             });
-            data_pk_groups.push((path, chunk.pk_keys, chunk.partition_values, chunk.row_ids));
+            data_pk_groups.push((
+                path,
+                chunk.pk_keys,
+                chunk.partition_values,
+                chunk.row_ids,
+                byte_size,
+            ));
         }
 
         let mut delete_files: Vec<DataFile> =
@@ -3315,11 +3335,12 @@ impl<C: Catalog> Materializer<C> {
         let entry_mut = self.tables.get_mut(ident).expect("checked above");
         // Removed PKs first (so a later add for the same PK overrides cleanly).
         entry_mut.file_index.remove_pks(&deleted_pks);
-        for (path, pks, partition_values, row_ids) in data_pk_groups {
+        for (path, pks, partition_values, row_ids, size) in data_pk_groups {
             entry_mut
                 .file_index
                 .add_file(path.clone(), pks, partition_values);
             entry_mut.file_index.store_row_ids(&path, row_ids);
+            entry_mut.file_index.set_size(&path, size);
         }
         unit.steps.push(PreparedCommit {
             ident: ident.clone(),
@@ -3623,36 +3644,45 @@ impl<C: Catalog> Materializer<C> {
             return Ok(replaced);
         }
         // Where the keys looked for are in each file that may hold them.
-        let mut wanted: BTreeMap<&str, std::collections::HashSet<&PkKey>> = BTreeMap::new();
+        let mut wanted: BTreeMap<&str, HashSet<&PkKey>> = BTreeMap::new();
         for (key, files) in &evicted {
             for f in files {
                 wanted.entry(f.as_str()).or_default().insert(*key);
             }
         }
         let entry = self.tables.get(ident).expect("checked by caller");
-        // Their keys, and the row ids they store.
-        let mut read_schema: Vec<ColumnSchema> = entry
+        let pk_schema: Vec<ColumnSchema> = entry
             .pk_cols
             .iter()
             .filter_map(|pk| entry.schema.columns.iter().find(|c| c.name == pk.0))
             .cloned()
             .collect();
-        read_schema.push(row_id_column());
-        #[allow(clippy::type_complexity)]
-        let mut held: BTreeMap<(&str, &PkKey), Vec<(u64, Option<i64>)>> = BTreeMap::new();
-        for (path, keys) in &wanted {
-            let bytes = self.blob_store.get(path).await?;
-            let mut at: u64 = 0;
-            for batch in RowBatches::new(bytes, &read_schema, self.batch_rows.max(1))? {
-                for row in batch? {
-                    let key = PkKey::from_row(&row, &entry.pk_cols);
-                    if let Some(k) = keys.get(&key) {
-                        held.entry((*path, *k))
-                            .or_default()
-                            .push((at, stored_row_id(&row)));
-                    }
-                    at += 1;
+        // Each file read in part: of its key and row id columns, the pages
+        // that may hold the keys.
+        // (Each read made before any runs: a stream's closure over
+        // borrowed items, held across an await, isn't `Send` to rustc.)
+        let reads: Vec<_> = wanted
+            .iter()
+            .map(|(&path, keys)| {
+                let file = self.partial_file(&entry.file_index, path);
+                let pk_schema = &pk_schema;
+                async move {
+                    let found = file.await?.find(pk_schema, keys, self.batch_rows).await?;
+                    Ok::<_, MaterializerError>((path, found))
                 }
+            })
+            .collect();
+        let reads: Vec<(&str, Vec<partial::Found>)> = stream::iter(reads)
+            .buffer_unordered(EVICTED_READS)
+            .try_collect()
+            .await?;
+        #[allow(clippy::type_complexity)]
+        let mut held: HashMap<(&str, &PkKey), Vec<(u64, Option<i64>)>> = HashMap::new();
+        for (path, found) in reads {
+            let keys = &wanted[path];
+            for (key, at, row_id) in found {
+                let key = *keys.get(&key).expect("found what it looked for");
+                held.entry((path, key)).or_default().push((at, row_id));
             }
         }
         for (key, files) in &evicted {
@@ -3714,29 +3744,38 @@ impl<C: Catalog> Materializer<C> {
                 (key, at, id)
             })
             .collect();
-        let unknown: BTreeSet<&str> = known
-            .iter()
-            .filter(|(_, _, id)| id.is_none())
-            .map(|(_, at, _)| at.path.as_str())
-            .collect();
-        let mut stored: HashMap<&str, StoredRowIds> = HashMap::new();
-        for path in unknown {
-            let bytes = self.blob_store.get(path).await?;
-            let mut ids = StoredRowIds::new();
-            let mut at: u32 = 0;
-            for batch in RowBatches::new(bytes, &[row_id_column()], self.batch_rows.max(1))? {
-                for row in batch? {
-                    if let Some(id) = stored_row_id(&row) {
-                        ids.push(at, id);
-                    }
-                    at += 1;
-                }
+        // Per file, the positions of rows whose ids it doesn't know: read
+        // in part, just those.
+        let mut unknown: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
+        for (_, at, id) in &known {
+            if id.is_none() {
+                unknown
+                    .entry(at.path.as_str())
+                    .or_default()
+                    .insert(at.position);
             }
-            stored.insert(path, ids);
         }
+        let this = &*self;
+        let reads: Vec<_> = unknown
+            .iter()
+            .map(|(&path, positions)| {
+                let file = this.partial_file(index, path);
+                async move {
+                    let positions: Vec<u64> = positions.iter().copied().collect();
+                    let ids = file.await?.row_ids(&positions, this.batch_rows).await?;
+                    let ids: HashMap<u64, Option<i64>> = positions.into_iter().zip(ids).collect();
+                    Ok::<_, MaterializerError>((path, ids))
+                }
+            })
+            .collect();
+        let reads: Vec<(&str, HashMap<u64, Option<i64>>)> = stream::iter(reads)
+            .buffer_unordered(EVICTED_READS)
+            .try_collect()
+            .await?;
+        let stored: HashMap<&str, HashMap<u64, Option<i64>>> = reads.into_iter().collect();
         for (_, at, id) in &mut known {
             if id.is_none() {
-                *id = Some(match stored[at.path.as_str()].get(at.position as u32) {
+                *id = Some(match stored[at.path.as_str()][&at.position] {
                     Some(stored) => RowId::Stored(stored),
                     None => RowId::Inherited,
                 });
@@ -3775,6 +3814,15 @@ impl<C: Catalog> Materializer<C> {
                 Some((key, id))
             })
             .collect())
+    }
+
+    /// Data file `path` of a table whose index is `index`, opened to read
+    /// in part — read whole, if the index doesn't know its size.
+    async fn partial_file(&self, index: &FileIndex, path: &str) -> Result<PartialFile> {
+        Ok(match index.size(path) {
+            Some(size) => PartialFile::open(self.blob_store.clone(), path, size).await?,
+            None => PartialFile::whole(self.blob_store.get(path).await?)?,
+        })
     }
 
     /// Learn, from the table's history, the first row ids of the data
