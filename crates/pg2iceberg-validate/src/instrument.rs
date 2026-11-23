@@ -277,6 +277,19 @@ impl<B: BlobStore + ?Sized> BlobStore for Instrumented<B> {
         out
     }
 
+    /// A GET too, of just the range.
+    async fn get_range(
+        &self,
+        path: &str,
+        range: std::ops::Range<u64>,
+    ) -> pg2iceberg_stream::Result<Bytes> {
+        let out = self.blob("get", self.inner.get_range(path, range)).await;
+        if let Ok(bytes) = &out {
+            self.bytes("get", bytes.len());
+        }
+        out
+    }
+
     async fn list(&self, prefix: &str) -> pg2iceberg_stream::Result<Vec<BlobInfo>> {
         self.blob("list", self.inner.list(prefix)).await
     }
@@ -572,10 +585,20 @@ mod tests {
 
     #[test]
     fn blob_requests_are_timed_and_their_bytes_counted() {
-        let (blob, registry) = instrumented(Arc::new(MemoryBlobStore::new()));
+        let store = Arc::new(MemoryBlobStore::new());
+        let (blob, registry) = instrumented(store.clone());
         block_on(blob.put("s3://b/k", Bytes::from_static(b"hello"))).unwrap();
         assert_eq!(block_on(blob.get("s3://b/k")).unwrap().len(), 5);
         assert!(block_on(blob.get("s3://b/missing")).is_err());
+        // A ranged read is a GET of just the range.
+        assert_eq!(
+            &block_on(blob.get_range("s3://b/k", 1..3)).unwrap()[..],
+            b"el"
+        );
+        assert_eq!(
+            (store.gets_of("s3://b/k"), store.range_bytes_of("s3://b/k")),
+            (1, 2)
+        );
 
         let put = labels([("op", "put")]);
         let get = labels([("op", "get")]);
@@ -585,10 +608,10 @@ mod tests {
         );
         assert_eq!(
             registry.histogram_count(names::BLOB_REQUEST_DURATION, &get),
-            2
+            3
         );
         assert_eq!(registry.counter_value(names::BLOB_BYTES_TOTAL, &put), 5);
-        assert_eq!(registry.counter_value(names::BLOB_BYTES_TOTAL, &get), 5);
+        assert_eq!(registry.counter_value(names::BLOB_BYTES_TOTAL, &get), 7);
         assert_eq!(
             registry.counter_value(names::BLOB_REQUEST_ERRORS_TOTAL, &get),
             1

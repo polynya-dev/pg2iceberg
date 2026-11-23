@@ -3102,6 +3102,13 @@ impl pg2iceberg_stream::BlobStore for SlowCompactionUploads {
     async fn get(&self, path: &str) -> pg2iceberg_stream::Result<bytes::Bytes> {
         self.inner.get(path).await
     }
+    async fn get_range(
+        &self,
+        path: &str,
+        range: std::ops::Range<u64>,
+    ) -> pg2iceberg_stream::Result<bytes::Bytes> {
+        self.inner.get_range(path, range).await
+    }
     async fn list(
         &self,
         prefix: &str,
@@ -3287,6 +3294,75 @@ async fn a_failed_background_flush_loses_nothing() {
     .await
     .unwrap();
     assert_eq!(rows.len(), 54);
+}
+
+// ── Reading in part ──────────────────────────────────────────────
+
+/// A v3 table's deletion vectors are read a blob at a time: each just its
+/// range of the Puffin file holding it — often with the vectors of every
+/// other file its commit touched — through every store a run reads
+/// through, its metrics' included. A store that wraps another and
+/// doesn't pass a ranged read on reads the whole file.
+#[tokio::test(start_paused = true)]
+async fn a_run_reads_a_deletion_vector_not_its_whole_file() {
+    use pg2iceberg_iceberg::{Catalog, FormatVersion};
+    use std::time::Duration;
+
+    let db = SimPostgres::new();
+    db.create_table(schema()).unwrap();
+    let mut stores = SimStores::new();
+    stores.catalog = Arc::new(MemoryCatalog::new().with_format_version(FormatVersion::V3));
+    let lifecycle = sim_lifecycle_on(&db, &stores, every_second());
+    let script = db.clone();
+    let shutdown = Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut tx = script.begin_tx();
+        for i in 1..=3 {
+            tx.insert(&ident(), row(i, i * 10));
+        }
+        tx.commit(Timestamp(1)).unwrap();
+        // Each update a commit of its own: the second replaces the vector
+        // the first wrote for the rows' file, reading it.
+        for (at, id) in [(2, 1), (3, 2)] {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut tx = script.begin_tx();
+            tx.update(&ident(), row(id, id * 10 + 1));
+            tx.commit(Timestamp(at)).unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    pg2iceberg_validate::run_logical_lifecycle(lifecycle, shutdown)
+        .await
+        .unwrap();
+
+    let puffins: BTreeSet<String> = stores
+        .catalog
+        .snapshots(&ident())
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|s| s.deletion_vectors)
+        .map(|dv| dv.path)
+        .collect();
+    assert_eq!(puffins.len(), 2, "a vector each update: {puffins:?}");
+    for p in &puffins {
+        assert_eq!(stores.blob.gets_of(p), 0, "{p} read whole");
+    }
+    assert!(
+        puffins.iter().any(|p| stores.blob.range_bytes_of(p) > 0),
+        "the second update read the first's vector"
+    );
+    let mut rows = read_materialized_state(
+        stores.catalog.as_ref(),
+        stores.blob.as_ref(),
+        &ident(),
+        &schema(),
+        &[ColumnName("id".into())],
+    )
+    .await
+    .unwrap();
+    sort_by_pk(&mut rows);
+    assert_eq!(rows, vec![row(1, 11), row(2, 21), row(3, 30)]);
 }
 
 // ── Observability ────────────────────────────────────────────────

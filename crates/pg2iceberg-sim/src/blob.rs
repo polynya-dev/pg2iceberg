@@ -31,6 +31,10 @@ pub struct MemoryBlobStore {
     clock_ms: AtomicI64,
     /// `get` calls so far — lets tests assert how much an operation reads.
     gets: std::sync::atomic::AtomicU64,
+    /// `get` calls so far, by object key.
+    gets_by_key: Mutex<BTreeMap<String, u64>>,
+    /// Bytes read by `get_range` so far, by object key.
+    ranged_by_key: Mutex<BTreeMap<String, u64>>,
 }
 
 impl MemoryBlobStore {
@@ -41,6 +45,18 @@ impl MemoryBlobStore {
     /// Number of `get` calls so far.
     pub fn gets(&self) -> u64 {
         self.gets.load(Ordering::SeqCst)
+    }
+
+    /// Number of `get` calls of `path` so far.
+    pub fn gets_of(&self, path: &str) -> u64 {
+        let gets = self.gets_by_key.lock().unwrap();
+        gets.get(object_key(path)).copied().unwrap_or(0)
+    }
+
+    /// Bytes of `path` read by `get_range` so far — not counting `get`s.
+    pub fn range_bytes_of(&self, path: &str) -> u64 {
+        let ranged = self.ranged_by_key.lock().unwrap();
+        ranged.get(object_key(path)).copied().unwrap_or(0)
     }
 
     /// Test-only: enumerate every stored path, as written.
@@ -104,12 +120,44 @@ impl BlobStore for MemoryBlobStore {
 
     async fn get(&self, path: &str) -> Result<Bytes> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        *self
+            .gets_by_key
+            .lock()
+            .unwrap()
+            .entry(object_key(path).to_string())
+            .or_default() += 1;
         self.inner
             .lock()
             .unwrap()
             .get(object_key(path))
             .map(|e| e.bytes.clone())
             .ok_or_else(|| StreamError::Io(format!("not found: {path}")))
+    }
+
+    /// Just the range, as an object store reads it — counted apart from
+    /// `get`s, so a test can tell a whole file's read from a part's.
+    async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let bytes = self
+            .inner
+            .lock()
+            .unwrap()
+            .get(object_key(path))
+            .map(|e| e.bytes.clone())
+            .ok_or_else(|| StreamError::Io(format!("not found: {path}")))?;
+        let (start, end) = (range.start as usize, range.end as usize);
+        if start > end || end > bytes.len() {
+            return Err(StreamError::Io(format!(
+                "get_range {path:?}: {range:?} of {} bytes",
+                bytes.len()
+            )));
+        }
+        *self
+            .ranged_by_key
+            .lock()
+            .unwrap()
+            .entry(object_key(path).to_string())
+            .or_default() += (end - start) as u64;
+        Ok(bytes.slice(start..end))
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<BlobInfo>> {
@@ -171,6 +219,10 @@ impl BlobStore for Archive {
 
     async fn get(&self, path: &str) -> Result<Bytes> {
         self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        self.inner.get_range(path, range).await
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<BlobInfo>> {

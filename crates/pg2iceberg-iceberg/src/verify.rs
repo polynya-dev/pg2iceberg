@@ -203,6 +203,14 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| pg2iceberg_stream::StreamError::Io(format!("missing: {path}")))
         }
+        async fn get_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> std::result::Result<bytes::Bytes, pg2iceberg_stream::StreamError> {
+            let bytes = self.get(path).await?;
+            Ok(bytes.slice(range.start as usize..range.end as usize))
+        }
         async fn list(
             &self,
             prefix: &str,

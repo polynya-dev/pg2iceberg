@@ -218,6 +218,15 @@ impl BlobStore for FaultyBlobStore {
         self.inner.get(path).await
     }
 
+    async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> BlobResult<Bytes> {
+        if self.plan.tick(ops::BLOB_GET) {
+            return Err(StreamError::Io(format!(
+                "injected fault: blob.get_range {path:?}"
+            )));
+        }
+        self.inner.get_range(path, range).await
+    }
+
     async fn list(&self, prefix: &str) -> BlobResult<Vec<BlobInfo>> {
         if self.plan.tick(ops::BLOB_LIST) {
             return Err(StreamError::Io(format!(
