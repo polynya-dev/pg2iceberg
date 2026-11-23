@@ -8187,6 +8187,115 @@ fn a_default_filled_in_keeps_the_rows_ids_on_iceberg() {
 /// evicted, and the newest still mapped.
 const SMALL_INDEX_BYTES: usize = 600;
 
+/// A seven-key FileIndex evicts the oldest files' keys. An update of a
+/// row of one finds the row by reading the files that may hold its key —
+/// in part: their footers, then the pages of their key and row id columns
+/// that may hold it, never a whole file — and keeps the row's id.
+#[test]
+fn an_update_of_an_evicted_row_reads_its_file_in_part() {
+    FORMAT_V3.set(true);
+    BOUNDED_INDEX.set(true);
+    let mut h = DstHarness::boot();
+    h.materializer.set_pk_index_memory(SMALL_INDEX_BYTES);
+    for id in 1..=12 {
+        h.run_step(&Step::Insert { id, qty: id });
+        h.run_step(&Step::DriveFlush);
+        h.run_step(&Step::MaterializerCycle);
+    }
+    let key = |id: i32| {
+        let row = Row::from([(ColumnName("id".into()), PgValue::Int4(id))]);
+        pg2iceberg_iceberg::PkKey::from_row(&row, &[ColumnName("id".into())])
+    };
+    let index = h.materializer.file_index(&ident()).unwrap();
+    let files: Vec<String> = index
+        .candidates(&key(1))
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert!(!files.is_empty(), "row 1's file is evicted: {index:?}");
+    h.run_step(&Step::Update { id: 1, qty: 10 });
+    h.run_step(&Step::DriveFlush);
+    // The materializer's reads alone (see the test below).
+    h.audited
+        .audit_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let blob = h.storage.sim_blob();
+    let read = |f: &String| (blob.gets_of(f), blob.range_bytes_of(f));
+    let before: Vec<(u64, u64)> = files.iter().map(read).collect();
+    block_on(h.materializer.cycle()).unwrap();
+    let after: Vec<(u64, u64)> = files.iter().map(read).collect();
+    h.audited
+        .audit_paused
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    for ((f, (gets, ranged)), (gets_after, ranged_after)) in files.iter().zip(before).zip(after) {
+        assert_eq!(gets_after, gets, "{f} read whole");
+        assert!(ranged_after > ranged, "{f} not read");
+    }
+    check_step_invariants(&h).unwrap();
+    check_invariants(&mut h).unwrap();
+}
+
+/// A step updates rows into one file, storing their ids: a one-key
+/// FileIndex takes in its keys until its budget runs out, evicts them —
+/// the file among them, its stored ids with it — and maps the last. An
+/// update of that row finds it in the index, but not the id it stores: it
+/// reads that from the file — in part, the row id column's page holding
+/// the row — and keeps it.
+#[test]
+fn an_update_of_a_row_mapped_into_an_evicted_file_keeps_its_id() {
+    FORMAT_V3.set(true);
+    BOUNDED_INDEX.set(true);
+    let mut h = DstHarness::boot();
+    h.materializer.set_pk_index_memory(TINY_INDEX_BYTES);
+    for id in 1..=12 {
+        h.run_step(&Step::Insert { id, qty: id });
+    }
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    for id in 1..=12 {
+        h.run_step(&Step::Update { id, qty: id * 10 });
+    }
+    h.run_step(&Step::DriveFlush);
+    h.run_step(&Step::MaterializerCycle);
+    let key = |id: i32| {
+        let row = Row::from([(ColumnName("id".into()), PgValue::Int4(id))]);
+        pg2iceberg_iceberg::PkKey::from_row(&row, &[ColumnName("id".into())])
+    };
+    let index = h.materializer.file_index(&ident()).unwrap();
+    let (file, at) = index.locate(&key(12)).expect("row 12's key is mapped");
+    assert!(
+        index.row_id(file, at).is_none(),
+        "the index doesn't know the ids {file} stores: {index:?}"
+    );
+    let file = file.to_string();
+    let row_id = |h: &DstHarness| {
+        let lineage = block_on(h.storage.lineage(&ident())).unwrap().unwrap();
+        lineage[&key(12)].1
+    };
+    let kept = row_id(&h);
+    h.run_step(&Step::Update { id: 12, qty: 1200 });
+    h.run_step(&Step::DriveFlush);
+    h.audited
+        .audit_paused
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let blob = h.storage.sim_blob();
+    let (gets, ranged) = (blob.gets_of(&file), blob.range_bytes_of(&file));
+    block_on(h.materializer.cycle()).unwrap();
+    let read = (
+        blob.gets_of(&file) - gets,
+        blob.range_bytes_of(&file) - ranged,
+    );
+    h.audited
+        .audit_paused
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(read.0, 0, "{file} read whole");
+    assert!(read.1 > 0, "{file} not read");
+    // (The audit, paused, didn't check it.)
+    assert_eq!(row_id(&h), kept, "row 12 kept its id");
+    check_step_invariants(&h).unwrap();
+    check_invariants(&mut h).unwrap();
+}
+
 /// Compaction merges files a seven-key FileIndex evicted with files it
 /// holds into one output, which is evicted for the rows it holds that the
 /// map doesn't — and maps the keys of the rows that came from the files

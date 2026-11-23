@@ -24,6 +24,7 @@ use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::ProjectionMask;
+use parquet::schema::types::SchemaDescriptor;
 use pg2iceberg_core::value::{DaysSinceEpoch, Decimal, TimestampMicros};
 use pg2iceberg_core::{ColumnName, ColumnSchema, Columns, IcebergType, PgValue, Row};
 use std::collections::BTreeMap;
@@ -119,22 +120,29 @@ fn projected_reader(
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|e| WriterError::Encode(format!("parquet reader: {e}")))?;
     let parquet_schema = builder.parquet_schema();
-    let wanted = (0..parquet_schema.num_columns()).filter(|&i| {
-        let column = parquet_schema.column(i);
-        let info = column.self_type().get_basic_info();
-        if info.has_id() {
-            cols.iter().any(|c| c.field_id == info.id())
-        } else {
-            let name = column.path().string();
-            cols.iter().any(|c| c.name == name)
-        }
-    });
-    let projection = ProjectionMask::leaves(parquet_schema, wanted);
+    let projection = ProjectionMask::leaves(parquet_schema, leaves(parquet_schema, cols));
     builder
         .with_projection(projection)
         .with_batch_size(batch_rows.max(1))
         .build()
         .map_err(|e| WriterError::Encode(format!("parquet reader build: {e}")))
+}
+
+/// The file's columns among `cols`: by field id, by name for a column
+/// the file wrote without one.
+pub(crate) fn leaves(parquet_schema: &SchemaDescriptor, cols: &[ColumnSchema]) -> Vec<usize> {
+    (0..parquet_schema.num_columns())
+        .filter(|&i| {
+            let column = parquet_schema.column(i);
+            let info = column.self_type().get_basic_info();
+            if info.has_id() {
+                cols.iter().any(|c| c.field_id == info.id())
+            } else {
+                let name = column.path().string();
+                cols.iter().any(|c| c.name == name)
+            }
+        })
+        .collect()
 }
 
 /// Reads a data file one record batch at a time like [`RowBatches`], but
@@ -168,27 +176,40 @@ impl Iterator for ArrowBatches {
             Ok(b) => b,
             Err(e) => return Some(Err(WriterError::Encode(format!("read batch: {e}")))),
         };
-        let n = batch.num_rows();
-        let columns = column_indices(&batch, &self.cols)
-            .into_iter()
-            .zip(self.schema.fields())
-            .map(|(i, field)| match i.map(|i| batch.column(i)) {
-                Some(a) if a.data_type() == field.data_type() => Ok(a.clone()),
-                Some(a) => cast(a, field.data_type()).map_err(|e| {
-                    WriterError::Encode(format!(
-                        "cast {} to {}: {e}",
-                        field.name(),
-                        field.data_type()
-                    ))
-                }),
-                None => Ok(new_null_array(field.data_type(), n)),
-            })
-            .collect::<Result<Vec<ArrayRef>>>();
-        Some(columns.and_then(|columns| {
-            RecordBatch::try_new(self.schema.clone(), columns)
-                .map_err(|e| WriterError::Encode(format!("build record batch: {e}")))
-        }))
+        Some(conform(&batch, &self.cols, &self.schema))
     }
+}
+
+/// `batch`, of a data file's columns among `cols`, in `cols`' schema
+/// `schema` as the writer encodes it ([`arrow_schema_for`]): a column the
+/// file doesn't have is NULL, and one a type promotion widened is cast.
+pub(crate) fn conform(
+    batch: &RecordBatch,
+    cols: &[ColumnSchema],
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    let columns = column_indices(batch, cols)
+        .into_iter()
+        .zip(schema.fields())
+        .map(|(i, field)| match i.map(|i| batch.column(i)) {
+            Some(a) if a.data_type() == field.data_type() => Ok(a.clone()),
+            Some(a) => cast(a, field.data_type()).map_err(|e| {
+                WriterError::Encode(format!(
+                    "cast {} to {}: {e}",
+                    field.name(),
+                    field.data_type()
+                ))
+            }),
+            None => Ok(new_null_array(field.data_type(), n)),
+        })
+        .collect::<Result<Vec<ArrayRef>>>()?;
+    RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(n)),
+    )
+    .map_err(|e| WriterError::Encode(format!("build record batch: {e}")))
 }
 
 /// Row `i`'s value in `arr`, the column of `col`: what [`RowBatches`]

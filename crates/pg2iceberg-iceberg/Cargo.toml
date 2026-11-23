@@ -17,7 +17,8 @@ arrow-cast = "54"
 arrow-schema = "54"
 arrow-select = "54"
 bytes = "1"
-parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+# `async`: reading a data file in part (`partial`).
+parquet = { version = "54", default-features = false, features = ["arrow", "snap", "async"] }
 pg2iceberg-core.workspace = true
 pg2iceberg-stream.workspace = true
 serde.workspace = true

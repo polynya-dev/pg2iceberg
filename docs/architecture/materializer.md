@@ -61,7 +61,7 @@ For each table, the materializer keeps a map from each live row's primary key to
 
 A key a row makes the map a table's worth of keys: `sink.pk_index_memory` (576 MiB by default) bounds it for each table. Within the budget — about 7 million keys at 576 MiB — the map holds every key, in about 25 bytes each. Past it, the oldest files' keys are evicted, into a Bloom filter that tells a key that may be theirs from one that surely isn't, and each evicted file keeps the range of its keys and a count of its live rows that's never too high. The filter grows a layer at a time, each knowing the range of its keys, and a key is looked for only in those whose range holds it: files are evicted oldest first, mostly a range of keys at a time. The cost falls on the rows of evicted files:
 
-- an insert of a key the filter may hold writes an equality delete, which deletes nothing if the key wasn't there; on a v3 table, it reads the evicted files whose range holds the key instead, as does an update or delete of one, to find the row's position and id;
+- an insert of a key the filter may hold writes an equality delete, which deletes nothing if the key wasn't there; on a v3 table, it reads the evicted files whose range holds the key instead, as does an update or delete of one, to find the row's position and id. It reads them in part: each file's footer, then of its key and row id columns just the pages whose smallest and largest values may hold the key — by its page index, or its row groups' statistics without one;
 - an update leaving TOAST columns out reads the evicted files whose range holds its key, to find the old row;
 - a delete on a partitioned v2 table goes to each partition such a file is in;
 - a `TRUNCATE`, or a column added with a default, reads those files;
