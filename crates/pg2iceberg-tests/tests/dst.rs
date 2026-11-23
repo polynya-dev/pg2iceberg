@@ -1042,17 +1042,30 @@ impl Storage {
                     .await
                     .map_err(|e| e.to_string())?;
                 // Every snapshot but the current one is gone: the files it
-                // doesn't hold are held by none.
+                // doesn't hold are held by none — Puffin files too, but
+                // for one holding a vector of a live data file.
                 let history = catalog.history(ident);
                 let live: BTreeSet<String> = live_files_from_history(&history)
                     .into_iter()
                     .map(|f| f.path)
                     .collect();
+                let live_puffins: BTreeSet<&str> =
+                    pg2iceberg_iceberg::live_deletion_vectors(&history)
+                        .into_iter()
+                        .filter(|(file, _)| live.contains(*file))
+                        .map(|(_, (dv, _))| dv.path.as_str())
+                        .collect();
+                let puffins = history
+                    .iter()
+                    .flat_map(|s| &s.deletion_vectors)
+                    .map(|dv| dv.path.clone())
+                    .filter(|p| !live_puffins.contains(p.as_str()));
                 history
                     .iter()
                     .flat_map(|s| s.data_files.iter().chain(&s.delete_files))
                     .map(|f| f.path.clone())
                     .filter(|p| !live.contains(p))
+                    .chain(puffins)
                     .collect()
             }
             #[cfg(feature = "integration")]
@@ -7262,6 +7275,52 @@ fn a_v3_table_deletes_rows_through_deletion_vectors() {
 #[test]
 fn a_v3_table_deletes_rows_through_deletion_vectors_on_iceberg() {
     dv_case(true, false, false, &writes());
+}
+
+/// The catalog maintains the table (`MANAGED`): it compacts what the
+/// materializer committed, then expires every snapshot but the current
+/// one, deleting the files only expired ones held. The materializer's
+/// next commit reads only what the table still holds. (Found by
+/// `deletion_vectors_survive_random_workloads_that_compact`.)
+fn compacted_then_expired_by_the_catalog() -> Vec<Step> {
+    let compact = [
+        Step::Compact,
+        Step::CatalogCompactPlan {
+            own_sequence_number: false,
+        },
+        Step::CatalogCompactCommit,
+    ];
+    [
+        &[Step::DropNote, Step::DriveFlush, Step::MaterializerCycle][..],
+        &compact[..],
+        &[
+            Step::BigTx { inserts: 2, qty: 0 },
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ][..],
+        &compact[..],
+        &[
+            Step::AddNote,
+            Step::CatalogExpire,
+            Step::DriveFlush,
+            Step::MaterializerCycle,
+        ][..],
+        &compact[..],
+    ]
+    .concat()
+}
+
+#[test]
+fn a_table_the_catalog_compacted_and_expired_reads_only_its_live_files() {
+    BOUNDED_INDEX.set(true);
+    dv_case(false, true, false, &compacted_then_expired_by_the_catalog());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_table_the_catalog_compacted_and_expired_reads_only_its_live_files_on_iceberg() {
+    BOUNDED_INDEX.set(true);
+    dv_case(true, true, false, &compacted_then_expired_by_the_catalog());
 }
 
 /// A transaction too big for one step updates every row twice: its later

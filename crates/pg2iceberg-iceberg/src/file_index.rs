@@ -1069,11 +1069,18 @@ pub async fn catch_up_from_catalog(
             .unwrap_or(snapshots.len()),
         None => 0,
     };
-    // Sequence numbers count snapshots: one missing is expired too.
-    let whole = snapshots[newer..]
-        .iter()
-        .zip(at.unwrap_or(0) + 1..)
-        .all(|(s, seq)| s.id == seq && !s.expired);
+    // Sequence numbers count snapshots: one missing is expired too. So
+    // may be `at` itself, since the index caught up to it: then the
+    // snapshot after it removes nothing — what a snapshot removed is
+    // what its parent held that it doesn't, which the catalog forgot
+    // with the parent — and replaying it would keep files, and their
+    // deletion vectors, long gone.
+    let at_held = at.is_some_and(|at| snapshots.iter().any(|s| s.id == at && !s.expired));
+    let whole = at_held
+        && snapshots[newer..]
+            .iter()
+            .zip(at.unwrap_or(0) + 1..)
+            .all(|(s, seq)| s.id == seq && !s.expired);
     let replayable = snapshots[newer..]
         .iter()
         .all(|s| removes_vectors_known(fi, s));

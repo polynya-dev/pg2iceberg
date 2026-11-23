@@ -740,8 +740,22 @@ impl Catalog for MemoryCatalog {
             .collect();
         Ok(t.snapshots
             .iter()
-            .filter_map(|snap| {
+            .enumerate()
+            .filter_map(|(i, snap)| {
                 if !t.expired.contains(&snap.id) {
+                    // Like a real catalog's: what a snapshot removed is
+                    // what its parent held that it doesn't — unknown once
+                    // its parent is expired, its metadata gone.
+                    let parent_expired = i
+                        .checked_sub(1)
+                        .is_some_and(|p| t.expired.contains(&t.snapshots[p].id));
+                    if parent_expired {
+                        return Some(Snapshot {
+                            removed_paths: Vec::new(),
+                            removed_deletion_vectors: Vec::new(),
+                            ..snap.clone()
+                        });
+                    }
                     return Some(snap.clone());
                 }
                 // Like a real catalog's: what the snapshot removed is gone
