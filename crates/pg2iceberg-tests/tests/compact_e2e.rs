@@ -783,6 +783,14 @@ impl BlobStore for CountingBlob {
         self.gets.lock().unwrap().push(path.to_string());
         self.inner.get(path).await
     }
+    async fn get_range(
+        &self,
+        path: &str,
+        range: std::ops::Range<u64>,
+    ) -> pg2iceberg_stream::Result<Bytes> {
+        self.gets.lock().unwrap().push(path.to_string());
+        self.inner.get_range(path, range).await
+    }
     async fn list(
         &self,
         prefix: &str,

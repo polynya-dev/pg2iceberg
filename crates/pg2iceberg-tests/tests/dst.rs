@@ -1748,6 +1748,13 @@ mod prod_backend {
         async fn get(&self, path: &str) -> pg2iceberg_stream::Result<bytes::Bytes> {
             self.0.get(path).await
         }
+        async fn get_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> pg2iceberg_stream::Result<bytes::Bytes> {
+            self.0.get_range(path, range).await
+        }
         async fn list(
             &self,
             prefix: &str,

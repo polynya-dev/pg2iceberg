@@ -246,6 +246,17 @@ impl BlobStore for SlowBlobStore {
         self.inner.get(path).await
     }
 
+    async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> BlobResult<Bytes> {
+        let _reading = Reading::start(&self.reads);
+        self.authorize().await;
+        let n = self.gets.fetch_add(1, Ordering::SeqCst);
+        let pieces = self.stores.read_pieces;
+        for _ in 0..pieces {
+            tokio::time::sleep((self.stores.read_latency)(n) / pieces).await;
+        }
+        self.inner.get_range(path, range).await
+    }
+
     async fn list(&self, prefix: &str) -> BlobResult<Vec<BlobInfo>> {
         self.authorize().await;
         tokio::time::sleep(LATENCY).await;
