@@ -1924,10 +1924,14 @@ impl SimReplicationStream {
                     let (commit_lsn, ts) = s.commit_of(xid, final_lsn);
                     out.push(WireMessage::Pgoutput(pgoutput::begin(commit_lsn, ts, xid)));
                 }
-                DecodedMessage::Commit { commit_lsn, xid } => {
+                DecodedMessage::Commit {
+                    commit_lsn,
+                    end_lsn,
+                    xid,
+                } => {
                     let (_, ts) = s.commit_of(xid, Lsn::ZERO);
                     out.push(WireMessage::Pgoutput(pgoutput::commit(
-                        commit_lsn, commit_lsn, ts,
+                        commit_lsn, end_lsn, ts,
                     )));
                 }
                 DecodedMessage::Relation { ident, .. } => {
@@ -2044,6 +2048,8 @@ impl SimReplicationStream {
                     }
                     return Some(vec![DecodedMessage::Commit {
                         commit_lsn: entry.lsn,
+                        // The record's end, where the next one starts.
+                        end_lsn: Lsn(entry.lsn.0 + 1),
                         xid: entry.xid.unwrap_or(0),
                     }]);
                 }

@@ -290,6 +290,7 @@ impl<C: Coordinator + ?Sized + 'static> SnapshotSink for Pipeline<C> {
         }
         self.process(DecodedMessage::Commit {
             commit_lsn: lsn,
+            end_lsn: lsn,
             xid,
         })
         .await?;

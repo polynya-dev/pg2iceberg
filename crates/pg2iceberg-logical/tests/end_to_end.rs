@@ -310,6 +310,7 @@ fn keepalive_between_txns_advances_flushed_lsn_past_unpublished_wal() {
         insert(1, 11, 1),
         DecodedMessage::Commit {
             commit_lsn: Lsn(12),
+            end_lsn: Lsn(13),
             xid: 1,
         },
         keepalive(50),
@@ -363,9 +364,12 @@ fn keepalive_inside_open_tx_is_not_trusted() {
 
     block_on(h.pipeline.process(DecodedMessage::Commit {
         commit_lsn: Lsn(12),
+        end_lsn: Lsn(13),
         xid: 1,
     }))
     .unwrap();
-    assert_eq!(block_on(h.pipeline.flush()).unwrap(), Some(Lsn(12)));
-    assert_eq!(h.pipeline.flushed_lsn(), Lsn(12));
+    // Past the commit record: a stream resumed there doesn't send the
+    // transaction again.
+    assert_eq!(block_on(h.pipeline.flush()).unwrap(), Some(Lsn(13)));
+    assert_eq!(h.pipeline.flushed_lsn(), Lsn(13));
 }

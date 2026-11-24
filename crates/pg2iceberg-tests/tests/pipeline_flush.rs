@@ -91,6 +91,7 @@ async fn transaction(p: &mut Pipeline<MemoryCoordinator>, xid: u32, commit: u64,
     p.process(DecodedMessage::Commit {
         xid,
         commit_lsn: Lsn(commit),
+        end_lsn: Lsn(commit + 1),
     })
     .await
     .unwrap();
@@ -105,7 +106,8 @@ async fn a_flush_uploads_its_tables_chunks_together() {
     let start = Instant::now();
     p.flush().await.unwrap();
     let took = start.elapsed();
-    assert_eq!(p.flushed_lsn(), Lsn(100));
+    // Past the commit record, where the transaction's WAL ends.
+    assert_eq!(p.flushed_lsn(), Lsn(101));
     assert!(took < 2 * PUT, "four tables' chunks took {took:?} to stage");
 }
 
@@ -132,9 +134,10 @@ async fn processing_goes_on_while_a_flush_stages() {
     transaction(&mut p, 3, 300, 1).await;
     transaction(&mut p, 4, 400, 1).await;
     assert_eq!(start.elapsed(), PUT);
-    assert_eq!(p.flushed_lsn(), Lsn(200));
+    // Past the second commit record.
+    assert_eq!(p.flushed_lsn(), Lsn(201));
 
     p.wait_flushed().await.unwrap();
     assert_eq!(start.elapsed(), 2 * PUT);
-    assert_eq!(p.flushed_lsn(), Lsn(400));
+    assert_eq!(p.flushed_lsn(), Lsn(401));
 }

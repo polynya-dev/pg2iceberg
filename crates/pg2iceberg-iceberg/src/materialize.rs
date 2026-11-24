@@ -103,9 +103,9 @@ fn prior_row<'a>(
 /// The key whose committed row holds `r`'s unchanged values, and that row:
 /// the key it moved from ([`MaterializedRow::unchanged_from`]), else its
 /// own. A row that moved from a key the table no longer has is a replay —
-/// a key-changing transaction the pipeline staged again after a crash,
-/// directly after its first copy — which already moved the row: its own
-/// key has the values.
+/// a key-changing transaction staged again after a crash, directly after
+/// its first copy, as a pipeline that resumed at the last commit LSN, not
+/// past it, did — which already moved the row: its own key has the values.
 fn toast_source<'a>(
     r: &MaterializedRow,
     pk_cols: &[ColumnName],

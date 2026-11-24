@@ -58,7 +58,7 @@ The coordinator role is filled by the **source PostgreSQL database** itself. Thi
 
 Step 2 is atomic — a flush is either fully registered or not registered at all. A failed step 2 leaves its uploaded files behind: nothing references them, and [orphan cleanup](maintenance.md#orphan-file-cleanup) only looks at tables' data files.
 
-While streaming, a flush — encoding its changes, both steps — runs on a task of its own, and the flusher goes on receiving the next changes meanwhile. One flush runs at a time, so batches register in commit order, and the slot is acked past a flush only once its step 2 commits. A flush that fails stops pg2iceberg, which resumes from the last registered batch on restart — or, if the replication stream dropped with it, the reconnected stream starts there — so none of its changes is skipped.
+While streaming, a flush — encoding its changes, both steps — runs on a task of its own, and the flusher goes on receiving the next changes meanwhile. One flush runs at a time, so batches register in commit order, and the slot is acked past a flush only once its step 2 commits. A flush that fails stops pg2iceberg, which resumes from the last registered batch on restart — or, if the replication stream dropped with it, the reconnected stream starts there — so none of its changes is skipped. It resumes past the batch's last transaction — at the end of its commit record, not the commit's LSN, from which Postgres would send that transaction again — so none is staged twice either: applied twice, a transaction that deleted a row and inserted it again, or moved it to another key, would give a v3 table's row a new `_row_id`.
 
 **Read** (materializer ← log):
 
