@@ -42,7 +42,7 @@ Each file is a round trip to the object store, so a pass overlaps them: the inpu
 
 ## Row lineage
 
-A v3 table ([`sink.format_version`](../usage/configuration.md#notes-on-individual-fields)) gives every row a `_row_id` and the sequence number of the commit that last changed it, `_last_updated_sequence_number`. A data file doesn't store them unless it has to: the catalog gives each file it commits a range of row ids, and a row's id is the first plus its position in the file; its sequence number is the file's. Moved into a new file, a row would take the new file's — a new id, as if it were a new row, and a later sequence number, as if it had changed.
+A v3 table ([`sink.format_version`](../usage/configuration.md#notes-on-individual-fields), or the table's own `iceberg.format_version`) gives every row a `_row_id` and the sequence number of the commit that last changed it, `_last_updated_sequence_number`. A data file doesn't store them unless it has to: the catalog gives each file it commits a range of row ids, and a row's id is the first plus its position in the file; its sequence number is the file's. Moved into a new file, a row would take the new file's — a new id, as if it were a new row, and a later sequence number, as if it had changed.
 
 So on a v3 table, compaction writes both into the files it writes, for every row: the ones the input stored, else the ones it gave. The row keeps them however many times it's moved, and engines that read the table incrementally see nothing changed.
 

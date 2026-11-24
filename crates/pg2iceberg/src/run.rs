@@ -193,13 +193,26 @@ fn data_path(location: &str, kind: &str, partition_segment: &str, id: &str) -> S
 
 pub async fn run(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     cfg.require_catalog()?;
-    let catalog = build_rest_catalog(&cfg).await?;
-    let catalog = IcebergRustCatalog::new(Arc::new(catalog))
-        .with_format_version(cfg.sink.resolved_format_version()?);
+    let catalog = build_catalog(&cfg).await?;
     let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
     run_inner(cfg, catalog, storage, metrics).await
+}
+
+/// The catalog pg2iceberg writes the tables through: the REST catalog
+/// [`build_rest_catalog`] builds, creating each table in the format
+/// version configured for it ([`Config::format_versions`]).
+pub async fn build_catalog(
+    cfg: &Config,
+) -> Result<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> {
+    let versions = cfg.format_versions()?;
+    let mut catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(cfg).await?))
+        .with_format_version(versions.default);
+    for (ident, version) in versions.tables {
+        catalog = catalog.with_table_format_version(ident, version);
+    }
+    Ok(catalog)
 }
 
 /// Build a REST `iceberg::Catalog` from sink config. We default to the
@@ -380,9 +393,7 @@ fn bucket_from_warehouse(warehouse: &str) -> Result<String> {
 /// monitored.
 pub async fn run_stream_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     cfg.require_catalog()?;
-    let catalog = build_rest_catalog(&cfg).await?;
-    let catalog = IcebergRustCatalog::new(Arc::new(catalog))
-        .with_format_version(cfg.sink.resolved_format_version()?);
+    let catalog = build_catalog(&cfg).await?;
     let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
@@ -737,8 +748,7 @@ async fn build_one_shot_materializer(
     cursors: Cursors,
 ) -> Result<Materializer<OneShotCatalog>> {
     cfg.require_catalog()?;
-    let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?))
-        .with_format_version(cfg.sink.resolved_format_version()?);
+    let catalog = build_catalog(&cfg).await?;
     let storage = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?;
@@ -850,10 +860,8 @@ async fn build_one_shot_materializer(
 /// cron can detect drift.
 pub async fn run_verify(cfg: Config, chunk_size: usize) -> Result<()> {
     cfg.require_catalog()?;
-    let catalog: Arc<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> = Arc::new(
-        IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?))
-            .with_format_version(cfg.sink.resolved_format_version()?),
-    );
+    let catalog: Arc<IcebergRustCatalog<iceberg_catalog_rest::RestCatalog>> =
+        Arc::new(build_catalog(&cfg).await?);
     let blob = build_storage(&cfg, &catalog)
         .await
         .context("build blob store")?
@@ -1056,8 +1064,7 @@ async fn snapshot_only(cfg: Config, metrics: Arc<dyn Metrics>) -> Result<()> {
     use pg2iceberg_validate::LifecycleError;
 
     cfg.require_catalog()?;
-    let catalog = IcebergRustCatalog::new(Arc::new(build_rest_catalog(&cfg).await?))
-        .with_format_version(cfg.sink.resolved_format_version()?);
+    let catalog = build_catalog(&cfg).await?;
     // The snapshot is written straight to the tables: nothing to stage.
     let Storage {
         blob,

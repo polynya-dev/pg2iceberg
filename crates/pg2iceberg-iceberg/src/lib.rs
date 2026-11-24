@@ -312,6 +312,22 @@ impl FormatVersion {
     }
 }
 
+/// The format version each table pg2iceberg creates takes: its own, if
+/// it has one (`tables[].iceberg.format_version`), else the default
+/// (`sink.format_version`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormatVersions {
+    pub default: FormatVersion,
+    pub tables: std::collections::BTreeMap<TableIdent, FormatVersion>,
+}
+
+impl FormatVersions {
+    /// The format version `ident` is created in.
+    pub fn of(&self, ident: &TableIdent) -> FormatVersion {
+        self.tables.get(ident).copied().unwrap_or(self.default)
+    }
+}
+
 /// The field id the spec reserves for row lineage's `_row_id`.
 pub const ROW_ID_FIELD_ID: i32 = 2147483540;
 /// The field id the spec reserves for row lineage's

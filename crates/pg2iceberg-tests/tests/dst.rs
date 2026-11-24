@@ -74,6 +74,11 @@
 //! file's footer just as its manifest entry says. The oracle reads them
 //! with a decoder of its own (`pg2iceberg_sim::deletion_vector`).
 //!
+//! In `OWN_FORMAT` cases the first table has a format version of its own
+//! (`tables[].iceberg.format_version`), the one the sink's isn't, so one
+//! pipeline writes a v2 table and a v3 one. pg2iceberg creates each in the
+//! version configured for it, and changes neither's after (invariant 27).
+//!
 //! The staged log keeps only what's left to apply, and the entry each
 //! table's cursor sits at the end of: the materializer drops the rest from
 //! `log_index`, and deletes their files (22) — never an entry Iceberg
@@ -707,14 +712,39 @@ thread_local! {
     /// hold (`Step::UpgradeToV3`, or at quiescence) — tables pg2iceberg
     /// finds v3 whatever its setting.
     static V3_UPGRADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the first table has a format version of its own
+    /// (`tables[].iceberg.format_version`): the one the sink's
+    /// (`sink.format_version`) isn't. The second table takes the sink's,
+    /// so the two are created in different versions.
+    static OWN_FORMAT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The format version pg2iceberg creates this case's tables in.
-fn created_format_version() -> pg2iceberg_iceberg::FormatVersion {
+/// The format version pg2iceberg creates this case's tables in, unless
+/// one has its own (`OWN_FORMAT`).
+fn sink_format_version() -> pg2iceberg_iceberg::FormatVersion {
     if FORMAT_V3.get() && !V3_UPGRADED.get() {
         pg2iceberg_iceberg::FormatVersion::V3
     } else {
         pg2iceberg_iceberg::FormatVersion::V2
+    }
+}
+
+/// In `OWN_FORMAT` cases, the first table's own format version: the one
+/// the sink's isn't.
+fn own_format_version() -> Option<pg2iceberg_iceberg::FormatVersion> {
+    use pg2iceberg_iceberg::FormatVersion;
+    OWN_FORMAT.get().then(|| match sink_format_version() {
+        FormatVersion::V2 => FormatVersion::V3,
+        FormatVersion::V3 => FormatVersion::V2,
+    })
+}
+
+/// The format version pg2iceberg creates `table` in: its own, if it has
+/// one, else the sink's.
+fn created_format_version(table: &TableIdent) -> pg2iceberg_iceberg::FormatVersion {
+    match own_format_version() {
+        Some(own) if *table == ident() => own,
+        _ => sink_format_version(),
     }
 }
 
@@ -811,7 +841,11 @@ impl Storage {
     }
 
     fn sim() -> Self {
-        let catalog = Arc::new(MemoryCatalog::new().with_format_version(created_format_version()));
+        let mut catalog = MemoryCatalog::new().with_format_version(sink_format_version());
+        if let Some(own) = own_format_version() {
+            catalog = catalog.with_table_format_version(ident(), own);
+        }
+        let catalog = Arc::new(catalog);
         let blob = Arc::new(MemoryBlobStore::new());
         Self {
             catalog: catalog.clone(),
@@ -1115,11 +1149,13 @@ mod prod_backend {
         let blob = Arc::new(WriteOnce(ObjectStoreBlobStore::new(Arc::new(
             object_store::memory::InMemory::new(),
         ))));
+        let mut catalog =
+            IcebergRustCatalog::new(iceberg.clone()).with_format_version(sink_format_version());
+        if let Some(own) = own_format_version() {
+            catalog = catalog.with_table_format_version(ident(), own);
+        }
         Storage {
-            catalog: Arc::new(
-                IcebergRustCatalog::new(iceberg.clone())
-                    .with_format_version(created_format_version()),
-            ),
+            catalog: Arc::new(catalog),
             blob,
             backend: Backend::Prod { iceberg },
         }
@@ -3771,6 +3807,27 @@ enum HeldPass {
 }
 
 impl AuditedCatalog {
+    /// 27. pg2iceberg creates each table in the format version configured
+    ///     for it: its own (`tables[].iceberg.format_version`), else the
+    ///     sink's (`sink.format_version`) — as the table is, not as the
+    ///     catalog's response says.
+    async fn check_created_format_version(&self, ident: &TableIdent) {
+        let want = created_format_version(ident) == pg2iceberg_iceberg::FormatVersion::V3;
+        match self.storage.is_v3(ident).await {
+            Ok(v3) if v3 == want => {}
+            Ok(v3) => self.violations.lock().unwrap().push(format!(
+                "invariant 27 (format version): pg2iceberg created {ident} {}, configured {:?}",
+                if v3 { "v3" } else { "v2" },
+                created_format_version(ident),
+            )),
+            Err(e) => self
+                .violations
+                .lock()
+                .unwrap()
+                .push(format!("invariant 27: {ident}'s format version: {e}")),
+        }
+    }
+
     /// 24. A v3 table takes no new equality deletes: pg2iceberg deletes
     ///     its rows through deletion vectors, as v4 requires. (Those it
     ///     took while v2 stay, until compaction retires them.)
@@ -3983,7 +4040,9 @@ impl Catalog for AuditedCatalog {
         &self,
         schema: &TableSchema,
     ) -> pg2iceberg_iceberg::Result<TableMetadata> {
-        self.inner.create_table(schema).await
+        let meta = self.inner.create_table(schema).await?;
+        self.check_created_format_version(&schema.ident).await;
+        Ok(meta)
     }
     async fn commit_snapshot(
         &self,
@@ -4485,13 +4544,31 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
 
     // 20. Row lineage is whole (see `Storage::lineage`), at quiescence as
     //     after every commit.
-    let lineage = block_on(h.storage.lineage(&ident()))?;
-    if FORMAT_V3.get() != lineage.is_some() {
-        return Err(format!(
-            "FORMAT_V3 is {}, but the table has row lineage: {}",
-            FORMAT_V3.get(),
-            lineage.is_some()
-        ));
+    block_on(h.storage.lineage(&ident()))?;
+
+    // 27. Each table is still in the format version pg2iceberg created it
+    //     in — v3, if another engine upgraded it (`V3_UPGRADED`, which has
+    //     by now): pg2iceberg changes no table's.
+    let mut tables = vec![ident()];
+    if SECOND_TABLE.get() > 0 {
+        tables.push(other_ident());
+    }
+    for table in tables {
+        let want = V3_UPGRADED.get()
+            || created_format_version(&table) == pg2iceberg_iceberg::FormatVersion::V3;
+        let v3 = block_on(h.storage.is_v3(&table))?;
+        if v3 != want {
+            return Err(format!(
+                "invariant 27 (format version): {table} is {}, but was created {:?}{}",
+                if v3 { "v3" } else { "v2" },
+                created_format_version(&table),
+                if V3_UPGRADED.get() {
+                    " and upgraded to v3"
+                } else {
+                    ""
+                },
+            ));
+        }
     }
     if let Some(v) = h.audited.violations.lock().unwrap().first() {
         return Err(v.clone());
@@ -4607,9 +4684,11 @@ proptest! {
         managed in any::<bool>(),
         bounded_index in any::<bool>(),
         format in 0u8..3,
+        own_format in any::<bool>(),
     ) {
         FORMAT_V3.set(format > 0);
         V3_UPGRADED.set(format == 2);
+        OWN_FORMAT.set(own_format);
         MANAGED.set(managed);
         BOUNDED_INDEX.set(bounded_index);
         SECOND_TABLE.set(second_table);
@@ -8350,4 +8429,80 @@ fn an_update_in_an_evicted_compaction_output_reads_no_data_file() {
     assert_eq!(reads, 0, "an update of row 12 read its file {reads} times");
     check_step_invariants(&h).unwrap();
     check_invariants(&mut h).unwrap();
+}
+
+// ---------- a table with a format version of its own ----------
+
+/// Run `steps` with `orders` in a format version of its own — v3 when the
+/// sink's is v2 (`sink_v3` false), v2 when it's v3 — beside `sales.orders`,
+/// in the sink's: the same name in another namespace, so a version keyed
+/// by name alone would land on both.
+fn own_format_case(prod: bool, sink_v3: bool, steps: &[Step]) {
+    FORMAT_V3.set(sink_v3);
+    OWN_FORMAT.set(true);
+    SECOND_TABLE.set(1);
+    PROD_BACKEND.set(prod);
+    let mut h = DstHarness::boot();
+    for step in steps {
+        h.run_step(step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    if let Err(e) = check_invariants(&mut h) {
+        panic!("at quiescence: {e}");
+    }
+}
+
+/// Inserts, updates and deletes on both tables, materialized together,
+/// compacted, and again after a restart: each table's deletes as its own
+/// version has them — deletion vectors on the v3 one (invariant 24),
+/// equality deletes on the v2 one, which the catalogs refuse vectors.
+fn own_format_steps() -> Vec<Step> {
+    vec![
+        Step::Insert { id: 1, qty: 10 },
+        Step::Insert { id: 2, qty: 20 },
+        Step::OtherInsert { id: 1, qty: 10 },
+        Step::OtherInsert { id: 2, qty: 20 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Update { id: 1, qty: 11 },
+        Step::Delete { id: 2 },
+        Step::OtherUpdate { id: 1, qty: 11 },
+        Step::OtherDelete { id: 2 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Compact,
+        Step::RestartMaterializer,
+        Step::Update { id: 1, qty: 12 },
+        Step::OtherUpdate { id: 1, qty: 12 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+    ]
+}
+
+/// A v3 table beside v2 ones: `tables[].iceberg.format_version: 3` under
+/// `sink.format_version: 2`.
+#[test]
+fn a_table_is_created_in_its_own_format_version() {
+    own_format_case(false, false, &own_format_steps());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_table_is_created_in_its_own_format_version_on_iceberg() {
+    own_format_case(true, false, &own_format_steps());
+}
+
+/// A v2 table beside v3 ones: `tables[].iceberg.format_version: 2` under
+/// `sink.format_version: 3`.
+#[test]
+fn a_table_is_created_in_its_own_format_version_under_a_v3_sink() {
+    own_format_case(false, true, &own_format_steps());
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_table_is_created_in_its_own_format_version_under_a_v3_sink_on_iceberg() {
+    own_format_case(true, true, &own_format_steps());
 }

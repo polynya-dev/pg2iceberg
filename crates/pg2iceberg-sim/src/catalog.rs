@@ -11,7 +11,8 @@
 //! snapshot sees — independent of what [`Catalog::snapshots`] reports.
 //!
 //! Tables are created format v2 unless the catalog is told otherwise
-//! ([`MemoryCatalog::with_format_version`]), and can be upgraded
+//! ([`MemoryCatalog::with_format_version`], or for one table
+//! [`MemoryCatalog::with_table_format_version`]), and can be upgraded
 //! ([`MemoryCatalog::upgrade_format_version`]). A v3 table has row
 //! lineage, as the spec requires: every commit gives each data file it
 //! adds the next `record_count` row ids, the first one recorded on the
@@ -31,8 +32,8 @@ use pg2iceberg_core::{Namespace, TableIdent, TableSchema};
 use pg2iceberg_iceberg::PreparedCommit;
 use pg2iceberg_iceberg::{
     apply_schema_changes, live_deletion_vectors, log_ends_property, merge_log_ends,
-    recorded_log_ends, Catalog, DataFile, DeletionVectorKey, FormatVersion, IcebergError, LogRange,
-    PreparedCompaction, Result, SchemaChange, Snapshot, TableMetadata,
+    recorded_log_ends, Catalog, DataFile, DeletionVectorKey, FormatVersion, FormatVersions,
+    IcebergError, LogRange, PreparedCompaction, Result, SchemaChange, Snapshot, TableMetadata,
     DELETES_SINCE_REWRITE_CONFLICT, DELETION_VECTOR_CONFLICT, EQUALITY_DELETES_ON_V3_CONFLICT,
     MISSING_DATA_FILE_CONFLICT,
 };
@@ -299,8 +300,8 @@ impl MemTable {
 #[derive(Default, Clone)]
 pub struct MemoryCatalog {
     state: Arc<Mutex<State>>,
-    /// The format version of the tables it creates.
-    format_version: FormatVersion,
+    /// The format version of each table it creates.
+    formats: FormatVersions,
 }
 
 impl MemoryCatalog {
@@ -308,13 +309,19 @@ impl MemoryCatalog {
         Self::default()
     }
 
-    /// Create tables in format `version` (v2 by default), as
-    /// `IcebergRustCatalog::with_format_version` does.
-    pub fn with_format_version(self, version: FormatVersion) -> Self {
-        Self {
-            format_version: version,
-            ..self
-        }
+    /// Create tables in format `version` (v2 by default), unless one has
+    /// a version of its own, as `IcebergRustCatalog::with_format_version`
+    /// does.
+    pub fn with_format_version(mut self, version: FormatVersion) -> Self {
+        self.formats.default = version;
+        self
+    }
+
+    /// Create `ident` in format `version`, whatever the others take, as
+    /// `IcebergRustCatalog::with_table_format_version` does.
+    pub fn with_table_format_version(mut self, ident: TableIdent, version: FormatVersion) -> Self {
+        self.formats.tables.insert(ident, version);
+        self
     }
 
     /// Every snapshot ever committed to `ident`, expired or not: the
@@ -541,6 +548,7 @@ impl Catalog for MemoryCatalog {
                 ident.namespace
             )));
         }
+        let format_version = self.formats.of(&ident);
         let metadata = TableMetadata {
             ident: ident.clone(),
             schema: schema.clone(),
@@ -549,7 +557,7 @@ impl Catalog for MemoryCatalog {
             location: String::new(),
             log_ends: BTreeMap::new(),
             properties: BTreeMap::new(),
-            format_version: self.format_version,
+            format_version,
             row_range: None,
         };
         s.tables.insert(
@@ -560,7 +568,7 @@ impl Catalog for MemoryCatalog {
                 expired: BTreeSet::new(),
                 next_snapshot_id: 1,
                 log_ends: BTreeMap::new(),
-                format_version: self.format_version,
+                format_version,
                 next_row_id: 0,
             },
         );
