@@ -59,8 +59,11 @@ use crate::{
 pub struct IcebergRustCatalog<C: IcebergCatalogTrait> {
     inner: Arc<C>,
     manifests: Arc<ManifestCache>,
-    /// The format version of the tables it creates.
-    format_version: crate::FormatVersion,
+    /// The format version of each table it creates.
+    formats: crate::FormatVersions,
+    /// The tables it found in a version other than their own
+    /// ([`Self::with_table_format_version`]), and has warned of.
+    warned: Arc<std::sync::Mutex<BTreeSet<TableIdent>>>,
 }
 
 impl<C: IcebergCatalogTrait> IcebergRustCatalog<C> {
@@ -68,15 +71,44 @@ impl<C: IcebergCatalogTrait> IcebergRustCatalog<C> {
         Self {
             inner,
             manifests: Arc::default(),
-            format_version: crate::FormatVersion::default(),
+            formats: crate::FormatVersions::default(),
+            warned: Arc::default(),
         }
     }
 
-    /// Create tables in format `version` (v2 by default).
-    pub fn with_format_version(self, version: crate::FormatVersion) -> Self {
-        Self {
-            format_version: version,
-            ..self
+    /// Create tables in format `version` (v2 by default), unless one has a
+    /// version of its own ([`Self::with_table_format_version`]).
+    pub fn with_format_version(mut self, version: crate::FormatVersion) -> Self {
+        self.formats.default = version;
+        self
+    }
+
+    /// Create `ident` in format `version`, whatever the others take.
+    pub fn with_table_format_version(
+        mut self,
+        ident: TableIdent,
+        version: crate::FormatVersion,
+    ) -> Self {
+        self.formats.tables.insert(ident, version);
+        self
+    }
+
+    /// Warn, once per table, of one in a version other than its own: it
+    /// existed before, so its configured version doesn't apply.
+    /// pg2iceberg writes it as its version says, and never upgrades it.
+    fn warn_unless_its_own_version(&self, meta: &TableMetadata) {
+        let Some(&own) = self.formats.tables.get(&meta.ident) else {
+            return;
+        };
+        if meta.format_version != own && self.warned.lock().unwrap().insert(meta.ident.clone()) {
+            tracing::warn!(
+                table = %meta.ident,
+                configured = ?own,
+                actual = ?meta.format_version,
+                "table exists in another format version than the one configured for it, \
+                 which applies only to tables pg2iceberg creates: it is written as its own \
+                 version says, and pg2iceberg doesn't upgrade it"
+            );
         }
     }
 }
@@ -86,7 +118,8 @@ impl<C: IcebergCatalogTrait> Clone for IcebergRustCatalog<C> {
         Self {
             inner: Arc::clone(&self.inner),
             manifests: Arc::clone(&self.manifests),
-            format_version: self.format_version,
+            formats: self.formats.clone(),
+            warned: Arc::clone(&self.warned),
         }
     }
 }
@@ -154,7 +187,11 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
     async fn load_table(&self, ident: &TableIdent) -> Result<Option<TableMetadata>> {
         let it = to_iceberg_table_ident(ident)?;
         match self.inner.load_table(&it).await {
-            Ok(table) => Ok(Some(metadata_from_table(ident, &table)?)),
+            Ok(table) => {
+                let meta = metadata_from_table(ident, &table)?;
+                self.warn_unless_its_own_version(&meta);
+                Ok(Some(meta))
+            }
             // Either a missing table or a missing namespace means "no such
             // table" from the materializer's perspective.
             Err(e)
@@ -190,11 +227,12 @@ impl<C: IcebergCatalogTrait + Send + Sync + 'static> Catalog for IcebergRustCata
         // build. The `clone()` on `ice_schema` is the cost of avoiding
         // a more elaborate dynamic-build dance.
         //
-        // The format version explicitly, never the catalog's default: v2
-        // unless configured — what every engine reads (v3 isn't yet —
-        // ClickHouse, open-source Trino). (A REST catalog takes it as the
-        // `format-version` property, which the fork's client sends.)
-        let format_version = match self.format_version {
+        // The format version explicitly, never the catalog's default: the
+        // table's own, else v2 unless configured — what every engine reads
+        // (v3 isn't yet — ClickHouse, open-source Trino). (A REST catalog
+        // takes it as the `format-version` property, which the fork's
+        // client sends.)
+        let format_version = match self.formats.of(&schema.ident) {
             crate::FormatVersion::V2 => FormatVersion::V2,
             crate::FormatVersion::V3 => FormatVersion::V3,
         };
@@ -1564,6 +1602,37 @@ mod tests {
             partition_spec: Vec::new(),
             pg_schema: None,
         }
+    }
+
+    /// A table with a format version of its own is created in it, the
+    /// others in the default — `sales.orders` too, the same name in
+    /// another namespace. One that exists keeps its version, whatever its
+    /// own says.
+    #[tokio::test]
+    async fn a_table_is_created_in_its_own_format_version() {
+        use crate::FormatVersion::{V2, V3};
+        let other = TableIdent {
+            namespace: Namespace(vec!["sales".into()]),
+            name: "orders".into(),
+        };
+        let c = fresh().await.with_table_format_version(ident(), V3);
+        for t in [ident(), other.clone()] {
+            c.ensure_namespace(&t.namespace).await.unwrap();
+            c.create_table(&TableSchema {
+                ident: t,
+                ..schema()
+            })
+            .await
+            .unwrap();
+        }
+        let version = |c: &IcebergRustCatalog<_>, t: TableIdent| {
+            let c = c.clone();
+            async move { c.load_table(&t).await.unwrap().unwrap().format_version }
+        };
+        assert_eq!(version(&c, ident()).await, V3);
+        assert_eq!(version(&c, other).await, V2);
+        let v2 = c.clone().with_table_format_version(ident(), V2);
+        assert_eq!(version(&v2, ident()).await, V3);
     }
 
     #[tokio::test]

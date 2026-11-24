@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pg2iceberg::config::{Config, SinkConfig, SourceConfig, TableConfig};
-use pg2iceberg::run::build_rest_catalog;
+use pg2iceberg::run::{build_catalog, build_rest_catalog};
 use pg2iceberg_core::metrics::{labels, names, Labels};
 use pg2iceberg_core::{ColumnName, Namespace, PgValue, Phase, TableIdent};
 use pg2iceberg_iceberg::{prod::IcebergRustCatalog, read_materialized_state};
@@ -359,26 +359,42 @@ async fn iam_credentials_with_a_custom_endpoint_commit_snapshots() {
         .await
         .expect("commit, writing manifests to MinIO");
 }
-/// A REST catalog creates each table in the format version pg2iceberg is
-/// set to — its create request carries it only as a table property — and,
+/// A REST catalog creates each table in the format version configured
+/// for it — its own (`tables[].iceberg.format_version`), else the sink's —
+/// though its create request carries one only as a table property; and,
 /// for v3, takes a commit's row range: the next commit's rows get ids.
 #[tokio::test]
 async fn a_rest_catalog_creates_tables_in_the_configured_format_version() {
     use iceberg::Catalog as _;
+    use pg2iceberg::config::IcebergTableConfig;
     use pg2iceberg_core::{ColumnSchema, IcebergType, TableSchema};
-    use pg2iceberg_iceberg::{Catalog as _, DataFile, FormatVersion, PreparedCommit};
+    use pg2iceberg_iceberg::{Catalog as _, DataFile, PreparedCommit};
 
     let stack = bring_up_stack(PG16).await;
-    let cfg = config_for_stack(&stack, "unused", "unused", "unused");
-    for (version, expected) in [
-        (FormatVersion::V2, iceberg::spec::FormatVersion::V2),
-        (FormatVersion::V3, iceberg::spec::FormatVersion::V3),
-    ] {
+    let created = [(2u8, 3u8), (3, 2)].into_iter().flat_map(|(sink, own)| {
+        let sinks = format!("sink_v{sink}_{}", uniq());
+        let owns = format!("own_v{own}_{}", uniq());
+        let mut cfg = config_for_stack(&stack, &sinks, "unused", "unused");
+        cfg.sink.format_version = sink;
+        cfg.tables.push(TableConfig {
+            iceberg: IcebergTableConfig {
+                format_version: Some(own),
+                ..Default::default()
+            },
+            ..TableConfig::named(&format!("public.{owns}"))
+        });
+        [(cfg.clone(), sinks, sink), (cfg, owns, own)]
+    });
+    for (cfg, name, version) in created {
+        let expected = match version {
+            2 => iceberg::spec::FormatVersion::V2,
+            _ => iceberg::spec::FormatVersion::V3,
+        };
         let rest = Arc::new(build_rest_catalog(&cfg).await.expect("rest catalog"));
-        let catalog = IcebergRustCatalog::new(rest.clone()).with_format_version(version);
+        let catalog = build_catalog(&cfg).await.expect("catalog");
         let ident = TableIdent {
             namespace: Namespace(vec!["public".into()]),
-            name: format!("v{}_{}", expected as u8, uniq()),
+            name,
         };
         catalog
             .ensure_namespace(&ident.namespace)

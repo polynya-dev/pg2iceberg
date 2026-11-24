@@ -97,13 +97,12 @@ pub struct TableConfig {
     /// don't match what you want to materialize, or for testing.
     #[serde(default, rename = "columns")]
     pub columns: Vec<ColumnConfig>,
-    /// Iceberg-specific per-table settings. Currently just partition.
+    /// Iceberg-specific per-table settings: partition and format version.
     #[serde(default)]
     pub iceberg: IcebergTableConfig,
 }
 
-/// Iceberg per-table options. Just `partition` for now; sort orders
-/// and other knobs are
+/// Iceberg per-table options. Sort orders and other knobs are
 /// follow-ons.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct IcebergTableConfig {
@@ -112,6 +111,11 @@ pub struct IcebergTableConfig {
     /// [`pg2iceberg_core::parse_partition_expr`] for the grammar.
     #[serde(default)]
     pub partition: Vec<String>,
+    /// The Iceberg format version pg2iceberg creates this table in: 2
+    /// or 3. Unset: `sink.format_version`. A table that already exists
+    /// keeps its own. See [`Config::format_versions`].
+    #[serde(default)]
+    pub format_version: Option<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -411,8 +415,9 @@ pub struct SinkConfig {
     /// The Iceberg format version of the tables pg2iceberg creates: 2
     /// (the default), or 3, whose rows carry row lineage (`_row_id`,
     /// `_last_updated_sequence_number`) — but which fewer engines read.
+    /// A table's own (`tables[].iceberg.format_version`) overrides it.
     /// Tables that already exist keep theirs. See
-    /// [`Self::resolved_format_version`].
+    /// [`Config::format_versions`].
     #[serde(default = "default_format_version")]
     pub format_version: u8,
 
@@ -716,7 +721,7 @@ impl Config {
         self.metrics_addr()?;
         self.liveness_timeout()?;
         self.sink.resolved_maintenance()?;
-        self.sink.resolved_format_version()?;
+        self.format_versions()?;
         Ok(self)
     }
 
@@ -906,10 +911,11 @@ impl Config {
                 if !t.columns.is_empty()
                     || !t.primary_key.is_empty()
                     || !t.iceberg.partition.is_empty()
+                    || t.iceberg.format_version.is_some()
                 {
                     anyhow::bail!(
-                        "{} can't set columns, primary_key or iceberg.partition: list the \
-                         tables that need them by name",
+                        "{} can't set columns, primary_key, iceberg.partition or \
+                         iceberg.format_version: list the tables that need them by name",
                         t.name
                     );
                 }
@@ -932,6 +938,32 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The format version of each table pg2iceberg creates: its own
+    /// (`tables[].iceberg.format_version`), else `sink.format_version`.
+    /// Only for tables it creates: one that exists keeps its version, and
+    /// pg2iceberg writes it as that says.
+    pub fn format_versions(&self) -> Result<pg2iceberg_iceberg::FormatVersions> {
+        let mut versions = pg2iceberg_iceberg::FormatVersions {
+            default: self.sink.resolved_format_version()?,
+            tables: BTreeMap::new(),
+        };
+        for t in &self.tables {
+            let Some(n) = t.iceberg.format_version else {
+                continue;
+            };
+            let version = pg2iceberg_iceberg::FormatVersion::from_number(n).map_err(|_| {
+                anyhow::anyhow!(
+                    "unsupported iceberg.format_version {n} for table {}; expected 2 or 3",
+                    t.name
+                )
+            })?;
+            versions
+                .tables
+                .insert(t.iceberg_ident(&self.sink.namespace)?, version);
+        }
+        Ok(versions)
     }
 
     /// Connection string for the coordinator: the source's, in
@@ -1657,6 +1689,49 @@ sink:
                 .to_string();
             assert!(err.contains("format"), "{bad}: {err}");
         }
+    }
+
+    /// A table's own format version overrides the sink's for that table,
+    /// by its Iceberg name; another version, or one on a `schema.*`
+    /// pattern, fails the config load.
+    #[test]
+    fn a_table_can_have_a_format_version_of_its_own() {
+        use pg2iceberg_iceberg::FormatVersion::{V2, V3};
+        let load = |own: &str, sink: u8| {
+            let tables = format!(
+                "tables:\n  - name: public.orders\n    iceberg:\n      format_version: {own}\n  \
+                 - name: public.items\n"
+            );
+            let yaml =
+                INTERVALS.replace("tables: []", &tables) + &format!("  format_version: {sink}\n");
+            let env = vars(&[]);
+            Config::parse(&yaml, &env).and_then(|cfg| cfg.finish(&env))
+        };
+        let ns = |name: &str| TableIdent {
+            namespace: pg2iceberg_core::Namespace(vec!["ns".into()]),
+            name: name.into(),
+        };
+        for (own, sink, orders, items) in [("3", 2, V3, V2), ("2", 3, V2, V3)] {
+            let versions = load(own, sink).unwrap().format_versions().unwrap();
+            assert_eq!(versions.of(&ns("orders")), orders, "own {own}, sink {sink}");
+            assert_eq!(versions.of(&ns("items")), items, "own {own}, sink {sink}");
+        }
+        let err = load("4", 2).unwrap_err().to_string();
+        assert!(
+            err.contains("iceberg.format_version 4 for table public.orders"),
+            "{err}"
+        );
+        assert!(load("v3", 2).is_err());
+        let yaml = INTERVALS.replace(
+            "tables: []",
+            "tables:\n  - name: public.*\n    iceberg:\n      format_version: 3\n",
+        );
+        let env = vars(&[]);
+        let err = Config::parse(&yaml, &env)
+            .and_then(|cfg| cfg.finish(&env))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("iceberg.format_version"), "{err}");
     }
 
     /// The state lives on the source's server, in the source's database
