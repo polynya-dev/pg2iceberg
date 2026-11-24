@@ -3129,6 +3129,47 @@ mod tests {
         assert!(matches!(err, IcebergError::Other(_)), "{err:?}");
     }
 
+    /// The manifests of the table's current snapshot holding deletes.
+    async fn delete_manifests(c: &IcebergRustCatalog<iceberg::memory::MemoryCatalog>) -> usize {
+        let it = to_iceberg_table_ident(&ident()).unwrap();
+        let table = c.inner.load_table(&it).await.unwrap();
+        let snap = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snap).load().await.unwrap();
+        list.entries()
+            .iter()
+            .filter(|m| m.content == ManifestContentType::Deletes)
+            .count()
+    }
+
+    /// A commit replacing vectors of several earlier commits — as one
+    /// updating rows all over the table does — leaves the vectors of theirs
+    /// it doesn't replace in one manifest, beside its own: a table's
+    /// delete manifests don't multiply with its commits, nor what each
+    /// commit reads and writes.
+    #[tokio::test]
+    async fn replacing_vectors_of_several_commits_keeps_their_manifests_few() {
+        let c = v3().await;
+        let files: Vec<String> = (0..8).map(|i| format!("{i}.parquet")).collect();
+        commit(&c, files.iter().map(|f| data(f)).collect(), vec![], vec![])
+            .await
+            .unwrap();
+        let mut vectors = Vec::new();
+        for pair in files.chunks(2) {
+            let puffin = format!("p-{}", pair[0]);
+            let added = vec![dv(&puffin, 4, &pair[0]), dv(&puffin, 44, &pair[1])];
+            commit(&c, vec![], added.clone(), vec![]).await.unwrap();
+            vectors.push(added);
+        }
+        assert_eq!(delete_manifests(&c).await, 4);
+        let replacing: Vec<DeletionVector> = (0..4)
+            .map(|i| dv("p-new", 4 + 40 * i as u64, &files[2 * i]))
+            .collect();
+        let replaced: Vec<&DeletionVector> = vectors.iter().map(|pair| &pair[0]).collect();
+        commit(&c, vec![], replacing, replaced).await.unwrap();
+        assert_eq!(live_vectors(&c).await.len(), 8);
+        assert_eq!(delete_manifests(&c).await, 2);
+    }
+
     #[tokio::test]
     async fn a_compaction_takes_its_inputs_vectors_with_them() {
         let c = v3().await;
