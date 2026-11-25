@@ -86,8 +86,11 @@ impl BlobNamer for CounterBlobNamer {
 /// Where to start replication: past every transaction already staged
 /// ([`Coordinator::replicated_lsn`]) and past the snapshot, if one just
 /// ran. Postgres skips transactions that committed before it and sends
-/// the rest, so at most the last staged transaction comes again,
-/// directly after its first copy.
+/// the rest — one whose commit LSN is the start position too — so what
+/// was staged is the end of its last transaction's WAL, past the commit
+/// record: none comes again. (Staged twice, a transaction would be
+/// applied twice, and a v3 table's rows it deleted and inserted again,
+/// or moved to another key, would take new row ids.)
 ///
 /// Starting at the slot's confirmed position instead replays every
 /// transaction staged after the last slot ack — after a crash between
@@ -377,7 +380,11 @@ impl<C: Coordinator + ?Sized + 'static> Pipeline<C> {
                 self.open_tx = Some((xid, final_lsn));
                 self.sink.begin_tx(xid);
             }
-            DecodedMessage::Commit { xid, commit_lsn } => {
+            DecodedMessage::Commit {
+                xid,
+                commit_lsn,
+                end_lsn,
+            } => {
                 self.open_tx = None;
                 self.received.transactions += 1;
                 // Drain any markers observed in this tx before
@@ -388,7 +395,9 @@ impl<C: Coordinator + ?Sized + 'static> Pipeline<C> {
                         self.ready_markers.push(MarkerInfo { uuid, commit_lsn });
                     }
                 }
-                self.sink.commit_tx(xid, commit_lsn);
+                // Staged, the stream resumes past it: at its end, not its
+                // commit LSN, which Postgres would send it again from.
+                self.sink.commit_tx(xid, end_lsn);
                 // A transaction staged in chunks is claimed as soon as it
                 // commits, keeping the log in commit order (see
                 // `spill_if_full`). Otherwise flush once enough rows are

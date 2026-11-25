@@ -33,7 +33,8 @@ pub type Result<T> = std::result::Result<T, SinkError>;
 #[derive(Debug)]
 pub(crate) struct TxBuffer {
     pub(crate) events: Vec<ChangeEvent>,
-    pub(crate) commit_lsn: Option<Lsn>,
+    /// Where the transaction's WAL ends, past its commit record.
+    pub(crate) end_lsn: Option<Lsn>,
     pub(crate) commit_ts: Option<Timestamp>,
 }
 
@@ -109,7 +110,7 @@ impl Sink {
             xid,
             TxBuffer {
                 events: Vec::new(),
-                commit_lsn: None,
+                end_lsn: None,
                 commit_ts: None,
             },
         );
@@ -144,9 +145,11 @@ impl Sink {
         Ok(())
     }
 
-    pub fn commit_tx(&mut self, xid: u32, commit_lsn: Lsn) {
+    /// Commit `xid`, whose WAL ends at `end_lsn` (past its commit
+    /// record): flushed, a stream resumed there doesn't send it again.
+    pub fn commit_tx(&mut self, xid: u32, end_lsn: Lsn) {
         if let Some(mut tx) = self.open_txns.remove(&xid) {
-            tx.commit_lsn = Some(commit_lsn);
+            tx.end_lsn = Some(end_lsn);
             self.committed.push_back(tx);
         }
     }
@@ -214,7 +217,7 @@ impl Sink {
     }
 
     /// Drains every committed tx into per-table writers, flushes them, and
-    /// returns the resulting chunks plus the highest commit_lsn covered.
+    /// returns the resulting chunks plus the highest end LSN covered.
     /// Returns `None` when nothing is ready.
     pub fn flush(&mut self) -> Result<Option<FlushOutput>> {
         let Some(Committed {
@@ -244,7 +247,7 @@ impl Sink {
         let mut max_lsn = Lsn::ZERO;
         let txns: Vec<TxBuffer> = self.committed.drain(..).collect();
         for tx in txns {
-            if let Some(lsn) = tx.commit_lsn {
+            if let Some(lsn) = tx.end_lsn {
                 if lsn > max_lsn {
                     max_lsn = lsn;
                 }
@@ -395,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn flushable_lsn_is_max_commit_lsn_across_txns() {
+    fn flushable_lsn_is_max_end_lsn_across_txns() {
         let mut s = Sink::new(100);
         s.begin_tx(1);
         s.record_change(insert(1, 10, 1)).unwrap();

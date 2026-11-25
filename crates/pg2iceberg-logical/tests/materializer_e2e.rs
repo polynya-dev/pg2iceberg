@@ -522,6 +522,7 @@ fn a_default_added_mid_transaction_is_filled_once() {
         change(Op::Insert, 1, 12, &[("id", int(2)), ("qty", int(20))]),
         DecodedMessage::Commit {
             commit_lsn: Lsn(13),
+            end_lsn: Lsn(14),
             xid: 1,
         },
     ];
@@ -552,6 +553,7 @@ fn a_default_added_mid_transaction_is_filled_once() {
         ),
         DecodedMessage::Commit {
             commit_lsn: Lsn(25),
+            end_lsn: Lsn(26),
             xid: 2,
         },
     ];

@@ -1908,7 +1908,7 @@ pub struct StreamStandby {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StandbyView {
-    /// The furthest position the stream has sent: a commit's LSN, a
+    /// The furthest position the stream has sent: a commit's end, a
     /// keepalive's `wal_end`.
     streamed: Lsn,
     phase: StandbyPhase,
@@ -1942,7 +1942,7 @@ impl StreamStandby {
     /// The stream sent `msg`.
     pub fn received(&self, msg: &DecodedMessage) {
         match msg {
-            DecodedMessage::Commit { commit_lsn, .. } => self.sent(*commit_lsn),
+            DecodedMessage::Commit { end_lsn, .. } => self.sent(*end_lsn),
             DecodedMessage::Keepalive { wal_end, .. } => self.sent(*wal_end),
             _ => {}
         }

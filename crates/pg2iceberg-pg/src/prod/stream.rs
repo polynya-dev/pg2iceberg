@@ -276,9 +276,14 @@ impl ReaderState {
             }
             PgMsg::Commit(c) => {
                 let commit_lsn = Lsn(c.commit_lsn());
+                let end_lsn = Lsn(c.end_lsn());
                 let xid = self.current_txn.map(|t| t.xid).unwrap_or(0);
                 self.current_txn = None;
-                Ok(Some(DecodedMessage::Commit { commit_lsn, xid }))
+                Ok(Some(DecodedMessage::Commit {
+                    commit_lsn,
+                    end_lsn,
+                    xid,
+                }))
             }
             PgMsg::Relation(r) => {
                 let ident = build_table_ident(

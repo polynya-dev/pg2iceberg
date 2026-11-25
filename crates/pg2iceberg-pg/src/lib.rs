@@ -140,7 +140,12 @@ pub enum DecodedMessage {
         xid: u32,
     },
     Commit {
+        /// Where the transaction's commit record starts: its LSN.
         commit_lsn: Lsn,
+        /// Where its WAL ends, past the commit record. A stream started
+        /// here doesn't send the transaction again; one started at
+        /// `commit_lsn` does.
+        end_lsn: Lsn,
         xid: u32,
     },
     /// Schema for a relation. Sent before the first change to it in a

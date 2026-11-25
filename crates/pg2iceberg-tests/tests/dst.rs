@@ -4354,13 +4354,13 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     for entry in &entries {
         staged_events.append(&mut staged_events_of(h, entry)?);
     }
-    // Staging is at-least-once: a crash between a claim and the slot ack
-    // replays the transaction, staging it again, and the fold absorbs the
-    // repeat (invariant 5). So per transaction, staging holds its events,
-    // possibly repeated.
-    // 14. Staging keeps commit order. At-least-once staging may repeat
-    //     the last transaction staged (a reconnect resends the one
-    //     committing at the acked LSN), but never stages an older one
+    // Staging is exactly-once: the stream resumes past the last
+    // transaction staged — at its commit's end, not its commit LSN — so
+    // Postgres doesn't send it again after a crash or a reconnect. Staged
+    // twice, it would be applied twice: a v3 table's rows it deleted and
+    // inserted again, or moved to another key, would take new row ids
+    // (invariant 26). So per transaction, staging holds its events, once.
+    // 14. Staging keeps commit order: it never stages an older transaction
     //     after a newer one: the materializer applies the log in order,
     //     so that would publish the older transaction's rows over the
     //     newer ones. Snapshot chunks interleave with CDC by design.
@@ -4456,14 +4456,14 @@ fn check_invariants(h: &mut DstHarness) -> Result<(), String> {
     }
     for (xid, want) in &expected {
         let got = &staged[xid];
-        if got.len() % want.len() != 0 {
+        if got.len() != want.len() {
             return Err(format!(
-                "invariant 4: xid {xid} staged {} events, not a multiple of its {}",
+                "invariant 4 (staged once): xid {xid} staged {} events, not its {}",
                 got.len(),
                 want.len()
             ));
         }
-        for (m, (lsn, op, row)) in got.iter().zip(want.iter().cycle()) {
+        for (m, (lsn, op, row)) in got.iter().zip(want) {
             if m.lsn != *lsn || m.op != *op || m.row != *row {
                 return Err(format!(
                     "invariant 4: xid {xid} staged ({}, {:?}, {:?}), WAL ({lsn}, {op:?}, {row:?})",
@@ -4940,10 +4940,11 @@ fn truncate_removes_rows_not_yet_materialized() {
     check_invariants(&mut h).unwrap();
 }
 
-/// A key change with a TOASTed column unchanged, replayed after a crash
-/// between its claim and the slot ack: the replayed copy's delete of the
-/// old key comes after the first copy's moved the row. A delete has no
-/// TOASTed value to resolve, so it must not look for one.
+/// A key change with a TOASTed column unchanged, then a crash between its
+/// claim and the slot ack: the stream resumes past it. (When it resumed at
+/// the commit LSN, the transaction came again, and its second copy's
+/// delete of the old key followed the first copy's move of the row: a
+/// delete has no TOASTed value to resolve, and must not look for one.)
 #[test]
 fn replayed_key_change_with_toast_deletes_without_resolving() {
     let mut h = DstHarness::boot();
@@ -4956,7 +4957,7 @@ fn replayed_key_change_with_toast_deletes_without_resolving() {
         toast: true,
     });
     // Its Begin, change and Commit, claimed before any keepalive: the
-    // restart resends the transaction committing at the claimed LSN.
+    // restart resumes past the claimed transaction's commit.
     h.run_step(&Step::DrivePartial { n: 3 });
     block_on(h.pipeline.flush()).unwrap();
     h.run_step(&Step::CrashMidStream);
@@ -5784,10 +5785,11 @@ fn crash_after_a_backfill_commit_does_not_apply_it_again() {
     check_invariants(&mut h).unwrap();
 }
 
-/// A key change with a TOASTed column unchanged, replayed after a crash
-/// between its claim and the slot ack, with its first copy already in
-/// Iceberg: the replayed copy can't resolve the value from the old key —
-/// the first copy moved the row off it.
+/// A key change with a TOASTed column unchanged, then a crash between its
+/// claim and the slot ack, with it already in Iceberg: the stream resumes
+/// past it. (When it resumed at the commit LSN, the transaction came
+/// again, and its second copy couldn't resolve the value from the old
+/// key: the first copy had moved the row off it.)
 #[test]
 fn replayed_key_change_with_toast_resolves_after_its_first_copy_landed() {
     DEFAULT_IDENTITY.set(true);
@@ -5801,7 +5803,7 @@ fn replayed_key_change_with_toast_resolves_after_its_first_copy_landed() {
         toast: true,
     });
     // Its Begin, change and Commit, claimed before any keepalive: the
-    // restart resends the transaction committing at the claimed LSN.
+    // restart resumes past the claimed transaction's commit.
     h.run_step(&Step::DrivePartial { n: 3 });
     block_on(h.pipeline.flush()).unwrap();
     h.run_step(&Step::MaterializerCycle);
@@ -8505,4 +8507,120 @@ fn a_table_is_created_in_its_own_format_version_under_a_v3_sink() {
 #[test]
 fn a_table_is_created_in_its_own_format_version_under_a_v3_sink_on_iceberg() {
     own_format_case(true, true, &own_format_steps());
+}
+
+// ---------- a transaction staged before a crash ----------
+
+/// Insert row 2, then run `tx`; the pipeline takes in both transactions
+/// (`messages` of them, up to `tx`'s commit), and the three rows they
+/// hold fill it, so it stages them as `tx` commits. It crashes before the
+/// slot is acked, and the stream resumes past what it staged: Postgres
+/// doesn't send `tx` again. Staged twice, it would be applied twice
+/// (invariant 4), and on a v3 table a row it deleted and inserted again,
+/// or moved to another key, would take a new id (26).
+fn staged_before_a_crash(prod: bool, v3: bool, tx: Step, messages: usize) {
+    FORMAT_V3.set(v3);
+    PROD_BACKEND.set(prod);
+    // On production's side, over the wire too: its decoder reads each
+    // commit's end.
+    WIRE.set(prod);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::Insert { id: 1, qty: 10 },
+        Step::DriveFlush,
+        Step::MaterializerCycle,
+        Step::Insert { id: 2, qty: 20 },
+        tx,
+        Step::DrivePartial { n: messages },
+        Step::MaterializerCycle,
+        Step::CrashMidStream,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
+}
+
+/// Row 1 moved to key 5: 3 + 3 messages.
+fn key_change() -> (Step, usize) {
+    let change = Step::ChangePk {
+        from: 1,
+        to: 5,
+        toast: false,
+    };
+    (change, 6)
+}
+
+/// The table truncated and row 3 inserted: 3 + 5 messages.
+fn truncate_and_insert() -> (Step, usize) {
+    let truncate = Step::Truncate {
+        reinsert: Some((3, 30)),
+    };
+    (truncate, 8)
+}
+
+#[test]
+fn a_transaction_staged_before_a_crash_is_staged_once() {
+    let (tx, n) = key_change();
+    staged_before_a_crash(false, false, tx, n);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_transaction_staged_before_a_crash_is_staged_once_on_iceberg() {
+    let (tx, n) = key_change();
+    staged_before_a_crash(true, false, tx, n);
+}
+
+#[test]
+fn a_key_change_staged_before_a_crash_keeps_the_rows_id() {
+    let (tx, n) = key_change();
+    staged_before_a_crash(false, true, tx, n);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_key_change_staged_before_a_crash_keeps_the_rows_id_on_iceberg() {
+    let (tx, n) = key_change();
+    staged_before_a_crash(true, true, tx, n);
+}
+
+#[test]
+fn a_row_inserted_after_a_truncate_staged_before_a_crash_keeps_its_id() {
+    let (tx, n) = truncate_and_insert();
+    staged_before_a_crash(false, true, tx, n);
+}
+
+#[cfg(feature = "integration")]
+#[test]
+fn a_row_inserted_after_a_truncate_staged_before_a_crash_keeps_its_id_on_iceberg() {
+    let (tx, n) = truncate_and_insert();
+    staged_before_a_crash(true, true, tx, n);
+}
+
+/// Found by the random DST: a key change during a backfill, staged before
+/// a crash, the backfill's rows staged after it.
+#[test]
+fn a_key_change_during_a_backfill_keeps_the_rows_id() {
+    FORMAT_V3.set(true);
+    BACKFILL.set(true);
+    let mut h = DstHarness::boot();
+    for step in [
+        Step::ChangePk {
+            from: 1,
+            to: 5,
+            toast: false,
+        },
+        Step::DrivePartial { n: 5 },
+        Step::DrivePartial { n: 2 },
+        Step::CrashMidStream,
+    ] {
+        h.run_step(&step);
+        if let Err(e) = check_step_invariants(&h) {
+            panic!("after {step:?}: {e}");
+        }
+    }
+    check_invariants(&mut h).unwrap();
 }
